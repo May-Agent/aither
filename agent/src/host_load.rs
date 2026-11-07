@@ -393,8 +393,8 @@ impl HostLoadEvent {
     /// for a model that saw critical.
     pub(crate) fn for_change(
         condition: &HostCondition,
-        seen: Option<&HostLevel>,
-        now: &HostLevel,
+        seen: Option<HostLevel>,
+        now: HostLevel,
         reading: &Self,
     ) -> Self {
         match (condition, now) {
@@ -410,7 +410,7 @@ impl HostLoadEvent {
                 else {
                     unreachable!("a load level comes from a load event")
                 };
-                if *high {
+                if high {
                     Self::LoadHigh {
                         load,
                         foreground_wait,
@@ -434,15 +434,15 @@ impl HostLoadEvent {
                 match level {
                     MemoryPressure::Normal => Self::MemoryDroppedBack {
                         domain,
-                        level: *level,
+                        level,
                         jobs,
                     },
                     MemoryPressure::Warning
-                        if seen == Some(&HostLevel::Memory(MemoryPressure::Critical)) =>
+                        if seen == Some(HostLevel::Memory(MemoryPressure::Critical)) =>
                     {
                         Self::MemoryDroppedBack {
                             domain,
-                            level: *level,
+                            level,
                             jobs,
                         }
                     }
@@ -457,8 +457,7 @@ impl HostLoadEvent {
                     unreachable!("a disk level comes from a disk event")
                 };
                 let volume = volume.clone();
-                let level = *level;
-                let fell = matches!(seen, Some(HostLevel::Disk(before)) if *before > level);
+                let fell = matches!(seen, Some(HostLevel::Disk(before)) if before > level);
                 if fell || level == DiskPressure::Normal {
                     Self::DiskPressureDroppedBack {
                         volume,
@@ -631,8 +630,12 @@ impl crate::context::StateSource for HostConditions {
             .expect("a condition with a level has the event that set it");
         crate::context::Block::new(
             "system-reminder",
-            self.notices
-                .host_condition(change.key(), change.seen(), change.now(), reading),
+            self.notices.host_condition(
+                change.key(),
+                change.seen().copied(),
+                *change.now(),
+                reading,
+            ),
         )
     }
 }

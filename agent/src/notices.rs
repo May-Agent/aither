@@ -209,8 +209,8 @@ pub trait Notices: SandboxNotices {
     fn host_condition(
         &self,
         condition: &HostCondition,
-        seen: Option<&HostLevel>,
-        now: &HostLevel,
+        seen: Option<HostLevel>,
+        now: HostLevel,
         reading: &HostLoadEvent,
     ) -> String {
         HostLoadEvent::for_change(condition, seen, now, reading).alert_text()

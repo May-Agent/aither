@@ -831,6 +831,7 @@ impl PermissionPauseTracker {
 /// asks the model for; [`HandoffDocument`] unless the builder's
 /// [`handoff`](crate::AgentBuilder::handoff) sets another.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Agent<
     Advanced,
     Balanced = Advanced,
@@ -3281,8 +3282,15 @@ where
         let delivered =
             futures::future::join_all(self.event_sources.iter_mut().map(AnyEventSource::deliver))
                 .await;
-        for block in delivered.into_iter().flatten() {
-            self.push_source_alert(&block);
+        self.append_alerts(delivered, Context::push_block_alert);
+    }
+
+    /// Appends every source's alerts to the conversation with `push`,
+    /// counting each against the budget.
+    fn append_alerts(&mut self, alerts: Vec<Vec<Block>>, push: fn(&mut Context, &Block) -> u64) {
+        for block in alerts.into_iter().flatten() {
+            self.budget.append(block.len());
+            push(&mut self.context, &block);
         }
     }
 
@@ -3295,10 +3303,7 @@ where
                 .map(|source| source.on_request(reassembled)),
         )
         .await;
-        for block in changed.into_iter().flatten() {
-            self.budget.append(block.len());
-            self.context.push_state_alert(&block);
-        }
+        self.append_alerts(changed, Context::push_state_alert);
     }
 
     /// Collects the durable alerts sources raise as a request begins: the
@@ -5895,39 +5900,22 @@ mod tests {
     /// restates it on the requests that follow.
     #[tokio::test]
     async fn host_load_events_are_injected_once() {
-        use aither_core::llm::Role;
-
-        async fn mentions(agent: &mut Agent<MockLlm, MockLlm, MockLlm, ()>, text: &str) -> usize {
-            let request = agent
-                .prepare_request(&EventSink::discarding())
-                .await
-                .expect("request boundary")
-                .expect("a fresh window must accept a request");
-            request
-                .messages()
-                .iter()
-                .filter(|message| {
-                    message.role() == Role::System && message.content().contains(text)
-                })
-                .count()
-        }
-
         let mut agent = Agent::new(MockLlm {
             context_length: 200_000,
         });
         let events = agent.watch_host_load();
         agent.ensure_initialized().await.expect("agent initializes");
 
-        assert_eq!(mentions(&mut agent, "load is high").await, 0);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 0);
         events
             .send(crate::HostLoadEvent::LoadHigh {
                 load: crate::MachineLoad(1.8),
                 foreground_wait: Duration::from_secs(90),
             })
             .await;
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
 
         events
             .send(crate::HostLoadEvent::LoadEnded {
@@ -5935,9 +5923,9 @@ mod tests {
                 foreground_wait: Duration::from_secs(10),
             })
             .await;
-        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
-        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
     }
 
     fn memory_red() -> crate::HostLoadEvent {
@@ -5969,7 +5957,7 @@ mod tests {
         let host = agent.watch_host_load();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
-        assert_eq!(system_mentions_of(&mut agent, RED).await, 0);
+        assert_eq!(system_mentions(&mut agent, RED).await, 0);
 
         // The model last saw normal memory: red and back is no news.
         host.send(memory_red()).await;
@@ -6007,9 +5995,9 @@ mod tests {
                 .is_err(),
             "state wakes nothing"
         );
-        assert_eq!(system_mentions_of(&mut agent, GREEN).await, 1);
-        assert_eq!(system_mentions_of(&mut agent, YELLOW).await, 0);
-        assert_eq!(system_mentions_of(&mut agent, GREEN).await, 1, "said once");
+        assert_eq!(system_mentions(&mut agent, GREEN).await, 1);
+        assert_eq!(system_mentions(&mut agent, YELLOW).await, 0);
+        assert_eq!(system_mentions(&mut agent, GREEN).await, 1, "said once");
     }
 
     /// A cold reassembly removes every earlier alert of a state, the
@@ -6078,9 +6066,11 @@ mod tests {
             &self,
             request: LLMRequest,
         ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-            let mut requests = self.requests.lock().expect("requests lock");
-            requests.push(request);
-            let first = requests.len() == 1;
+            let first = {
+                let mut requests = self.requests.lock().expect("requests lock");
+                requests.push(request);
+                requests.len() == 1
+            };
             futures_lite::stream::iter([if first {
                 Err(MockError)
             } else {
@@ -6118,16 +6108,26 @@ mod tests {
             capacity: aither_sandbox::MemorySize(32 << 30),
         })
         .await;
-        agent.query("go").await.expect_err("the first request fails");
+        agent
+            .query("go")
+            .await
+            .expect_err("the first request fails");
         agent.context_mut().reassemble();
         agent.query("again").await.expect("the second request runs");
         agent.context_mut().reassemble();
-        agent.query("once more").await.expect("the third request runs");
+        agent
+            .query("once more")
+            .await
+            .expect("the third request runs");
 
         let requests = llm.requests.lock().expect("requests lock").clone();
         let told = |request: &LLMRequest| system_count(request, KILLED);
         assert_eq!(told(&requests[0]), 1);
-        assert_eq!(told(&requests[1]), 1, "the failed request delivered nothing");
+        assert_eq!(
+            told(&requests[1]),
+            1,
+            "the failed request delivered nothing"
+        );
         assert_eq!(told(&requests[2]), 0, "an answered request delivered it");
     }
 
@@ -6154,11 +6154,11 @@ mod tests {
         assert!(mentions(&next_request_of(&mut agent).await, RED));
         host.send(memory_back_to(crate::MemoryPressure::Warning))
             .await;
-        assert_eq!(system_mentions_of(&mut agent, WARNING).await, 1);
+        assert_eq!(system_mentions(&mut agent, WARNING).await, 1);
     }
 
     /// The next request of an agent whose context fits.
-    async fn next_request_of(agent: &mut Agent<ScriptedLlm>) -> LLMRequest {
+    async fn next_request_of<L: LanguageModel + 'static>(agent: &mut Agent<L>) -> LLMRequest {
         agent
             .prepare_request(&EventSink::discarding())
             .await
@@ -6167,7 +6167,7 @@ mod tests {
     }
 
     /// The system messages of the next request that contain `text`.
-    async fn system_mentions_of(agent: &mut Agent<ScriptedLlm>, text: &str) -> usize {
+    async fn system_mentions<L: LanguageModel + 'static>(agent: &mut Agent<L>, text: &str) -> usize {
         system_count(&next_request_of(agent).await, text)
     }
 
@@ -6192,8 +6192,8 @@ mod tests {
         fn host_condition(
             &self,
             condition: &crate::HostCondition,
-            seen: Option<&crate::HostLevel>,
-            now: &crate::HostLevel,
+            seen: Option<crate::HostLevel>,
+            now: crate::HostLevel,
             reading: &crate::HostLoadEvent,
         ) -> String {
             match (now, reading) {
@@ -6211,22 +6211,6 @@ mod tests {
                 _ => crate::DefaultNotices.job_alert(alert),
             }
         }
-    }
-
-    /// The system messages of the next request that contain `text`.
-    async fn system_mentions(agent: &mut Agent<MockLlm>, text: &str) -> usize {
-        let request = agent
-            .prepare_request(&EventSink::discarding())
-            .await
-            .expect("request boundary")
-            .expect("a fresh window must accept a request");
-        request
-            .messages()
-            .iter()
-            .filter(|message| {
-                message.role() == aither_core::llm::Role::System && message.content().contains(text)
-            })
-            .count()
     }
 
     #[tokio::test]
