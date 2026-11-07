@@ -3295,14 +3295,20 @@ where
     }
 
     /// Appends an alert for every state whose value differs from what the
-    /// model last saw. `reassembled` says every earlier state alert is gone.
-    async fn push_state_alerts(&mut self, reassembled: bool) {
-        let changed = futures::future::join_all(
-            self.state_sources
-                .iter_mut()
-                .map(|source| source.on_request(reassembled)),
-        )
+    /// model last saw, which the context keeps, and records what it has
+    /// seen then.
+    async fn push_state_alerts(&mut self) {
+        let seen = &self.context;
+        let answers = futures::future::join_all(self.state_sources.iter_mut().map(|source| {
+            let stored = seen.seen_states().get(source.id()).cloned();
+            source.on_request(stored)
+        }))
         .await;
+        let mut changed = Vec::with_capacity(answers.len());
+        for (source, (alerts, seen)) in self.state_sources.iter().zip(answers) {
+            self.context.set_seen_states(source.id(), seen);
+            changed.push(alerts);
+        }
         self.append_alerts(changed, Context::push_state_alert);
     }
 
@@ -3318,7 +3324,7 @@ where
         self.sync_live_sources().await;
         let reassembled = std::mem::take(&mut self.reassembled);
         self.push_event_alerts().await;
-        self.push_state_alerts(reassembled).await;
+        self.push_state_alerts().await;
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
                 self.push_source_alert(&block);
@@ -6052,6 +6058,45 @@ mod tests {
         );
     }
 
+    /// What the model has seen of a state travels with the context: after a
+    /// round trip through serialization, a return to normal is announced
+    /// and a level the model already saw is not told again.
+    #[tokio::test]
+    async fn what_the_model_saw_of_a_state_survives_a_restore() {
+        let (mut agent, _sender, _llm) = detached_agent(Vec::new());
+        let host = agent.watch_host_load();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        host.send(memory_red()).await;
+        assert_eq!(system_mentions(&mut agent, RED).await, 1);
+        let saved = serde_json::to_string(agent.context()).expect("the context serializes");
+
+        let restore = || async {
+            let (mut agent, _sender, _llm) = detached_agent(Vec::new());
+            let host = agent.watch_host_load();
+            agent.ensure_initialized().await.expect("agent initializes");
+            *agent.context_mut() = serde_json::from_str(&saved).expect("the context deserializes");
+            (agent, host)
+        };
+
+        let (mut restored, host) = restore().await;
+        host.send(memory_red()).await;
+        assert_eq!(
+            system_mentions(&mut restored, RED).await,
+            1,
+            "the level the model saw is not told again"
+        );
+
+        let (mut restored, host) = restore().await;
+        host.send(memory_back_to(crate::MemoryPressure::Normal))
+            .await;
+        assert_eq!(
+            system_mentions(&mut restored, GREEN).await,
+            1,
+            "a return to normal is announced"
+        );
+    }
+
     /// Fails its first request before any event and answers the rest,
     /// recording every request.
     #[derive(Clone)]
@@ -6167,7 +6212,10 @@ mod tests {
     }
 
     /// The system messages of the next request that contain `text`.
-    async fn system_mentions<L: LanguageModel + 'static>(agent: &mut Agent<L>, text: &str) -> usize {
+    async fn system_mentions<L: LanguageModel + 'static>(
+        agent: &mut Agent<L>,
+        text: &str,
+    ) -> usize {
         system_count(&next_request_of(agent).await, text)
     }
 

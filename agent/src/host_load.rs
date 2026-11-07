@@ -29,13 +29,14 @@ use std::time::Duration;
 use aither_sandbox::{ForegroundWait, JobFootprint, MemoryDomain, MemorySize};
 use askama::Template;
 use async_channel::{Receiver, Sender};
+use serde::{Deserialize, Serialize};
 
 use crate::clock::{AnyClock, Instant};
 
 pub use system::{SystemReader, psi_memory_pressure};
 
 /// How hard the host's memory is pressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MemoryPressure {
     /// Memory is plentiful.
     Normal,
@@ -479,7 +480,7 @@ impl HostLoadEvent {
 
 /// A condition of the host the agent is told about as state: the
 /// machine's load, a domain's memory, or a volume's free space.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HostCondition {
     /// The machine's CPU load.
     Load,
@@ -490,7 +491,7 @@ pub enum HostCondition {
 }
 
 /// How a [`HostCondition`] stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostLevel {
     /// The load is high or not.
     Load {
@@ -601,6 +602,7 @@ pub struct HostConditions {
 }
 
 impl crate::context::StateSource for HostConditions {
+    const ID: &'static str = "host_conditions";
     type Key = HostCondition;
     type Value = HostLevel;
 
