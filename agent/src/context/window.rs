@@ -297,13 +297,29 @@ impl Context {
     }
 
     /// Records that a request carried the current system prefix, which a
-    /// provider may now cache, and every item in the window, which the
-    /// model has now been delivered.
-    pub(crate) fn mark_prefix_sent(&mut self) {
+    /// provider may now cache. Whether the model received the items it
+    /// carried is a separate matter, see
+    /// [`mark_delivered_below`](Self::mark_delivered_below).
+    pub(crate) const fn mark_prefix_carried(&mut self) {
         self.prefix_sent = true;
-        for item in &mut self.items {
+    }
+
+    /// Records that the provider began answering a request that carried
+    /// the items numbered below `seq`, which the model has now been
+    /// delivered. A request that failed before that delivered nothing, and
+    /// its items stay undelivered for the next one.
+    pub(crate) fn mark_delivered_below(&mut self, seq: u64) {
+        for item in self.items.iter_mut().filter(|item| item.seq < seq) {
             item.undelivered = false;
         }
+    }
+
+    /// A request carried the prefix and the provider answered it, in one
+    /// step, for tests that do not run a request.
+    #[cfg(test)]
+    pub(crate) fn mark_prefix_sent(&mut self) {
+        self.mark_prefix_carried();
+        self.mark_delivered_below(u64::MAX);
     }
 
     /// The blocks live sources rendered, as the prefix holds them.

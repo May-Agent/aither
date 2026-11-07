@@ -1016,6 +1016,11 @@ pub struct Agent<
     /// prompt-cache keep-alive can re-send it verbatim.
     pub(crate) last_request: Option<LLMRequest>,
 
+    /// The items of the request in flight, as the sequence number after the
+    /// last of them, until the provider begins answering it: only then has
+    /// the model been delivered what it carried.
+    pub(crate) delivering: Option<u64>,
+
     /// Prompt-cache keep-alive bookkeeping for the current run.
     pub(crate) cache_keep_alive: CacheKeepAliveState,
 
@@ -1122,6 +1127,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             stop_hook: None,
             restore_dir: None,
             last_request: None,
+            delivering: None,
             cache_keep_alive: CacheKeepAliveState::default(),
             fork_source: None,
             compact_signal: None,
@@ -1287,6 +1293,9 @@ where
             )
             .await
             .map_err(|error| BrokenStream { error, opened })?;
+            if received && let Some(carried) = self.delivering.take() {
+                self.context.mark_delivered_below(carried);
+            }
             opened |= received;
             match action {
                 ModelEventAction::Emit(event) => events.emit(event),
@@ -3765,7 +3774,8 @@ where
 
         self.sync_compact_signal();
         self.commit_tail(&tail).await;
-        self.context.mark_prefix_sent();
+        self.context.mark_prefix_carried();
+        self.delivering = Some(self.context.fork_point());
         self.warmth.start_entry_now();
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);
@@ -4991,6 +5001,8 @@ mod tests {
         agent.push_message(Message::system(
             "<system-reminder>stale alert</system-reminder>",
         ));
+        // An earlier request carried everything above.
+        agent.context.mark_delivered_below(u64::MAX);
         agent
     }
 
@@ -6059,6 +6071,73 @@ mod tests {
             !mentions(&normal, WARNING) && !mentions(&normal, GREEN),
             "a normal value is not restated"
         );
+    }
+
+    /// Fails its first request before any event and answers the rest,
+    /// recording every request.
+    #[derive(Clone)]
+    struct FailsFirst {
+        requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
+    }
+
+    impl LanguageModel for FailsFirst {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let mut requests = self.requests.lock().expect("requests lock");
+            requests.push(request);
+            let first = requests.len() == 1;
+            futures_lite::stream::iter([if first {
+                Err(MockError)
+            } else {
+                Ok(Event::Text("ok".to_string()))
+            }])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock", "test", "flaky", "flaky", 200_000,
+            )))
+        }
+    }
+
+    /// An event counts as delivered only once the provider begins
+    /// answering the request that carried it: after a failed request the
+    /// next one carries it again, even across a reassembly.
+    #[tokio::test]
+    async fn a_failed_request_does_not_deliver_its_events() {
+        const KILLED: &str = "was killed with everything it started";
+        let llm = FailsFirst {
+            requests: Arc::default(),
+        };
+        let mut agent = Agent::new(llm.clone());
+        let host = agent.watch_host_load();
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        host.send(crate::HostLoadEvent::JobKilledForMemory {
+            domain: aither_sandbox::MemoryDomain::Machine,
+            task_id: "amber".to_string(),
+            command: "make".to_string(),
+            footprint: aither_sandbox::MemorySize(8 << 30),
+            capacity: aither_sandbox::MemorySize(32 << 30),
+        })
+        .await;
+        agent.query("go").await.expect_err("the first request fails");
+        agent.context_mut().reassemble();
+        agent.query("again").await.expect("the second request runs");
+        agent.context_mut().reassemble();
+        agent.query("once more").await.expect("the third request runs");
+
+        let requests = llm.requests.lock().expect("requests lock").clone();
+        let told = |request: &LLMRequest| system_count(request, KILLED);
+        assert_eq!(told(&requests[0]), 1);
+        assert_eq!(told(&requests[1]), 1, "the failed request delivered nothing");
+        assert_eq!(told(&requests[2]), 0, "an answered request delivered it");
     }
 
     /// The alert is worded from the level the model saw, not from the path
@@ -7553,6 +7632,8 @@ mod tests {
         agent.push_message(Message::system(
             "<system-reminder>ephemeral</system-reminder>",
         ));
+        // An earlier request carried it.
+        agent.context.mark_delivered_below(u64::MAX);
 
         // The default lifetime is one hour: five minutes is nothing.
         agent.backdate_cache_entry(Duration::from_secs(300));
@@ -8404,6 +8485,7 @@ mod tests {
             .await
             .expect("request boundary")
             .expect("first request");
+        agent.context.mark_delivered_below(u64::MAX);
 
         agent.push_message(Message::assistant("done"));
         land_document(

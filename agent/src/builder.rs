@@ -1299,6 +1299,7 @@ where
             notices,
             connectivity,
             last_request: None,
+            delivering: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
