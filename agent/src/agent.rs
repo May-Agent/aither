@@ -138,16 +138,6 @@ impl EventSink {
     }
 }
 
-/// How an agent's last run stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LastRun {
-    /// It returned, or none started.
-    Finished,
-    /// It started and has not returned: running, or dropped before it
-    /// finished.
-    Unfinished,
-}
-
 /// What [`Agent::wait_background`] took from the background channel, and
 /// whether it starts a run.
 #[derive(Debug)]
@@ -161,7 +151,7 @@ pub struct BackgroundWake {
     /// Only a command the agent started can start one: a background command
     /// that completed, or one that needs the model — blocked on stdin, or a
     /// monitor's output. State and live content never do. After the host
-    /// interrupted the agent's last run ([`Agent::interrupted`]), nothing
+    /// interrupted the agent ([`Agent::interrupt`]), nothing
     /// does: what the wake recorded is in the context and reaches the model
     /// with the next user input.
     pub starts_run: bool,
@@ -921,10 +911,9 @@ pub struct Agent<
     /// request begin, which wipes every durable alert they pushed before.
     pub(crate) reassembled: bool,
 
-    /// How the last run stands: unfinished from its start until it returns,
-    /// so between runs an unfinished one was dropped before it finished,
-    /// which is how a host interrupts it.
-    pub(crate) last_run: LastRun,
+    /// Whether the host interrupted the agent ([`Agent::interrupt`]) and no
+    /// user input has started a run since.
+    pub(crate) interrupted: bool,
 
     /// What rewrote the prompt prefix since the previous request, reported
     /// with the next one's [`AgentEvent::PromptPrefix`].
@@ -1103,7 +1092,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             state_sources: Vec::new(),
             event_sources: Vec::new(),
             reassembled: false,
-            last_run: LastRun::Finished,
+            interrupted: false,
             prefix_rewrites: PrefixRewrites::default(),
             requests_sent: 0,
             compaction: CompactionState::default(),
@@ -1323,10 +1312,8 @@ where
         attachments: Vec<Attachment>,
         events: &EventSink,
     ) -> Result<(), AgentError> {
-        self.last_run = LastRun::Unfinished;
-        let result = self.run_to_end(prompt, attachments, events).await;
-        self.last_run = LastRun::Finished;
-        result
+        self.interrupted = false;
+        self.run_to_end(prompt, attachments, events).await
     }
 
     async fn run_to_end(
@@ -1394,10 +1381,7 @@ where
     /// A run without a new user message: the model acts on what
     /// [`wait_background`](Self::wait_background) recorded.
     async fn resume_streaming(&mut self, events: &EventSink) -> Result<(), AgentError> {
-        self.last_run = LastRun::Unfinished;
-        let result = self.resume_to_end(events).await;
-        self.last_run = LastRun::Finished;
-        result
+        self.resume_to_end(events).await
     }
 
     async fn resume_to_end(&mut self, events: &EventSink) -> Result<(), AgentError> {
@@ -2517,16 +2501,23 @@ where
         }
     }
 
-    /// Whether the host interrupted the agent's last run: dropped it, or
-    /// broke out of [`Run::drive`], before it finished. Cleared as the next
-    /// run starts.
+    /// Marks the agent interrupted: the user stopped it. A host calls this
+    /// when it stops a run on the user's behalf; dropping a run for any
+    /// other reason, such as a shutdown or a rebuild of the agent, is no
+    /// interrupt.
     ///
     /// While it holds, no background wake starts a run
-    /// ([`BackgroundWake::starts_run`]): the user stopped the agent, and only
-    /// the user's next input starts it again.
+    /// ([`BackgroundWake::starts_run`]): only the user's next input, a
+    /// [`run`](Self::run), starts the agent again and clears it.
+    pub const fn interrupt(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// Whether the host interrupted the agent ([`interrupt`](Self::interrupt))
+    /// and no user input has started a run since.
     #[must_use]
     pub const fn interrupted(&self) -> bool {
-        matches!(self.last_run, LastRun::Unfinished)
+        self.interrupted
     }
 
     /// Registers a tool for the agent to use.
@@ -9053,6 +9044,8 @@ mod tests {
         .expect("the stop ends the run")
         .expect("a stopped run is no error");
         assert!(flow.is_break(), "the user stopped the run");
+        assert!(!agent.interrupted(), "a dropped run is no interrupt");
+        agent.interrupt();
         assert!(agent.interrupted());
 
         sender
@@ -9088,8 +9081,8 @@ mod tests {
         assert!(mentions(next, "what happened?"));
     }
 
-    /// A run that ends on its own leaves nothing interrupted, so the next
-    /// completion starts a run.
+    /// A run that ends or is dropped without the host's `interrupt` leaves
+    /// nothing interrupted, so the next completion starts a run.
     #[tokio::test]
     async fn a_finished_run_is_not_an_interrupt() {
         let (mut agent, _sender, _llm) = detached_agent(["done".to_string()]);

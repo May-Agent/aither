@@ -1266,7 +1266,7 @@ where
             state_sources,
             event_sources,
             reassembled: false,
-            last_run: crate::agent::LastRun::Finished,
+            interrupted: false,
             prefix_rewrites: crate::context::PrefixRewrites::default(),
             requests_sent: 0,
             compaction: crate::compaction_state::CompactionState::default(),
