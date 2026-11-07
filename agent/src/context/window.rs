@@ -841,12 +841,15 @@ impl Context {
         alerts + dedupe_bytes
     }
 
-    /// Removes the durable system alerts numbered below `fork_point` and
-    /// returns how many were pruned.
+    /// Removes the delivered durable system alerts numbered below
+    /// `fork_point` and returns how many were pruned. An alert no request
+    /// has carried yet stays, as it does in
+    /// [`reassemble_below`](Self::reassemble_below).
     pub fn prune_system_messages_below(&mut self, fork_point: u64) -> usize {
         let before = self.items.len();
-        self.items
-            .retain(|item| item.message.role() != Role::System || item.seq >= fork_point);
+        self.items.retain(|item| {
+            item.message.role() != Role::System || item.seq >= fork_point || item.undelivered
+        });
         before - self.items.len()
     }
 
