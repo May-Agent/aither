@@ -18,9 +18,10 @@ use crate::{
     compaction_state::CompactionState,
     config::{AgentConfig, AgentKind, BackgroundJobPolicy},
     context::{
-        AnyContextSource, AnyStableContextSource, BackgroundJobs, Block, CacheLifetime,
-        CompactionFork, CompletedCompaction, Context, ContextBudget, HandoffDocument,
-        InstructionSlot, PendingCompaction, PrefixChain, PrefixRewrites, PromptCache, PromptPrefix,
+        AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, BackgroundJobs, Block,
+        CacheLifetime, CompactionFork, CompletedCompaction, Context, ContextBudget,
+        HandoffDocument, InstructionSlot, PendingCompaction, PrefixChain, PrefixRewrites,
+        PromptCache, PromptPrefix,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
@@ -137,16 +138,23 @@ impl EventSink {
     }
 }
 
-/// What [`Agent::wait_background`] took from the background channel.
+/// What [`Agent::wait_background`] took from the background channel, and
+/// whether it starts a run.
 #[derive(Debug)]
 pub struct BackgroundWake {
     /// Events the background work produced, such as a completed command's
     /// result, for the host to show.
     pub events: Vec<TimedEvent>,
-    /// Whether the model has something to act on: a command it started in
-    /// the background completed, or one is blocked on stdin. The host then
-    /// calls [`Agent::resume`].
-    pub needs_model: bool,
+    /// The wake decision: whether the host starts a run with
+    /// [`Agent::resume`].
+    ///
+    /// Only a command the agent started can start one: a background command
+    /// that completed, or one that needs the model — blocked on stdin, or a
+    /// monitor's output. State and live content never do. After the host
+    /// interrupted the agent ([`Agent::interrupt`]), nothing
+    /// does: what the wake recorded is in the context and reaches the model
+    /// with the next user input.
+    pub starts_run: bool,
     /// The completions this wake recorded. Each job reads
     /// [`Delivery::Pending`](aither_sandbox::Delivery) in its registry until
     /// this is dropped, so a host that drops the wake only once the turn it
@@ -825,6 +833,7 @@ impl PermissionPauseTracker {
 /// asks the model for; [`HandoffDocument`] unless the builder's
 /// [`handoff`](crate::AgentBuilder::handoff) sets another.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Agent<
     Advanced,
     Balanced = Advanced,
@@ -890,13 +899,24 @@ pub struct Agent<
     /// Sources rendered into the volatile tail of every request.
     pub(crate) context_sources: Vec<AnyContextSource>,
 
-    /// Sources rendered into the cacheable prefix, after the system prompt,
-    /// in this order.
-    pub(crate) stable_sources: Vec<AnyStableContextSource>,
+    /// Live content: sources rendered into the cacheable prefix, after the
+    /// system prompt, in this order.
+    pub(crate) live_sources: Vec<AnyLiveSource>,
+
+    /// State, with the values the model has seen, read in this order as a
+    /// request is assembled.
+    pub(crate) state_sources: Vec<AnyStateSource>,
+
+    /// Events, delivered in this order as a request is assembled.
+    pub(crate) event_sources: Vec<AnyEventSource>,
 
     /// Whether the window was rewritten since the sources last heard a
     /// request begin, which wipes every durable alert they pushed before.
     pub(crate) reassembled: bool,
+
+    /// Whether the host interrupted the agent ([`Agent::interrupt`]) and no
+    /// user input has started a run since.
+    pub(crate) interrupted: bool,
 
     /// What rewrote the prompt prefix since the previous request, reported
     /// with the next one's [`AgentEvent::PromptPrefix`].
@@ -942,8 +962,6 @@ pub struct Agent<
     /// The commands `terminal` runs, kept current in the command table
     /// block; `None` for an agent without a terminal agent's command table.
     pub(crate) commands: Option<crate::command_catalog::CommandCatalog>,
-    /// Receiver for the host memory pressure and machine load events.
-    pub(crate) host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
     /// Registry for running background terminal tasks.
     pub(crate) job_registry: Option<JobRegistry>,
 
@@ -989,6 +1007,11 @@ pub struct Agent<
     /// The most recent LLM request issued by this agent, retained so a
     /// prompt-cache keep-alive can re-send it verbatim.
     pub(crate) last_request: Option<LLMRequest>,
+
+    /// The items of the request in flight, as the sequence number after the
+    /// last of them, until the provider begins answering it: only then has
+    /// the model been delivered what it carried.
+    pub(crate) delivering: Option<u64>,
 
     /// Prompt-cache keep-alive bookkeeping for the current run.
     pub(crate) cache_keep_alive: CacheKeepAliveState,
@@ -1068,8 +1091,11 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             budget: ContextBudget::default(),
             prompt_cache,
             context_sources: Vec::new(),
-            stable_sources: Vec::new(),
+            live_sources: Vec::new(),
+            state_sources: Vec::new(),
+            event_sources: Vec::new(),
             reassembled: false,
+            interrupted: false,
             prefix_rewrites: PrefixRewrites::default(),
             requests_sent: 0,
             compaction: CompactionState::default(),
@@ -1085,7 +1111,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             kept_receiver: None,
             kept_exchanges: HashSet::new(),
             commands: None,
-            host_load_events: None,
             job_registry: None,
             detached_task_ids: HashSet::new(),
             sandbox_dir: None,
@@ -1094,6 +1119,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             stop_hook: None,
             restore_dir: None,
             last_request: None,
+            delivering: None,
             cache_keep_alive: CacheKeepAliveState::default(),
             fork_source: None,
             compact_signal: None,
@@ -1259,6 +1285,9 @@ where
             )
             .await
             .map_err(|error| BrokenStream { error, opened })?;
+            if received && let Some(carried) = self.delivering.take() {
+                self.context.mark_delivered_below(carried);
+            }
             opened |= received;
             match action {
                 ModelEventAction::Emit(event) => events.emit(event),
@@ -1278,7 +1307,19 @@ where
         })
     }
 
+    /// Runs on the user's `prompt`: the one input that starts a run even
+    /// after the last one was interrupted.
     async fn run_streaming(
+        &mut self,
+        prompt: String,
+        attachments: Vec<Attachment>,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        self.interrupted = false;
+        self.run_to_end(prompt, attachments, events).await
+    }
+
+    async fn run_to_end(
         &mut self,
         prompt: String,
         attachments: Vec<Attachment>,
@@ -1343,6 +1384,10 @@ where
     /// A run without a new user message: the model acts on what
     /// [`wait_background`](Self::wait_background) recorded.
     async fn resume_streaming(&mut self, events: &EventSink) -> Result<(), AgentError> {
+        self.resume_to_end(events).await
+    }
+
+    async fn resume_to_end(&mut self, events: &EventSink) -> Result<(), AgentError> {
         let run_id = uuid::Uuid::new_v4().to_string();
         self.cache_keep_alive.begin_run();
         events.emit(AgentEvent::run_start(
@@ -2141,6 +2186,20 @@ where
             .start_entry(crate::clock::Instant::from_nanos(0));
     }
 
+    /// Wires the agent to a host load monitor the test drives through the
+    /// returned senders, as [`AgentBuilder::host_load`](crate::AgentBuilder::host_load)
+    /// wires a real one.
+    #[cfg(test)]
+    pub(crate) fn watch_host_load(&mut self) -> crate::host_load::HostLoadSenders {
+        let (senders, channels) = crate::host_load::channels();
+        channels.register(
+            &self.notices,
+            &mut self.state_sources,
+            &mut self.event_sources,
+        );
+        senders
+    }
+
     /// Swaps the cache lifetime, forgetting any started entry.
     #[cfg(test)]
     pub(crate) fn use_cache_lifetime(&mut self, lifetime: CacheLifetime) {
@@ -2175,7 +2234,6 @@ where
     /// whose stdin watch failed. Returns whether any of them is a job blocked
     /// on stdin, which the model must act on.
     fn push_job_alerts(&mut self) -> bool {
-        self.push_host_load_alerts();
         let Some(receiver) = self.background_receiver.clone() else {
             return false;
         };
@@ -2184,19 +2242,6 @@ where
             wake |= self.push_job_alert(&alert);
         }
         wake
-    }
-
-    /// Pushes one durable alert per host load event raised since the last
-    /// call: a condition starting or ending. An event leaves the channel as
-    /// it is pushed, so the model sees it once.
-    fn push_host_load_alerts(&mut self) {
-        let Some(receiver) = self.host_load_events.clone() else {
-            return;
-        };
-        while let Ok(event) = receiver.try_recv() {
-            let alert = self.notices.host_load(&event);
-            self.push_system_alert(alert);
-        }
     }
 
     /// Pushes one durable alert for a background job alert; returns whether
@@ -2412,9 +2457,12 @@ where
     /// For an agent built with [`BackgroundJobPolicy::Detach`]: its runs end
     /// with the model's turn, and the host races this against its own work
     /// while the agent is idle. When the returned
-    /// [`BackgroundWake::needs_model`] is set, the host continues with
-    /// [`resume`](Self::resume). The wait is cancel-safe: nothing is taken
-    /// until it completes. Without a terminal it never completes.
+    /// [`BackgroundWake::starts_run`] is set, the host continues with
+    /// [`resume`](Self::resume). State — host load, memory and disk
+    /// pressure — is never read here: it reaches the model with the next
+    /// request, if it still differs from what the model saw. The wait is
+    /// cancel-safe: nothing is taken until it completes. Without a terminal
+    /// it never completes.
     ///
     /// The completions it recorded stay pending in their job registries
     /// until the host drops the wake's [`BackgroundWake::pending`]: the host
@@ -2445,11 +2493,36 @@ where
         while let Ok(event) = emitted.try_recv() {
             events.push(event);
         }
+        let starts_run = needs_model && !self.interrupted();
+        if needs_model && !starts_run {
+            tracing::info!(
+                "background work recorded for the next user input: the last run was interrupted"
+            );
+        }
         BackgroundWake {
             events,
-            needs_model,
+            starts_run,
             pending,
         }
+    }
+
+    /// Marks the agent interrupted: the user stopped it. A host calls this
+    /// when it stops a run on the user's behalf; dropping a run for any
+    /// other reason, such as a shutdown or a rebuild of the agent, is no
+    /// interrupt.
+    ///
+    /// While it holds, no background wake starts a run
+    /// ([`BackgroundWake::starts_run`]): only the user's next input, a
+    /// [`run`](Self::run), starts the agent again and clears it.
+    pub const fn interrupt(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// Whether the host interrupted the agent ([`interrupt`](Self::interrupt))
+    /// and no user input has started a run since.
+    #[must_use]
+    pub const fn interrupted(&self) -> bool {
+        self.interrupted
     }
 
     /// Registers a tool for the agent to use.
@@ -3186,41 +3259,76 @@ where
         }
     }
 
-    /// Brings every stable source's block to what it renders now.
+    /// Brings every live source's block to what it renders now.
     ///
     /// The blocks are prefix content: a change the model has not heard of is
     /// announced once, by the alert the source writes for it, and the next
     /// reassembly folds the new block into the prefix. Rendering is
     /// concurrent because the sources are independent.
-    async fn sync_stable_sources(&mut self) {
-        let rendered = futures::future::join_all(
-            self.stable_sources
-                .iter()
-                .map(AnyStableContextSource::render),
-        )
-        .await;
-        for (source, desired) in self.stable_sources.iter().zip(rendered) {
+    async fn sync_live_sources(&mut self) {
+        let rendered =
+            futures::future::join_all(self.live_sources.iter().map(AnyLiveSource::render)).await;
+        for (source, desired) in self.live_sources.iter().zip(rendered) {
             // An empty block costs a message and says nothing.
             let desired = desired.filter(|content| !content.is_empty());
-            if let Some(alert) = self
-                .context
-                .update_stable(&source.slot(), desired, |change| source.announce(change))
+            if let Some(alert) =
+                self.context
+                    .update_live_source(&source.slot(), desired, |change| source.announce(change))
             {
                 self.budget.append(alert);
             }
         }
     }
 
-    /// Collects the durable alerts sources raise as a request begins.
+    /// Delivers the events every event source raised since the last
+    /// request, each as an alert of its own.
+    async fn push_event_alerts(&mut self) {
+        let delivered =
+            futures::future::join_all(self.event_sources.iter_mut().map(AnyEventSource::deliver))
+                .await;
+        self.append_alerts(delivered, Context::push_block_alert);
+    }
+
+    /// Appends every source's alerts to the conversation with `push`,
+    /// counting each against the budget.
+    fn append_alerts(&mut self, alerts: Vec<Vec<Block>>, push: fn(&mut Context, &Block) -> u64) {
+        for block in alerts.into_iter().flatten() {
+            self.budget.append(block.len());
+            push(&mut self.context, &block);
+        }
+    }
+
+    /// Appends an alert for every state whose value differs from what the
+    /// model last saw, which the context keeps, and records what it has
+    /// seen then.
+    async fn push_state_alerts(&mut self) {
+        let seen = &self.context;
+        let answers = futures::future::join_all(self.state_sources.iter_mut().map(|source| {
+            let stored = seen.seen_states().get(source.id()).cloned();
+            source.on_request(stored)
+        }))
+        .await;
+        let mut changed = Vec::with_capacity(answers.len());
+        for (source, (alerts, seen)) in self.state_sources.iter().zip(answers) {
+            self.context.set_seen_states(source.id(), seen);
+            changed.push(alerts);
+        }
+        self.append_alerts(changed, Context::push_state_alert);
+    }
+
+    /// Collects the durable alerts sources raise as a request begins: the
+    /// one moment state, live content and events are read, so nothing is
+    /// written while the agent is idle.
     ///
     /// Tells the sources whether the window was reassembled since the last
     /// time, which is when their earlier alerts stopped being in it.
     async fn push_request_alerts(&mut self) {
         self.push_injected_context();
-        self.push_host_load_alerts();
         self.sync_command_table();
-        self.sync_stable_sources().await;
+        self.sync_live_sources().await;
         let reassembled = std::mem::take(&mut self.reassembled);
+        self.push_event_alerts().await;
+        self.push_state_alerts().await;
         for index in 0..self.context_sources.len() {
             if let Some(block) = self.context_sources[index].on_request(reassembled).await {
                 self.push_source_alert(&block);
@@ -3672,7 +3780,8 @@ where
 
         self.sync_compact_signal();
         self.commit_tail(&tail).await;
-        self.context.mark_prefix_sent();
+        self.context.mark_prefix_carried();
+        self.delivering = Some(self.context.fork_point());
         self.warmth.start_entry_now();
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);
@@ -4898,6 +5007,8 @@ mod tests {
         agent.push_message(Message::system(
             "<system-reminder>stale alert</system-reminder>",
         ));
+        // An earlier request carried everything above.
+        agent.context.mark_delivered_below(u64::MAX);
         agent
     }
 
@@ -5799,52 +5910,328 @@ mod tests {
     /// restates it on the requests that follow.
     #[tokio::test]
     async fn host_load_events_are_injected_once() {
-        use aither_core::llm::Role;
-
-        async fn mentions(agent: &mut Agent<MockLlm, MockLlm, MockLlm, ()>, text: &str) -> usize {
-            let request = agent
-                .prepare_request(&EventSink::discarding())
-                .await
-                .expect("request boundary")
-                .expect("a fresh window must accept a request");
-            request
-                .messages()
-                .iter()
-                .filter(|message| {
-                    message.role() == Role::System && message.content().contains(text)
-                })
-                .count()
-        }
-
-        let (events, receiver) = async_channel::unbounded();
         let mut agent = Agent::new(MockLlm {
             context_length: 200_000,
         });
-        agent.host_load_events = Some(receiver);
+        let events = agent.watch_host_load();
         agent.ensure_initialized().await.expect("agent initializes");
 
-        assert_eq!(mentions(&mut agent, "load is high").await, 0);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 0);
         events
             .send(crate::HostLoadEvent::LoadHigh {
                 load: crate::MachineLoad(1.8),
                 foreground_wait: Duration::from_secs(90),
             })
-            .await
-            .expect("agent listens");
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+            .await;
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
 
         events
             .send(crate::HostLoadEvent::LoadEnded {
                 load: crate::MachineLoad(0.2),
                 foreground_wait: Duration::from_secs(10),
             })
+            .await;
+        assert_eq!(system_mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load has ended").await, 1);
+        assert_eq!(system_mentions(&mut agent, "load is high").await, 1);
+    }
+
+    fn memory_red() -> crate::HostLoadEvent {
+        crate::HostLoadEvent::MemoryRed {
+            domain: aither_sandbox::MemoryDomain::Machine,
+            jobs: Vec::new(),
+        }
+    }
+
+    fn memory_back_to(level: crate::MemoryPressure) -> crate::HostLoadEvent {
+        crate::HostLoadEvent::MemoryDroppedBack {
+            domain: aither_sandbox::MemoryDomain::Machine,
+            level,
+            jobs: Vec::new(),
+        }
+    }
+
+    const RED: &str = "critically tight";
+    const YELLOW: &str = "getting tight";
+    const GREEN: &str = "dropped back to normal";
+    const WARNING: &str = "dropped back to warning";
+
+    /// While the agent is idle, memory pressure turning red and then green
+    /// writes nothing and wakes nothing; the next request carries one
+    /// alert at most, and only when the model last saw something else.
+    #[tokio::test]
+    async fn red_then_green_while_idle_is_at_most_one_alert_and_no_wake() {
+        let (mut agent, _sender, _llm) = detached_agent(Vec::new());
+        let host = agent.watch_host_load();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        assert_eq!(system_mentions(&mut agent, RED).await, 0);
+
+        // The model last saw normal memory: red and back is no news.
+        host.send(memory_red()).await;
+        host.send(memory_back_to(crate::MemoryPressure::Normal))
+            .await;
+        let written = agent.context().count_recent_system_messages();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), agent.wait_background())
+                .await
+                .is_err(),
+            "state wakes nothing"
+        );
+        assert_eq!(
+            agent.context().count_recent_system_messages(),
+            written,
+            "nothing is written while idle"
+        );
+        let request = next_request_of(&mut agent).await;
+        assert!(!mentions(&request, RED) && !mentions(&request, GREEN));
+
+        // The model saw red: yellow and then green while idle is one alert,
+        // the green one.
+        host.send(memory_red()).await;
+        assert!(mentions(&next_request_of(&mut agent).await, RED));
+        host.send(crate::HostLoadEvent::MemoryYellow {
+            domain: aither_sandbox::MemoryDomain::Machine,
+            jobs: Vec::new(),
+        })
+        .await;
+        host.send(memory_back_to(crate::MemoryPressure::Normal))
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), agent.wait_background())
+                .await
+                .is_err(),
+            "state wakes nothing"
+        );
+        assert_eq!(system_mentions(&mut agent, GREEN).await, 1);
+        assert_eq!(system_mentions(&mut agent, YELLOW).await, 0);
+        assert_eq!(system_mentions(&mut agent, GREEN).await, 1, "said once");
+    }
+
+    /// A cold reassembly removes every earlier alert of a state, the
+    /// superseded one included, and restates the current value only when
+    /// it is not the normal one.
+    #[tokio::test]
+    async fn a_cold_reassembly_removes_a_superseded_state_alert() {
+        let compactor = ScriptedLlm::new(
+            1_000_000,
+            [HANDOFF_JSON.to_string(), HANDOFF_JSON.to_string()],
+        );
+        let mut agent = agent_with_compactor_after_one_request(
+            ScriptedLlm::new(1_000_000, []),
+            Some(compactor.clone()),
+        )
+        .await;
+        let host = agent.watch_host_load();
+
+        host.send(memory_red()).await;
+        agent.push_message(Message::user("go on"));
+        assert!(mentions(&next_request_of(&mut agent).await, RED));
+        host.send(memory_back_to(crate::MemoryPressure::Warning))
+            .await;
+        agent.push_message(Message::user("and now?"));
+        let warm = next_request_of(&mut agent).await;
+        assert!(
+            mentions(&warm, RED) && mentions(&warm, WARNING),
+            "while warm the superseded alert stays in the prefix"
+        );
+
+        agent.backdate_cache_entry(Duration::from_secs(3660));
+        let cold = next_request_of(&mut agent).await;
+        assert_eq!(compactor.recorded().len(), 1, "the cold send compacted");
+        assert!(!mentions(&cold, RED), "the superseded alert is gone");
+        assert_eq!(
+            system_count(&cold, YELLOW),
+            1,
+            "the current value is not normal, so it is restated once, \
+             as a rise from the normal level the model now assumes"
+        );
+        assert_eq!(system_count(&cold, WARNING), 0);
+
+        host.send(memory_back_to(crate::MemoryPressure::Normal))
+            .await;
+        agent.push_message(Message::user("better?"));
+        assert!(mentions(&next_request_of(&mut agent).await, GREEN));
+        agent.backdate_cache_entry(Duration::from_secs(3660));
+        let normal = next_request_of(&mut agent).await;
+        assert!(
+            !mentions(&normal, WARNING) && !mentions(&normal, GREEN),
+            "a normal value is not restated"
+        );
+    }
+
+    /// What the model has seen of a state travels with the context: after a
+    /// round trip through serialization, a return to normal is announced
+    /// and a level the model already saw is not told again.
+    #[tokio::test]
+    async fn what_the_model_saw_of_a_state_survives_a_restore() {
+        let (mut agent, _sender, _llm) = detached_agent(Vec::new());
+        let host = agent.watch_host_load();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        host.send(memory_red()).await;
+        assert_eq!(system_mentions(&mut agent, RED).await, 1);
+        let saved = serde_json::to_string(agent.context()).expect("the context serializes");
+
+        let restore = || async {
+            let (mut agent, _sender, _llm) = detached_agent(Vec::new());
+            let host = agent.watch_host_load();
+            agent.ensure_initialized().await.expect("agent initializes");
+            *agent.context_mut() = serde_json::from_str(&saved).expect("the context deserializes");
+            (agent, host)
+        };
+
+        let (mut restored, host) = restore().await;
+        host.send(memory_red()).await;
+        assert_eq!(
+            system_mentions(&mut restored, RED).await,
+            1,
+            "the level the model saw is not told again"
+        );
+
+        let (mut restored, host) = restore().await;
+        host.send(memory_back_to(crate::MemoryPressure::Normal))
+            .await;
+        assert_eq!(
+            system_mentions(&mut restored, GREEN).await,
+            1,
+            "a return to normal is announced"
+        );
+    }
+
+    /// Fails its first request before any event and answers the rest,
+    /// recording every request.
+    #[derive(Clone)]
+    struct FailsFirst {
+        requests: Arc<std::sync::Mutex<Vec<LLMRequest>>>,
+    }
+
+    impl LanguageModel for FailsFirst {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let first = {
+                let mut requests = self.requests.lock().expect("requests lock");
+                requests.push(request);
+                requests.len() == 1
+            };
+            futures_lite::stream::iter([if first {
+                Err(MockError)
+            } else {
+                Ok(Event::Text("ok".to_string()))
+            }])
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock", "test", "flaky", "flaky", 200_000,
+            )))
+        }
+    }
+
+    /// An event counts as delivered only once the provider begins
+    /// answering the request that carried it: after a failed request the
+    /// next one carries it again, even across a reassembly.
+    #[tokio::test]
+    async fn a_failed_request_does_not_deliver_its_events() {
+        const KILLED: &str = "was killed with everything it started";
+        let llm = FailsFirst {
+            requests: Arc::default(),
+        };
+        let mut agent = Agent::new(llm.clone());
+        let host = agent.watch_host_load();
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        host.send(crate::HostLoadEvent::JobKilledForMemory {
+            domain: aither_sandbox::MemoryDomain::Machine,
+            task_id: "amber".to_string(),
+            command: "make".to_string(),
+            footprint: aither_sandbox::MemorySize(8 << 30),
+            capacity: aither_sandbox::MemorySize(32 << 30),
+        })
+        .await;
+        agent
+            .query("go")
             .await
-            .expect("agent listens");
-        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
-        assert_eq!(mentions(&mut agent, "load has ended").await, 1);
-        assert_eq!(mentions(&mut agent, "load is high").await, 1);
+            .expect_err("the first request fails");
+        agent.context_mut().reassemble();
+        agent.query("again").await.expect("the second request runs");
+        agent.context_mut().reassemble();
+        agent
+            .query("once more")
+            .await
+            .expect("the third request runs");
+
+        let requests = llm.requests.lock().expect("requests lock").clone();
+        let told = |request: &LLMRequest| system_count(request, KILLED);
+        assert_eq!(told(&requests[0]), 1);
+        assert_eq!(
+            told(&requests[1]),
+            1,
+            "the failed request delivered nothing"
+        );
+        assert_eq!(told(&requests[2]), 0, "an answered request delivered it");
+    }
+
+    /// The alert is worded from the level the model saw, not from the path
+    /// the condition took while the agent was idle.
+    #[tokio::test]
+    async fn the_alert_is_worded_from_what_the_model_saw() {
+        let (mut agent, _sender, _llm) = detached_agent(Vec::new());
+        let host = agent.watch_host_load();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+
+        // The model saw normal; red and back to warning while idle is a
+        // rise to warning for it, not a fall.
+        host.send(memory_red()).await;
+        host.send(memory_back_to(crate::MemoryPressure::Warning))
+            .await;
+        let request = next_request_of(&mut agent).await;
+        assert!(mentions(&request, YELLOW), "told as a rise to warning");
+        assert!(!mentions(&request, WARNING) && !mentions(&request, RED));
+
+        // The model saw red; a fall to warning is a fall for it.
+        host.send(memory_red()).await;
+        assert!(mentions(&next_request_of(&mut agent).await, RED));
+        host.send(memory_back_to(crate::MemoryPressure::Warning))
+            .await;
+        assert_eq!(system_mentions(&mut agent, WARNING).await, 1);
+    }
+
+    /// The next request of an agent whose context fits.
+    async fn next_request_of<L: LanguageModel + 'static>(agent: &mut Agent<L>) -> LLMRequest {
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary")
+            .expect("the window accepts a request")
+    }
+
+    /// The system messages of the next request that contain `text`.
+    async fn system_mentions<L: LanguageModel + 'static>(
+        agent: &mut Agent<L>,
+        text: &str,
+    ) -> usize {
+        system_count(&next_request_of(agent).await, text)
+    }
+
+    /// The system messages of `request` that contain `text`.
+    fn system_count(request: &LLMRequest, text: &str) -> usize {
+        request
+            .messages()
+            .iter()
+            .filter(|message| {
+                message.role() == aither_core::llm::Role::System && message.content().contains(text)
+            })
+            .count()
     }
 
     /// Notices that reword the host load and job alert families and keep
@@ -5854,12 +6241,19 @@ mod tests {
     impl aither_sandbox::SandboxNotices for Reworded {}
 
     impl crate::Notices for Reworded {
-        fn host_load(&self, event: &crate::HostLoadEvent) -> String {
-            match event {
-                crate::HostLoadEvent::LoadHigh { load, .. } => {
-                    format!("Reworded: the host runs at {}%.", load.percent())
-                }
-                _ => crate::DefaultNotices.host_load(event),
+        fn host_condition(
+            &self,
+            condition: &crate::HostCondition,
+            seen: Option<crate::HostLevel>,
+            now: crate::HostLevel,
+            reading: &crate::HostLoadEvent,
+        ) -> String {
+            match (now, reading) {
+                (
+                    crate::HostLevel::Load { high: true },
+                    crate::HostLoadEvent::LoadHigh { load, .. },
+                ) => format!("Reworded: the host runs at {}%.", load.percent()),
+                _ => crate::DefaultNotices.host_condition(condition, seen, now, reading),
             }
         }
 
@@ -5871,31 +6265,14 @@ mod tests {
         }
     }
 
-    /// The system messages of the next request that contain `text`.
-    async fn system_mentions(agent: &mut Agent<MockLlm>, text: &str) -> usize {
-        let request = agent
-            .prepare_request(&EventSink::discarding())
-            .await
-            .expect("request boundary")
-            .expect("a fresh window must accept a request");
-        request
-            .messages()
-            .iter()
-            .filter(|message| {
-                message.role() == aither_core::llm::Role::System && message.content().contains(text)
-            })
-            .count()
-    }
-
     #[tokio::test]
     async fn a_host_load_alert_reaches_the_conversation_in_the_embedders_words() {
-        let (events, receiver) = async_channel::unbounded();
         let mut agent = Agent::builder(MockLlm {
             context_length: 200_000,
         })
         .notices(crate::AnyNotices::new(Reworded))
         .build();
-        agent.host_load_events = Some(receiver);
+        let events = agent.watch_host_load();
         agent.ensure_initialized().await.expect("agent initializes");
 
         events
@@ -5903,8 +6280,7 @@ mod tests {
                 load: crate::MachineLoad(1.8),
                 foreground_wait: Duration::from_secs(90),
             })
-            .await
-            .expect("agent listens");
+            .await;
         assert_eq!(
             system_mentions(&mut agent, "Reworded: the host runs at 180%.").await,
             1
@@ -6668,18 +7044,18 @@ mod tests {
         assert_eq!(second.rewrites, PrefixRewrites::default());
     }
 
-    /// A stable source of linked issues whose content a test changes.
+    /// A live source of linked issues whose content a test changes.
     #[derive(Clone)]
     struct LinkedIssues(Arc<std::sync::Mutex<String>>);
 
-    impl crate::StableContextSource for LinkedIssues {
+    impl crate::LiveSource for LinkedIssues {
         const TAG: &'static str = "linked_issues";
 
         fn render(&self) -> impl Future<Output = Option<String>> + Send {
             std::future::ready(Some(self.0.lock().expect("issues lock").clone()))
         }
 
-        fn announce(&self, change: &crate::StableChange<'_>) -> Block {
+        fn announce(&self, change: &crate::LiveChange<'_>) -> Block {
             Block::new("linked_issues_changed", change.diff())
         }
     }
@@ -6727,15 +7103,16 @@ mod tests {
             .count()
     }
 
-    /// The prefix-stability invariant with a stable source: unchanged, its
-    /// block keeps every request's prefix; changed, the prefix still holds
-    /// and the change is one alert; the compaction folds the new block in.
+    /// The prefix-stability invariant with a live source: unchanged, its
+    /// block keeps every request's prefix; changed while warm, the prefix
+    /// still holds and the change is one diff alert; the compaction folds
+    /// the new block in and drops the diff.
     #[tokio::test]
-    async fn a_stable_source_keeps_the_prompt_prefix_until_compaction() {
+    async fn a_live_source_change_is_a_diff_while_warm_and_folded_in_at_reassembly() {
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let issues = Arc::new(std::sync::Mutex::new("issue #23: open\n".to_string()));
         let mut agent = Agent::builder(llm)
-            .stable_context_source(LinkedIssues(issues.clone()))
+            .live_source(LinkedIssues(issues.clone()))
             .build();
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("hello"));
@@ -7100,6 +7477,8 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("before the fork"));
         agent.push_system_alert("stale alert before the fork");
+        // The request the compaction forked from carried it.
+        agent.context.mark_prefix_sent();
         let fork_point = agent.context.fork_point();
         agent.push_system_alert("background job 7 completed");
         agent.push_message(Message::user("during"));
@@ -7280,6 +7659,8 @@ mod tests {
         agent.push_message(Message::system(
             "<system-reminder>ephemeral</system-reminder>",
         ));
+        // An earlier request carried it.
+        agent.context.mark_delivered_below(u64::MAX);
 
         // The default lifetime is one hour: five minutes is nothing.
         agent.backdate_cache_entry(Duration::from_secs(300));
@@ -7782,6 +8163,8 @@ mod tests {
             agent.push_message(Message::system(
                 "<system-reminder>ephemeral</system-reminder>",
             ));
+            // An earlier request delivered it.
+            agent.context.mark_prefix_sent();
             agent.backdate_cache_entry(Duration::from_secs(3660));
             assert!(
                 agent
@@ -7884,6 +8267,8 @@ mod tests {
         agent.push_message(Message::system(
             "<system-reminder>ephemeral</system-reminder>",
         ));
+        // A request delivered it before the gap.
+        agent.context.mark_prefix_sent();
 
         agent.backdate_cache_entry(Duration::from_secs(3660));
         agent
@@ -8127,6 +8512,7 @@ mod tests {
             .await
             .expect("request boundary")
             .expect("first request");
+        agent.context.mark_delivered_below(u64::MAX);
 
         agent.push_message(Message::assistant("done"));
         land_document(
@@ -8582,7 +8968,7 @@ mod tests {
             .expect("the wait task should not panic");
 
         assert!(
-            wake.needs_model,
+            wake.starts_run,
             "a background command's result needs the model"
         );
         assert!(
@@ -8625,6 +9011,121 @@ mod tests {
         );
     }
 
+    /// A model whose first request never answers, so a run can be stopped
+    /// while it waits; it reports reaching that request on `reached`.
+    #[derive(Clone)]
+    struct StallsFirstLlm {
+        inner: ScriptedLlm,
+        stall: Arc<std::sync::atomic::AtomicBool>,
+        reached: async_channel::Sender<()>,
+    }
+
+    impl LanguageModel for StallsFirstLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            let stall = self.stall.swap(false, std::sync::atomic::Ordering::SeqCst);
+            if !stall {
+                return futures::future::Either::Right(self.inner.respond(request));
+            }
+            let reached = self.reached.clone();
+            futures::future::Either::Left(futures_lite::stream::once_future(async move {
+                reached.send(()).await.ok();
+                std::future::pending::<Result<Event, MockError>>().await
+            }))
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            self.inner.profile()
+        }
+    }
+
+    /// After the user interrupts a run, a background command that finishes
+    /// starts no run; its result waits in the context and reaches the model
+    /// with the user's next message.
+    #[tokio::test]
+    async fn a_completion_after_an_interrupt_starts_no_run_and_is_in_the_next_request() {
+        let scripted = ScriptedLlm::new(100_000, ["the build failed to link".to_string()]);
+        let (reached, stalled) = async_channel::bounded(1);
+        let llm = StallsFirstLlm {
+            inner: scripted.clone(),
+            stall: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reached,
+        };
+        let (sender, receiver) = aither_sandbox::background_task_channel();
+        let mut agent = Agent::with_config(
+            llm,
+            AgentConfig {
+                background_jobs: BackgroundJobPolicy::Detach,
+                ..AgentConfig::default()
+            },
+        );
+        agent.background_receiver = Some(receiver);
+        agent.detached_task_ids.insert("task-build".to_string());
+
+        let flow = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent.run("build it", std::iter::empty()).drive(
+                (),
+                async move { stalled.recv().await.ok() },
+                |(), _| async { ControlFlow::Continue(()) },
+            ),
+        )
+        .await
+        .expect("the stop ends the run")
+        .expect("a stopped run is no error");
+        assert!(flow.is_break(), "the user stopped the run");
+        assert!(!agent.interrupted(), "a dropped run is no interrupt");
+        agent.interrupt();
+        assert!(agent.interrupted());
+
+        sender
+            .send_completed(finished("task-build", "linker error"))
+            .await;
+        let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
+            .await
+            .expect("the completion ends the wait");
+        assert!(!wake.starts_run, "an interrupted agent waits for the user");
+        assert!(
+            wake.events
+                .iter()
+                .any(|timed| matches!(timed.event, AgentEvent::BackgroundTaskCompleted { .. })),
+            "the completion is recorded: {:?}",
+            wake.events
+        );
+        drop(wake);
+
+        let events = drain_run(agent.run("what happened?", std::iter::empty())).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Complete { .. })),
+            "{events:?}"
+        );
+        assert!(!agent.interrupted(), "the user's input started it again");
+        let requests = scripted.recorded();
+        let next = requests.last().expect("the next run asked the model");
+        assert!(
+            mentions(next, "linker error"),
+            "the next request carries the completion"
+        );
+        assert!(mentions(next, "what happened?"));
+    }
+
+    /// A run that ends or is dropped without the host's `interrupt` leaves
+    /// nothing interrupted, so the next completion starts a run.
+    #[tokio::test]
+    async fn a_finished_run_is_not_an_interrupt() {
+        let (mut agent, _sender, _llm) = detached_agent(["done".to_string()]);
+        drain_run(agent.run("build it", std::iter::empty())).await;
+        assert!(!agent.interrupted());
+    }
+
     /// A foreground command's completion is not news to the model: its
     /// result already returned through the tool call.
     #[tokio::test]
@@ -8636,7 +9137,7 @@ mod tests {
         let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
             .await
             .expect("the queued completion ends the wait");
-        assert!(!wake.needs_model);
+        assert!(!wake.starts_run);
         assert!(wake.events.is_empty(), "{:?}", wake.events);
     }
 
@@ -8669,7 +9170,7 @@ mod tests {
         let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
             .await
             .expect("the queued completion ends the wait");
-        assert!(wake.needs_model);
+        assert!(wake.starts_run);
         assert_eq!(wake.pending.len(), 1);
         let status = jobs.get(41).await.expect("job should exist").status;
         assert!(status.completion_pending(), "{status:?}");
@@ -8701,7 +9202,7 @@ mod tests {
         let wake = tokio::time::timeout(Duration::from_secs(5), agent.wait_background())
             .await
             .expect("the completion is still there for the next wait");
-        assert!(wake.needs_model);
+        assert!(wake.starts_run);
     }
 
     /// An agent with the `compact` tool on a 1M window, and the tool itself.

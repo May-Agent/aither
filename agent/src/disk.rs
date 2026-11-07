@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aither_sandbox::ContainerProbe;
+use serde::{Deserialize, Serialize};
 
 use crate::host_load::{HostLoadEvent, ReadError};
 use crate::pressure::{LevelTracker, Shift};
@@ -29,7 +30,7 @@ mod tests;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// How little free space a volume has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DiskPressure {
     /// Space is plentiful.
     Normal,

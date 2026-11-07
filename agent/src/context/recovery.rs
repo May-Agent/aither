@@ -124,6 +124,7 @@ mod tests {
         context.push(Message::system("<system-reminder>stale</system-reminder>"));
         context.push(Message::tool("call/1", "é".repeat(200)));
         context.push(Message::tool("call-2", "short"));
+        context.mark_prefix_sent();
 
         let report = clean_for_recovery(&mut context, u64::MAX, Some(dir.path()), limits())
             .await
@@ -154,6 +155,7 @@ mod tests {
     async fn only_alerts_below_the_fork_point_go() {
         let mut context = Context::new();
         context.push(Message::system("old alert"));
+        context.mark_prefix_sent();
         let fork_point = context.fork_point();
         context.push(Message::system("new alert"));
 
@@ -167,10 +169,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_alert_no_request_carried_survives_recovery() {
+        let mut context = Context::new();
+        context.push(Message::system("delivered alert"));
+        context.mark_prefix_sent();
+        context.push(Message::system("undelivered alert"));
+
+        let report = clean_for_recovery(&mut context, u64::MAX, None, limits())
+            .await
+            .expect("recovery");
+
+        assert_eq!(report.alerts_removed, 1);
+        let kept: Vec<_> = context.recent().iter().map(|m| m.content()).collect();
+        assert_eq!(kept, ["undelivered alert"]);
+    }
+
+    #[tokio::test]
     async fn without_a_working_directory_only_the_alerts_go() {
         let mut context = Context::new();
         context.push(Message::system("alert"));
         context.push(Message::tool("call-1", "x".repeat(500)));
+        context.mark_prefix_sent();
 
         let report = clean_for_recovery(&mut context, u64::MAX, None, limits())
             .await
