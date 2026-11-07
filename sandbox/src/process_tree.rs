@@ -1375,7 +1375,7 @@ mod platform {
                 Err(error) => return Err(error),
             };
             let mut process = parse_stat(pid, &line)
-                .ok_or_else(|| io::Error::other(format!("malformed /proc/{pid}/stat")))?;
+                .ok_or_else(|| io::Error::other(format!("malformed /proc/{pid}/stat: {line:?}")))?;
             if uid == me && !process.zombie {
                 process.marker = marker_of(pid);
             }
