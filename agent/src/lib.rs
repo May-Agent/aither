@@ -144,7 +144,7 @@ pub use hook::{
     TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use host_load::{
-    AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
+    AnyHostReader, HostCondition, HostLevel, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
     MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
 };
 pub use judgment::{JudgmentError, judge};

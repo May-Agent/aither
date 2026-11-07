@@ -22,7 +22,7 @@ use askama::Template;
 
 use crate::compact_tool::CompactRequest;
 use crate::external_hook::InjectedContext;
-use crate::host_load::HostLoadEvent;
+use crate::host_load::{HostCondition, HostLevel, HostLoadEvent};
 use crate::secret_guard::{SecretFinding, SecretRefusal};
 use crate::specialized::ForkRefusal;
 use crate::working_document::DocumentAlertItem;
@@ -195,10 +195,25 @@ pub(crate) fn rendered(template: &impl Template) -> String {
 /// itself; an implementation writes `impl SandboxNotices for … {}` to keep
 /// all of them.
 pub trait Notices: SandboxNotices {
-    /// A host load or memory or disk pressure condition starting, changing
-    /// or ending, or a job killed for memory.
+    /// A host event that is history rather than a condition: a final
+    /// memory warning, or a job killed for memory.
     fn host_load(&self, event: &HostLoadEvent) -> String {
         event.alert_text()
+    }
+
+    /// A host load, memory or disk condition going from the level the
+    /// model last saw to the level it has now. `seen` is `None` when the
+    /// model assumes the normal level; `reading` is the latest event of
+    /// the condition, which carries the numbers to quote (load, running
+    /// jobs, free space) and agrees with `now`.
+    fn host_condition(
+        &self,
+        condition: &HostCondition,
+        seen: Option<&HostLevel>,
+        now: &HostLevel,
+        reading: &HostLoadEvent,
+    ) -> String {
+        HostLoadEvent::for_change(condition, seen, now, reading).alert_text()
     }
 
     /// An event of a background job or of a monitor: processes killed with

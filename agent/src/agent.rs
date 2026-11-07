@@ -6042,10 +6042,12 @@ mod tests {
         assert_eq!(compactor.recorded().len(), 1, "the cold send compacted");
         assert!(!mentions(&cold, RED), "the superseded alert is gone");
         assert_eq!(
-            system_count(&cold, WARNING),
+            system_count(&cold, YELLOW),
             1,
-            "the current value is not normal, so it is restated once"
+            "the current value is not normal, so it is restated once, \
+             as a rise from the normal level the model now assumes"
         );
+        assert_eq!(system_count(&cold, WARNING), 0);
 
         host.send(memory_back_to(crate::MemoryPressure::Normal))
             .await;
@@ -6057,6 +6059,32 @@ mod tests {
             !mentions(&normal, WARNING) && !mentions(&normal, GREEN),
             "a normal value is not restated"
         );
+    }
+
+    /// The alert is worded from the level the model saw, not from the path
+    /// the condition took while the agent was idle.
+    #[tokio::test]
+    async fn the_alert_is_worded_from_what_the_model_saw() {
+        let (mut agent, _sender, _llm) = detached_agent(Vec::new());
+        let host = agent.watch_host_load();
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+
+        // The model saw normal; red and back to warning while idle is a
+        // rise to warning for it, not a fall.
+        host.send(memory_red()).await;
+        host.send(memory_back_to(crate::MemoryPressure::Warning))
+            .await;
+        let request = next_request_of(&mut agent).await;
+        assert!(mentions(&request, YELLOW), "told as a rise to warning");
+        assert!(!mentions(&request, WARNING) && !mentions(&request, RED));
+
+        // The model saw red; a fall to warning is a fall for it.
+        host.send(memory_red()).await;
+        assert!(mentions(&next_request_of(&mut agent).await, RED));
+        host.send(memory_back_to(crate::MemoryPressure::Warning))
+            .await;
+        assert_eq!(system_mentions_of(&mut agent, WARNING).await, 1);
     }
 
     /// The next request of an agent whose context fits.
@@ -6091,12 +6119,19 @@ mod tests {
     impl aither_sandbox::SandboxNotices for Reworded {}
 
     impl crate::Notices for Reworded {
-        fn host_load(&self, event: &crate::HostLoadEvent) -> String {
-            match event {
-                crate::HostLoadEvent::LoadHigh { load, .. } => {
-                    format!("Reworded: the host runs at {}%.", load.percent())
-                }
-                _ => crate::DefaultNotices.host_load(event),
+        fn host_condition(
+            &self,
+            condition: &crate::HostCondition,
+            seen: Option<&crate::HostLevel>,
+            now: &crate::HostLevel,
+            reading: &crate::HostLoadEvent,
+        ) -> String {
+            match (now, reading) {
+                (
+                    crate::HostLevel::Load { high: true },
+                    crate::HostLoadEvent::LoadHigh { load, .. },
+                ) => format!("Reworded: the host runs at {}%.", load.percent()),
+                _ => crate::DefaultNotices.host_condition(condition, seen, now, reading),
             }
         }
 

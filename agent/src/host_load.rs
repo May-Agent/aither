@@ -382,22 +382,125 @@ impl HostLoadEvent {
             Self::MemoryFinalWarning { .. } | Self::JobKilledForMemory { .. } => None,
         }
     }
+
+    /// The event that tells the model `condition` went from `seen` (what
+    /// it last saw; `None` when it assumes the normal level) to `now`,
+    /// filled with the readings of `reading`, the latest event of the
+    /// condition.
+    ///
+    /// The words depend on what the model saw, never on the path the
+    /// condition took meanwhile: a fall to warning is "dropped back" only
+    /// for a model that saw critical.
+    pub(crate) fn for_change(
+        condition: &HostCondition,
+        seen: Option<&HostLevel>,
+        now: &HostLevel,
+        reading: &Self,
+    ) -> Self {
+        match (condition, now) {
+            (_, HostLevel::Load { high }) => {
+                let (Self::LoadHigh {
+                    load,
+                    foreground_wait,
+                }
+                | Self::LoadEnded {
+                    load,
+                    foreground_wait,
+                }) = *reading
+                else {
+                    unreachable!("a load level comes from a load event")
+                };
+                if *high {
+                    Self::LoadHigh {
+                        load,
+                        foreground_wait,
+                    }
+                } else {
+                    Self::LoadEnded {
+                        load,
+                        foreground_wait,
+                    }
+                }
+            }
+            (HostCondition::Memory(domain), HostLevel::Memory(level)) => {
+                let (Self::MemoryYellow { jobs, .. }
+                | Self::MemoryRed { jobs, .. }
+                | Self::MemoryDroppedBack { jobs, .. }) = reading
+                else {
+                    unreachable!("a memory level comes from a memory event")
+                };
+                let domain = *domain;
+                let jobs = jobs.clone();
+                match level {
+                    MemoryPressure::Normal => Self::MemoryDroppedBack {
+                        domain,
+                        level: *level,
+                        jobs,
+                    },
+                    MemoryPressure::Warning
+                        if seen == Some(&HostLevel::Memory(MemoryPressure::Critical)) =>
+                    {
+                        Self::MemoryDroppedBack {
+                            domain,
+                            level: *level,
+                            jobs,
+                        }
+                    }
+                    MemoryPressure::Warning => Self::MemoryYellow { domain, jobs },
+                    MemoryPressure::Critical => Self::MemoryRed { domain, jobs },
+                }
+            }
+            (HostCondition::Disk(volume), HostLevel::Disk(level)) => {
+                let (Self::DiskPressureRose { free, .. }
+                | Self::DiskPressureDroppedBack { free, .. }) = *reading
+                else {
+                    unreachable!("a disk level comes from a disk event")
+                };
+                let volume = volume.clone();
+                let level = *level;
+                let fell = matches!(seen, Some(HostLevel::Disk(before)) if *before > level);
+                if fell || level == DiskPressure::Normal {
+                    Self::DiskPressureDroppedBack {
+                        volume,
+                        level,
+                        free,
+                    }
+                } else {
+                    Self::DiskPressureRose {
+                        volume,
+                        level,
+                        free,
+                    }
+                }
+            }
+            _ => unreachable!("a condition and its level are of one kind"),
+        }
+    }
 }
 
 /// A condition of the host the agent is told about as state: the
 /// machine's load, a domain's memory, or a volume's free space.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HostCondition {
+    /// The machine's CPU load.
     Load,
+    /// The memory of the machine or of the container.
     Memory(MemoryDomain),
+    /// The free space of the volume with this name.
     Disk(String),
 }
 
 /// How a [`HostCondition`] stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostLevel {
-    Load { high: bool },
+    /// The load is high or not.
+    Load {
+        /// Whether the load is high.
+        high: bool,
+    },
+    /// The memory pressure.
     Memory(MemoryPressure),
+    /// The disk pressure.
     Disk(DiskPressure),
 }
 
@@ -459,7 +562,7 @@ impl HostLoadChannels {
             0,
             crate::context::AnyStateSource::new(HostConditions {
                 receiver: self.conditions,
-                latest: HashMap::new(),
+                readings: HashMap::new(),
                 notices: notices.clone(),
             }),
         );
@@ -488,11 +591,13 @@ pub fn channels() -> (HostLoadSenders, HostLoadChannels) {
 
 /// Host load, memory and disk pressure as state: the model hears of a
 /// condition only when its level differs from the one it last saw, in the
-/// words of the event that brought it there.
+/// words for that change.
 pub struct HostConditions {
     receiver: Receiver<HostLoadEvent>,
-    /// The event that brought each condition to its level.
-    latest: HashMap<HostCondition, HostLoadEvent>,
+    /// The latest event of each condition: the readings (load, jobs, free
+    /// space) the alert quotes. Which words it gets depends on what the
+    /// model saw, not on this event.
+    readings: HashMap<HostCondition, HostLoadEvent>,
     notices: crate::AnyNotices,
 }
 
@@ -507,7 +612,7 @@ impl crate::context::StateSource for HostConditions {
                 .condition()
                 .expect("the monitor sends only conditions to the state channel");
             changed.push((condition.clone(), level));
-            self.latest.insert(condition, event);
+            self.readings.insert(condition, event);
         }
         std::future::ready(changed)
     }
@@ -520,11 +625,15 @@ impl crate::context::StateSource for HostConditions {
         &self,
         change: &crate::context::StateChange<'_, HostCondition, HostLevel>,
     ) -> crate::context::Block {
-        let event = self
-            .latest
+        let reading = self
+            .readings
             .get(change.key())
             .expect("a condition with a level has the event that set it");
-        crate::context::Block::new("system-reminder", self.notices.host_load(event))
+        crate::context::Block::new(
+            "system-reminder",
+            self.notices
+                .host_condition(change.key(), change.seen(), change.now(), reading),
+        )
     }
 }
 
