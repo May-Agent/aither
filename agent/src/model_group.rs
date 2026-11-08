@@ -357,7 +357,7 @@ impl<M> TieredModels<M> {
 
 use aither_core::{
     LanguageModel,
-    llm::{Event, LLMRequest, RetryPolicy, model::Profile},
+    llm::{Event, GenerateError, LLMRequest, RetryPolicy, TokenCounting, model::Profile},
 };
 use futures_core::Stream;
 
@@ -429,6 +429,37 @@ where
     fn retry_policy(&self) -> RetryPolicy {
         self.current()
             .map_or_else(RetryPolicy::none, |model| model.inner().retry_policy())
+    }
+
+    fn token_counting(&self) -> TokenCounting {
+        self.current()
+            .map_or(TokenCounting::None, |model| model.inner().token_counting())
+    }
+
+    async fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> Result<Option<u32>, GenerateError<Self::Error>> {
+        let Some(model) = self.current() else {
+            return Ok(None);
+        };
+        model
+            .inner()
+            .count_tokens(request)
+            .await
+            .map_err(|error| match error {
+                GenerateError::Provider(source) => {
+                    GenerateError::Provider(ModelGroupError::Model(source))
+                }
+                GenerateError::Parse { source, response } => {
+                    GenerateError::Parse { source, response }
+                }
+            })
+    }
+
+    fn count_text(&self, text: &str) -> Option<u32> {
+        self.current()
+            .and_then(|model| model.inner().count_text(text))
     }
 
     async fn profile(&self) -> Result<Profile, Self::Error> {

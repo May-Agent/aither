@@ -15,8 +15,8 @@ pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
 use aither_core::{
     EmbeddingModel, LanguageModel,
     llm::{
-        Classify, Event, LLMRequest, LanguageModelProvider, RetryPolicy, model::Profile,
-        provider::Profile as ProviderProfile,
+        Classify, Event, GenerateError, LLMRequest, LanguageModelProvider, RetryPolicy,
+        TokenCounting, model::Profile, provider::Profile as ProviderProfile,
     },
 };
 use futures_core::Stream;
@@ -207,6 +207,18 @@ impl Classify for CloudError {
     }
 }
 
+/// Rewraps a `count_tokens` failure as a `CloudError`, keeping parse
+/// failures (which name no provider) intact.
+fn map_cloud_error<E>(error: GenerateError<E>) -> GenerateError<CloudError>
+where
+    CloudError: From<E>,
+{
+    match error {
+        GenerateError::Provider(source) => GenerateError::Provider(CloudError::from(source)),
+        GenerateError::Parse { source, response } => GenerateError::Parse { source, response },
+    }
+}
+
 impl LanguageModel for CloudProvider {
     type Error = CloudError;
 
@@ -255,6 +267,41 @@ impl LanguageModel for CloudProvider {
                     }
                 }
             }
+        }
+    }
+
+    /// `count_tokens` reports `GenerateError` over each provider's own error
+    /// type; rewrap the provider arm so callers see one `CloudError`.
+    fn token_counting(&self) -> TokenCounting {
+        match self {
+            Self::OpenAI(inner) => inner.token_counting(),
+            Self::Claude(inner) => inner.token_counting(),
+            Self::Gemini(inner) => inner.token_counting(),
+            Self::Copilot(inner) => inner.token_counting(),
+            Self::Codex(inner) => inner.token_counting(),
+        }
+    }
+
+    async fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> Result<Option<u32>, GenerateError<Self::Error>> {
+        match self {
+            Self::OpenAI(inner) => inner.count_tokens(request).await.map_err(map_cloud_error),
+            Self::Claude(inner) => inner.count_tokens(request).await.map_err(map_cloud_error),
+            Self::Gemini(inner) => inner.count_tokens(request).await.map_err(map_cloud_error),
+            Self::Copilot(inner) => inner.count_tokens(request).await.map_err(map_cloud_error),
+            Self::Codex(inner) => inner.count_tokens(request).await.map_err(map_cloud_error),
+        }
+    }
+
+    fn count_text(&self, text: &str) -> Option<u32> {
+        match self {
+            Self::OpenAI(inner) => inner.count_text(text),
+            Self::Claude(inner) => inner.count_text(text),
+            Self::Gemini(inner) => inner.count_text(text),
+            Self::Copilot(inner) => inner.count_text(text),
+            Self::Codex(inner) => inner.count_text(text),
         }
     }
 

@@ -41,7 +41,7 @@ use aither_core::{
     LanguageModel,
     llm::{
         Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role,
-        StoredFile, ToolCall,
+        StoredFile, TokenCounting, ToolCall,
         model::{Ability, Parameters, Profile as ModelProfile},
     },
 };
@@ -3708,6 +3708,78 @@ where
     ///
     /// [`ContextPolicy::start_point`]: crate::ContextPolicy::start_point
     /// [`ContextPolicy::safe_buffer`]: crate::ContextPolicy::safe_buffer
+    /// How the active tier's model counts prompt tokens, if it can.
+    fn active_token_counting(&self) -> TokenCounting {
+        match self.tier {
+            ModelTier::Advanced => self.advanced.token_counting(),
+            ModelTier::Balanced => self.balanced.token_counting(),
+            ModelTier::Fast => self.fast.token_counting(),
+        }
+    }
+
+    /// Asks the active tier's model for the request's exact prompt tokens.
+    ///
+    /// Local counters run on every assembly; an endpoint counter costs a
+    /// round trip, so it counts only once the estimate is within
+    /// [`ContextPolicy::count_distance`] of the warn point. A counting
+    /// failure never fails the request — the estimate stands.
+    async fn count_active_request(&self, request: &LLMRequest) -> Option<u32> {
+        let should_count = match self.active_token_counting() {
+            TokenCounting::None => return None,
+            TokenCounting::Local => true,
+            TokenCounting::Endpoint => self
+                .config
+                .context_policy
+                .should_count_endpoint(self.budget.estimated_tokens(), self.budget.window()),
+        };
+        if !should_count {
+            return None;
+        }
+        let counted = match self.tier {
+            ModelTier::Advanced => self
+                .advanced
+                .count_tokens(request)
+                .await
+                .map_err(|error| error.to_string()),
+            ModelTier::Balanced => self
+                .balanced
+                .count_tokens(request)
+                .await
+                .map_err(|error| error.to_string()),
+            ModelTier::Fast => self
+                .fast
+                .count_tokens(request)
+                .await
+                .map_err(|error| error.to_string()),
+        };
+        match counted {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                tracing::warn!(%error, "token counting failed; using the estimate");
+                None
+            }
+        }
+    }
+
+    /// Records the assembled prompt's size — exactly, when the model can
+    /// count it.
+    async fn measure_assembled(
+        &mut self,
+        messages: &[Message],
+        definitions: &[aither_core::llm::tool::ToolDefinition],
+    ) {
+        self.budget
+            .observe_assembled(request_chars(messages, definitions));
+        if matches!(self.active_token_counting(), TokenCounting::None) {
+            return;
+        }
+        let request =
+            LLMRequest::new(messages.to_vec()).with_tool_definitions(definitions.to_vec());
+        if let Some(tokens) = self.count_active_request(&request).await {
+            self.budget.observe_counted(tokens);
+        }
+    }
+
     async fn prepare_request(
         &mut self,
         events: &EventSink,
@@ -3720,14 +3792,12 @@ where
         let definitions = self.tools.active_definitions();
         let mut tail = self.render_tail().await;
         let mut messages = self.request_messages(&tail);
-        self.budget
-            .observe_assembled(request_chars(&messages, &definitions));
+        self.measure_assembled(&messages, &definitions).await;
 
         self.sync_compact_signal();
         if self.raise_precompaction_alert() {
             messages = self.request_messages(&tail);
-            self.budget
-                .observe_assembled(request_chars(&messages, &definitions));
+            self.measure_assembled(&messages, &definitions).await;
         }
         let requested = self
             .compact_signal
@@ -3765,8 +3835,7 @@ where
             self.push_request_alerts().await;
             tail = self.render_tail().await;
             messages = self.request_messages(&tail);
-            self.budget
-                .observe_assembled(request_chars(&messages, &definitions));
+            self.measure_assembled(&messages, &definitions).await;
             // A landed compaction is still no guarantee the rebuilt request
             // fits; an unshrinkable request is paused rather than sent.
             if self
@@ -4589,6 +4658,71 @@ mod tests {
         }
     }
 
+    /// Counts tokens however the test configures: locally, through an
+    /// endpoint, or not at all — and can be told to fail.
+    #[derive(Clone)]
+    struct CountingLlm {
+        kind: TokenCounting,
+        count: u32,
+        fail: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        context_length: u32,
+    }
+
+    impl LanguageModel for CountingLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::empty()
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "counting",
+                "counting model",
+                self.context_length,
+            )))
+        }
+
+        fn token_counting(&self) -> TokenCounting {
+            self.kind
+        }
+
+        fn count_tokens(
+            &self,
+            _request: &LLMRequest,
+        ) -> impl std::future::Future<
+            Output = Result<Option<u32>, aither_core::llm::GenerateError<Self::Error>>,
+        > + Send {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let fail = self.fail;
+            let count = self.count;
+            async move {
+                if fail {
+                    return Err(aither_core::llm::GenerateError::Provider(MockError));
+                }
+                Ok(Some(count))
+            }
+        }
+    }
+
+    fn counting_llm(kind: TokenCounting) -> CountingLlm {
+        CountingLlm {
+            kind,
+            count: 42_000,
+            fail: false,
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            context_length: 1_000_000,
+        }
+    }
+
     /// Takes `lock` on the first chunk and keeps it across that chunk's
     /// emit, releasing it on the next chunk after a suspension: the shape of
     /// a run that holds a resource (a database writer) across an emit.
@@ -4888,6 +5022,64 @@ mod tests {
             matches!(&error, AgentError::Config(message) if message.contains("safe_buffer")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_local_count_replaces_the_estimate_on_every_assembly() {
+        let llm = counting_llm(TokenCounting::Local);
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        let messages = vec![Message::user("hello world, this is a prompt")];
+        agent.measure_assembled(&messages, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(agent.budget.estimated_tokens(), 42_000);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_count_is_skipped_far_below_the_warn_point() {
+        let llm = counting_llm(TokenCounting::Endpoint);
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        // warn_point(1M) = 800k - 80k = 720k; count gate = 690k; a small
+        // assembly stays far below it.
+        let messages = vec![Message::user("hi")];
+        agent.measure_assembled(&messages, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_count_is_used_near_the_warn_point() {
+        let llm = counting_llm(TokenCounting::Endpoint);
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        // The gate is warn_point − count_distance: a 1M window hits the
+        // 400k compact ceiling, so the warn point is 320k and counting
+        // starts at 290k estimated. 2.8M chars at the default
+        // 4-chars-per-token estimate ~700k — inside it.
+        let big = vec![Message::user("x".repeat(2_800_000))];
+        agent.measure_assembled(&big, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(agent.budget.estimated_tokens(), 42_000);
+    }
+
+    #[tokio::test]
+    async fn a_counting_error_falls_back_to_the_estimate() {
+        let mut llm = counting_llm(TokenCounting::Local);
+        llm.fail = true;
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        let messages = vec![Message::user("hello world")];
+        agent.measure_assembled(&messages, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Failure → the char estimate stands: 11 chars at 4.0 → 2 tokens
+        // plus framing nothing → estimate is 2 (ceil or floor per impl).
+        let estimate = agent.budget.estimated_tokens();
+        assert!(estimate < 100, "estimate {estimate} should stay small");
+        assert_ne!(estimate, 42_000);
     }
 
     #[tokio::test]

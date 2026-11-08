@@ -117,6 +117,15 @@ pub struct ContextPolicy {
     /// Tokens of a spilled tool output that stay in place as its head.
     pub spill_head: usize,
 
+    /// How far below the warn point an endpoint count is worth its round trip.
+    ///
+    /// Models that count through a provider endpoint (`TokenCounting::
+    /// Endpoint`) spend a network call on every measurement, so the count is
+    /// taken only once the estimate is this close to
+    /// [`warn_point`](Self::warn_point). Local counting is cheap enough to
+    /// run on every assembly and ignores this.
+    pub count_distance: usize,
+
     /// Tokens of the user's own messages that survive a compaction verbatim.
     ///
     /// The user's words are the authoritative record of what was asked,
@@ -138,6 +147,7 @@ impl Default for ContextPolicy {
             restore_budget: 0.15,
             idle_compact_before_expiry: Duration::from_secs(6 * 60),
             compaction_floor: 20_000,
+            count_distance: 30_000,
             spill_threshold: 4_000,
             spill_head: 200,
             user_message_budget: 20_000,
@@ -181,6 +191,15 @@ impl ContextPolicy {
     #[must_use]
     pub fn should_warn(&self, tokens: usize, window: u32) -> bool {
         window > 0 && tokens >= self.warn_point(window)
+    }
+
+    /// Whether `tokens` is close enough to the warn point that an endpoint
+    /// token count is worth its round trip — within
+    /// [`count_distance`](Self::count_distance) of it. A window of unknown
+    /// size is never counted.
+    #[must_use]
+    pub fn should_count_endpoint(&self, tokens: usize, window: u32) -> bool {
+        window > 0 && tokens >= self.warn_point(window).saturating_sub(self.count_distance)
     }
 
     /// The token count at which the loop waits for compaction.
@@ -235,6 +254,21 @@ fn to_tokens(value: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_endpoint_count_is_gated_on_the_warn_point() {
+        let policy = ContextPolicy {
+            count_distance: 30_000,
+            ..ContextPolicy::default()
+        };
+        // 1M window → compact point 400k (ceiling) → warn point 320k;
+        // endpoint counting starts at 290k estimated.
+        assert!(!policy.should_count_endpoint(100_000, 1_000_000));
+        assert!(policy.should_count_endpoint(290_000, 1_000_000));
+        assert!(policy.should_count_endpoint(320_000, 1_000_000));
+        // An unknown window is never counted.
+        assert!(!policy.should_count_endpoint(1_000_000, 0));
+    }
 
     #[test]
     fn the_auto_compact_point_is_the_lesser_of_the_fraction_and_the_ceiling() {
