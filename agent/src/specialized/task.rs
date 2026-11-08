@@ -5395,6 +5395,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_fork_near_the_compaction_point_is_refused_until_the_main_agent_compacts() {
+        use num_traits::ToPrimitive as _;
         let fixture = ForkFixture::new().await;
         let (seen_tx, seen_rx) = async_channel::unbounded();
         let big = "word ".repeat(40_000);
@@ -5417,13 +5418,14 @@ mod tests {
             .latest()
             .expect("the measuring run published its request")
             .usage();
-        let compact_at = usage / 0.95;
+        // The scripted model's window is a million tokens: aiming the
+        // pause point at `usage / 0.95` of it is a reserve of the rest.
+        let pause_at = usage / 0.95;
         let policy = crate::ContextPolicy {
-            compact_at,
+            handoff_reserve: (1_000_000.0 * (1.0 - pause_at)).to_usize().unwrap_or(0),
             compact_ceiling: usize::MAX,
             start_distance: 0,
-            safe_buffer: 0,
-            restore_budget: compact_at / 4.0,
+            restore_budget: pause_at / 4.0,
             ..crate::ContextPolicy::default()
         };
         drain(&seen_rx);

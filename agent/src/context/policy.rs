@@ -7,12 +7,12 @@
 //! second knob, no per-level strategy and no preservation config: a single
 //! policy keeps the behaviour predictable and the prompt cache analysable.
 //!
-//! Compaction points are token counts. A fraction of the window is the right
-//! unit only for small windows: on a million-token model it would compact at
-//! 600k, far past where a long context stays useful, so the auto-compact
-//! point is the smaller of a fraction and an absolute ceiling, and the
-//! distances around it are fixed token counts that do not stretch with the
-//! window.
+//! Compaction points are token counts. The room left below the window is
+//! the handoff reserve: what the compaction request's instruction and the
+//! handoff the model writes need — a size that does not grow with the
+//! window, so it is a fixed reserve, not a fraction. A ceiling still caps
+//! the pause point: on a million-token model even the full window stops
+//! being useful well before it is full.
 
 use std::time::Duration;
 
@@ -27,11 +27,12 @@ const FORK_HEADROOM: f64 = 0.9;
 /// what the response and the tool surface need from the model's raw context
 /// length. From it the policy derives three points, each in tokens:
 ///
-/// - the *auto-compact point*, `min(window * compact_at, compact_ceiling)`;
+/// - the *pause point*, `min(window - handoff_reserve, compact_ceiling)`,
+///   where the loop waits for the compaction instead of sending more;
 /// - the *start point*, [`start_distance`](Self::start_distance) before it,
 ///   where a background compaction is forked;
-/// - the *pause point*, [`safe_buffer`](Self::safe_buffer) before it, where
-///   the loop waits for the compaction instead of sending more.
+/// - the *warn point*, [`warn_distance`](Self::warn_distance) before it,
+///   where the model is told to save its work and compact itself.
 ///
 /// The distances are fixed counts, so a window too small for them (a start
 /// distance past the point itself) forks from the first request; a host with
@@ -43,24 +44,30 @@ const FORK_HEADROOM: f64 = 0.9;
 /// use aither_agent::ContextPolicy;
 ///
 /// let policy = ContextPolicy::default();
-/// assert_eq!(policy.compact_point(1_000_000), 400_000);
-/// assert_eq!(policy.compact_point(200_000), 160_000);
+/// assert_eq!(policy.pause_point(1_000_000), 400_000);
+/// assert_eq!(policy.pause_point(200_000), 180_000);
 /// assert!(policy.start_point(200_000) < policy.pause_point(200_000));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextPolicy {
-    /// Fraction of the window at which the conversation is compacted.
+    /// Tokens kept free below the window: the room the compaction
+    /// request's instruction and the handoff the model writes need.
     ///
-    /// Capped by [`compact_ceiling`](Self::compact_ceiling).
-    pub compact_at: f32,
+    /// A fixed count rather than a fraction — the handoff is about the same
+    /// size whatever the window — so a large window is not robbed of a fifth
+    /// of it and a small one is not under-reserved. The pause point is
+    /// `min(window - handoff_reserve, compact_ceiling)`, capped by
+    /// [`compact_ceiling`](Self::compact_ceiling), and every compaction
+    /// threshold sits at a fixed distance below it.
+    pub handoff_reserve: usize,
 
     /// Most tokens the conversation may hold before it is compacted,
     /// whatever the window: a long context stops being useful well before a
     /// large window is full.
     pub compact_ceiling: usize,
 
-    /// Tokens before the auto-compact point at which a background compaction
-    /// is forked.
+    /// Tokens before the pause point at which a background compaction is
+    /// forked.
     ///
     /// The fork happens at a request boundary and runs concurrently with the
     /// next model turns, so this distance buys the turns needed to finish the
@@ -68,15 +75,7 @@ pub struct ContextPolicy {
     /// fork; the turn keeps running.
     pub start_distance: usize,
 
-    /// Tokens before the auto-compact point at which the loop stops and
-    /// waits for the compaction to land, or runs one when none is in flight.
-    ///
-    /// A fixed count rather than a fraction, so the margin is the same on
-    /// every window: it must hold the compaction request's own instruction
-    /// and the handoff it produces.
-    pub safe_buffer: usize,
-
-    /// Tokens before the auto-compact point at which the model is told once
+    /// Tokens before the pause point at which the model is told once
     /// to save its work and call `compact` itself.
     ///
     /// Larger than [`start_distance`](Self::start_distance), so the model has
@@ -139,10 +138,9 @@ pub struct ContextPolicy {
 impl Default for ContextPolicy {
     fn default() -> Self {
         Self {
-            compact_at: 0.8,
+            handoff_reserve: 20_000,
             compact_ceiling: 400_000,
             start_distance: 50_000,
-            safe_buffer: 5_000,
             warn_distance: 80_000,
             restore_budget: 0.15,
             idle_compact_before_expiry: Duration::from_secs(6 * 60),
@@ -163,27 +161,17 @@ impl ContextPolicy {
         tokens < self.compaction_floor
     }
 
-    /// The auto-compact point for a window of `window` tokens:
-    /// `min(window * compact_at, compact_ceiling)`.
-    #[must_use]
-    pub fn compact_point(&self, window: u32) -> usize {
-        let fraction = f64::from(window) * f64::from(self.compact_at.clamp(0.0, 1.0));
-        to_tokens(fraction).min(self.compact_ceiling)
-    }
-
     /// The token count at which a background compaction is forked.
     #[must_use]
     pub fn start_point(&self, window: u32) -> usize {
-        self.compact_point(window)
-            .saturating_sub(self.start_distance)
+        self.pause_point(window).saturating_sub(self.start_distance)
     }
 
     /// The token count at which the model is told to save its work and call
     /// `compact`.
     #[must_use]
     pub fn warn_point(&self, window: u32) -> usize {
-        self.compact_point(window)
-            .saturating_sub(self.warn_distance)
+        self.pause_point(window).saturating_sub(self.warn_distance)
     }
 
     /// Whether the window holds enough to warn the model of the coming
@@ -202,10 +190,14 @@ impl ContextPolicy {
         window > 0 && tokens >= self.warn_point(window).saturating_sub(self.count_distance)
     }
 
-    /// The token count at which the loop waits for compaction.
+    /// The token count at which the loop waits for compaction:
+    /// `min(window - handoff_reserve, compact_ceiling)`.
     #[must_use]
     pub fn pause_point(&self, window: u32) -> usize {
-        self.compact_point(window).saturating_sub(self.safe_buffer)
+        usize::try_from(window)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(self.handoff_reserve)
+            .min(self.compact_ceiling)
     }
 
     /// Whether a window of `window` tokens leaves any room below the pause
@@ -224,19 +216,19 @@ impl ContextPolicy {
         window > 0 && tokens >= self.start_point(window)
     }
 
-    /// Whether the room left before the auto-compact point is down to the
-    /// safe buffer, so the loop must wait for a compaction.
+    /// Whether the window is down to the handoff reserve, so the loop must
+    /// wait for a compaction.
     #[must_use]
     pub fn should_pause(&self, tokens: usize, window: u32) -> bool {
         window > 0 && tokens >= self.pause_point(window)
     }
 
     /// Whether a fork may start from a context holding `tokens`: it is
-    /// refused within a tenth of the auto-compact point, where the main agent
-    /// and the fork would each go on to compact the same context.
+    /// refused within a tenth of the pause point, where the main agent and
+    /// the fork would each go on to compact the same context.
     #[must_use]
     pub fn allows_fork(&self, tokens: usize, window: u32) -> bool {
-        let limit = to_f64(self.compact_point(window)) * FORK_HEADROOM;
+        let limit = to_f64(self.pause_point(window)) * FORK_HEADROOM;
         to_f64(tokens) < limit
     }
 }
@@ -244,11 +236,6 @@ impl ContextPolicy {
 /// Widens a token count for ratio arithmetic, saturating rather than wrapping.
 fn to_f64(tokens: usize) -> f64 {
     tokens.to_f64().unwrap_or(f64::MAX)
-}
-
-/// Narrows a non-negative token estimate back to a count.
-fn to_tokens(value: f64) -> usize {
-    value.floor().to_usize().unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -261,7 +248,7 @@ mod tests {
             count_distance: 30_000,
             ..ContextPolicy::default()
         };
-        // 1M window → compact point 400k (ceiling) → warn point 320k;
+        // 1M window → pause point 400k (ceiling) → warn point 320k;
         // endpoint counting starts at 290k estimated.
         assert!(!policy.should_count_endpoint(100_000, 1_000_000));
         assert!(policy.should_count_endpoint(290_000, 1_000_000));
@@ -271,23 +258,23 @@ mod tests {
     }
 
     #[test]
-    fn the_auto_compact_point_is_the_lesser_of_the_fraction_and_the_ceiling() {
+    fn the_pause_point_is_the_lesser_of_window_minus_reserve_and_the_ceiling() {
         let policy = ContextPolicy::default();
-        assert_eq!(policy.compact_point(1_000_000), 400_000);
-        assert_eq!(policy.compact_point(200_000), 160_000);
-        assert_eq!(policy.compact_point(500_000), 400_000);
-        assert_eq!(policy.compact_point(0), 0);
+        assert_eq!(policy.pause_point(1_000_000), 400_000);
+        assert_eq!(policy.pause_point(200_000), 180_000);
+        assert_eq!(policy.pause_point(500_000), 400_000);
+        assert_eq!(policy.pause_point(0), 0);
     }
 
     #[test]
-    fn the_fraction_and_the_ceiling_are_configurable() {
+    fn the_reserve_and_the_ceiling_are_configurable() {
         let policy = ContextPolicy {
-            compact_at: 0.5,
+            handoff_reserve: 50_000,
             compact_ceiling: 100_000,
             ..ContextPolicy::default()
         };
-        assert_eq!(policy.compact_point(1_000_000), 100_000);
-        assert_eq!(policy.compact_point(100_000), 50_000);
+        assert_eq!(policy.pause_point(1_000_000), 100_000);
+        assert_eq!(policy.pause_point(100_000), 50_000);
     }
 
     #[test]
@@ -296,27 +283,26 @@ mod tests {
         for window in [100_000, 200_000, 1_000_000] {
             assert!(policy.warn_point(window) < policy.start_point(window));
             assert!(policy.start_point(window) < policy.pause_point(window));
-            assert!(policy.pause_point(window) < policy.compact_point(window));
+            assert!(policy.pause_point(window) < window as usize);
         }
-        assert!(policy.restore_budget < policy.compact_at);
     }
 
     #[test]
-    fn the_start_and_pause_points_sit_a_fixed_distance_before_the_compact_point() {
+    fn the_start_and_warn_points_sit_their_distances_before_the_pause_point() {
         let policy = ContextPolicy::default();
         assert_eq!(policy.start_point(1_000_000), 350_000);
-        assert_eq!(policy.pause_point(1_000_000), 395_000);
-        assert_eq!(policy.start_point(200_000), 110_000);
-        assert_eq!(policy.pause_point(200_000), 155_000);
+        assert_eq!(policy.warn_point(1_000_000), 320_000);
+        assert_eq!(policy.start_point(200_000), 130_000);
+        assert_eq!(policy.warn_point(200_000), 100_000);
     }
 
     #[test]
     fn thresholds_are_inclusive() {
         let policy = ContextPolicy::default();
-        assert!(policy.should_compact(110_000, 200_000));
-        assert!(!policy.should_compact(109_999, 200_000));
-        assert!(policy.should_pause(155_000, 200_000));
-        assert!(!policy.should_pause(154_999, 200_000));
+        assert!(policy.should_compact(130_000, 200_000));
+        assert!(!policy.should_compact(129_999, 200_000));
+        assert!(policy.should_pause(180_000, 200_000));
+        assert!(!policy.should_pause(179_999, 200_000));
     }
 
     #[test]
@@ -336,8 +322,19 @@ mod tests {
     #[test]
     fn a_fork_is_refused_within_a_tenth_of_the_compaction_point() {
         let policy = ContextPolicy::default();
-        assert!(policy.allows_fork(143_000, 200_000));
-        assert!(!policy.allows_fork(144_000, 200_000));
-        assert!(!policy.allows_fork(155_000, 200_000));
+        assert!(policy.allows_fork(161_999, 200_000));
+        assert!(!policy.allows_fork(162_000, 200_000));
+        assert!(!policy.allows_fork(175_000, 200_000));
+    }
+
+    /// A window no larger than the handoff reserve leaves nothing below
+    /// the pause point, so it is refused the way a window without that room
+    /// has always been.
+    #[test]
+    fn a_window_no_larger_than_the_reserve_is_not_admitted() {
+        let policy = ContextPolicy::default();
+        let smallest = u32::try_from(policy.handoff_reserve).expect("fits u32");
+        assert!(!policy.admits(smallest));
+        assert!(policy.admits(smallest + 1));
     }
 }

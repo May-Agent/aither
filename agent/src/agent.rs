@@ -3595,11 +3595,9 @@ where
         let policy = self.config.context_policy;
         if !policy.admits(profile.context_length) {
             return Err(AgentError::Config(format!(
-                "the {}-token context window leaves no room below its {}-token auto-compact point \
-                 once the {}-token safe buffer is kept; lower `ContextPolicy::safe_buffer`",
-                profile.context_length,
-                policy.compact_point(profile.context_length),
-                policy.safe_buffer,
+                "the {}-token context window is no larger than the {}-token handoff reserve, \
+                 so nothing fits below the pause point; lower `ContextPolicy::handoff_reserve`",
+                profile.context_length, policy.handoff_reserve,
             )));
         }
         self.budget.set_window(profile.context_length);
@@ -3708,7 +3706,7 @@ where
     /// counts, a compaction is forked if usage crossed
     /// [`ContextPolicy::start_point`], and the compaction is awaited (or run,
     /// with recovery when it fails) once the room left before the
-    /// auto-compact point is down to [`ContextPolicy::safe_buffer`].
+    /// pause point is reached — the window is down to the handoff reserve.
     ///
     /// With a compaction model set, a cache that went cold since the last
     /// request is rebuilt first (`rebuild_if_cache_is_cold`).
@@ -3723,7 +3721,6 @@ where
     /// nothing is sent on an uncompacted context.
     ///
     /// [`ContextPolicy::start_point`]: crate::ContextPolicy::start_point
-    /// [`ContextPolicy::safe_buffer`]: crate::ContextPolicy::safe_buffer
     /// How the active tier's model counts prompt tokens, if it can.
     fn active_token_counting(&self) -> TokenCounting {
         match self.tier {
@@ -3942,7 +3939,7 @@ where
             return false;
         }
         let alert = self.notices.precompaction(&crate::PreCompaction {
-            remaining_tokens: policy.compact_point(window).saturating_sub(tokens),
+            remaining_tokens: policy.pause_point(window).saturating_sub(tokens),
         });
         self.push_system_alert(alert);
         true
@@ -5028,7 +5025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_window_with_no_room_below_the_safe_buffer_is_refused() {
+    async fn a_window_no_larger_than_the_handoff_reserve_is_refused() {
         let mut agent = Agent::with_config(
             MockLlm {
                 context_length: 4_096,
@@ -5038,9 +5035,9 @@ mod tests {
         let error = agent
             .ensure_initialized()
             .await
-            .expect_err("a 4k window under the 5k buffer cannot hold a request");
+            .expect_err("a 4k window under the reserve cannot hold a request");
         assert!(
-            matches!(&error, AgentError::Config(message) if message.contains("safe_buffer")),
+            matches!(&error, AgentError::Config(message) if message.contains("handoff_reserve")),
             "unexpected error: {error:?}"
         );
     }
@@ -5109,7 +5106,7 @@ mod tests {
         let config = AgentConfig {
             system_prompt: Some("x".repeat(400)),
             context_policy: crate::ContextPolicy {
-                safe_buffer: 10,
+                handoff_reserve: 10,
                 ..crate::ContextPolicy::default()
             },
             ..AgentConfig::default()
@@ -5162,7 +5159,7 @@ mod tests {
         let config = AgentConfig {
             system_prompt: Some("x".repeat(4_000)),
             context_policy: crate::ContextPolicy {
-                safe_buffer: 10,
+                handoff_reserve: 10,
                 ..crate::ContextPolicy::default()
             },
             ..AgentConfig::default()
@@ -5261,13 +5258,13 @@ mod tests {
         assert!(!agent.compaction.is_active());
     }
 
-    /// Down to the safe buffer with no compaction in flight, the loop runs
-    /// one synchronously before the request goes out.
+    /// At the pause point with no compaction in flight, the loop runs one
+    /// synchronously before the request goes out.
     #[tokio::test]
     async fn reaching_the_buffer_runs_a_compaction_before_the_request() {
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
         // The fork the boundary starts is the compaction it then waits for.
         let request = agent
             .prepare_request(&EventSink::discarding())
@@ -5297,7 +5294,7 @@ mod tests {
             ],
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
 
         let events = drain_run(agent.run("keep going", [])).await;
 
@@ -5326,7 +5323,7 @@ mod tests {
             ],
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
 
         let (sender, events) = async_channel::unbounded();
         let request = agent
@@ -5385,7 +5382,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("outputs/compaction-call_1.txt"))
                 .expect("the spilled output is readable"),
-            "o".repeat(396_000 * 4)
+            "o".repeat(400_000 * 4)
         );
     }
 
@@ -7421,15 +7418,15 @@ mod tests {
         );
     }
 
-    /// A config whose compaction distances fit the few-hundred-token windows
-    /// [`window_for_usage`] sizes: the fork starts 50 tokens before the
-    /// auto-compact point (80% of the window) and the pause one token before.
+    /// A config whose compaction distances fit the few-hundred-token
+    /// windows [`window_for_usage`] sizes: it gives each window a handoff
+    /// reserve of a fifth, so the fork starts 50 tokens before the pause
+    /// point and the pause sits right at it.
     fn scaled_config() -> AgentConfig {
         AgentConfig {
             system_prompt: Some("x".repeat(400)),
             context_policy: crate::ContextPolicy {
                 start_distance: 50,
-                safe_buffer: 1,
                 // These windows are a few hundred tokens: the conversation
                 // must shrink to the handoff for a compaction to relieve them.
                 user_message_budget: 0,
@@ -7466,18 +7463,23 @@ mod tests {
         let tokens = chars.div_ceil(4);
         let window = u32::try_from((tokens * 100).div_ceil(usage_percent))
             .expect("the aimed window fits in u32");
+        // The handoff reserve is absolute: give the aimed window one a
+        // fifth of its size, the room the default's fraction used to leave.
+        let mut config = config.clone();
+        config.context_policy.handoff_reserve =
+            usize::try_from(window).expect("u32 fits usize") / 5;
         (
             Agent::with_config(
                 MockLlm {
                     context_length: window,
                 },
-                config.clone(),
+                config,
             ),
             window,
         )
     }
 
-    /// The handoff exists but the window grew past `compact_at` again: a new
+    /// The handoff exists but the window grew past the compact point again: a new
     /// compaction must fork, not rest on the previous one.
     #[tokio::test]
     async fn a_landed_handoff_compacts_again_when_the_window_grows() {
@@ -7494,18 +7496,18 @@ mod tests {
 
         assert!(
             request.is_some(),
-            "usage between compact_at and pause_at must not withhold the request"
+            "usage between the start and pause points must not withhold the request"
         );
         assert!(
             agent.compaction.is_running(),
-            "growth past compact_at must fork a compaction even after a handoff exists"
+            "growth past the compact point must fork a compaction even after a handoff exists"
         );
     }
 
-    /// Crossing `compact_at` during a tool round starts the compaction but
-    /// still lets that turn's request out: forking must not block the turn.
+    /// Crossing the start point during a tool round starts the compaction
+    /// but still lets that turn's request out: forking must not block the turn.
     #[tokio::test]
-    async fn a_tool_round_crossing_compact_at_forks_without_blocking() {
+    async fn a_tool_round_crossing_the_start_point_forks_without_blocking() {
         let config = scaled_config();
         let messages = vec![
             Message::user("run it"),
@@ -7532,11 +7534,11 @@ mod tests {
 
         assert!(
             request.is_some(),
-            "crossing compact_at alone must not withhold the turn's request"
+            "crossing the start point alone must not withhold the turn's request"
         );
         assert!(
             agent.compaction.is_running(),
-            "crossing compact_at must fork the compaction"
+            "crossing the start point must fork the compaction"
         );
     }
 
@@ -7546,7 +7548,7 @@ mod tests {
     async fn the_pause_waits_for_an_in_flight_compaction() {
         let config = scaled_config();
         // Aim at 95% of the window: a handoff a fraction of the conversation
-        // size lands the rebuilt request back under compact_at.
+        // size lands the rebuilt request back under the compact point.
         let probe_window = {
             let mut probe = Agent::with_config(
                 ScriptedLlm::new(u32::MAX / 4, [HANDOFF_JSON.to_string()]),
@@ -7559,6 +7561,9 @@ mod tests {
             let chars = request_chars(&assembled, &probe.tools.active_definitions());
             u32::try_from((chars.div_ceil(4) * 100).div_ceil(95)).expect("window fits in u32")
         };
+        let mut config = config;
+        config.context_policy.handoff_reserve =
+            usize::try_from(probe_window).expect("u32 fits usize") / 5;
         let llm = ScriptedLlm::new(probe_window, [HANDOFF_JSON.to_string()]);
         let mut agent = Agent::with_config(llm.clone(), config);
         agent.ensure_initialized().await.expect("agent initializes");
