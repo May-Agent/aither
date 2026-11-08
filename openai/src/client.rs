@@ -18,7 +18,8 @@ use aither_core::time::sleep;
 use aither_core::{
     LanguageModel,
     llm::{
-        Classify, Event, LLMRequest, ReasoningState, RetryPolicy, ToolCall, Usage,
+        Classify, Event, GenerateError, LLMRequest, ReasoningState, RetryPolicy, TokenCounting,
+        ToolCall, Usage,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -129,7 +130,13 @@ impl OpenAI {
     /// Override the default chat model in-place.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).chat_model = sanitize_model(model);
+        let model = sanitize_model(model);
+        let cfg = Arc::make_mut(&mut self.inner);
+        #[cfg(feature = "tokenizer")]
+        {
+            cfg.vocabulary = aither_core::tokenizer::Vocabulary::for_model(&model);
+        }
+        cfg.chat_model = model;
         self
     }
 
@@ -236,6 +243,39 @@ impl OpenAI {
 
 impl LanguageModel for OpenAI {
     type Error = OpenAIError;
+
+    fn token_counting(&self) -> TokenCounting {
+        #[cfg(feature = "tokenizer")]
+        if self.inner.vocabulary.is_some() {
+            return TokenCounting::Local;
+        }
+        TokenCounting::None
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> Result<Option<u32>, GenerateError<Self::Error>> {
+        #[cfg(feature = "tokenizer")]
+        if let Some(vocabulary) = self.inner.vocabulary {
+            let request = request.clone();
+            return Ok(Some(
+                blocking::unblock(move || vocabulary.count_request(&request)).await,
+            ));
+        }
+        let _ = request;
+        Ok(None)
+    }
+
+    fn count_text(&self, text: &str) -> Option<u32> {
+        #[cfg(feature = "tokenizer")]
+        if let Some(vocabulary) = self.inner.vocabulary {
+            return Some(vocabulary.count_text(text));
+        }
+        let _ = text;
+        None
+    }
 
     #[allow(clippy::too_many_lines)]
     fn respond(
@@ -1278,6 +1318,36 @@ fn builtin_result_event(item: &ResponsesOutputItem) -> Option<Event> {
 
 #[cfg(test)]
 mod tests {
+    /// With the `tokenizer` feature a published-family model counts in
+    /// process: `Local`, exact `count_text`, `count_tokens` on the whole
+    /// request.
+    #[cfg(feature = "tokenizer")]
+    #[tokio::test]
+    async fn a_published_family_model_counts_locally() {
+        let client = OpenAI::builder("key").model("gpt-4o").build();
+        assert_eq!(client.token_counting(), TokenCounting::Local);
+        assert_eq!(client.count_text("hello world"), Some(2));
+        let request = LLMRequest::new(vec![aither_core::llm::Message::user("hello world")]);
+        let counted = client
+            .count_tokens(&request)
+            .await
+            .expect("count succeeds")
+            .expect("the model counts");
+        // 3 message framing + 2 text + 3 reply primer.
+        assert_eq!(counted, 8);
+    }
+
+    /// An unmapped model keeps the defaults: no counting at all.
+    #[cfg(feature = "tokenizer")]
+    #[tokio::test]
+    async fn an_unmapped_model_does_not_count() {
+        let client = OpenAI::builder("key")
+            .model("unregistered-stub-model")
+            .build();
+        assert_eq!(client.token_counting(), TokenCounting::None);
+        assert_eq!(client.count_text("hello world"), None);
+    }
+
     use super::*;
     use crate::response::{
         ChatCompletionTokensDetails, ChatCompletionUsage, ChatPromptTokensDetails,
@@ -1866,6 +1936,8 @@ impl Builder {
                 api_key: self.api_key,
                 base_url: self.base_url,
                 api_kind: self.api_kind,
+                #[cfg(feature = "tokenizer")]
+                vocabulary: aither_core::tokenizer::Vocabulary::for_model(&self.chat_model),
                 chat_model: self.chat_model,
                 embedding_model: self.embedding_model,
                 embedding_dimensions: self.embedding_dimensions,
@@ -1908,6 +1980,9 @@ pub struct Config {
     pub(crate) request_timeout: Duration,
     pub(crate) extra_headers: Vec<(String, String)>,
     pub(crate) store: Option<bool>,
+    /// The published vocabulary `chat_model` counts with, when it has one.
+    #[cfg(feature = "tokenizer")]
+    pub(crate) vocabulary: Option<aither_core::tokenizer::Vocabulary>,
 }
 
 impl Config {

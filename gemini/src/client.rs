@@ -173,7 +173,7 @@ async fn get_json<T: for<'de> serde::Deserialize<'de>>(
 }
 
 #[allow(clippy::future_not_send)]
-async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Serialize>(
+pub async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Serialize>(
     cfg: &GeminiConfig,
     endpoint: String,
     body: &S,
