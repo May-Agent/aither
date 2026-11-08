@@ -59,7 +59,7 @@ impl ForkSnapshot {
         self.usage
     }
 
-    /// The fraction of the context window the main agent compacts at.
+    /// The fraction of the context window the main agent pauses at.
     #[must_use]
     pub fn compaction_usage(&self) -> f32 {
         let window = f64::from(self.budget.window());
@@ -67,14 +67,14 @@ impl ForkSnapshot {
             return 0.0;
         }
         let point = f64::from(
-            u32::try_from(self.context_policy.compact_point(self.budget.window()))
+            u32::try_from(self.context_policy.pause_point(self.budget.window()))
                 .unwrap_or(u32::MAX),
         );
         num_traits::ToPrimitive::to_f32(&(point / window)).unwrap_or(1.0)
     }
 
     /// Whether a fork may start from the request the main agent sent: it is
-    /// refused within a tenth of the main agent's auto-compact point.
+    /// refused within a tenth of the main agent's pause point.
     #[must_use]
     pub fn allows_fork(&self) -> bool {
         self.context_policy

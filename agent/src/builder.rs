@@ -1452,7 +1452,7 @@ mod tests {
     #[test]
     fn options_survive_the_steps_that_change_the_builders_type() {
         let policy = ContextPolicy {
-            safe_buffer: 1_234,
+            handoff_reserve: 1_234,
             ..ContextPolicy::default()
         };
         let agent = AgentBuilder::new(MockLlm)

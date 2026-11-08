@@ -41,7 +41,7 @@ use aither_core::{
     LanguageModel,
     llm::{
         Attachment, CommandStream, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role,
-        StoredFile, ToolCall,
+        StoredFile, TokenCounting, ToolCall,
         model::{Ability, Parameters, Profile as ModelProfile},
     },
 };
@@ -3595,11 +3595,9 @@ where
         let policy = self.config.context_policy;
         if !policy.admits(profile.context_length) {
             return Err(AgentError::Config(format!(
-                "the {}-token context window leaves no room below its {}-token auto-compact point \
-                 once the {}-token safe buffer is kept; lower `ContextPolicy::safe_buffer`",
-                profile.context_length,
-                policy.compact_point(profile.context_length),
-                policy.safe_buffer,
+                "the {}-token context window is no larger than the {}-token handoff reserve, \
+                 so nothing fits below the pause point; lower `ContextPolicy::handoff_reserve`",
+                profile.context_length, policy.handoff_reserve,
             )));
         }
         self.budget.set_window(profile.context_length);
@@ -3708,7 +3706,7 @@ where
     /// counts, a compaction is forked if usage crossed
     /// [`ContextPolicy::start_point`], and the compaction is awaited (or run,
     /// with recovery when it fails) once the room left before the
-    /// auto-compact point is down to [`ContextPolicy::safe_buffer`].
+    /// pause point is reached — the window is down to the handoff reserve.
     ///
     /// With a compaction model set, a cache that went cold since the last
     /// request is rebuilt first (`rebuild_if_cache_is_cold`).
@@ -3723,7 +3721,78 @@ where
     /// nothing is sent on an uncompacted context.
     ///
     /// [`ContextPolicy::start_point`]: crate::ContextPolicy::start_point
-    /// [`ContextPolicy::safe_buffer`]: crate::ContextPolicy::safe_buffer
+    /// How the active tier's model counts prompt tokens, if it can.
+    fn active_token_counting(&self) -> TokenCounting {
+        match self.tier {
+            ModelTier::Advanced => self.advanced.token_counting(),
+            ModelTier::Balanced => self.balanced.token_counting(),
+            ModelTier::Fast => self.fast.token_counting(),
+        }
+    }
+
+    /// Asks the active tier's model for the request's exact prompt tokens.
+    ///
+    /// Local counters run on every assembly; an endpoint counter costs a
+    /// round trip, so it counts only once the estimate is within
+    /// [`ContextPolicy::count_distance`] of the warn point. A counting
+    /// failure never fails the request — the estimate stands.
+    async fn count_active_request(&self, request: &LLMRequest) -> Option<u32> {
+        let should_count = match self.active_token_counting() {
+            TokenCounting::None => return None,
+            TokenCounting::Local => true,
+            TokenCounting::Endpoint => self
+                .config
+                .context_policy
+                .should_count_endpoint(self.budget.estimated_tokens(), self.budget.window()),
+        };
+        if !should_count {
+            return None;
+        }
+        let counted = match self.tier {
+            ModelTier::Advanced => self
+                .advanced
+                .count_tokens(request)
+                .await
+                .map_err(|error| error.to_string()),
+            ModelTier::Balanced => self
+                .balanced
+                .count_tokens(request)
+                .await
+                .map_err(|error| error.to_string()),
+            ModelTier::Fast => self
+                .fast
+                .count_tokens(request)
+                .await
+                .map_err(|error| error.to_string()),
+        };
+        match counted {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                tracing::warn!(%error, "token counting failed; using the estimate");
+                None
+            }
+        }
+    }
+
+    /// Records the assembled prompt's size — exactly, when the model can
+    /// count it.
+    async fn measure_assembled(
+        &mut self,
+        messages: &[Message],
+        definitions: &[aither_core::llm::tool::ToolDefinition],
+    ) {
+        self.budget
+            .observe_assembled(request_chars(messages, definitions));
+        if matches!(self.active_token_counting(), TokenCounting::None) {
+            return;
+        }
+        let request =
+            LLMRequest::new(messages.to_vec()).with_tool_definitions(definitions.to_vec());
+        if let Some(tokens) = self.count_active_request(&request).await {
+            self.budget.observe_counted(tokens);
+        }
+    }
+
     async fn prepare_request(
         &mut self,
         events: &EventSink,
@@ -3736,14 +3805,12 @@ where
         let definitions = self.tools.active_definitions();
         let mut tail = self.render_tail().await;
         let mut messages = self.request_messages(&tail);
-        self.budget
-            .observe_assembled(request_chars(&messages, &definitions));
+        self.measure_assembled(&messages, &definitions).await;
 
         self.sync_compact_signal();
         if self.raise_precompaction_alert() {
             messages = self.request_messages(&tail);
-            self.budget
-                .observe_assembled(request_chars(&messages, &definitions));
+            self.measure_assembled(&messages, &definitions).await;
         }
         let requested = self
             .compact_signal
@@ -3781,8 +3848,7 @@ where
             self.push_request_alerts().await;
             tail = self.render_tail().await;
             messages = self.request_messages(&tail);
-            self.budget
-                .observe_assembled(request_chars(&messages, &definitions));
+            self.measure_assembled(&messages, &definitions).await;
             // A landed compaction is still no guarantee the rebuilt request
             // fits; an unshrinkable request is paused rather than sent.
             if self
@@ -3873,7 +3939,7 @@ where
             return false;
         }
         let alert = self.notices.precompaction(&crate::PreCompaction {
-            remaining_tokens: policy.compact_point(window).saturating_sub(tokens),
+            remaining_tokens: policy.pause_point(window).saturating_sub(tokens),
         });
         self.push_system_alert(alert);
         true
@@ -4610,6 +4676,71 @@ mod tests {
         }
     }
 
+    /// Counts tokens however the test configures: locally, through an
+    /// endpoint, or not at all — and can be told to fail.
+    #[derive(Clone)]
+    struct CountingLlm {
+        kind: TokenCounting,
+        count: u32,
+        fail: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        context_length: u32,
+    }
+
+    impl LanguageModel for CountingLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::empty()
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock",
+                "test",
+                "counting",
+                "counting model",
+                self.context_length,
+            )))
+        }
+
+        fn token_counting(&self) -> TokenCounting {
+            self.kind
+        }
+
+        fn count_tokens(
+            &self,
+            _request: &LLMRequest,
+        ) -> impl std::future::Future<
+            Output = Result<Option<u32>, aither_core::llm::GenerateError<Self::Error>>,
+        > + Send {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let fail = self.fail;
+            let count = self.count;
+            async move {
+                if fail {
+                    return Err(aither_core::llm::GenerateError::Provider(MockError));
+                }
+                Ok(Some(count))
+            }
+        }
+    }
+
+    fn counting_llm(kind: TokenCounting) -> CountingLlm {
+        CountingLlm {
+            kind,
+            count: 42_000,
+            fail: false,
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            context_length: 1_000_000,
+        }
+    }
+
     /// Takes `lock` on the first chunk and keeps it across that chunk's
     /// emit, releasing it on the next chunk after a suspension: the shape of
     /// a run that holds a resource (a database writer) across an emit.
@@ -4894,7 +5025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_window_with_no_room_below_the_safe_buffer_is_refused() {
+    async fn a_window_no_larger_than_the_handoff_reserve_is_refused() {
         let mut agent = Agent::with_config(
             MockLlm {
                 context_length: 4_096,
@@ -4904,11 +5035,69 @@ mod tests {
         let error = agent
             .ensure_initialized()
             .await
-            .expect_err("a 4k window under the 5k buffer cannot hold a request");
+            .expect_err("a 4k window under the reserve cannot hold a request");
         assert!(
-            matches!(&error, AgentError::Config(message) if message.contains("safe_buffer")),
+            matches!(&error, AgentError::Config(message) if message.contains("handoff_reserve")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_local_count_replaces_the_estimate_on_every_assembly() {
+        let llm = counting_llm(TokenCounting::Local);
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        let messages = vec![Message::user("hello world, this is a prompt")];
+        agent.measure_assembled(&messages, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(agent.budget.estimated_tokens(), 42_000);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_count_is_skipped_far_below_the_warn_point() {
+        let llm = counting_llm(TokenCounting::Endpoint);
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        // warn_point(1M) = 800k - 80k = 720k; count gate = 690k; a small
+        // assembly stays far below it.
+        let messages = vec![Message::user("hi")];
+        agent.measure_assembled(&messages, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_count_is_used_near_the_warn_point() {
+        let llm = counting_llm(TokenCounting::Endpoint);
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        // The gate is warn_point − count_distance: a 1M window hits the
+        // 400k compact ceiling, so the warn point is 320k and counting
+        // starts at 290k estimated. 2.8M chars at the default
+        // 4-chars-per-token estimate ~700k — inside it.
+        let big = vec![Message::user("x".repeat(2_800_000))];
+        agent.measure_assembled(&big, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(agent.budget.estimated_tokens(), 42_000);
+    }
+
+    #[tokio::test]
+    async fn a_counting_error_falls_back_to_the_estimate() {
+        let mut llm = counting_llm(TokenCounting::Local);
+        llm.fail = true;
+        let calls = llm.calls.clone();
+        let mut agent = Agent::with_config(llm, AgentConfig::default());
+        agent.budget.set_window(1_000_000);
+        let messages = vec![Message::user("hello world")];
+        agent.measure_assembled(&messages, &[]).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Failure → the char estimate stands: 11 chars at 4.0 → 2 tokens
+        // plus framing nothing → estimate is 2 (ceil or floor per impl).
+        let estimate = agent.budget.estimated_tokens();
+        assert!(estimate < 100, "estimate {estimate} should stay small");
+        assert_ne!(estimate, 42_000);
     }
 
     #[tokio::test]
@@ -4917,7 +5106,7 @@ mod tests {
         let config = AgentConfig {
             system_prompt: Some("x".repeat(400)),
             context_policy: crate::ContextPolicy {
-                safe_buffer: 10,
+                handoff_reserve: 10,
                 ..crate::ContextPolicy::default()
             },
             ..AgentConfig::default()
@@ -4970,7 +5159,7 @@ mod tests {
         let config = AgentConfig {
             system_prompt: Some("x".repeat(4_000)),
             context_policy: crate::ContextPolicy {
-                safe_buffer: 10,
+                handoff_reserve: 10,
                 ..crate::ContextPolicy::default()
             },
             ..AgentConfig::default()
@@ -5069,13 +5258,13 @@ mod tests {
         assert!(!agent.compaction.is_active());
     }
 
-    /// Down to the safe buffer with no compaction in flight, the loop runs
-    /// one synchronously before the request goes out.
+    /// At the pause point with no compaction in flight, the loop runs one
+    /// synchronously before the request goes out.
     #[tokio::test]
     async fn reaching_the_buffer_runs_a_compaction_before_the_request() {
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
         // The fork the boundary starts is the compaction it then waits for.
         let request = agent
             .prepare_request(&EventSink::discarding())
@@ -5105,7 +5294,7 @@ mod tests {
             ],
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
 
         let events = drain_run(agent.run("keep going", [])).await;
 
@@ -5134,7 +5323,7 @@ mod tests {
             ],
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
 
         let (sender, events) = async_channel::unbounded();
         let request = agent
@@ -5193,7 +5382,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("outputs/compaction-call_1.txt"))
                 .expect("the spilled output is readable"),
-            "o".repeat(396_000 * 4)
+            "o".repeat(400_000 * 4)
         );
     }
 
@@ -7229,15 +7418,15 @@ mod tests {
         );
     }
 
-    /// A config whose compaction distances fit the few-hundred-token windows
-    /// [`window_for_usage`] sizes: the fork starts 50 tokens before the
-    /// auto-compact point (80% of the window) and the pause one token before.
+    /// A config whose compaction distances fit the few-hundred-token
+    /// windows [`window_for_usage`] sizes: it gives each window a handoff
+    /// reserve of a fifth, so the fork starts 50 tokens before the pause
+    /// point and the pause sits right at it.
     fn scaled_config() -> AgentConfig {
         AgentConfig {
             system_prompt: Some("x".repeat(400)),
             context_policy: crate::ContextPolicy {
                 start_distance: 50,
-                safe_buffer: 1,
                 // These windows are a few hundred tokens: the conversation
                 // must shrink to the handoff for a compaction to relieve them.
                 user_message_budget: 0,
@@ -7274,18 +7463,23 @@ mod tests {
         let tokens = chars.div_ceil(4);
         let window = u32::try_from((tokens * 100).div_ceil(usage_percent))
             .expect("the aimed window fits in u32");
+        // The handoff reserve is absolute: give the aimed window one a
+        // fifth of its size, the room the default's fraction used to leave.
+        let mut config = config.clone();
+        config.context_policy.handoff_reserve =
+            usize::try_from(window).expect("u32 fits usize") / 5;
         (
             Agent::with_config(
                 MockLlm {
                     context_length: window,
                 },
-                config.clone(),
+                config,
             ),
             window,
         )
     }
 
-    /// The handoff exists but the window grew past `compact_at` again: a new
+    /// The handoff exists but the window grew past the compact point again: a new
     /// compaction must fork, not rest on the previous one.
     #[tokio::test]
     async fn a_landed_handoff_compacts_again_when_the_window_grows() {
@@ -7302,18 +7496,18 @@ mod tests {
 
         assert!(
             request.is_some(),
-            "usage between compact_at and pause_at must not withhold the request"
+            "usage between the start and pause points must not withhold the request"
         );
         assert!(
             agent.compaction.is_running(),
-            "growth past compact_at must fork a compaction even after a handoff exists"
+            "growth past the compact point must fork a compaction even after a handoff exists"
         );
     }
 
-    /// Crossing `compact_at` during a tool round starts the compaction but
-    /// still lets that turn's request out: forking must not block the turn.
+    /// Crossing the start point during a tool round starts the compaction
+    /// but still lets that turn's request out: forking must not block the turn.
     #[tokio::test]
-    async fn a_tool_round_crossing_compact_at_forks_without_blocking() {
+    async fn a_tool_round_crossing_the_start_point_forks_without_blocking() {
         let config = scaled_config();
         let messages = vec![
             Message::user("run it"),
@@ -7340,11 +7534,11 @@ mod tests {
 
         assert!(
             request.is_some(),
-            "crossing compact_at alone must not withhold the turn's request"
+            "crossing the start point alone must not withhold the turn's request"
         );
         assert!(
             agent.compaction.is_running(),
-            "crossing compact_at must fork the compaction"
+            "crossing the start point must fork the compaction"
         );
     }
 
@@ -7354,7 +7548,7 @@ mod tests {
     async fn the_pause_waits_for_an_in_flight_compaction() {
         let config = scaled_config();
         // Aim at 95% of the window: a handoff a fraction of the conversation
-        // size lands the rebuilt request back under compact_at.
+        // size lands the rebuilt request back under the compact point.
         let probe_window = {
             let mut probe = Agent::with_config(
                 ScriptedLlm::new(u32::MAX / 4, [HANDOFF_JSON.to_string()]),
@@ -7367,6 +7561,9 @@ mod tests {
             let chars = request_chars(&assembled, &probe.tools.active_definitions());
             u32::try_from((chars.div_ceil(4) * 100).div_ceil(95)).expect("window fits in u32")
         };
+        let mut config = config;
+        config.context_policy.handoff_reserve =
+            usize::try_from(probe_window).expect("u32 fits usize") / 5;
         let llm = ScriptedLlm::new(probe_window, [HANDOFF_JSON.to_string()]);
         let mut agent = Agent::with_config(llm.clone(), config);
         agent.ensure_initialized().await.expect("agent initializes");

@@ -1811,10 +1811,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let (requests, _captured) = async_channel::unbounded();
         let policy = crate::ContextPolicy {
-            compact_at: 0.5,
+            handoff_reserve: 55_000,
             compact_ceiling: 300_000,
             start_distance: 20_000,
-            safe_buffer: 5_000,
             ..crate::ContextPolicy::default()
         };
         let agent = TerminalAgentBuilder::new(
