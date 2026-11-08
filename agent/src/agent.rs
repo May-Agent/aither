@@ -5045,13 +5045,13 @@ mod tests {
         assert!(!agent.compaction.is_active());
     }
 
-    /// Down to the safe buffer with no compaction in flight, the loop runs
-    /// one synchronously before the request goes out.
+    /// At the pause point with no compaction in flight, the loop runs one
+    /// synchronously before the request goes out.
     #[tokio::test]
     async fn reaching_the_buffer_runs_a_compaction_before_the_request() {
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
         // The fork the boundary starts is the compaction it then waits for.
         let request = agent
             .prepare_request(&EventSink::discarding())
@@ -5081,7 +5081,7 @@ mod tests {
             ],
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
 
         let events = drain_run(agent.run("keep going", [])).await;
 
@@ -5110,7 +5110,7 @@ mod tests {
             ],
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut agent = agent_with_long_output(&llm, 396_000, dir.path()).await;
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
 
         let (sender, events) = async_channel::unbounded();
         let request = agent
@@ -5169,7 +5169,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("outputs/compaction-call_1.txt"))
                 .expect("the spilled output is readable"),
-            "o".repeat(396_000 * 4)
+            "o".repeat(400_000 * 4)
         );
     }
 
