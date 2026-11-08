@@ -346,6 +346,7 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-test",
  "url",
@@ -572,7 +573,6 @@ dependencies = [
  "globset",
  "heel",
  "hex",
- "human-hash",
  "image",
  "jiff",
  "libc",
@@ -4073,9 +4073,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9e8401f187045391a6494252c29da3663475e5819acd098e505ecd129455bd8"
+checksum = "c39ba724ff8c7e06342ef658b1154901d08eb58c84a60649b01de0177002c66a"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -4311,15 +4311,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "human-hash"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee5afc14f104d821c7dae9cabe97a19510b62532bf7d506ef14fab73c4bbf4fa"
-dependencies = [
- "uuid",
-]
 
 [[package]]
 name = "humansize"

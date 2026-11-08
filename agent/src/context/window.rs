@@ -10,6 +10,8 @@
 //! ┌───────────────────────────────┐
 //! │ system blocks (stable prefix) │  rewritten only by reassembly
 //! ├───────────────────────────────┤
+//! │ live source blocks            │  rewritten only by reassembly
+//! ├───────────────────────────────┤
 //! │ handoff document              │  replaced only by compaction
 //! ├───────────────────────────────┤
 //! │ conversation items (seq 1..n) │  append-only
@@ -43,11 +45,13 @@ use serde::{Deserialize, Serialize};
 use aither_core::llm::model::ReasoningEffort;
 use aither_core::llm::{Message, Role, ToolCall};
 
-use super::compaction::Handoff;
+use super::compaction::{AttachmentCatalogEntry, AttachmentRef, Handoff};
 use super::live::{LiveContent, LiveUpdate};
-use super::source::Block;
+use super::source::{Block, LiveChange};
+use super::state::SeenStates;
 use super::system::{
-    External, Instruction, SystemLayout, SystemRegion, TaggedBlockTemplate, render_prefix,
+    External, Instruction, Sourced, SourcedSlot, SystemLayout, SystemRegion, TaggedBlockTemplate,
+    render_prefix,
 };
 
 /// Tombstone text left in place of a superseded tool result.
@@ -74,11 +78,18 @@ pub struct ContextItem {
     /// never tombstoned or spilled.
     #[serde(default)]
     kept: bool,
-    /// Whether this is the alert announcing a change to live content: the
-    /// next reassembly folds the change into the prefix, so it removes the
-    /// alert whatever its position.
+    /// Whether the next reassembly removes this alert whatever its
+    /// position, because what it says is restated from the source after
+    /// it: a live-content diff, whose change the reassembly folds into the
+    /// prefix, or a state alert, whose current value the next request
+    /// writes again when it is not the normal one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     live: bool,
+    /// Whether no request has carried this item yet. A reassembly or
+    /// compaction keeps an undelivered alert, so an event recorded while
+    /// the agent waited still reaches the model with the next request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    undelivered: bool,
 }
 
 impl ContextItem {
@@ -120,8 +131,9 @@ enum ItemKind {
     Ordinary,
     /// A tool result closing an exchange kept verbatim through compaction.
     Kept,
-    /// The alert announcing a change to live content.
-    LiveAlert,
+    /// An alert its source restates after a reassembly: a live-content
+    /// diff or a state alert.
+    Restated,
 }
 
 /// The entire context window state. Fully serializable for persistence.
@@ -138,6 +150,13 @@ pub struct Context {
     /// block inside their boundaries.
     #[serde(default = "default_external")]
     external: SystemRegion<External>,
+
+    /// The blocks live sources render, one system message each after the
+    /// system prefix, in the order the sources were registered.
+    /// A change made after a request carried them is staged like a live
+    /// system block's.
+    #[serde(default = "default_sourced")]
+    sourced: SystemRegion<Sourced>,
 
     /// Compaction handoff document from the previous compaction.
     ///
@@ -156,6 +175,11 @@ pub struct Context {
     /// change is staged and announced instead of written into it.
     #[serde(default)]
     prefix_sent: bool,
+
+    /// What the model has seen of each state source's states. Reassembling
+    /// removes the state alerts that told it, and this with them.
+    #[serde(default, skip_serializing_if = "SeenStates::is_empty")]
+    seen_states: SeenStates,
 }
 
 impl Default for Context {
@@ -172,6 +196,10 @@ fn default_external() -> SystemRegion<External> {
     SystemRegion::with_order(SystemLayout::default().into_regions().1)
 }
 
+const fn default_sourced() -> SystemRegion<Sourced> {
+    SystemRegion::with_order(Vec::new())
+}
+
 impl Context {
     /// Creates a new empty context with the default [`SystemLayout`].
     #[must_use]
@@ -186,11 +214,23 @@ impl Context {
         Self {
             instructions: SystemRegion::with_order(instructions),
             external: SystemRegion::with_order(external),
+            sourced: default_sourced(),
             handoff: None,
             items: Vec::new(),
             next_seq: 0,
             prefix_sent: false,
+            seen_states: SeenStates::default(),
         }
+    }
+
+    /// What the model has seen of each state source's states.
+    pub(crate) const fn seen_states(&self) -> &SeenStates {
+        &self.seen_states
+    }
+
+    /// Records what the model has seen of a state source's states.
+    pub(crate) fn set_seen_states(&mut self, id: &str, seen: serde_json::Value) {
+        self.seen_states.set(id, seen);
     }
 
     // ── System blocks (stable, cacheable prefix) ──────────────────────
@@ -269,20 +309,77 @@ impl Context {
         let Some(alert) = live.into_alert(content) else {
             return false;
         };
-        self.push_item(Message::system(alert), ItemKind::LiveAlert);
+        self.push_item(Message::system(alert), ItemKind::Restated);
         true
     }
 
     /// Records that a request carried the current system prefix, which a
-    /// provider may now cache.
-    pub(crate) const fn mark_prefix_sent(&mut self) {
+    /// provider may now cache. Whether the model received the items it
+    /// carried is a separate matter, see
+    /// [`mark_delivered_below`](Self::mark_delivered_below).
+    pub(crate) const fn mark_prefix_carried(&mut self) {
         self.prefix_sent = true;
     }
 
-    /// Returns the number of persistent system blocks.
+    /// Records that the provider began answering a request that carried
+    /// the items numbered below `seq`, which the model has now been
+    /// delivered. A request that failed before that delivered nothing, and
+    /// its items stay undelivered for the next one.
+    pub(crate) fn mark_delivered_below(&mut self, seq: u64) {
+        for item in self.items.iter_mut().filter(|item| item.seq < seq) {
+            item.undelivered = false;
+        }
+    }
+
+    /// A request carried the prefix and the provider answered it, in one
+    /// step, for tests that do not run a request.
+    #[cfg(test)]
+    pub(crate) fn mark_prefix_sent(&mut self) {
+        self.mark_prefix_carried();
+        self.mark_delivered_below(u64::MAX);
+    }
+
+    /// The blocks live sources rendered, as the prefix holds them.
+    #[must_use]
+    pub const fn live_source_blocks(&self) -> &SystemRegion<Sourced> {
+        &self.sourced
+    }
+
+    /// Brings the live source block in `slot` to `desired` (`None` removes
+    /// it), the way [`update_live`](Self::update_live) brings a system block.
+    ///
+    /// A slot seen for the first time takes its place after every slot seen
+    /// before it, so blocks render in the order their sources are synced.
+    /// Before any request has carried the prefix the block is written into
+    /// it. After, the prefix is left byte-identical, the change is staged for
+    /// the next reassembly, and the alert `announce` writes for it is
+    /// appended — removed, like every live-content alert, by that
+    /// reassembly. Returns the alert's length when one was appended.
+    pub(crate) fn update_live_source(
+        &mut self,
+        slot: &SourcedSlot,
+        desired: Option<String>,
+        announce: impl FnOnce(&LiveChange<'_>) -> Block,
+    ) -> Option<usize> {
+        self.sourced.place(slot.clone());
+        let change = self.sourced.change(slot, desired, self.prefix_sent)?;
+        let alert = announce(&LiveChange::new(&change.before, &change.after));
+        self.push_item(Message::system(alert.content()), ItemKind::Restated);
+        Some(alert.len())
+    }
+
+    /// Appends a state alert: removed by the next reassembly whatever its
+    /// position, since the state source restates the current value after
+    /// it when that is not the normal one.
+    pub(crate) fn push_state_alert(&mut self, block: &Block) -> u64 {
+        self.push_item(Message::system(block.content()), ItemKind::Restated)
+    }
+
+    /// Returns the number of persistent system blocks, live source blocks
+    /// included.
     #[must_use]
     pub fn system_block_count(&self) -> usize {
-        self.instructions.len() + self.external.len()
+        self.instructions.len() + self.external.len() + self.sourced.len()
     }
 
     /// Renders the cacheable system prefix: the instruction blocks, then the
@@ -292,23 +389,27 @@ impl Context {
         render_prefix(&self.instructions, &self.external)
     }
 
-    /// Returns a stable fingerprint of the rendered system prefix.
+    /// Returns a stable fingerprint of the rendered system prefix and the
+    /// live source blocks after it.
     ///
-    /// The fingerprint changes if and only if the prefix's bytes change.
-    /// Hosts can use this to detect cache-invalidating modifications to the
-    /// stable system prefix (for example, to track KV-cache hit rate over
-    /// time).
+    /// The fingerprint changes if and only if those bytes change. Hosts can
+    /// use this to detect cache-invalidating modifications to the stable
+    /// prefix (for example, to track KV-cache hit rate over time).
     #[must_use]
     pub fn stable_prefix_fingerprint(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.system_prefix().hash(&mut hasher);
+        for (_, block) in self.sourced.iter() {
+            block.hash(&mut hasher);
+        }
         hasher.finish()
     }
 
-    /// Whether any system block rewrite is waiting for reassembly.
+    /// Whether any system block or live source block rewrite is waiting
+    /// for reassembly.
     #[must_use]
     pub fn has_staged_system_updates(&self) -> bool {
-        self.instructions.has_staged() || self.external.has_staged()
+        self.instructions.has_staged() || self.external.has_staged() || self.sourced.has_staged()
     }
 
     // ── Handoff ───────────────────────────────────────────────────────
@@ -356,7 +457,8 @@ impl Context {
             message,
             committed_at: Timestamp::now(),
             kept: matches!(kind, ItemKind::Kept),
-            live: matches!(kind, ItemKind::LiveAlert),
+            live: matches!(kind, ItemKind::Restated),
+            undelivered: true,
         });
         seq
     }
@@ -397,6 +499,39 @@ impl Context {
     #[must_use]
     pub const fn fork_point(&self) -> u64 {
         self.next_seq
+    }
+
+    /// The catalog of attachments the user messages below `fork_point`
+    /// carry, in conversation order.
+    ///
+    /// Offered to the compaction model so its handoff can name the
+    /// attachments the next turns still need;
+    /// [`apply_handoff`](Self::apply_handoff) resolves the names back to
+    /// the `reference` each entry carries.
+    #[must_use]
+    pub fn attachment_catalog(&self, fork_point: u64) -> Vec<AttachmentCatalogEntry> {
+        let mut catalog = Vec::new();
+        for item in self.items.iter().filter(|item| item.seq < fork_point) {
+            let Message::User {
+                content,
+                attachments,
+            } = &item.message
+            else {
+                continue;
+            };
+            for (index, attachment) in attachments.iter().enumerate() {
+                catalog.push(AttachmentCatalogEntry {
+                    id: format!("attachment-{}", catalog.len() + 1),
+                    media_type: attachment.media_type().essence_str().to_string(),
+                    excerpt: attachment_excerpt(content),
+                    reference: AttachmentRef {
+                        seq: item.seq,
+                        index,
+                    },
+                });
+            }
+        }
+        catalog
     }
 
     /// Returns the items added at or after `seq`.
@@ -477,20 +612,27 @@ impl Context {
     ///
     /// Layout:
     /// 1. persistent system blocks, as one cacheable system message,
-    /// 2. the compaction handoff, if any,
-    /// 3. the append-only conversation,
-    /// 4. one system message holding every live tail block.
+    /// 2. each live source block, as a system message of its own,
+    /// 3. the compaction handoff, if any,
+    /// 4. the append-only conversation,
+    /// 5. one system message holding every live tail block.
     ///
-    /// Steps 1-3 are byte-identical to the previous request whenever nothing
+    /// Steps 1-4 are byte-identical to the previous request whenever nothing
     /// was staged or compacted, which is exactly the condition a provider
     /// prefix cache needs.
     #[must_use]
     pub fn build_request(&self, tail: &[Block]) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(self.items.len() + 3);
+        let mut messages = Vec::with_capacity(self.items.len() + self.sourced.len() + 3);
 
         if let Some(prefix) = self.system_prefix() {
             messages.push(Message::system(prefix));
         }
+
+        messages.extend(
+            self.sourced
+                .iter()
+                .map(|(_, block)| Message::system(block.as_str())),
+        );
 
         if let Some(handoff) = &self.handoff {
             messages.push(Message::system(handoff.render()));
@@ -527,11 +669,12 @@ impl Context {
     #[must_use]
     pub fn stable_chars(&self) -> usize {
         let blocks = self.system_prefix().map_or(0, |prefix| prefix.len());
+        let sourced: usize = self.sourced.iter().map(|(_, block)| block.len()).sum();
         let handoff = self
             .handoff
             .as_ref()
             .map_or(0, |handoff| handoff.render().len());
-        blocks + handoff
+        blocks + sourced + handoff
     }
 
     /// The number of characters the conversation renders to.
@@ -548,18 +691,21 @@ impl Context {
     /// Clears only the conversation, keeping system blocks and the handoff.
     pub fn clear_recent(&mut self) {
         self.items.clear();
+        self.seen_states.clear();
     }
 
     /// Clears all non-persistent context: the handoff and the conversation.
     pub fn clear_history(&mut self) {
         self.handoff = None;
         self.items.clear();
+        self.seen_states.clear();
     }
 
     /// Clears everything, including persistent system blocks.
     pub fn clear_all(&mut self) {
         self.instructions.clear();
         self.external.clear();
+        self.sourced.clear();
         self.prefix_sent = false;
         self.clear_history();
     }
@@ -577,6 +723,7 @@ impl Context {
             handoff: self.handoff.clone(),
             items: self.items.clone(),
             next_seq: self.next_seq,
+            seen_states: self.seen_states.clone(),
         }
     }
 
@@ -587,6 +734,7 @@ impl Context {
             .next_seq
             .max(checkpoint.items.last().map_or(0, |item| item.seq + 1));
         self.items = checkpoint.items;
+        self.seen_states = checkpoint.seen_states;
     }
 
     /// Restores runtime-managed state from another serialized context while
@@ -601,6 +749,9 @@ impl Context {
     /// above `fork_point` are kept: they arrived while the handoff was being
     /// written and are not described by it.
     ///
+    /// An alert below the fork that no request has carried yet stays too:
+    /// the model has not seen it, whatever the handoff says of it.
+    ///
     /// The user's own words outlive the handoff beside it, verbatim and in
     /// order: every `ask_user` exchange from below the fork, whatever its
     /// size, and the newest user messages that fit `user_message_chars`
@@ -609,8 +760,20 @@ impl Context {
     ///
     /// The last configuration update below the fork is kept too, in its
     /// place, so the effort it set stays in force: the handoff restates it.
-    pub fn apply_handoff(&mut self, handoff: Handoff, fork_point: u64, user_message_chars: usize) {
-        let mut kept = self.verbatim_below(fork_point, user_message_chars);
+    ///
+    /// A kept user message carries only the attachments `kept_attachments`
+    /// names, resolved from the catalog the compaction's instruction
+    /// rendered; a message whose attachment is named is kept even when it
+    /// falls outside `user_message_chars`, and every unnamed attachment is
+    /// gone with the conversation the handoff replaced.
+    pub fn apply_handoff(
+        &mut self,
+        handoff: Handoff,
+        fork_point: u64,
+        user_message_chars: usize,
+        kept_attachments: &HashSet<AttachmentRef>,
+    ) {
+        let mut kept = self.verbatim_below(fork_point, user_message_chars, kept_attachments);
         self.items.retain(|item| item.seq >= fork_point);
         kept.append(&mut self.items);
         self.items = kept;
@@ -619,8 +782,14 @@ impl Context {
 
     /// The items below `fork_point` that survive a handoff: answered
     /// `ask_user` exchanges, and the newest user messages within
-    /// `user_message_chars`, oldest first.
-    fn verbatim_below(&self, fork_point: u64, user_message_chars: usize) -> Vec<ContextItem> {
+    /// `user_message_chars`, each carrying only the attachments
+    /// `kept_attachments` names, oldest first.
+    fn verbatim_below(
+        &self,
+        fork_point: u64,
+        user_message_chars: usize,
+        kept_attachments: &HashSet<AttachmentRef>,
+    ) -> Vec<ContextItem> {
         let below = || self.items.iter().filter(|item| item.seq < fork_point);
 
         let asks: HashSet<&str> = below()
@@ -647,6 +816,11 @@ impl Context {
                     }
                 }
                 Message::Tool { .. } if item.kept => kept.push(item.clone()),
+                // An alert no request carried yet, an event recorded while
+                // the agent waited, still owes the model its delivery.
+                message if message.role() == Role::System && item.undelivered => {
+                    kept.push(item.clone());
+                }
                 _ => {}
             }
         }
@@ -655,15 +829,52 @@ impl Context {
         }
 
         let mut remaining = user_message_chars;
+        let mut text_budget_spent = false;
         for item in below().rev() {
-            if !matches!(item.message, Message::User { .. }) {
+            let Message::User {
+                content,
+                attachments,
+            } = &item.message
+            else {
                 continue;
-            }
-            let Some(left) = remaining.checked_sub(item.message.content().len()) else {
-                break;
             };
-            remaining = left;
-            kept.push(item.clone());
+            let named: Vec<usize> = (0..attachments.len())
+                .filter(|index| {
+                    kept_attachments.contains(&AttachmentRef {
+                        seq: item.seq,
+                        index: *index,
+                    })
+                })
+                .collect();
+            // A message whose attachment the handoff named is kept
+            // whatever the budget says; an unnamed one pays for its text.
+            // Once the budget is spent the scan still runs on — an older
+            // message can still be kept on a named attachment.
+            if named.is_empty() {
+                if text_budget_spent {
+                    continue;
+                }
+                let Some(left) = remaining.checked_sub(content.len()) else {
+                    text_budget_spent = true;
+                    continue;
+                };
+                remaining = left;
+            }
+            let message = if named.len() == attachments.len() {
+                item.message.clone()
+            } else {
+                Message::User {
+                    content: content.clone(),
+                    attachments: named
+                        .iter()
+                        .map(|index| attachments[*index].clone())
+                        .collect(),
+                }
+            };
+            kept.push(ContextItem {
+                message,
+                ..item.clone()
+            });
         }
         kept.sort_by_key(|item| item.seq);
         kept
@@ -695,18 +906,25 @@ impl Context {
     }
 
     /// [`reassemble`](Self::reassemble) that removes only the durable system
-    /// alerts numbered below `fork_point`, and every live-content alert.
+    /// alerts numbered below `fork_point`, and every live-content and state
+    /// alert.
     ///
     /// Applying a compaction handoff uses it: alerts at or after the fork
     /// arrived while the handoff was written, are not described by it and
     /// must reach the model. A live-content alert is the exception: the
-    /// change it announced is folded into the prefix here.
+    /// change it announced is folded into the prefix here; so is a state
+    /// alert, whose source restates the current value after it. An alert no
+    /// request has carried yet stays wherever it is, so an event is dropped
+    /// only once it was delivered.
     pub fn reassemble_below(&mut self, fork_point: u64) -> ReassemblyReport {
         let mut report = ReassemblyReport::default();
+        // Every state alert goes below, and what the model saw with them.
+        self.seen_states.clear();
 
         for (applied, freed) in [
             self.instructions.apply_staged(),
             self.external.apply_staged(),
+            self.sourced.apply_staged(),
         ] {
             report.staged_updates_applied += applied;
             report.bytes_freed += freed;
@@ -716,7 +934,9 @@ impl Context {
         let mut system_messages_pruned = 0usize;
         let mut removed_bytes = 0usize;
         self.items.retain(|item| {
-            if item.message.role() == Role::System && (item.seq < fork_point || item.live) {
+            if item.message.role() == Role::System
+                && (item.live || (item.seq < fork_point && !item.undelivered))
+            {
                 system_messages_pruned += 1;
                 removed_bytes += item.message.content().len();
                 false
@@ -748,12 +968,15 @@ impl Context {
         alerts + dedupe_bytes
     }
 
-    /// Removes the durable system alerts numbered below `fork_point` and
-    /// returns how many were pruned.
+    /// Removes the delivered durable system alerts numbered below
+    /// `fork_point` and returns how many were pruned. An alert no request
+    /// has carried yet stays, as it does in
+    /// [`reassemble_below`](Self::reassemble_below).
     pub fn prune_system_messages_below(&mut self, fork_point: u64) -> usize {
         let before = self.items.len();
-        self.items
-            .retain(|item| item.message.role() != Role::System || item.seq >= fork_point);
+        self.items.retain(|item| {
+            item.message.role() != Role::System || item.seq >= fork_point || item.undelivered
+        });
         before - self.items.len()
     }
 
@@ -909,6 +1132,8 @@ pub struct ContextCheckpoint {
     items: Vec<ContextItem>,
     #[serde(default)]
     next_seq: u64,
+    #[serde(default, skip_serializing_if = "SeenStates::is_empty")]
+    seen_states: SeenStates,
 }
 
 impl ContextCheckpoint {
@@ -920,6 +1145,7 @@ impl ContextCheckpoint {
             handoff,
             items,
             next_seq,
+            seen_states: SeenStates::default(),
         }
     }
 
@@ -971,6 +1197,21 @@ impl Handoff {
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
+/// The length of the excerpt an attachment catalog entry carries of the
+/// user message the attachment came with.
+const ATTACHMENT_EXCERPT_CHARS: usize = 80;
+
+/// The beginning of `content` as a one-line excerpt for the attachment
+/// catalog: at most [`ATTACHMENT_EXCERPT_CHARS`] characters, newlines
+/// collapsed to spaces.
+fn attachment_excerpt(content: &str) -> String {
+    content
+        .chars()
+        .map(|ch| if matches!(ch, '\n' | '\r') { ' ' } else { ch })
+        .take(ATTACHMENT_EXCERPT_CHARS)
+        .collect()
+}
+
 /// Joins the live tail blocks into the single trailing system message.
 fn render_tail(tail: &[Block]) -> Option<Message> {
     let mut rendered = String::new();
@@ -1000,7 +1241,7 @@ fn message_chars(message: &Message) -> usize {
 mod tests {
     use super::*;
     use crate::context::system::{ExternalContent, ExternalSlot, InstructionSlot};
-    use aither_core::llm::ToolCall;
+    use aither_core::llm::{Attachment, ToolCall};
 
     #[derive(Template)]
     #[template(path = "tagged_block.txt", escape = "none")]
@@ -1276,14 +1517,28 @@ mod tests {
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
+        assert_eq!(set_issues(&mut context, "#23 open"), None);
         context.push(Message::user("first"));
 
         let before = context.build_request(&[Block::new("tasks", "<tasks>v1</tasks>")]);
         let prefix_len = before.len() - 1;
+        context.mark_prefix_sent();
 
         context.push(Message::assistant("answer"));
+        // A live source rendered again, unchanged and then changed: the
+        // change is appended, the block the prefix holds stays.
+        assert_eq!(set_issues(&mut context, "#23 open"), None);
+        assert!(set_issues(&mut context, "#23 closed").is_some());
+        // A state alert and an event are appended like any alert.
+        context.push_state_alert(&Block::new("memory", "memory is critically tight"));
+        context.push_block_alert(&Block::new("job", "job 7 was killed"));
         context.push(Message::user("second"));
         let after = context.build_request(&[Block::new("tasks", "<tasks>v2</tasks>")]);
+        assert_eq!(
+            before[1].content(),
+            "#23 open",
+            "the stable block is cached"
+        );
 
         for index in 0..prefix_len {
             assert_eq!(
@@ -1293,6 +1548,100 @@ mod tests {
             );
         }
         assert!(after.last().expect("tail present").content().contains("v2"));
+    }
+
+    const ISSUES: SourcedSlot = SourcedSlot::new("linked_issues");
+
+    /// The alert a live source of linked issues writes for a change.
+    fn announce_issues(change: &LiveChange<'_>) -> Block {
+        Block::new("linked_issues_changed", change.diff())
+    }
+
+    fn set_issues(context: &mut Context, text: &str) -> Option<usize> {
+        context.update_live_source(&ISSUES, Some(text.to_owned()), announce_issues)
+    }
+
+    /// A live source's block is prefix content: after the system prompt,
+    /// before the handoff and the conversation.
+    #[test]
+    fn a_live_block_sits_between_the_system_prompt_and_the_handoff() {
+        let mut context = Context::new();
+        context
+            .instructions_mut()
+            .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
+        context.set_handoff(Handoff::new("summary"));
+        context.push(Message::user("hello"));
+        assert_eq!(set_issues(&mut context, "#23 open"), None);
+
+        let messages = context.build_request(&[Block::new("tasks", "<tasks>todo</tasks>")]);
+
+        assert_eq!(messages.len(), 5);
+        assert!(messages[0].content().contains("be useful"));
+        assert_eq!(messages[1].role(), Role::System);
+        assert_eq!(messages[1].content(), "#23 open");
+        assert!(messages[2].content().contains("summary"));
+        assert_eq!(messages[3].content(), "hello");
+        assert!(messages[4].content().contains("todo"));
+        assert!(context.stable_chars() >= "#23 open".len());
+    }
+
+    /// While the block is cached, a change is one alert and the prefix keeps
+    /// the old block; reassembly folds the new one in and drops the alert.
+    #[test]
+    fn a_live_change_is_announced_once_and_folded_in_at_reassembly() {
+        let mut context = Context::new();
+        assert_eq!(set_issues(&mut context, "#23 open\n"), None);
+        context.mark_prefix_sent();
+        let fingerprint = context.stable_prefix_fingerprint();
+
+        assert_eq!(set_issues(&mut context, "#23 open\n"), None);
+        assert!(set_issues(&mut context, "#23 closed\n").is_some());
+        // Rendering the same change again announces nothing.
+        assert_eq!(set_issues(&mut context, "#23 closed\n"), None);
+
+        let alerts = live_alerts(&context);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("\n-#23 open\n+#23 closed\n"));
+        assert_eq!(context.build_messages()[0].content(), "#23 open\n");
+        assert_eq!(context.stable_prefix_fingerprint(), fingerprint);
+        assert!(context.has_staged_system_updates());
+
+        let report = context.reassemble();
+        assert_eq!(report.staged_updates_applied, 1);
+        assert_eq!(context.build_messages()[0].content(), "#23 closed\n");
+        assert_eq!(context.build_messages().len(), 1, "the alert is gone");
+        assert_ne!(context.stable_prefix_fingerprint(), fingerprint);
+        assert_eq!(set_issues(&mut context, "#23 closed\n"), None);
+    }
+
+    /// A compaction folds the staged block in, its alert does not outlive
+    /// it, and a block the source stopped rendering leaves the prefix there
+    /// too.
+    #[test]
+    fn a_compaction_folds_a_live_change_in_and_drops_its_alert() {
+        const PRS: SourcedSlot = SourcedSlot::new("linked_prs");
+        let mut context = Context::new();
+        set_issues(&mut context, "#23 open");
+        context.update_live_source(&PRS, Some("#40 draft".to_owned()), announce_issues);
+        context.mark_prefix_sent();
+        context.push(Message::user("before the fork"));
+        assert!(set_issues(&mut context, "#23 closed").is_some());
+        let fork_point = context.fork_point();
+        assert!(
+            context
+                .update_live_source(&PRS, None, announce_issues)
+                .is_some()
+        );
+        assert_eq!(context.build_messages()[1].content(), "#40 draft");
+
+        context.reassemble_below(fork_point);
+        context.apply_handoff(handoff(), fork_point, 0, &HashSet::new());
+
+        assert_eq!(live_alerts(&context), Vec::<String>::new());
+        let messages = context.build_messages();
+        assert_eq!(messages[0].content(), "#23 closed");
+        assert!(messages[1].content().contains("handoff"));
+        assert_eq!(context.live_source_blocks().len(), 1);
     }
 
     const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
@@ -1397,7 +1746,7 @@ mod tests {
         context.push(Message::system("<alert>after the fork</alert>"));
 
         context.reassemble_below(fork_point);
-        context.apply_handoff(handoff(), fork_point, 0);
+        context.apply_handoff(handoff(), fork_point, 0, &HashSet::new());
         assert_eq!(
             live_alerts(&context),
             Vec::<String>::new(),
@@ -1553,7 +1902,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("new request"));
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         assert_eq!(context.len_recent(), 1);
         assert_eq!(context.recent()[0].content(), "new request");
@@ -1576,7 +1925,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("new request"));
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let recent: Vec<_> = context.recent().into_iter().cloned().collect();
         assert_eq!(
@@ -1591,6 +1940,16 @@ mod tests {
 
     fn handoff() -> Handoff {
         Handoff::new("task")
+    }
+
+    /// A PNG screenshot the way a host attaches one to a user message.
+    fn screenshot(name: &str) -> Attachment {
+        Attachment::new(
+            format!("https://files.example.com/{name}.png")
+                .parse()
+                .expect("url"),
+            "image/png".parse().expect("media type"),
+        )
     }
 
     /// Pushes one answered `ask_user` exchange and returns its question.
@@ -1639,7 +1998,7 @@ mod tests {
         push_terminal_call(&mut context, "plain", "ls", false);
         let fork = context.fork_point();
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let recent = context.recent();
         assert_eq!(recent.len(), 2);
@@ -1669,7 +2028,7 @@ mod tests {
             .collect();
         assert_eq!(tags, [false, true, false, false]);
         let fork = restored.fork_point();
-        restored.apply_handoff(handoff(), fork, 0);
+        restored.apply_handoff(handoff(), fork, 0, &HashSet::new());
         assert_eq!(restored.len_recent(), 2);
     }
 
@@ -1703,7 +2062,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("after the fork"));
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let kept = context.recent();
         // Five exchanges (call and answer each) and the suffix; the turn's
@@ -1743,7 +2102,12 @@ mod tests {
         let fork = context.fork_point();
 
         // "middle" + "newest" fit; "oldest" does not.
-        context.apply_handoff(handoff(), fork, "middle".len() + "newest".len());
+        context.apply_handoff(
+            handoff(),
+            fork,
+            "middle".len() + "newest".len(),
+            &HashSet::new(),
+        );
 
         let kept = texts(&context);
         assert_eq!(kept.len(), 4, "{kept:?}");
@@ -1754,13 +2118,163 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_user_message_loses_the_attachment_the_handoff_did_not_name() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("the settings panel still clips the footer on mobile")
+                .with_attachment(screenshot("settings-mobile")),
+        );
+        let fork = context.fork_point();
+
+        context.apply_handoff(handoff(), fork, 1_000, &HashSet::new());
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].content(),
+            "the settings panel still clips the footer on mobile"
+        );
+        assert!(
+            recent[0].attachments().is_empty(),
+            "the unnamed screenshot is gone with the compacted turn"
+        );
+    }
+
+    /// A named attachment stays in the message it came with, which is kept
+    /// past the text budget too, while the message's other attachments go.
+    #[test]
+    fn a_named_attachment_keeps_its_message_past_the_budget() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("match this palette when you restyle the header")
+                .with_attachments([screenshot("draft-notes"), screenshot("palette-reference")]),
+        );
+        context.push(Message::user("and keep the footer links"));
+        let fork = context.fork_point();
+        let catalog = context.attachment_catalog(fork);
+        // The handoff names only the palette, the second attachment.
+        let kept: HashSet<AttachmentRef> = catalog
+            .iter()
+            .filter(|entry| entry.reference.index == 1)
+            .map(|entry| entry.reference)
+            .collect();
+
+        // The budget fits the second message alone; the palette message is
+        // over it and survives on its named attachment.
+        context.apply_handoff(handoff(), fork, "and keep the footer links".len(), &kept);
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(
+            recent[0].content(),
+            "match this palette when you restyle the header"
+        );
+        assert_eq!(
+            recent[0].attachments(),
+            &[screenshot("palette-reference")],
+            "only the named attachment stays, in place"
+        );
+        assert_eq!(recent[1].content(), "and keep the footer links");
+    }
+
+    /// A message whose attachment is named survives even when an unnamed
+    /// message between it and the suffix exhausted the text budget.
+    #[test]
+    fn a_named_attachment_is_found_past_an_over_budget_message() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("use this exact spacing in the footer")
+                .with_attachments([screenshot("rough-draft"), screenshot("footer-spacing")]),
+        );
+        context.push(Message::user("q".repeat(10_000)));
+        context.push(Message::user("and the header still clips"));
+        let fork = context.fork_point();
+        let catalog = context.attachment_catalog(fork);
+        let kept: HashSet<AttachmentRef> = catalog
+            .iter()
+            .filter(|entry| entry.id == "attachment-2")
+            .map(|entry| entry.reference)
+            .collect();
+
+        // The short newest message fits; the long middle one does not,
+        // but the scan must still reach the named attachment's message.
+        context.apply_handoff(handoff(), fork, "and the header still clips".len(), &kept);
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 2, "{recent:?}");
+        assert_eq!(recent[0].content(), "use this exact spacing in the footer");
+        assert_eq!(
+            recent[0].attachments(),
+            &[screenshot("footer-spacing")],
+            "only the named attachment stays"
+        );
+        assert_eq!(recent[1].content(), "and the header still clips");
+    }
+
+    #[test]
+    fn a_message_at_the_fork_point_keeps_its_attachments() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("the layout before the fork").with_attachment(screenshot("before-fork")),
+        );
+        let fork = context.fork_point();
+        context.push(
+            Message::user("look at this screenshot too").with_attachment(screenshot("after-fork")),
+        );
+
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].attachments(), &[screenshot("after-fork")]);
+    }
+
+    /// The catalog numbers every attachment below the fork in conversation
+    /// order, describes it by media type and the message's first line, and
+    /// cuts the excerpt on a character boundary.
+    #[test]
+    fn the_attachment_catalog_lists_every_attachment_below_the_fork() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("compare these two dashboards\nfor the weekly report")
+                .with_attachment(screenshot("dashboard-q3")),
+        );
+        context.push(Message::assistant("pulling both up"));
+        context.push(Message::user("").with_attachment(screenshot("bare")));
+        let cjk = "把这张截图里的页眉配色套用到报表页，このスクリーンショットのヘッダー配色をレポートページに適用して，이 스크린샷의 헤더 색상을 보고서 페이지에 적용해 주세요";
+        context.push(Message::user(cjk).with_attachment(screenshot("header-colors")));
+        let fork = context.fork_point();
+        context.push(Message::user("one more after the fork").with_attachment(screenshot("late")));
+
+        let catalog = context.attachment_catalog(fork);
+
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(catalog[0].id, "attachment-1");
+        assert_eq!(catalog[0].media_type, "image/png");
+        assert_eq!(
+            catalog[0].excerpt,
+            "compare these two dashboards for the weekly report"
+        );
+        assert_eq!(catalog[0].reference, AttachmentRef { seq: 0, index: 0 });
+        assert_eq!(catalog[1].id, "attachment-2");
+        assert_eq!(catalog[1].reference, AttachmentRef { seq: 2, index: 0 });
+        assert!(catalog[1].excerpt.is_empty(), "the message has no text");
+        assert_eq!(catalog[2].id, "attachment-3");
+        assert!(
+            catalog[2].excerpt.chars().count() <= 80,
+            "the excerpt is cut on a character boundary, not a byte one"
+        );
+        assert!(catalog[2].excerpt.starts_with('把'));
+    }
+
+    #[test]
     fn a_message_holding_an_offloaded_paste_keeps_its_file_reference() {
         let mut context = Context::new();
         let message = "see the log at pastes/build-1.txt (12000 bytes) for the failure";
         context.push(Message::user(message));
         let fork = context.fork_point();
 
-        context.apply_handoff(handoff(), fork, 1_000);
+        context.apply_handoff(handoff(), fork, 1_000, &HashSet::new());
 
         assert_eq!(context.recent()[0].content(), message);
     }
@@ -1778,7 +2292,7 @@ mod tests {
         ));
         let fork = context.fork_point();
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         assert_eq!(context.len_recent(), 0);
     }
@@ -1806,10 +2320,50 @@ mod tests {
         assert_eq!(context.recent()[1].content(), answer);
     }
 
+    /// A state alert goes with any reassembly, before or after the fork,
+    /// since its source restates the current value after it.
+    #[test]
+    fn every_reassembly_removes_the_state_alerts() {
+        let mut context = Context::new();
+        context.push_state_alert(&Block::new("memory", "critical"));
+        context.mark_prefix_sent();
+        let fork_point = context.fork_point();
+        context.push_state_alert(&Block::new("memory", "warning"));
+        context.mark_prefix_sent();
+
+        let report = context.reassemble_below(fork_point);
+
+        assert_eq!(report.system_messages_pruned, 2);
+        assert_eq!(context.len_recent(), 0);
+    }
+
+    /// An event no request has carried survives a reassembly and a
+    /// compaction's apply, wherever it sits; once delivered it goes.
+    #[test]
+    fn an_undelivered_event_outlives_reassembly_until_a_request_carries_it() {
+        let mut context = Context::new();
+        context.push(Message::user("build it"));
+        context.push(Message::system("delivered: the build started"));
+        context.mark_prefix_sent();
+        context.push(Message::system("undelivered: the build failed"));
+        let fork_point = context.fork_point();
+
+        context.reassemble_below(fork_point);
+        context.apply_handoff(handoff(), fork_point, 0, &HashSet::new());
+
+        let kept: Vec<_> = context.recent().iter().map(|m| m.content()).collect();
+        assert_eq!(kept, ["undelivered: the build failed"]);
+
+        context.mark_prefix_sent();
+        context.reassemble();
+        assert_eq!(context.len_recent(), 0, "delivered, it is dropped");
+    }
+
     #[test]
     fn reassembling_below_a_fork_keeps_the_later_alerts() {
         let mut context = Context::new();
         context.push(Message::system("old"));
+        context.mark_prefix_sent();
         let fork_point = context.fork_point();
         context.push(Message::system("new"));
 
@@ -1835,6 +2389,7 @@ mod tests {
             vec![tool_call("b", "read", serde_json::json!({"path": "x"}))],
         ));
         context.push(Message::tool("b", "second read ".repeat(32)));
+        context.mark_prefix_sent();
 
         let estimate = context.estimate_reassembly_savings();
         let report = context.reassemble();
@@ -1874,7 +2429,7 @@ mod tests {
         context.push(Message::user("one"));
         context.push(Message::user("two"));
         let fork = context.fork_point();
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let checkpoint = context.checkpoint();
 

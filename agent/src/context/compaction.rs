@@ -88,6 +88,9 @@ pub struct HandoffPrompt<'a> {
     pub focus: Option<&'a str>,
     /// The session's skills the handoff may name for restoration.
     pub skills: &'a [SkillCatalogEntry],
+    /// The attachments of the user messages below the fork the handoff may
+    /// name to keep.
+    pub attachments: &'a [AttachmentCatalogEntry],
 }
 
 /// What a handoff asks to be put back in view after compaction.
@@ -98,6 +101,9 @@ pub struct Restoration {
     /// Names of catalog skills whose instructions are restored; a name not
     /// in the catalog is reported instead.
     pub skills: Vec<String>,
+    /// Ids of catalog attachments kept in their user messages; an id not
+    /// in the catalog is reported instead.
+    pub attachments: Vec<String>,
 }
 
 /// Why a parsed handoff document is unusable.
@@ -146,6 +152,11 @@ pub struct HandoffDocument {
     /// chosen from the catalog the instruction lists.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Attachments of user messages the next turns must see again, by
+    /// their id in the catalog the instruction lists; every other
+    /// attachment below the fork is stripped on apply.
+    #[serde(default)]
+    pub attachments: Vec<KeptAttachment>,
 }
 
 /// A file range the next turns need in view, named by the handoff.
@@ -157,6 +168,16 @@ pub struct ContextFile {
     /// whole file.
     pub lines: Option<LineRange>,
     /// Why the next turns need this file in view.
+    pub why: String,
+}
+
+/// An attachment the next turns must see again, named by the id the
+/// instruction's catalog gave it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KeptAttachment {
+    /// The attachment's id in the catalog the instruction listed.
+    pub id: String,
+    /// What in it the remaining work must match or inspect.
     pub why: String,
 }
 
@@ -184,6 +205,37 @@ pub struct SkillCatalogEntry {
     pub instructions: String,
 }
 
+/// A catalog attachment's place in the window.
+///
+/// The sequence number identifies the user message carrying it; the index
+/// its position in that message's attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttachmentRef {
+    /// Sequence number of the user message carrying the attachment.
+    pub seq: u64,
+    /// Index of the attachment within that message.
+    pub index: usize,
+}
+
+/// An attachment of a user message below the fork, offered to the
+/// compaction model so the handoff can name it to be kept.
+///
+/// The catalog is built when the fork is taken and the instruction renders
+/// exactly it, so on apply a named id resolves against what the model saw
+/// and the attachment stays in the message it came with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentCatalogEntry {
+    /// The id the handoff names, `attachment-N` in conversation order.
+    pub id: String,
+    /// The attachment's media type.
+    pub media_type: String,
+    /// The beginning of the user message the attachment came with, empty
+    /// when the message has no text.
+    pub excerpt: String,
+    /// Where the attachment sits in the window.
+    pub reference: AttachmentRef,
+}
+
 #[derive(Template)]
 #[template(path = "handoff_document.md", escape = "none")]
 struct HandoffDocumentTemplate<'a> {
@@ -196,6 +248,7 @@ struct HandoffDocumentTemplate<'a> {
 struct CompactionInstruction<'a> {
     focus: Option<&'a str>,
     skills: &'a [SkillCatalogEntry],
+    attachments: &'a [AttachmentCatalogEntry],
 }
 
 #[derive(Template)]
@@ -215,6 +268,7 @@ impl HandoffSchema for HandoffDocument {
         CompactionInstruction {
             focus: prompt.focus,
             skills: prompt.skills,
+            attachments: prompt.attachments,
         }
         .render()
         .expect("compaction instruction template must render")
@@ -259,6 +313,7 @@ impl HandoffSchema for HandoffDocument {
         Restoration {
             context_files: self.context_files,
             skills: self.skills,
+            attachments: self.attachments.into_iter().map(|kept| kept.id).collect(),
         }
     }
 }
@@ -408,6 +463,10 @@ pub struct CompactionFork<D> {
     previous_file_index: Vec<String>,
     /// The session's outputs directory, for the file index.
     outputs_dir: Option<std::path::PathBuf>,
+    /// The attachment catalog the instruction renders, carried to the
+    /// completed compaction so apply resolves the handoff's names against
+    /// exactly what the model saw.
+    attachment_catalog: Vec<AttachmentCatalogEntry>,
     /// The main request, source blocks, tools and cache parameters included,
     /// with the handoff instruction appended to its messages. Replaying it is
     /// what lets the provider serve the compaction from the same prefix
@@ -431,7 +490,9 @@ impl<D: HandoffSchema> CompactionFork<D> {
     /// Forks `request` — the exact request the run is about to send — into a
     /// compaction request for a `D`, optionally focused by `focus`.
     /// `previous_file_index` is the file index of the handoff the result
-    /// will replace.
+    /// will replace, and `attachments` the catalog of attachments the user
+    /// messages below `fork_point` carry, which the instruction offers for
+    /// the handoff to name.
     ///
     /// The instruction [`D::instruction`](HandoffSchema::instruction)
     /// renders is *appended* and the tool definitions and parameters are
@@ -449,6 +510,7 @@ impl<D: HandoffSchema> CompactionFork<D> {
         previous_file_index: &[String],
         focus: Option<&str>,
         skills: &[SkillCatalogEntry],
+        attachments: &[AttachmentCatalogEntry],
     ) -> Result<Self, CompactionError> {
         if request
             .messages()
@@ -458,13 +520,18 @@ impl<D: HandoffSchema> CompactionFork<D> {
             return Err(CompactionError::Empty);
         }
         let focus = focus.map(str::trim).filter(|focus| !focus.is_empty());
-        let instruction = D::instruction(&HandoffPrompt { focus, skills });
+        let instruction = D::instruction(&HandoffPrompt {
+            focus,
+            skills,
+            attachments,
+        });
         let mut messages = request.messages().to_vec();
         messages.push(Message::user(instruction));
         Ok(Self {
             fork_point,
             previous_file_index: previous_file_index.to_vec(),
             outputs_dir: None,
+            attachment_catalog: attachments.to_vec(),
             request: LLMRequest::new(messages)
                 .with_parameters(request.parameters().clone())
                 .with_tool_definitions(request.tool_definitions().to_vec()),
@@ -514,6 +581,7 @@ impl<D: HandoffSchema> CompactionFork<D> {
             request,
             previous_file_index,
             outputs_dir,
+            attachment_catalog,
             ..
         } = self;
         let file_index = build_file_index(
@@ -523,7 +591,14 @@ impl<D: HandoffSchema> CompactionFork<D> {
         );
         let reason = match model.generate::<D>(request.clone()).await {
             Ok(document) => match document.validate() {
-                Ok(()) => return Ok(CompletedCompaction::new(fork_point, document, file_index)),
+                Ok(()) => {
+                    return Ok(CompletedCompaction::new(
+                        fork_point,
+                        document,
+                        file_index,
+                        attachment_catalog,
+                    ));
+                }
                 Err(error) => error.reason,
             },
             Err(GenerateError::Provider(error)) => {
@@ -544,23 +619,31 @@ impl<D: HandoffSchema> CompactionFork<D> {
         let response = collect_text(&model, retry_request).await?;
         let document = parse_handoff::<D>(&response)?;
         document.validate()?;
-        Ok(CompletedCompaction::new(fork_point, document, file_index))
+        Ok(CompletedCompaction::new(
+            fork_point,
+            document,
+            file_index,
+            attachment_catalog,
+        ))
     }
 }
 
 impl CompletedCompaction {
     /// Splits an accepted `document` into the handoff it renders to, with
-    /// `file_index`, and its restoration.
+    /// `file_index`, and its restoration; `attachment_catalog` is the
+    /// catalog the instruction offered the document's attachments against.
     pub(crate) fn new<D: HandoffSchema>(
         fork_point: u64,
         document: D,
         file_index: Vec<String>,
+        attachment_catalog: Vec<AttachmentCatalogEntry>,
     ) -> Self {
         let text = document.render(&file_index);
         Self {
             fork_point,
             handoff: Handoff::with_file_index(text, file_index),
             restoration: document.into_restoration(),
+            attachment_catalog,
         }
     }
 }
@@ -578,6 +661,9 @@ pub struct CompletedCompaction {
     pub handoff: Handoff,
     /// What the handoff asked to put back in view.
     pub restoration: Restoration,
+    /// The attachment catalog the instruction offered, so the ids the
+    /// handoff named resolve against what the model saw.
+    pub attachment_catalog: Vec<AttachmentCatalogEntry>,
 }
 
 /// The owned, `'static` future a forked compaction runs as.
@@ -702,7 +788,7 @@ mod tests {
             ),
             Message::tool(
                 "call_1",
-                "Output saved to outputs/amber-oak-swift-river.txt (100 lines, 5000 bytes)",
+                "Output saved to outputs/river.txt (100 lines, 5000 bytes)",
             ),
             Message::assistant_with_tool_calls(
                 "",
@@ -718,7 +804,7 @@ mod tests {
         let index = build_file_index(&[], &messages, None);
         assert_eq!(index.len(), 2);
         assert!(
-            index[0].contains("outputs/amber-oak-swift-river.txt")
+            index[0].contains("outputs/river.txt")
                 && index[0].contains("Fetch WebGPU status pages"),
             "index entry should pair path with description: {index:?}"
         );
@@ -730,7 +816,7 @@ mod tests {
         let dir = std::path::Path::new("/work/session/outputs");
         // Joined the way the sandbox names the file, so the separator is the
         // platform's.
-        let path = dir.join("amber-oak-swift-river.txt").display().to_string();
+        let path = dir.join("river.txt").display().to_string();
         let path = path.as_str();
         let messages = vec![
             Message::assistant_with_tool_calls(
@@ -805,6 +891,7 @@ mod tests {
             Handoff::with_file_index("task".to_string(), file_index.clone()),
             u64::MAX,
             0,
+            &std::collections::HashSet::new(),
         );
         file_index
     }
@@ -863,6 +950,98 @@ mod tests {
         assert!(error.reason.contains("current_task"));
     }
 
+    /// A PNG screenshot the way a host attaches one to a user message.
+    fn screenshot(name: &str) -> aither_core::llm::Attachment {
+        aither_core::llm::Attachment::new(
+            format!("https://files.example.com/{name}.png")
+                .parse()
+                .expect("url"),
+            "image/png".parse().expect("media type"),
+        )
+    }
+
+    /// The instruction offers the catalog the window built: each entry's
+    /// id, media type and the excerpt of its message, cut to a character
+    /// boundary on Chinese, Japanese and Korean text.
+    #[test]
+    fn the_instruction_renders_the_attachment_catalog() {
+        let mut context = crate::context::Context::new();
+        let cjk = "把这张截图里的页眉配色套用到报表页，このスクリーンショットのヘッダー配色をレポートページに適用して，이 스크린샷의 헤더 색상을 보고서 페이지에 적용해 주세요";
+        context.push(Message::user(cjk).with_attachment(screenshot("header-colors")));
+        context.push(Message::user("").with_attachment(screenshot("bare")));
+        let catalog = context.attachment_catalog(context.fork_point());
+
+        let instruction = HandoffDocument::instruction(&HandoffPrompt {
+            focus: None,
+            skills: &[],
+            attachments: &catalog,
+        });
+
+        assert!(instruction.contains("`attachments`: {`id`: string, `why`: string}[]"));
+        assert!(
+            instruction.contains("`attachment-1`: image/png, sent with the user message beginning"),
+            "{instruction}"
+        );
+        let excerpt = catalog[0].excerpt.clone();
+        assert!(excerpt.chars().count() <= 80 && excerpt.starts_with('把'));
+        assert!(instruction.contains(&format!("\"{excerpt}\"")));
+        assert!(
+            instruction
+                .contains("`attachment-2`: image/png, sent with a user message that has no text"),
+            "{instruction}"
+        );
+    }
+
+    #[test]
+    fn the_instruction_marks_an_empty_attachment_catalog() {
+        let instruction = HandoffDocument::instruction(&HandoffPrompt {
+            focus: None,
+            skills: &[],
+            attachments: &[],
+        });
+
+        assert!(
+            instruction.contains("(the conversation has no attachments; leave the list empty)")
+        );
+    }
+
+    #[test]
+    fn a_stored_handoff_without_attachments_still_deserializes() {
+        let json = r#"{"current_task":"restyle the header","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["update the palette"],"recovery_hints":[],"skills":[]}"#;
+        let document: HandoffDocument = serde_json::from_str(json).expect("stored handoff parses");
+        assert_eq!(document.attachments, Vec::new());
+    }
+
+    #[test]
+    fn handoff_markdown_renders_the_attachments_section() {
+        let handoff = HandoffDocument {
+            current_task: "restyle the header".to_string(),
+            attachments: vec![KeptAttachment {
+                id: "attachment-2".to_string(),
+                why: "the palette the header must match".to_string(),
+            }],
+            ..HandoffDocument::default()
+        };
+
+        let markdown = handoff.render(&[]);
+        assert!(markdown.contains("## Attachments"));
+        assert!(markdown.contains("- the palette the header must match"));
+        assert!(
+            !markdown.contains("attachment-2"),
+            "the catalog id means nothing after apply"
+        );
+
+        let markdown = HandoffDocument {
+            current_task: "restyle the header".to_string(),
+            ..HandoffDocument::default()
+        }
+        .render(&[]);
+        assert!(
+            !markdown.contains("## Attachments"),
+            "the section is omitted when the handoff names none"
+        );
+    }
+
     #[test]
     fn handoff_parsing_tolerates_fences_and_commentary() {
         let response = "Sure! Here you go:\n```json\n{\"current_task\": \"ship it\", \
@@ -883,7 +1062,7 @@ mod tests {
     fn forking_an_empty_context_is_an_error() {
         let request = LLMRequest::new(vec![Message::system("only the prefix")]);
         assert!(matches!(
-            CompactionFork::<HandoffDocument>::new(&request, 0, &[], None, &[]),
+            CompactionFork::<HandoffDocument>::new(&request, 0, &[], None, &[], &[]),
             Err(CompactionError::Empty)
         ));
     }
@@ -914,6 +1093,7 @@ mod tests {
             &[],
             Some("the failing test"),
             &skills,
+            &[],
         )
         .expect("fork");
 
@@ -1019,7 +1199,8 @@ mod tests {
             false,
         );
         let main = LLMRequest::new(messages).with_parameters(parameters);
-        let fork = CompactionFork::<HandoffDocument>::new(&main, 0, &[], None, &[]).expect("fork");
+        let fork =
+            CompactionFork::<HandoffDocument>::new(&main, 0, &[], None, &[], &[]).expect("fork");
         let model = CapturingModel {
             seen: std::sync::Mutex::default(),
         };

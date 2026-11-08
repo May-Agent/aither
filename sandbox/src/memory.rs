@@ -36,7 +36,7 @@ use crate::shell_session::{ContainerProbe, ContainerProbeError};
 pub const JOB_MARKER_ENV: &str = "AITHER_CONTAINER_JOB";
 
 /// Which memory a job competes for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MemoryDomain {
     /// The memory of the machine the embedder runs on.
     Machine,
@@ -1193,7 +1193,7 @@ mod tests {
                 jobs.register_at(
                     place,
                     pid,
-                    task,
+                    &crate::test_ids::lease(task),
                     "exec",
                     task,
                     crate::ScriptLanguage::Shell,

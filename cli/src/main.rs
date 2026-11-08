@@ -488,7 +488,8 @@ async fn build_agent(
     args: &Args,
 ) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>>
 {
-    // Create terminal tool (creates random four-word working dir under system temp)
+    // Create terminal tool (heel names its working dir under system temp with
+    // four random words; the ids the model reads are leased words)
     // Uses interactive permission handler:
     // - Sandboxed: always allow (no prompt)
     // - Network: ask once, then remember
@@ -573,20 +574,10 @@ async fn build_agent(
         }
     }
 
-    // The bundled subagents are kept in the global subagents directory,
-    // overwritten so they match this build; only the main agent gets the
-    // `subagent` command.
-    let global_subagents = workdir_parent.join("subagents");
-    aither_agent::install_bundled_subagents(&global_subagents)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to install the bundled subagents into {}",
-                global_subagents.display()
-            )
-        })?;
-    let subagent_tool =
-        SubagentTool::new(cloud, global_subagents).with_base_dir(builder.sandbox_dir().to_string());
+    // aither defines no subagents: the CLI has the built-in routes and the
+    // working directory's `agents/`. Only the main agent gets the `subagent`
+    // command.
+    let subagent_tool = SubagentTool::new(cloud).with_base_dir(builder.sandbox_dir().to_string());
     builder = builder.subagents(subagent_tool, SUBAGENT_DESCRIPTION);
 
     // Add system prompt

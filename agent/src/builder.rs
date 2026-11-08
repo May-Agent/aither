@@ -26,8 +26,9 @@ use crate::{
     agent::Agent,
     config::{AgentConfig, AgentKind},
     context::{
-        AnyContextSource, Context, ContextPolicy, ContextSource, ExternalContent, ExternalSlot,
-        HandoffDocument, HandoffSchema, InstructionSlot, SystemLayout,
+        AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, Context, ContextPolicy,
+        ContextSource, EventSource, ExternalContent, ExternalSlot, HandoffDocument, HandoffSchema,
+        InstructionSlot, LiveSource, StateSource, SystemLayout,
     },
     hook::{HCons, Hook},
     model_group::ModelTier,
@@ -103,6 +104,9 @@ pub struct AgentSettings {
     pub(crate) prompt_cache: crate::context::PromptCache,
     pub(crate) clock: crate::AnyClock,
     pub(crate) context_sources: Vec<AnyContextSource>,
+    pub(crate) live_sources: Vec<AnyLiveSource>,
+    pub(crate) state_sources: Vec<AnyStateSource>,
+    pub(crate) event_sources: Vec<AnyEventSource>,
     /// The agent's working document and what the host gives it.
     pub(crate) document: crate::working_document::DocumentWiring,
     /// The embedder's stop rule; without one a run ends whenever the model
@@ -137,6 +141,9 @@ impl Default for AgentSettings {
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
+            live_sources: Vec::new(),
+            state_sources: Vec::new(),
+            event_sources: Vec::new(),
             document: crate::working_document::DocumentWiring::default(),
             stop_hook: None,
             fork_source: None,
@@ -160,7 +167,7 @@ struct Wiring {
     kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// The commands the terminal runs, kept current in the command table.
     commands: Option<crate::command_catalog::CommandCatalog>,
-    host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
+    host_load: Option<crate::host_load::HostLoadChannels>,
     job_registry: Option<JobRegistry>,
     /// Directory the agent's working document is kept in: the directory its
     /// terminal works in.
@@ -260,8 +267,8 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Create an explore subagent using the balanced model
-    /// let explore_agent = Agent::builder(opus)
+    /// // Create an agent that reasons on the balanced model
+    /// let balanced_agent = Agent::builder(opus)
     ///     .balanced_model(sonnet, Parameters::default())
     ///     .fast_model(haiku, Parameters::default())
     ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
@@ -362,6 +369,58 @@ pub trait AgentOptions: sealed::Sealed + Sized {
         self.settings()
             .context_sources
             .push(AnyContextSource::new(source));
+        self
+    }
+
+    /// Registers live content: a source rendered into the cacheable prefix,
+    /// after the system prompt and before the handoff, for content too large
+    /// to resend uncached in every request's tail.
+    ///
+    /// Blocks render in registration order. A change after a request carried
+    /// the block reaches the model as the diff alert the source writes for
+    /// it, and the new block replaces the old one at the next reassembly or
+    /// compaction (see [`LiveSource`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a live source with the same [`TAG`](LiveSource::TAG) is
+    /// already registered.
+    #[must_use]
+    fn live_source<S: LiveSource>(mut self, source: S) -> Self {
+        let sources = &mut self.settings().live_sources;
+        assert!(
+            sources.iter().all(|registered| registered.tag() != S::TAG),
+            "live source `{}` is registered twice",
+            S::TAG
+        );
+        sources.push(AnyLiveSource::new(source));
+        self
+    }
+
+    /// Registers state: keyed conditions the model is told about, as a
+    /// request is assembled, only when a value differs from the one it last
+    /// saw (see [`StateSource`]).
+    ///
+    /// Sources are read in registration order, after the built-in host load
+    /// state.
+    #[must_use]
+    fn state_source<S: StateSource>(mut self, source: S) -> Self {
+        self.settings()
+            .state_sources
+            .push(AnyStateSource::new(source));
+        self
+    }
+
+    /// Registers events, each told to the model once with the next request
+    /// (see [`EventSource`]).
+    ///
+    /// Sources are read in registration order, after the built-in host
+    /// events.
+    #[must_use]
+    fn event_source<S: EventSource>(mut self, source: S) -> Self {
+        self.settings()
+            .event_sources
+            .push(AnyEventSource::new(source));
         self
     }
 
@@ -1002,8 +1061,9 @@ where
     /// Registers the terminal tool for command execution in a sandbox.
     ///
     /// The terminal tool enables command execution with configurable permission modes
-    /// (sandboxed, network, unsafe). It creates its own working directory with
-    /// four random words and manages output storage internally.
+    /// (sandboxed, network, unsafe). It creates its own working directory,
+    /// which heel names with four random words (not a leased id), and manages
+    /// output storage internally.
     ///
     /// This also captures the background task receiver for polling completed
     /// background tasks during the agent loop.
@@ -1071,9 +1131,10 @@ where
         self
     }
 
-    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor` and
-    /// tells the agent, once per event, when machine load becomes high and when
-    /// it ends.
+    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor`
+    /// and keeps machine load, memory and disk pressure as state the agent
+    /// is told about when a level differs from the one it last saw (see
+    /// [`StateSource`]).
     ///
     /// With `memory`, the same readings drive the agent's
     /// [`RunawayGuard`](crate::RunawayGuard): memory warnings listing its
@@ -1093,7 +1154,7 @@ where
         R: crate::HostReader,
         E: executor_core::Executor,
     {
-        self.wiring.host_load_events = Some(crate::host_load::spawn(
+        self.wiring.host_load = Some(crate::host_load::spawn(
             executor,
             monitor,
             memory.map(crate::RunawayGuard::new),
@@ -1139,6 +1200,9 @@ where
     }
 
     /// Builds the agent.
+    // One line per field of the settings, the wiring and the agent they
+    // assemble; splitting it would only scatter that list.
+    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor, Schema> {
         let AgentSettings {
             parameters,
@@ -1148,6 +1212,9 @@ where
             prompt_cache,
             clock,
             context_sources,
+            live_sources,
+            mut state_sources,
+            mut event_sources,
             document,
             stop_hook,
             fork_source,
@@ -1163,7 +1230,7 @@ where
             permission_receiver,
             kept_receiver,
             commands,
-            host_load_events,
+            host_load,
             job_registry,
             sandbox_dir,
             restore_dir,
@@ -1171,14 +1238,13 @@ where
             inherited,
             fork_tools,
         } = self.wiring;
+        if let Some(channels) = host_load {
+            channels.register(&notices, &mut state_sources, &mut event_sources);
+        }
         let tools = assemble_tools(tools, fork_tools, compact_signal.as_ref(), &notices);
         // A fork starts initialized, from what the main agent carried over.
         let initialized = inherited.is_some();
-        let Inherited {
-            budget,
-            profile,
-            effort,
-        } = inherited.unwrap_or_default();
+        let inherited = inherited.unwrap_or_default();
         Agent {
             warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
@@ -1194,10 +1260,14 @@ where
             tier,
             tools,
             hooks: self.hooks,
-            budget,
+            budget: inherited.budget,
             prompt_cache,
             context_sources,
+            live_sources,
+            state_sources,
+            event_sources,
             reassembled: false,
+            interrupted: false,
             prefix_rewrites: crate::context::PrefixRewrites::default(),
             requests_sent: 0,
             compaction: crate::compaction_state::CompactionState::default(),
@@ -1206,14 +1276,13 @@ where
             config,
             context,
             initialized,
-            effort,
-            profile,
+            effort: inherited.effort,
+            profile: inherited.profile,
             compaction_profile: None,
             background_receiver,
             permission_receiver,
             kept_receiver,
             commands,
-            host_load_events,
             job_registry,
             detached_task_ids: std::collections::HashSet::new(),
             // Every agent with a sandbox, a fork included, keeps its own
@@ -1231,6 +1300,7 @@ where
             notices,
             connectivity,
             last_request: None,
+            delivering: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
@@ -1470,7 +1540,7 @@ mod tests {
             .await
             .unwrap();
         let registry =
-            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
         let subagent = terminal
             .binding()

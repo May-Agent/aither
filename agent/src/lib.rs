@@ -88,9 +88,8 @@ pub mod specialized;
 
 // Subagent definitions
 pub use subagent_file::{
-    BUNDLED_SUBAGENTS, BundledSubagent, DefinitionError, LOCAL_SUBAGENTS_DIR,
-    RESERVED_SUBAGENT_NAMES, ResolveError, SubagentAccess, SubagentDefinition,
-    install_bundled_subagents, validate_subagent_name,
+    DefinitionError, LOCAL_SUBAGENTS_DIR, RESERVED_SUBAGENT_NAMES, ResolveError, SubagentAccess,
+    SubagentDefinition, validate_subagent_name,
 };
 
 // Re-export tool crates
@@ -118,12 +117,14 @@ pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
 pub use context::{
-    AnyContextSource, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
+    AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, AttachmentCatalogEntry,
+    AttachmentRef, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
     ContextBudget, ContextCheckpoint, ContextFile, ContextItem, ContextPolicy, ContextSource,
-    ExternalContent, ExternalSlot, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema,
-    InstructionSlot, InvalidHandoff, LineRange, LiveContent, LiveUpdate, PrefixBlock, PrefixChain,
-    PrefixRewrites, PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry,
-    SystemLayout,
+    EventSource, ExternalContent, ExternalSlot, Handoff, HandoffDocument, HandoffPrompt,
+    HandoffSchema, InstructionSlot, InvalidHandoff, KeptAttachment, LineRange, LiveChange,
+    LiveContent, LiveSource, LiveUpdate, PrefixBlock, PrefixChain, PrefixRewrites, PromptCache,
+    PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, Sourced, SourcedSlot,
+    StateChange, StateSource, SystemLayout,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use disk::{
@@ -143,8 +144,8 @@ pub use hook::{
     TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use host_load::{
-    AnyHostReader, HostLoadConfig, HostLoadEvent, HostLoadMonitor, HostReader, HostSample,
-    MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
+    AnyHostReader, HostCondition, HostLevel, HostLoadConfig, HostLoadEvent, HostLoadMonitor,
+    HostReader, HostSample, MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
 };
 pub use judgment::{JudgmentError, judge};
 #[cfg(feature = "languages")]

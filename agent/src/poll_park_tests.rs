@@ -15,7 +15,7 @@ use futures_core::Stream;
 
 use crate::{Agent, AgentBuilder, AgentOptions, BackgroundJobPolicy};
 
-const TASK: &str = "amber-forest-thunder-pearl";
+const TASK: &str = "amber";
 /// What the background build reports when it finishes.
 const FINISHED: &str = "the build finished";
 /// The start of the text an unchanged `terminal_read` is refused with.
@@ -117,7 +117,7 @@ async fn polling_agent(
     registry
         .register(
             7,
-            TASK,
+            &aither_sandbox::test_ids::lease(TASK),
             "exec-build",
             "cargo check",
             TerminalMode::Sandboxed,
@@ -230,7 +230,7 @@ async fn a_detached_run_ends_on_a_refused_reread_and_the_completion_resumes_it()
     let wake = tokio::time::timeout(Duration::from_secs(20), agent.wait_background())
         .await
         .expect("the completion wakes the idle agent");
-    assert!(wake.needs_model, "the completion is news for the model");
+    assert!(wake.starts_run, "the completion is news for the model");
     drop(wake);
     tokio::time::timeout(
         Duration::from_secs(20),
