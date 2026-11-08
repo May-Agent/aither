@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/agent-v0.23.0...agent-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(agent)* [**breaking**] the context keeps what the model saw of each state
+- *(agent)* [**breaking**] the host marks an interrupt with Agent::interrupt
+- *(agent)* [**breaking**] live, state and event context sources and a wake decision
+- *(agent)* [**breaking**] take subagent definitions from the embedder
+- *(agent)* stable-placement context sources with staged updates
+- *(agent)* route untiered subagents through an embedder-supplied SubagentRouter
+- *(sandbox)* [**breaking**] lease model-facing ids from an embedder-supplied allocator
+
+### Fixed
+
+- *(agent)* [**breaking**] compaction keeps only the attachments the handoff names
+- *(agent)* the pre-compaction alert leaves the warn distance to the work
+- *(agent)* count an item delivered once the provider answers the request
+- *(agent)* word a host condition alert from what the model saw
+- *(agent)* recovery keeps alerts no request has carried
+- *(agent)* name the host, not the embedder, in the subagent listing
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+
+### Other
+
+- Merge pull request #645 from May-Agent/fix/642-compaction-images
+- Merge pull request #640 from May-Agent/feat/617-context-kinds
+- *(agent)* share the alert append and the test helpers, pass levels by value
+- Merge origin/dev into feat/597-embedder-personas
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+- Merge pull request #633 from May-Agent/feat/101-stable-context-sources
+- Merge origin/dev into feat/625-id-allocator
+- Merge pull request #632 from May-Agent/chore/main-into-dev-0.23
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+
 ## [0.23.0](https://github.com/May-Agent/aither/compare/agent-v0.22.0...agent-v0.23.0) - 2026-11-07
 
 ### Added

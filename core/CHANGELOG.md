@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/core-v0.23.0...core-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(sandbox)* [**breaking**] lease model-facing ids from an embedder-supplied allocator
+
+### Fixed
+
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+
+### Other
+
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+
 ## [0.23.0](https://github.com/May-Agent/aither/compare/core-v0.22.0...core-v0.23.0) - 2026-11-07
 
 ### Fixed

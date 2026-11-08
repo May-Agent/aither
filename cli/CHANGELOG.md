@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/cli-v0.23.0...cli-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(agent)* [**breaking**] take subagent definitions from the embedder
+
+### Fixed
+
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+
+### Other
+
+- Merge origin/dev into feat/597-embedder-personas
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+
 ## [0.23.0](https://github.com/May-Agent/aither/compare/cli-v0.22.0...cli-v0.23.0) - 2026-11-07
 
 ### Added
