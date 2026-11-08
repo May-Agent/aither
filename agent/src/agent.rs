@@ -18,10 +18,10 @@ use crate::{
     compaction_state::CompactionState,
     config::{AgentConfig, AgentKind, BackgroundJobPolicy},
     context::{
-        AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, BackgroundJobs, Block,
-        CacheLifetime, CompactionFork, CompletedCompaction, Context, ContextBudget,
-        HandoffDocument, InstructionSlot, PendingCompaction, PrefixChain, PrefixRewrites,
-        PromptCache, PromptPrefix,
+        AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, AttachmentRef,
+        BackgroundJobs, Block, CacheLifetime, CompactionFork, CompletedCompaction, Context,
+        ContextBudget, HandoffDocument, InstructionSlot, PendingCompaction, PrefixChain,
+        PrefixRewrites, PromptCache, PromptPrefix,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
@@ -2629,12 +2629,14 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
+        let attachments = self.context.attachment_catalog(self.context.fork_point());
         let fork = CompactionFork::<Schema>::new(
             &request,
             self.context.fork_point(),
             self.context.handoff_file_index(),
             focus,
             &skills,
+            &attachments,
         )
         .map_err(AgentError::from)?
         .with_outputs_dir(self.outputs_dir());
@@ -2985,12 +2987,14 @@ where
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
+        let attachments = self.context.attachment_catalog(self.context.fork_point());
         match CompactionFork::<Schema>::new(
             request,
             self.context.fork_point(),
             self.context.handoff_file_index(),
             focus,
             &skills,
+            &attachments,
         )
         .map(|fork| fork.with_outputs_dir(self.outputs_dir()))
         {
@@ -3040,6 +3044,7 @@ where
         };
         let handoff = completed.handoff.clone();
         let restoration = completed.restoration.clone();
+        let attachment_catalog = completed.attachment_catalog.clone();
         let restored = match self.restore_dir.clone() {
             Some(restore_dir) => {
                 let tokens = self
@@ -3055,6 +3060,7 @@ where
                     handoff.file_index(),
                     &[restore_dir],
                     &skills,
+                    &attachment_catalog,
                     budget_chars,
                 )
                 .await
@@ -3073,8 +3079,18 @@ where
         let user_message_chars = self
             .budget
             .chars_for_tokens(self.config.context_policy.user_message_budget);
+        let kept_attachments: HashSet<AttachmentRef> = restoration
+            .attachments
+            .iter()
+            .filter_map(|id| {
+                attachment_catalog
+                    .iter()
+                    .find(|entry| &entry.id == id)
+                    .map(|entry| entry.reference)
+            })
+            .collect();
         self.context
-            .apply_handoff(handoff, fork_point, user_message_chars);
+            .apply_handoff(handoff, fork_point, user_message_chars, &kept_attachments);
         if let Some(block) = restored {
             self.context.push_block_alert(&block);
         }
@@ -4281,7 +4297,12 @@ mod tests {
         fork_point: u64,
         document: HandoffDocument,
     ) {
-        compaction.land(CompletedCompaction::new(fork_point, document, Vec::new()));
+        compaction.land(CompletedCompaction::new(
+            fork_point,
+            document,
+            Vec::new(),
+            Vec::new(),
+        ));
     }
 
     /// aither's wording of a finished background task.
@@ -5527,6 +5548,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         )
         .expect("fork");
         agent.compaction.start(PendingCompaction::start(fork, llm));
@@ -5679,7 +5701,9 @@ mod tests {
             .expect("results apply");
 
         let fork = agent.context.fork_point();
-        agent.context.apply_handoff(Handoff::new("task"), fork, 0);
+        agent
+            .context
+            .apply_handoff(Handoff::new("task"), fork, 0, &HashSet::new());
 
         let kept = agent.context.recent();
         let ids: Vec<&str> = kept[0].tool_calls().iter().map(|c| c.id.as_str()).collect();
@@ -6876,6 +6900,7 @@ mod tests {
                     })
                     .collect(),
                 skills: Vec::new(),
+                attachments: Vec::new(),
             }
         }
     }
@@ -7356,6 +7381,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         )
         .expect("fork");
         agent
@@ -7578,6 +7604,7 @@ mod tests {
             agent.context.fork_point(),
             &[],
             None,
+            &[],
             &[],
         )
         .expect("fork");
@@ -7900,6 +7927,7 @@ mod tests {
             agent.context.fork_point(),
             &[],
             None,
+            &[],
             &[],
         )
         .expect("fork");
