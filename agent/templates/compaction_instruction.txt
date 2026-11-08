@@ -14,6 +14,7 @@ Output a single JSON object with EXACTLY these top-level keys:
 - `pending_work`: string[]
 - `recovery_hints`: string[]
 - `skills`: string[]
+- `attachments`: {`id`: string, `why`: string}[]
 
 Populate them as follows:
 - `current_task`: what the user asked for, verbatim, and the current state of progress
@@ -28,6 +29,14 @@ Populate them as follows:
 {% else %}
 {% for skill in skills %}
   - `{{ skill.name }}`: {{ skill.description }}
+{% endfor %}
+{% endif %}
+- `attachments`: the attachments the next turns must see again, by their id in this catalog, with `why` each is needed. Attachments not listed are removed from the context; the messages they came with keep their text. List an attachment only when the remaining work must match or inspect its visual detail and words cannot carry that detail: a design or style reference, a mockup, a layout, color or spacing the output must reproduce. In `why`, state what in it must be matched. For every other attachment, write what mattered into the fields above instead: copy any text it shows (error messages, logs, terminal output) verbatim, and state what it showed and what was concluded from it. Of several attachments showing the same thing, list at most the newest. Never list one of finished work.
+{% if attachments.is_empty() %}
+  (the conversation has no attachments; leave the list empty)
+{% else %}
+{% for attachment in attachments %}
+  - `{{ attachment.id }}`: {{ attachment.media_type }}, {% if attachment.excerpt.is_empty() %}sent with a user message that has no text{% else %}sent with the user message beginning "{{ attachment.excerpt }}"{% endif %}
 {% endfor %}
 {% endif %}
 

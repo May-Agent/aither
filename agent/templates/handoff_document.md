@@ -54,6 +54,14 @@
 - `{{ item }}`
 {% endfor %}
 {% endif %}
+{% if !handoff.attachments.is_empty() %}
+
+## Attachments
+These stay in the user messages they came with.
+{% for item in handoff.attachments %}
+- {{ item.why }}
+{% endfor %}
+{% endif %}
 
 ## Materials Already On Disk
 {% if file_index.is_empty() %}

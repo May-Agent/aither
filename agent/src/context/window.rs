@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use aither_core::llm::model::ReasoningEffort;
 use aither_core::llm::{Message, Role, ToolCall};
 
-use super::compaction::Handoff;
+use super::compaction::{AttachmentCatalogEntry, AttachmentRef, Handoff};
 use super::live::{LiveContent, LiveUpdate};
 use super::source::{Block, LiveChange};
 use super::state::SeenStates;
@@ -501,6 +501,39 @@ impl Context {
         self.next_seq
     }
 
+    /// The catalog of attachments the user messages below `fork_point`
+    /// carry, in conversation order.
+    ///
+    /// Offered to the compaction model so its handoff can name the
+    /// attachments the next turns still need;
+    /// [`apply_handoff`](Self::apply_handoff) resolves the names back to
+    /// the `reference` each entry carries.
+    #[must_use]
+    pub fn attachment_catalog(&self, fork_point: u64) -> Vec<AttachmentCatalogEntry> {
+        let mut catalog = Vec::new();
+        for item in self.items.iter().filter(|item| item.seq < fork_point) {
+            let Message::User {
+                content,
+                attachments,
+            } = &item.message
+            else {
+                continue;
+            };
+            for (index, attachment) in attachments.iter().enumerate() {
+                catalog.push(AttachmentCatalogEntry {
+                    id: format!("attachment-{}", catalog.len() + 1),
+                    media_type: attachment.media_type().essence_str().to_string(),
+                    excerpt: attachment_excerpt(content),
+                    reference: AttachmentRef {
+                        seq: item.seq,
+                        index,
+                    },
+                });
+            }
+        }
+        catalog
+    }
+
     /// Returns the items added at or after `seq`.
     #[must_use]
     pub fn items_since(&self, seq: u64) -> Vec<Message> {
@@ -727,8 +760,20 @@ impl Context {
     ///
     /// The last configuration update below the fork is kept too, in its
     /// place, so the effort it set stays in force: the handoff restates it.
-    pub fn apply_handoff(&mut self, handoff: Handoff, fork_point: u64, user_message_chars: usize) {
-        let mut kept = self.verbatim_below(fork_point, user_message_chars);
+    ///
+    /// A kept user message carries only the attachments `kept_attachments`
+    /// names, resolved from the catalog the compaction's instruction
+    /// rendered; a message whose attachment is named is kept even when it
+    /// falls outside `user_message_chars`, and every unnamed attachment is
+    /// gone with the conversation the handoff replaced.
+    pub fn apply_handoff(
+        &mut self,
+        handoff: Handoff,
+        fork_point: u64,
+        user_message_chars: usize,
+        kept_attachments: &HashSet<AttachmentRef>,
+    ) {
+        let mut kept = self.verbatim_below(fork_point, user_message_chars, kept_attachments);
         self.items.retain(|item| item.seq >= fork_point);
         kept.append(&mut self.items);
         self.items = kept;
@@ -737,8 +782,14 @@ impl Context {
 
     /// The items below `fork_point` that survive a handoff: answered
     /// `ask_user` exchanges, and the newest user messages within
-    /// `user_message_chars`, oldest first.
-    fn verbatim_below(&self, fork_point: u64, user_message_chars: usize) -> Vec<ContextItem> {
+    /// `user_message_chars`, each carrying only the attachments
+    /// `kept_attachments` names, oldest first.
+    fn verbatim_below(
+        &self,
+        fork_point: u64,
+        user_message_chars: usize,
+        kept_attachments: &HashSet<AttachmentRef>,
+    ) -> Vec<ContextItem> {
         let below = || self.items.iter().filter(|item| item.seq < fork_point);
 
         let asks: HashSet<&str> = below()
@@ -778,15 +829,52 @@ impl Context {
         }
 
         let mut remaining = user_message_chars;
+        let mut text_budget_spent = false;
         for item in below().rev() {
-            if !matches!(item.message, Message::User { .. }) {
+            let Message::User {
+                content,
+                attachments,
+            } = &item.message
+            else {
                 continue;
-            }
-            let Some(left) = remaining.checked_sub(item.message.content().len()) else {
-                break;
             };
-            remaining = left;
-            kept.push(item.clone());
+            let named: Vec<usize> = (0..attachments.len())
+                .filter(|index| {
+                    kept_attachments.contains(&AttachmentRef {
+                        seq: item.seq,
+                        index: *index,
+                    })
+                })
+                .collect();
+            // A message whose attachment the handoff named is kept
+            // whatever the budget says; an unnamed one pays for its text.
+            // Once the budget is spent the scan still runs on — an older
+            // message can still be kept on a named attachment.
+            if named.is_empty() {
+                if text_budget_spent {
+                    continue;
+                }
+                let Some(left) = remaining.checked_sub(content.len()) else {
+                    text_budget_spent = true;
+                    continue;
+                };
+                remaining = left;
+            }
+            let message = if named.len() == attachments.len() {
+                item.message.clone()
+            } else {
+                Message::User {
+                    content: content.clone(),
+                    attachments: named
+                        .iter()
+                        .map(|index| attachments[*index].clone())
+                        .collect(),
+                }
+            };
+            kept.push(ContextItem {
+                message,
+                ..item.clone()
+            });
         }
         kept.sort_by_key(|item| item.seq);
         kept
@@ -1109,6 +1197,21 @@ impl Handoff {
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
+/// The length of the excerpt an attachment catalog entry carries of the
+/// user message the attachment came with.
+const ATTACHMENT_EXCERPT_CHARS: usize = 80;
+
+/// The beginning of `content` as a one-line excerpt for the attachment
+/// catalog: at most [`ATTACHMENT_EXCERPT_CHARS`] characters, newlines
+/// collapsed to spaces.
+fn attachment_excerpt(content: &str) -> String {
+    content
+        .chars()
+        .map(|ch| if matches!(ch, '\n' | '\r') { ' ' } else { ch })
+        .take(ATTACHMENT_EXCERPT_CHARS)
+        .collect()
+}
+
 /// Joins the live tail blocks into the single trailing system message.
 fn render_tail(tail: &[Block]) -> Option<Message> {
     let mut rendered = String::new();
@@ -1138,7 +1241,7 @@ fn message_chars(message: &Message) -> usize {
 mod tests {
     use super::*;
     use crate::context::system::{ExternalContent, ExternalSlot, InstructionSlot};
-    use aither_core::llm::ToolCall;
+    use aither_core::llm::{Attachment, ToolCall};
 
     #[derive(Template)]
     #[template(path = "tagged_block.txt", escape = "none")]
@@ -1532,7 +1635,7 @@ mod tests {
         assert_eq!(context.build_messages()[1].content(), "#40 draft");
 
         context.reassemble_below(fork_point);
-        context.apply_handoff(handoff(), fork_point, 0);
+        context.apply_handoff(handoff(), fork_point, 0, &HashSet::new());
 
         assert_eq!(live_alerts(&context), Vec::<String>::new());
         let messages = context.build_messages();
@@ -1643,7 +1746,7 @@ mod tests {
         context.push(Message::system("<alert>after the fork</alert>"));
 
         context.reassemble_below(fork_point);
-        context.apply_handoff(handoff(), fork_point, 0);
+        context.apply_handoff(handoff(), fork_point, 0, &HashSet::new());
         assert_eq!(
             live_alerts(&context),
             Vec::<String>::new(),
@@ -1799,7 +1902,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("new request"));
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         assert_eq!(context.len_recent(), 1);
         assert_eq!(context.recent()[0].content(), "new request");
@@ -1822,7 +1925,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("new request"));
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let recent: Vec<_> = context.recent().into_iter().cloned().collect();
         assert_eq!(
@@ -1837,6 +1940,16 @@ mod tests {
 
     fn handoff() -> Handoff {
         Handoff::new("task")
+    }
+
+    /// A PNG screenshot the way a host attaches one to a user message.
+    fn screenshot(name: &str) -> Attachment {
+        Attachment::new(
+            format!("https://files.example.com/{name}.png")
+                .parse()
+                .expect("url"),
+            "image/png".parse().expect("media type"),
+        )
     }
 
     /// Pushes one answered `ask_user` exchange and returns its question.
@@ -1885,7 +1998,7 @@ mod tests {
         push_terminal_call(&mut context, "plain", "ls", false);
         let fork = context.fork_point();
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let recent = context.recent();
         assert_eq!(recent.len(), 2);
@@ -1915,7 +2028,7 @@ mod tests {
             .collect();
         assert_eq!(tags, [false, true, false, false]);
         let fork = restored.fork_point();
-        restored.apply_handoff(handoff(), fork, 0);
+        restored.apply_handoff(handoff(), fork, 0, &HashSet::new());
         assert_eq!(restored.len_recent(), 2);
     }
 
@@ -1949,7 +2062,7 @@ mod tests {
         let fork = context.fork_point();
         context.push(Message::user("after the fork"));
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let kept = context.recent();
         // Five exchanges (call and answer each) and the suffix; the turn's
@@ -1989,7 +2102,12 @@ mod tests {
         let fork = context.fork_point();
 
         // "middle" + "newest" fit; "oldest" does not.
-        context.apply_handoff(handoff(), fork, "middle".len() + "newest".len());
+        context.apply_handoff(
+            handoff(),
+            fork,
+            "middle".len() + "newest".len(),
+            &HashSet::new(),
+        );
 
         let kept = texts(&context);
         assert_eq!(kept.len(), 4, "{kept:?}");
@@ -2000,13 +2118,163 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_user_message_loses_the_attachment_the_handoff_did_not_name() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("the settings panel still clips the footer on mobile")
+                .with_attachment(screenshot("settings-mobile")),
+        );
+        let fork = context.fork_point();
+
+        context.apply_handoff(handoff(), fork, 1_000, &HashSet::new());
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].content(),
+            "the settings panel still clips the footer on mobile"
+        );
+        assert!(
+            recent[0].attachments().is_empty(),
+            "the unnamed screenshot is gone with the compacted turn"
+        );
+    }
+
+    /// A named attachment stays in the message it came with, which is kept
+    /// past the text budget too, while the message's other attachments go.
+    #[test]
+    fn a_named_attachment_keeps_its_message_past_the_budget() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("match this palette when you restyle the header")
+                .with_attachments([screenshot("draft-notes"), screenshot("palette-reference")]),
+        );
+        context.push(Message::user("and keep the footer links"));
+        let fork = context.fork_point();
+        let catalog = context.attachment_catalog(fork);
+        // The handoff names only the palette, the second attachment.
+        let kept: HashSet<AttachmentRef> = catalog
+            .iter()
+            .filter(|entry| entry.reference.index == 1)
+            .map(|entry| entry.reference)
+            .collect();
+
+        // The budget fits the second message alone; the palette message is
+        // over it and survives on its named attachment.
+        context.apply_handoff(handoff(), fork, "and keep the footer links".len(), &kept);
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(
+            recent[0].content(),
+            "match this palette when you restyle the header"
+        );
+        assert_eq!(
+            recent[0].attachments(),
+            &[screenshot("palette-reference")],
+            "only the named attachment stays, in place"
+        );
+        assert_eq!(recent[1].content(), "and keep the footer links");
+    }
+
+    /// A message whose attachment is named survives even when an unnamed
+    /// message between it and the suffix exhausted the text budget.
+    #[test]
+    fn a_named_attachment_is_found_past_an_over_budget_message() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("use this exact spacing in the footer")
+                .with_attachments([screenshot("rough-draft"), screenshot("footer-spacing")]),
+        );
+        context.push(Message::user("q".repeat(10_000)));
+        context.push(Message::user("and the header still clips"));
+        let fork = context.fork_point();
+        let catalog = context.attachment_catalog(fork);
+        let kept: HashSet<AttachmentRef> = catalog
+            .iter()
+            .filter(|entry| entry.id == "attachment-2")
+            .map(|entry| entry.reference)
+            .collect();
+
+        // The short newest message fits; the long middle one does not,
+        // but the scan must still reach the named attachment's message.
+        context.apply_handoff(handoff(), fork, "and the header still clips".len(), &kept);
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 2, "{recent:?}");
+        assert_eq!(recent[0].content(), "use this exact spacing in the footer");
+        assert_eq!(
+            recent[0].attachments(),
+            &[screenshot("footer-spacing")],
+            "only the named attachment stays"
+        );
+        assert_eq!(recent[1].content(), "and the header still clips");
+    }
+
+    #[test]
+    fn a_message_at_the_fork_point_keeps_its_attachments() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("the layout before the fork").with_attachment(screenshot("before-fork")),
+        );
+        let fork = context.fork_point();
+        context.push(
+            Message::user("look at this screenshot too").with_attachment(screenshot("after-fork")),
+        );
+
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].attachments(), &[screenshot("after-fork")]);
+    }
+
+    /// The catalog numbers every attachment below the fork in conversation
+    /// order, describes it by media type and the message's first line, and
+    /// cuts the excerpt on a character boundary.
+    #[test]
+    fn the_attachment_catalog_lists_every_attachment_below_the_fork() {
+        let mut context = Context::new();
+        context.push(
+            Message::user("compare these two dashboards\nfor the weekly report")
+                .with_attachment(screenshot("dashboard-q3")),
+        );
+        context.push(Message::assistant("pulling both up"));
+        context.push(Message::user("").with_attachment(screenshot("bare")));
+        let cjk = "把这张截图里的页眉配色套用到报表页，このスクリーンショットのヘッダー配色をレポートページに適用して，이 스크린샷의 헤더 색상을 보고서 페이지에 적용해 주세요";
+        context.push(Message::user(cjk).with_attachment(screenshot("header-colors")));
+        let fork = context.fork_point();
+        context.push(Message::user("one more after the fork").with_attachment(screenshot("late")));
+
+        let catalog = context.attachment_catalog(fork);
+
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(catalog[0].id, "attachment-1");
+        assert_eq!(catalog[0].media_type, "image/png");
+        assert_eq!(
+            catalog[0].excerpt,
+            "compare these two dashboards for the weekly report"
+        );
+        assert_eq!(catalog[0].reference, AttachmentRef { seq: 0, index: 0 });
+        assert_eq!(catalog[1].id, "attachment-2");
+        assert_eq!(catalog[1].reference, AttachmentRef { seq: 2, index: 0 });
+        assert!(catalog[1].excerpt.is_empty(), "the message has no text");
+        assert_eq!(catalog[2].id, "attachment-3");
+        assert!(
+            catalog[2].excerpt.chars().count() <= 80,
+            "the excerpt is cut on a character boundary, not a byte one"
+        );
+        assert!(catalog[2].excerpt.starts_with('把'));
+    }
+
+    #[test]
     fn a_message_holding_an_offloaded_paste_keeps_its_file_reference() {
         let mut context = Context::new();
         let message = "see the log at pastes/build-1.txt (12000 bytes) for the failure";
         context.push(Message::user(message));
         let fork = context.fork_point();
 
-        context.apply_handoff(handoff(), fork, 1_000);
+        context.apply_handoff(handoff(), fork, 1_000, &HashSet::new());
 
         assert_eq!(context.recent()[0].content(), message);
     }
@@ -2024,7 +2292,7 @@ mod tests {
         ));
         let fork = context.fork_point();
 
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         assert_eq!(context.len_recent(), 0);
     }
@@ -2081,7 +2349,7 @@ mod tests {
         let fork_point = context.fork_point();
 
         context.reassemble_below(fork_point);
-        context.apply_handoff(handoff(), fork_point, 0);
+        context.apply_handoff(handoff(), fork_point, 0, &HashSet::new());
 
         let kept: Vec<_> = context.recent().iter().map(|m| m.content()).collect();
         assert_eq!(kept, ["undelivered: the build failed"]);
@@ -2161,7 +2429,7 @@ mod tests {
         context.push(Message::user("one"));
         context.push(Message::user("two"));
         let fork = context.fork_point();
-        context.apply_handoff(handoff(), fork, 0);
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let checkpoint = context.checkpoint();
 

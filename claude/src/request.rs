@@ -85,6 +85,31 @@ pub struct MessagesRequest {
 /// Claude thinking configuration.
 ///
 /// Only adaptive thinking is modelled. The manual
+/// The body of `POST /v1/messages/count_tokens`: a messages request minus
+/// `max_tokens`, `stream`, and the sampling fields the endpoint rejects.
+#[derive(Debug, Serialize)]
+pub struct CountTokensRequest {
+    /// Model identifier.
+    pub model: String,
+    /// Conversation messages.
+    pub messages: Vec<MessagePayload>,
+    /// System prompt, extracted from messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemPayload>,
+    /// Tool definitions the request carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolPayload>>,
+    /// Forced tool choice, which affects the count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoicePayload>,
+    /// Thinking configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingPayload>,
+    /// Output configuration (effort, format).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfigPayload>,
+}
+
 /// `{"type": "enabled", "budget_tokens": N}` mode is deprecated on the 4.6
 /// generation and returns a 400 on every model after it, so aither does not
 /// offer a way to construct it.

@@ -49,9 +49,9 @@ use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
 use heel::{
-    Access, AllowAll, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter,
-    NetworkAuditLog, NetworkPolicy, ProcessPriority, ResolvedPath, Sandbox, SandboxConfig,
-    SecurityConfig, StdioConfig, WorkingDir,
+    Access, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter, NetworkAuditLog,
+    NetworkPolicy, ProcessPriority, ResolvedPath, Sandbox, SandboxConfig, SecurityConfig,
+    StdioConfig, WorkingDir,
 };
 /// On platforms without `heel supervise` a wait produces no report.
 #[cfg(not(target_os = "linux"))]
@@ -5105,7 +5105,7 @@ where
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let (grants, mut runtime_environment, _) = local_launch_policy(&context).await?;
+    let (_, mut runtime_environment, _) = local_launch_policy(&context).await?;
     let marker = JobMarker::new();
     runtime_environment.push(marker.entry());
     let heel_binary = context
@@ -5114,17 +5114,15 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         .await
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
     let config_builder = SandboxConfig::builder()
-        .network(AllowAll)
         .working_dir(
             std::fs::canonicalize(context.working_dir)
                 .unwrap_or_else(|_| context.working_dir.to_path_buf()),
         )
-        .grants(grants)
-        .heel_binary(heel_binary)
         // Unsafe is approved host execution — the user runs the script
         // themselves in every respect except IPC plumbing, so no
         // credential or filesystem protection may apply.
-        .security(SecurityConfig::permissive())
+        .host_access()
+        .heel_binary(heel_binary)
         .executable_working_dir(true)
         .priority(context.priority);
     #[cfg(target_os = "linux")]
@@ -13657,6 +13655,145 @@ mod tests {
             !unsafe_run.contains("sandboxed uname refused"),
             "an unsafe script never reaches the command, not even through `ipc`: {unsafe_run}"
         );
+    }
+
+    /// A terminal that approves unsafe scripts, with the managed tools adopted.
+    #[cfg(unix)]
+    async fn unsafe_terminal(
+        dir: &Path,
+        shell_sessions: ShellSessionRegistry,
+    ) -> TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured> {
+        let tool = TerminalTool::new_exact(
+            dir,
+            TestPermissionHandler {
+                allow_unsafe: true,
+                ..Default::default()
+            },
+            executor_core::tokio::TokioGlobal,
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
+        tool.with_registry(Arc::new(
+            ToolRegistryBuilder::new().build(test_outputs(dir.join("outputs"))),
+        ))
+    }
+
+    /// Runs an approved unsafe `script` to its end and renders the result.
+    #[cfg(unix)]
+    async fn run_unsafe(
+        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        script: &str,
+    ) -> String {
+        let result = tool
+            .call(
+                TerminalArgs {
+                    mode: TerminalExecutionMode::Unsafe,
+                    ..terminal_args("unsafe probe", script)
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("the unsafe call succeeds");
+        render_terminal_result(&result)
+    }
+
+    /// An approved unsafe script reads a file its sandboxed sibling cannot:
+    /// host access grants the invoking user's whole filesystem, not a grant
+    /// list.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsafe_script_reads_a_file_outside_every_grant() {
+        let session = tempfile::tempdir().expect("temp dir should be created");
+        let home = tempfile::Builder::new()
+            .prefix("aither-unsafe-home-")
+            .tempdir_in(std::env::var_os("HOME").expect("HOME is set"))
+            .expect("a temp dir under the real home");
+        let secret = home.path().join("secret.txt");
+        std::fs::write(&secret, "token-value").expect("secret written");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = unsafe_terminal(session.path(), shell_sessions).await;
+
+        let result = run_unsafe(&tool, &format!("cat {}", secret.display())).await;
+
+        assert!(
+            result.contains("token-value"),
+            "the unsafe run read the file: {result}"
+        );
+    }
+
+    /// Host access also writes wherever the invoking user may write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsafe_script_writes_a_file_outside_every_grant() {
+        let session = tempfile::tempdir().expect("temp dir should be created");
+        let outside = tempfile::tempdir().expect("temp dir should be created");
+        let probe = outside.path().join("written.txt");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = unsafe_terminal(session.path(), shell_sessions).await;
+
+        let result = run_unsafe(&tool, &format!("printf %s written > {}", probe.display())).await;
+
+        assert!(
+            !result.contains("Exit code"),
+            "the unsafe run failed: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&probe).expect("written file reads back"),
+            "written"
+        );
+    }
+
+    /// Confined profiles deny exec in the shared temp directories; host access
+    /// runs what a user put there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsafe_script_executes_a_program_written_to_the_temp_directory() {
+        let session = tempfile::tempdir().expect("temp dir should be created");
+        let outside = tempfile::tempdir().expect("temp dir should be created");
+        let probe = outside.path().join("probe.sh");
+        std::fs::write(&probe, "#!/bin/sh\necho executed\n").expect("probe written");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = unsafe_terminal(session.path(), shell_sessions).await;
+
+        let result = run_unsafe(&tool, &format!("chmod +x {0} && {0}", probe.display())).await;
+
+        assert!(
+            result.contains("executed"),
+            "the unsafe run ran the probe: {result}"
+        );
+    }
+
+    /// No proxy stands between an unsafe script and the network: a loopback
+    /// listener the test binds accepts its connection directly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsafe_script_connects_to_loopback_without_a_proxy() {
+        let session = tempfile::tempdir().expect("temp dir should be created");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let (accepted, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = accepted.send(listener.accept());
+        });
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool = unsafe_terminal(session.path(), shell_sessions).await;
+
+        let result = run_unsafe(
+            &tool,
+            &format!("/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}'"),
+        )
+        .await;
+
+        assert!(
+            !result.contains("Exit code"),
+            "the unsafe run failed: {result}"
+        );
+        got.recv_timeout(Duration::from_secs(10))
+            .expect("the listener accepted the connection")
+            .expect("accept succeeded");
     }
 
     #[tokio::test]

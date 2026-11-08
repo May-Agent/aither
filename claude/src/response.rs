@@ -59,6 +59,13 @@ impl Usage {
     }
 }
 
+/// The `POST /v1/messages/count_tokens` response.
+#[derive(Debug, Deserialize)]
+pub struct CountTokensResponse {
+    /// Total input tokens across the messages, system prompt, and tools.
+    pub input_tokens: u32,
+}
+
 /// Content block start event data.
 #[derive(Debug, Deserialize)]
 pub struct ContentBlockStartEvent {
