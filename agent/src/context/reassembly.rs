@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use askama::Template;
 use futures::StreamExt as _;
 
-use super::compaction::{LineRange, Restoration, SkillCatalogEntry};
+use super::compaction::{AttachmentCatalogEntry, LineRange, Restoration, SkillCatalogEntry};
 use super::source::Block;
 
 /// How many files are read from disk at once.
@@ -94,7 +94,8 @@ struct RestoredContextTemplate<'a> {
 /// canonical form stays inside one of them — `..` segments, absolute paths
 /// outside a root and symlinks escaping one are listed with the reason
 /// rather than opened. Skill names are resolved against `catalog`; an
-/// unknown name is listed too.
+/// unknown name is listed too, as is an attachment id the `attachments`
+/// catalog does not list.
 ///
 /// Returns `None` only when the handoff names nothing at all; a block whose
 /// files all failed still renders, listing each with its reason.
@@ -108,6 +109,7 @@ pub async fn restore_context(
     file_index: &[String],
     roots: &[PathBuf],
     skills: &[SkillCatalogEntry],
+    attachments: &[AttachmentCatalogEntry],
     budget_chars: usize,
 ) -> Option<Block> {
     if budget_chars == 0 {
@@ -115,7 +117,15 @@ pub async fn restore_context(
     }
 
     let candidates = restoration_candidates(restoration, file_index);
-    if candidates.is_empty() && restoration.skills.is_empty() {
+    let unknown_attachments: Vec<&str> = restoration
+        .attachments
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter(|id| !attachments.iter().any(|entry| entry.id == *id))
+        .collect();
+    if candidates.is_empty() && restoration.skills.is_empty() && unknown_attachments.is_empty() {
         return None;
     }
 
@@ -131,13 +141,17 @@ pub async fn restore_context(
     .len();
 
     let contents = read_all(roots, &candidates).await;
-    let (files, restored_skills, unavailable) = place_restorations(
+    let (files, restored_skills, mut unavailable) = place_restorations(
         contents,
         &restoration.skills,
         skills,
         overhead,
         budget_chars,
     );
+    unavailable.extend(unknown_attachments.into_iter().map(|id| UnavailableEntry {
+        name: id.to_string(),
+        reason: "not in the attachment catalog".to_string(),
+    }));
 
     let rendered = RestoredContextTemplate {
         files: &files,
@@ -459,7 +473,7 @@ pub(crate) fn truncate_on_char_boundary(content: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::compaction::ContextFile;
+    use super::super::compaction::{AttachmentRef, ContextFile};
     use super::*;
 
     fn handoff(paths: &[&str]) -> Restoration {
@@ -490,9 +504,16 @@ mod tests {
             .await
             .expect("write b");
 
-        let block = restore_context(&handoff(&["a.rs", "b.rs"]), &[], &roots(&root), &[], 10_000)
-            .await
-            .expect("restoration produces a block");
+        let block = restore_context(
+            &handoff(&["a.rs", "b.rs"]),
+            &[],
+            &roots(&root),
+            &[],
+            &[],
+            10_000,
+        )
+        .await
+        .expect("restoration produces a block");
 
         assert_eq!(block.tag(), "restored_context");
         assert!(block.content().contains("fn a() {}"));
@@ -515,7 +536,7 @@ mod tests {
             }],
             ..Restoration::default()
         };
-        let block = restore_context(&document, &[], &roots(&root), &[], 10_000)
+        let block = restore_context(&document, &[], &roots(&root), &[], &[], 10_000)
             .await
             .expect("restoration produces a block");
 
@@ -537,7 +558,7 @@ mod tests {
             skills: vec!["pdf".to_string(), "nonsense".to_string()],
             ..Restoration::default()
         };
-        let block = restore_context(&document, &[], &roots(&root), &catalog, 10_000)
+        let block = restore_context(&document, &[], &roots(&root), &catalog, &[], 10_000)
             .await
             .expect("restoration produces a block");
 
@@ -547,6 +568,57 @@ mod tests {
             block
                 .content()
                 .contains("not in the session's skill catalog")
+        );
+    }
+
+    /// An attachment id the catalog does not list is reported like an
+    /// unknown skill; a block naming only unknown ids still renders.
+    #[tokio::test]
+    async fn an_unknown_attachment_id_is_listed_not_resolved() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let catalog = vec![AttachmentCatalogEntry {
+            id: "attachment-1".to_string(),
+            media_type: "image/png".to_string(),
+            excerpt: "the palette mockup".to_string(),
+            reference: AttachmentRef { seq: 0, index: 0 },
+        }];
+        let document = Restoration {
+            attachments: vec!["attachment-1".to_string(), "attachment-7".to_string()],
+            ..Restoration::default()
+        };
+
+        let block = restore_context(&document, &[], &roots(&root), &[], &catalog, 10_000)
+            .await
+            .expect("the unknown id still produces a block");
+
+        assert!(block.content().contains("attachment-7"));
+        assert!(block.content().contains("not in the attachment catalog"));
+        assert!(
+            !block.content().contains("attachment-1`: not in"),
+            "the catalog id resolves, {block:?}"
+        );
+    }
+
+    /// A handoff naming only catalog ids resolves them all in place, so no
+    /// block is rendered for them.
+    #[tokio::test]
+    async fn naming_only_known_attachments_yields_no_block() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let catalog = vec![AttachmentCatalogEntry {
+            id: "attachment-1".to_string(),
+            media_type: "image/png".to_string(),
+            excerpt: "the palette mockup".to_string(),
+            reference: AttachmentRef { seq: 0, index: 0 },
+        }];
+        let document = Restoration {
+            attachments: vec!["attachment-1".to_string()],
+            ..Restoration::default()
+        };
+
+        assert!(
+            restore_context(&document, &[], &roots(&root), &[], &catalog, 10_000)
+                .await
+                .is_none()
         );
     }
 
@@ -577,7 +649,7 @@ mod tests {
             ],
             ..Restoration::default()
         };
-        let block = restore_context(&document, &[], &roots(&root), &[], 10_000)
+        let block = restore_context(&document, &[], &roots(&root), &[], &[], 10_000)
             .await
             .expect("a block still lists what it could not restore");
 
@@ -600,9 +672,16 @@ mod tests {
         )
         .expect("symlink");
 
-        let block = restore_context(&handoff(&["link.txt"]), &[], &roots(&root), &[], 10_000)
-            .await
-            .expect("a block still lists what it could not restore");
+        let block = restore_context(
+            &handoff(&["link.txt"]),
+            &[],
+            &roots(&root),
+            &[],
+            &[],
+            10_000,
+        )
+        .await
+        .expect("a block still lists what it could not restore");
 
         assert!(!block.content().contains("real contents"));
         assert!(
@@ -626,6 +705,7 @@ mod tests {
             &handoff(&["big.rs", "next.rs"]),
             &[],
             &roots(&root),
+            &[],
             &[],
             300,
         )
@@ -653,6 +733,7 @@ mod tests {
             &[],
             &roots(&root),
             &[],
+            &[],
             10_000,
         )
         .await
@@ -667,7 +748,7 @@ mod tests {
     async fn nothing_named_yields_no_block() {
         let root = tempfile::tempdir().expect("tempdir");
         assert!(
-            restore_context(&handoff(&[]), &[], &roots(&root), &[], 10_000)
+            restore_context(&handoff(&[]), &[], &roots(&root), &[], &[], 10_000)
                 .await
                 .is_none()
         );
@@ -680,7 +761,7 @@ mod tests {
             .await
             .expect("write a");
         assert!(
-            restore_context(&handoff(&["a.rs"]), &[], &roots(&root), &[], 0)
+            restore_context(&handoff(&["a.rs"]), &[], &roots(&root), &[], &[], 0)
                 .await
                 .is_none()
         );

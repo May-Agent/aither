@@ -48,9 +48,9 @@ pub mod window;
 pub use budget::ContextBudget;
 pub use cache::{CacheLifetime, PromptCache};
 pub use compaction::{
-    CompactionError, CompactionFork, CompletedCompaction, ContextFile, Handoff, HandoffDocument,
-    HandoffPrompt, HandoffSchema, InvalidHandoff, LineRange, PendingCompaction, Restoration,
-    SkillCatalogEntry, build_file_index,
+    AttachmentCatalogEntry, AttachmentRef, CompactionError, CompactionFork, CompletedCompaction,
+    ContextFile, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema, InvalidHandoff,
+    KeptAttachment, LineRange, PendingCompaction, Restoration, SkillCatalogEntry, build_file_index,
 };
 pub use event::{AnyEventSource, EventSource};
 pub use live::{LiveContent, LiveUpdate};
