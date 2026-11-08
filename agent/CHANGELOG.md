@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0](https://github.com/May-Agent/aither/compare/agent-v0.24.0...agent-v0.25.0) - 2026-11-08
+
+### Added
+
+- *(agent)* [**breaking**] compaction points are fixed distances below one handoff reserve
+- exact token counting per model for the context budget
+
+### Fixed
+
+- *(openai)* allow non-async path when tokenizer is off; fix budget test expectation
+- *(agent)* recovery tests fill the window past the pause point
+
+### Other
+
+- merge main into dev after v0.24.0
+- Merge remote-tracking branch 'origin/dev' into feat/646-compact-buffer
+- Merge remote-tracking branch 'origin/dev' into feat/648-token-counting
+
 ## [0.24.0](https://github.com/May-Agent/aither/compare/agent-v0.23.0...agent-v0.24.0) - 2026-11-08
 
 ### Added
