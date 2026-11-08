@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/mcp-v0.23.0...mcp-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(sandbox)* [**breaking**] lease model-facing ids from an embedder-supplied allocator
+
 ## [0.18.0](https://github.com/May-Agent/aither/compare/mcp-v0.17.0...mcp-v0.18.0) - 2026-11-05
 
 ### Added

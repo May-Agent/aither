@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/sandbox-v0.23.0...sandbox-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(agent)* [**breaking**] the context keeps what the model saw of each state
+- *(sandbox)* [**breaking**] lease model-facing ids from an embedder-supplied allocator
+- *(sandbox)* show IPC command progress in the terminal job's output
+
+### Fixed
+
+- *(sandbox)* run approved unsafe commands under heel host access
+- *(sandbox)* feed a command fifo when it registers
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+- *(sandbox)* hold command progress for a job that is still registering
+
+### Other
+
+- Merge pull request #640 from May-Agent/feat/617-context-kinds
+- Merge pull request #635 from May-Agent/fix/634-feed-on-register
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+- Merge main into dev after v0.23.0
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+- Merge remote-tracking branch 'origin/dev' into feat/626-ipc-progress
+
 ## [0.23.0](https://github.com/May-Agent/aither/compare/sandbox-v0.22.0...sandbox-v0.23.0) - 2026-11-07
 
 ### Added
