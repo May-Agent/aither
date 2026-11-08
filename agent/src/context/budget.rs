@@ -347,9 +347,9 @@ mod tests {
         // Chars appended since still charge at the default 4.0 ratio.
         budget.append(400);
         assert_eq!(budget.estimated_tokens(), 1000);
-        // A new assembly drops the stale count.
+        // A new assembly drops the stale count and the appended chars.
         budget.observe_assembled(2000);
-        assert_eq!(budget.estimated_tokens(), 600);
+        assert_eq!(budget.estimated_tokens(), 500);
     }
 
     #[test]

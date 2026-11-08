@@ -252,6 +252,7 @@ impl LanguageModel for OpenAI {
         TokenCounting::None
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn count_tokens(
         &self,
         request: &LLMRequest,
