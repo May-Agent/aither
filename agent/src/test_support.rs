@@ -241,7 +241,12 @@ pub async fn real_distribution(binary: &std::path::Path) -> aither_sandbox::Tool
         .iter()
         .map(|artifact| serde_json::to_value(artifact).unwrap()),
     );
-    distribution_of(&artifacts, pinned["python"].as_array().unwrap())
+    let distribution = distribution_of(&artifacts, pinned["python"].as_array().unwrap());
+    // CI hands its job token down so release downloads are authenticated.
+    match std::env::var("GITHUB_TOKEN") {
+        Ok(token) => distribution.with_github_token(token),
+        Err(_) => distribution,
+    }
 }
 
 /// Baseline tools prepared as a terminal prepares them, kept alive with
