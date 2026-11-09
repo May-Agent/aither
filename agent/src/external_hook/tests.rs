@@ -295,10 +295,12 @@ async fn compaction_fires_before_and_after() {
 
     bounded(agent.query("hello")).await.unwrap();
     assert_eq!(events_of(&log), Vec::<String>::new());
-    let compacted = bounded(agent.compact(Some("the parser")))
-        .await
-        .unwrap()
-        .expect("there was something to compact");
+    let compacted = bounded(crate::test_support::finish_compaction(
+        agent.compact(Some("the parser")),
+    ))
+    .await
+    .unwrap()
+    .expect("there was something to compact");
 
     assert_eq!(events_of(&log), ["before_compaction", "after_compaction"]);
     let inputs = logged(&log);

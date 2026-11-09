@@ -38,6 +38,7 @@ mod hook;
 
 use std::collections::HashSet;
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +49,9 @@ use aither_agent::sandbox::{
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
-use aither_agent::{Agent, AgentOptions, Hook, TerminalAgentBuilder};
+use aither_agent::{
+    Agent, AgentEvent, AgentOptions, CompactionOutcome, Hook, TerminalAgentBuilder,
+};
 use aither_core::LanguageModel;
 use aither_core::llm::ToolResult;
 use aither_mcp::{McpConnection, McpServersConfig};
@@ -639,19 +642,28 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
                     continue;
                 }
                 "/compact" => {
-                    match Box::pin(agent.compact(None)).await {
-                        Ok(Some(result)) => {
-                            println!(
-                                "\x1b[2mCompacted {} messages into summary, starting fresh session\x1b[22m",
-                                result.messages_compacted
-                            );
-                        }
-                        Ok(None) => {
-                            println!("Nothing to compact (no conversation history).");
-                        }
-                        Err(e) => {
-                            println!("\x1b[31mCompaction failed: {e}\x1b[0m");
-                        }
+                    let driven = Box::pin(agent.compact(None).drive(
+                        (),
+                        std::future::pending(),
+                        |(), timed| async move {
+                            if let AgentEvent::CompactionFinished { outcome } = timed.event {
+                                match outcome {
+                                    CompactionOutcome::Applied(result) => println!(
+                                        "\x1b[2mCompacted {} messages into summary, starting fresh session\x1b[22m",
+                                        result.messages_compacted
+                                    ),
+                                    CompactionOutcome::NothingToCompact => {
+                                        println!("Nothing to compact (no conversation history).");
+                                    }
+                                    CompactionOutcome::Failed(_) | CompactionOutcome::Discarded => {}
+                                }
+                            }
+                            ControlFlow::<std::convert::Infallible, _>::Continue(())
+                        },
+                    ))
+                    .await;
+                    if let Err(e) = driven {
+                        println!("\x1b[31mCompaction failed: {e}\x1b[0m");
                     }
                     continue;
                 }

@@ -5244,8 +5244,7 @@ mod tests {
         let SubagentBody::Agent { agent, .. } = &mut finished.body else {
             panic!("a fork is an aither agent");
         };
-        let compacted = agent
-            .compact(None)
+        let compacted = crate::test_support::finish_compaction(agent.compact(None))
             .await
             .expect("the fork compacts")
             .expect("the fork has a conversation");
@@ -5457,7 +5456,9 @@ mod tests {
         assert_eq!(spaces(), before, "no subagent terminal was launched");
         assert!(tool.runs().list().is_empty());
 
-        agent.compact(None).await.expect("compaction");
+        crate::test_support::finish_compaction(agent.compact(None))
+            .await
+            .expect("compaction");
         agent
             .query("continue")
             .await

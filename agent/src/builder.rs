@@ -1272,6 +1272,7 @@ where
             requests_sent: 0,
             compaction: crate::compaction_state::CompactionState::default(),
             compaction_failure: None,
+            compaction_announced: false,
             tool_results: std::collections::VecDeque::new(),
             config,
             context,

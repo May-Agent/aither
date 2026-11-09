@@ -21,6 +21,25 @@ pub async fn finish_run(
     .map(|_| ())
 }
 
+/// Drives a compaction run from [`Agent::compact`](crate::Agent::compact) or
+/// [`Agent::compact_when_idle`](crate::Agent::compact_when_idle) to its end:
+/// the result its finish event applied, or `None` when nothing was compacted.
+pub async fn finish_compaction(
+    run: crate::Run<impl std::future::Future<Output = Result<(), crate::AgentError>>>,
+) -> Result<Option<crate::CompactResult>, crate::AgentError> {
+    let std::ops::ControlFlow::Continue(applied) = run
+        .drive(None, std::future::pending(), |applied, timed| async move {
+            std::ops::ControlFlow::<std::convert::Infallible, _>::Continue(match timed.event {
+                crate::AgentEvent::CompactionFinished {
+                    outcome: crate::CompactionOutcome::Applied(result),
+                } => Some(result),
+                _ => applied,
+            })
+        })
+        .await?;
+    Ok(applied)
+}
+
 /// A temporary directory that can hold prepared tool runtimes: the managed
 /// interpreter tree is read-only, which a plain `TempDir` cannot delete.
 pub struct TempDir(tempfile::TempDir);
