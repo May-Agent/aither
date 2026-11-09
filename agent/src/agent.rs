@@ -27,7 +27,7 @@ use crate::{
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
-    event::{AgentEvent, RunPauseReason, TimedEvent},
+    event::{AgentEvent, CompactionOutcome, RunPauseReason, TimedEvent},
     external_hook,
     hook::{
         CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
@@ -942,6 +942,10 @@ pub struct Agent<
     /// the next compaction the window forces recovers first.
     pub(crate) compaction_failure: Option<crate::context::CompactionError>,
 
+    /// Whether an [`AgentEvent::CompactionStarted`] was emitted whose
+    /// [`AgentEvent::CompactionFinished`] is still owed.
+    pub(crate) compaction_announced: bool,
+
     /// Results of the tool calls of the turn in flight, in completion order,
     /// until they are moved into the context.
     pub(crate) tool_results: VecDeque<ToolExecutionResult>,
@@ -1109,6 +1113,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             requests_sent: 0,
             compaction: CompactionState::default(),
             compaction_failure: None,
+            compaction_announced: false,
             tool_results: VecDeque::new(),
             profile: None,
             compaction_profile: None,
@@ -1340,6 +1345,7 @@ where
             run_id.clone(),
             self.config.max_iterations,
         ));
+        self.finish_lost_compaction(events);
         self.ensure_initialized().await?;
         if std::mem::replace(&mut self.session, SessionPhase::Started) == SessionPhase::NotStarted {
             self.hooks
@@ -1403,6 +1409,7 @@ where
             run_id.clone(),
             self.config.max_iterations,
         ));
+        self.finish_lost_compaction(events);
         self.ensure_initialized().await?;
         self.settle_interrupted_tool_calls();
         let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
@@ -1560,6 +1567,7 @@ where
             Some(Ok(completed)) => self.compaction.land(completed),
             Some(Err(error)) => {
                 tracing::warn!(%error, "forked compaction failed");
+                self.finish_compaction(events, CompactionOutcome::Failed(error.clone().into()));
                 self.compaction_failure = Some(error);
             }
             None => {}
@@ -2603,30 +2611,72 @@ where
         self.context.clear_history();
     }
 
-    /// Compacts the conversation by generating a structured handoff and starting fresh.
+    /// Compacts the conversation by generating a structured handoff and
+    /// starting fresh, focused on `focus` when one is given. Driven like
+    /// [`run`](Self::run).
+    ///
+    /// The run emits [`AgentEvent::CompactionStarted`] and then
+    /// [`AgentEvent::CompactionFinished`], whose
+    /// [`CompactionOutcome`] carries the [`CompactResult`] when the handoff
+    /// applied. A compaction forked earlier alongside a run is stale once this
+    /// one starts: it finishes as [`CompactionOutcome::Discarded`] first.
     ///
     /// # Errors
     ///
-    /// Returns an error if handoff generation fails.
-    pub async fn compact(
+    /// [`drive`](Run::drive) returns the failure when handoff generation
+    /// fails, after the finish event reported it.
+    pub fn compact(
         &mut self,
         focus: Option<&str>,
+    ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+        let focus = focus.map(str::to_string);
+        Run::new(move |sink| async move {
+            self.finish_lost_compaction(&sink);
+            Box::pin(self.compact_streaming(focus.as_deref(), &sink))
+                .await
+                .map(drop)
+        })
+    }
+
+    /// Runs one compaction to its end, announcing it on `events`.
+    async fn compact_streaming(
+        &mut self,
+        focus: Option<&str>,
+        events: &EventSink,
     ) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await?;
         self.settle_interrupted_tool_calls();
-
-        let messages = self.context.conversation_messages();
-        if messages.is_empty() {
-            return Ok(None);
-        }
-
-        let messages_compacted = messages.len();
         // This handoff describes the whole conversation as it stands, so a
         // compaction forked earlier, running or landed, is stale from here.
         self.compaction.retire();
+        self.finish_compaction(events, CompactionOutcome::Discarded);
+        self.announce_compaction(events);
+        match self.fork_and_apply(focus, events).await {
+            Ok(Some(result)) => Ok(Some(result)),
+            Ok(None) => {
+                self.finish_compaction(events, CompactionOutcome::NothingToCompact);
+                Ok(None)
+            }
+            Err(error) => {
+                self.finish_compaction(events, CompactionOutcome::Failed(error.clone()));
+                Err(error)
+            }
+        }
+    }
+
+    /// Generates the handoff for the whole conversation and applies it;
+    /// `None` when there is no conversation to compact.
+    async fn fork_and_apply(
+        &mut self,
+        focus: Option<&str>,
+        events: &EventSink,
+    ) -> Result<Option<CompactResult>, AgentError> {
+        if self.context.is_conversation_empty() {
+            return Ok(None);
+        }
         self.hooks
             .on_lifecycle(&external_hook::BeforeCompaction {
-                messages: messages_compacted,
+                messages: self.context.len_recent(),
                 focus: focus.map(str::to_string),
             })
             .await;
@@ -2639,30 +2689,30 @@ where
         #[cfg(not(feature = "skills"))]
         let skills = Vec::new();
         let attachments = self.context.attachment_catalog(self.context.fork_point());
-        let fork = CompactionFork::<Schema>::new(
+        let fork = match CompactionFork::<Schema>::new(
             &request,
             self.context.fork_point(),
             self.context.handoff_file_index(),
             focus,
             &skills,
             &attachments,
-        )
-        .map_err(AgentError::from)?
-        .with_outputs_dir(self.outputs_dir());
+        ) {
+            Ok(fork) => fork.with_outputs_dir(self.outputs_dir()),
+            // Only system messages: nothing a handoff could summarize.
+            Err(crate::context::CompactionError::Empty) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let completed = self
             .compaction_future(fork)
             .await
             .map_err(AgentError::from)?;
-        let summary = completed.handoff.text().to_string();
 
         self.compaction.land(completed);
-        self.apply_completed_compaction().await;
-
-        Ok(Some(CompactResult {
-            messages_compacted,
-            messages_remaining: self.context.len_recent(),
-            summary,
-        }))
+        Ok(Some(
+            self.apply_completed_compaction(events)
+                .await
+                .expect("the compaction just landed"),
+        ))
     }
 
     /// The parameters of the requests the agent sends on its own tier's model.
@@ -2964,22 +3014,30 @@ where
     /// it. Nothing is kept across the handoff, so no thinking produced under
     /// the old prefix is replayed after it.
     ///
+    /// Driven like [`compact`](Self::compact), and emits its compaction
+    /// events only when the compaction is due; otherwise the run emits
+    /// nothing.
+    ///
     /// # Errors
     ///
-    /// Returns the compaction failure; the window is left as it was.
-    pub async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
-        if self.idle_compaction_due_in() != Some(Duration::ZERO) {
-            return Ok(None);
-        }
-        let result = self.compact(None).await?;
-        self.idle_compacted = true;
-        if let Some(result) = &result {
-            tracing::info!(
-                compacted = result.messages_compacted,
-                "compacted the idle context shortly before its cache expires"
-            );
-        }
-        Ok(result)
+    /// [`drive`](Run::drive) returns the compaction failure; the window is
+    /// left as it was.
+    pub fn compact_when_idle(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+        Run::new(move |sink| async move {
+            self.finish_lost_compaction(&sink);
+            if self.idle_compaction_due_in() != Some(Duration::ZERO) {
+                return Ok(());
+            }
+            let result = Box::pin(self.compact_streaming(None, &sink)).await?;
+            self.idle_compacted = true;
+            if let Some(result) = &result {
+                tracing::info!(
+                    compacted = result.messages_compacted,
+                    "compacted the idle context shortly before its cache expires"
+                );
+            }
+            Ok(())
+        })
     }
 
     /// Forks a compaction off `request` to run alongside the turns that follow.
@@ -2990,8 +3048,9 @@ where
     /// the cache the run just paid for.
     ///
     /// A failure to even start — an empty conversation — is not an error for
-    /// the run: there is simply nothing to compact yet.
-    fn start_compaction(&mut self, request: &LLMRequest, focus: Option<&str>) {
+    /// the run: there is simply nothing to compact yet, and nothing is
+    /// announced.
+    fn start_compaction(&mut self, request: &LLMRequest, focus: Option<&str>, events: &EventSink) {
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
@@ -3013,6 +3072,7 @@ where
                     usage = self.budget.usage(),
                     "forking compaction alongside the run"
                 );
+                self.announce_compaction(events);
                 self.compaction.start(self.start_pending_compaction(fork));
             }
             Err(error) => {
@@ -3039,18 +3099,48 @@ where
         Vec::new()
     }
 
-    /// Folds a landed handoff into the window and restores what it named.
+    /// Announces on `events` that a compaction starts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the compaction announced before it has not finished:
+    /// compactions never overlap.
+    fn announce_compaction(&mut self, events: &EventSink) {
+        assert!(
+            !self.compaction_announced,
+            "a compaction started before the previous one finished"
+        );
+        self.compaction_announced = true;
+        events.emit(AgentEvent::CompactionStarted);
+    }
+
+    /// Reports on `events` how the announced compaction ended, if one is
+    /// announced and not yet finished.
+    fn finish_compaction(&mut self, events: &EventSink, outcome: CompactionOutcome) {
+        if std::mem::take(&mut self.compaction_announced) {
+            events.emit(AgentEvent::CompactionFinished { outcome });
+        }
+    }
+
+    /// Finishes as discarded an announced compaction that is gone: retired,
+    /// or dropped with its run, where no stream was open to report it.
+    fn finish_lost_compaction(&mut self, events: &EventSink) {
+        if !self.compaction.is_active() {
+            self.finish_compaction(events, CompactionOutcome::Discarded);
+        }
+    }
+
+    /// Folds a landed handoff into the window and restores what it named,
+    /// reporting it on `events`; `None` when no handoff had landed.
     ///
     /// Called only at request boundaries: the conversation is whole there, so
     /// replacing everything below the fork point cannot strand a tool call
     /// from its result.
-    async fn apply_completed_compaction(&mut self) {
+    async fn apply_completed_compaction(&mut self, events: &EventSink) -> Option<CompactResult> {
         // The files are read while the completed compaction is still stored:
         // a caller that drops this future during the read leaves it pending
         // for the next boundary, with nothing half applied.
-        let Some(completed) = self.compaction.landed() else {
-            return;
-        };
+        let completed = self.compaction.landed()?;
         let handoff = completed.handoff.clone();
         let restoration = completed.restoration.clone();
         let attachment_catalog = completed.attachment_catalog.clone();
@@ -3079,9 +3169,9 @@ where
 
         // From here to the hook there is no await: the handoff, the cleanup
         // and the restored block commit together.
-        let Some(CompletedCompaction { fork_point, .. }) = self.compaction.take_landed() else {
-            return;
-        };
+        let CompletedCompaction { fork_point, .. } = self.compaction.take_landed()?;
+        let messages_compacted = self.context.len_below(fork_point);
+        let summary = handoff.text().to_string();
         // Compaction rewrites the cacheable prefix anyway, so this is where
         // staged system-block updates and superseded tool results fold in.
         self.context.reassemble_below(fork_point);
@@ -3114,11 +3204,18 @@ where
             kept = self.context.len_recent(),
             "applied handoff from forked compaction"
         );
+        let result = CompactResult {
+            messages_compacted,
+            messages_remaining: self.context.len_recent(),
+            summary,
+        };
+        self.finish_compaction(events, CompactionOutcome::Applied(result.clone()));
         self.hooks
             .on_lifecycle(&external_hook::AfterCompaction {
-                messages_remaining: self.context.len_recent(),
+                messages_remaining: result.messages_remaining,
             })
             .await;
+        Some(result)
     }
 
     /// Makes room at the pause point: waits for the compaction in flight and
@@ -3143,18 +3240,20 @@ where
             match pending.wait().await {
                 Ok(completed) => {
                     self.compaction.land(completed);
-                    self.apply_completed_compaction().await;
+                    self.apply_completed_compaction(events).await;
                     return Ok(true);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "compaction failed with the window exhausted");
-                    failure = Some(error.into());
+                    let error = AgentError::from(error);
+                    self.finish_compaction(events, CompactionOutcome::Failed(error.clone()));
+                    failure = Some(error);
                 }
             }
         }
         let failure = match failure {
             Some(failure) => failure,
-            None => match Box::pin(self.compact(None)).await {
+            None => match Box::pin(self.compact_streaming(None, events)).await {
                 Ok(result) => return Ok(result.is_some()),
                 Err(error) => {
                     tracing::warn!(%error, "compaction failed with the window exhausted");
@@ -3193,7 +3292,7 @@ where
         });
         self.reassembled = true;
         self.prefix_rewrites.reassembled = true;
-        let result = Box::pin(self.compact(None)).await?;
+        let result = Box::pin(self.compact_streaming(None, events)).await?;
         Ok(result.is_some())
     }
 
@@ -3806,8 +3905,8 @@ where
         &mut self,
         events: &EventSink,
     ) -> Result<Option<LLMRequest>, AgentError> {
-        self.apply_completed_compaction().await;
-        self.rebuild_if_cache_is_cold().await?;
+        self.apply_completed_compaction(events).await;
+        self.rebuild_if_cache_is_cold(events).await?;
         self.settle_effort()?;
         self.push_request_alerts().await;
 
@@ -3839,7 +3938,7 @@ where
                     focus: None,
                 })
                 .await;
-            self.start_compaction(&fork_request, None);
+            self.start_compaction(&fork_request, None, events);
         }
 
         if self
@@ -4003,7 +4102,7 @@ where
     /// itself, so it is left alone.
     ///
     /// [`CacheLifetime`]: crate::context::CacheLifetime
-    async fn rebuild_if_cache_is_cold(&mut self) -> Result<(), AgentError> {
+    async fn rebuild_if_cache_is_cold(&mut self, events: &EventSink) -> Result<(), AgentError> {
         if self.compaction_model.is_none() || self.compaction.is_running() {
             return Ok(());
         }
@@ -4016,7 +4115,7 @@ where
         }
         // Boxed: the compaction future is large and sits on every run's path
         // (see `run_futures_stay_small_with_a_real_provider_type`).
-        if let Some(result) = Box::pin(self.compact(None)).await? {
+        if let Some(result) = Box::pin(self.compact_streaming(None, events)).await? {
             tracing::info!(
                 compacted = result.messages_compacted,
                 "compacted the context before sending on a cold cache"
@@ -7070,7 +7169,9 @@ mod tests {
         agent.query("first").await.expect("the first turn runs");
         agent.set_parameters(ModelTier::Advanced, effort(ReasoningEffort::Low));
         agent.query("second").await.expect("the second turn runs");
-        agent.compact(None).await.expect("compaction succeeds");
+        crate::test_support::finish_compaction(agent.compact(None))
+            .await
+            .expect("compaction succeeds");
         agent.query("third").await.expect("the third turn runs");
 
         let after = llm.recorded().pop().expect("the turn after compaction");
@@ -7159,8 +7260,7 @@ mod tests {
         agent.ensure_initialized().await.expect("agent initializes");
         agent.push_message(Message::user("build the parser"));
 
-        let result = agent
-            .compact(None)
+        let result = crate::test_support::finish_compaction(agent.compact(None))
             .await
             .expect("compaction succeeds")
             .expect("there was a conversation to compact");
@@ -7405,8 +7505,7 @@ mod tests {
         );
         assert_eq!(issues_alerts(&fourth), 1, "the change is announced once");
 
-        agent
-            .compact(None)
+        crate::test_support::finish_compaction(agent.compact(None))
             .await
             .expect("compaction runs")
             .expect("there is something to compact");
@@ -7424,8 +7523,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = agent_with_long_output(&llm, 100_000, dir.path()).await;
         let before = next_prompt_prefix(&mut agent).await;
-        agent
-            .compact(None)
+        crate::test_support::finish_compaction(agent.compact(None))
             .await
             .expect("compaction runs")
             .expect("there is something to compact");
@@ -7802,7 +7900,9 @@ mod tests {
             },
         );
 
-        let first_poll = futures_lite::future::poll_once(agent.apply_completed_compaction()).await;
+        let sink = EventSink::discarding();
+        let first_poll =
+            futures_lite::future::poll_once(agent.apply_completed_compaction(&sink)).await;
         if first_poll.is_none() {
             assert!(agent.context().handoff().is_none(), "nothing was committed");
             assert!(agent.compaction.landed().is_some(), "still pending");
@@ -8043,7 +8143,12 @@ mod tests {
         let mut small = agent_after_one_message(llm.clone(), "hello", policy).await;
         small.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(small.idle_compaction_due_in(), None);
-        assert!(small.compact_when_idle().await.expect("no-op").is_none());
+        assert!(
+            crate::test_support::finish_compaction(small.compact_when_idle())
+                .await
+                .expect("no-op")
+                .is_none()
+        );
         assert!(llm.recorded().is_empty());
 
         let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
@@ -8051,7 +8156,7 @@ mod tests {
         let mut big = agent_after_one_message(llm.clone(), &big_text, policy).await;
         big.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(big.idle_compaction_due_in(), Some(Duration::ZERO));
-        big.compact_when_idle()
+        crate::test_support::finish_compaction(big.compact_when_idle())
             .await
             .expect("the compaction succeeds")
             .expect("the compaction ran");
@@ -8081,14 +8186,18 @@ mod tests {
             .idle_compaction_due_in()
             .expect("a compaction is pending");
         assert!(due_in > Duration::from_secs(30) && due_in <= Duration::from_secs(60));
-        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(
+            crate::test_support::finish_compaction(agent.compact_when_idle())
+                .await
+                .expect("no-op")
+                .is_none()
+        );
         assert!(llm.recorded().is_empty());
 
         // Fifty-four minutes: due now.
         agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
-        let result = agent
-            .compact_when_idle()
+        let result = crate::test_support::finish_compaction(agent.compact_when_idle())
             .await
             .expect("the compaction succeeds")
             .expect("the compaction ran");
@@ -8099,7 +8208,12 @@ mod tests {
         // Still idle: nothing more, however long the gap grows inside the hour.
         agent.backdate_cache_entry(Duration::from_secs(3300));
         assert_eq!(agent.idle_compaction_due_in(), None);
-        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(
+            crate::test_support::finish_compaction(agent.compact_when_idle())
+                .await
+                .expect("no-op")
+                .is_none()
+        );
         assert_eq!(llm.recorded().len(), 1, "one compaction per idle gap");
 
         // The next request re-arms it for the next gap.
@@ -8175,8 +8289,7 @@ mod tests {
             .start(PendingCompaction::start(fork, stale.clone()));
         assert!(agent.compaction.is_running());
 
-        agent
-            .compact(Some("the manual focus"))
+        crate::test_support::finish_compaction(agent.compact(Some("the manual focus")))
             .await
             .expect("manual compaction succeeds")
             .expect("the manual compaction ran");
@@ -8204,7 +8317,12 @@ mod tests {
         let mut agent = agent_after_one_request(llm.clone()).await;
         agent.backdate_cache_entry(Duration::from_secs(3660));
         assert_eq!(agent.idle_compaction_due_in(), None);
-        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(
+            crate::test_support::finish_compaction(agent.compact_when_idle())
+                .await
+                .expect("no-op")
+                .is_none()
+        );
         assert!(llm.recorded().is_empty());
     }
 
@@ -8217,7 +8335,12 @@ mod tests {
         agent.use_cache_lifetime(CacheLifetime::Permanent);
         agent.backdate_cache_entry(Duration::from_secs(86_400));
         assert_eq!(agent.idle_compaction_due_in(), None);
-        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(
+            crate::test_support::finish_compaction(agent.compact_when_idle())
+                .await
+                .expect("no-op")
+                .is_none()
+        );
         assert!(llm.recorded().is_empty());
     }
 
@@ -8240,10 +8363,17 @@ mod tests {
 
         agent.backdate_cache_entry(Duration::from_secs(3240));
         assert_eq!(agent.idle_compaction_due_in(), None);
-        assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+        assert!(
+            crate::test_support::finish_compaction(agent.compact_when_idle())
+                .await
+                .expect("no-op")
+                .is_none()
+        );
         assert!(main.recorded().is_empty() && compactor.recorded().is_empty());
 
-        agent.compact(None).await.expect("compaction succeeds");
+        crate::test_support::finish_compaction(agent.compact(None))
+            .await
+            .expect("compaction succeeds");
         assert_eq!(compactor.recorded().len(), 1, "the compaction model ran it");
         assert!(main.recorded().is_empty(), "the session's model did not");
 
@@ -8256,13 +8386,9 @@ mod tests {
         agent.push_message(Message::user("hello"));
         let tail = agent.render_tail().await;
         let request = LLMRequest::new(agent.context.build_request(&tail));
-        agent.start_compaction(&request, None);
-        assert!(
-            agent
-                .make_room(&EventSink::discarding())
-                .await
-                .expect("compaction lands")
-        );
+        let sink = EventSink::discarding();
+        agent.start_compaction(&request, None, &sink);
+        assert!(agent.make_room(&sink).await.expect("compaction lands"));
         assert_eq!(compactor.recorded().len(), 1);
     }
 
@@ -8343,7 +8469,9 @@ mod tests {
             .prompt_cache(PromptCache::new("session-1"))
             .build();
         agent.query("hello").await.expect("the turn runs");
-        agent.compact(None).await.expect("compaction succeeds");
+        crate::test_support::finish_compaction(agent.compact(None))
+            .await
+            .expect("compaction succeeds");
 
         let [turn, compaction]: [LLMRequest; 2] = llm
             .recorded()
@@ -8391,7 +8519,9 @@ mod tests {
             .compaction_model(compactor.clone(), compacting.clone())
             .build();
         agent.query("hello").await.expect("the turn runs");
-        agent.compact(None).await.expect("compaction succeeds");
+        crate::test_support::finish_compaction(agent.compact(None))
+            .await
+            .expect("compaction succeeds");
 
         let [turn]: [LLMRequest; 1] = main
             .recorded()
@@ -9912,5 +10042,236 @@ mod tests {
         assert_eq!(assistants.len(), 1);
         assert_eq!(assistants[0].content(), "");
         assert_eq!(assistants[0].reasoning(), [thinking]);
+    }
+
+    /// The compaction lifecycle `events` report, in order.
+    fn compaction_lifecycle(events: &[AgentEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::CompactionStarted => Some("started"),
+                AgentEvent::CompactionFinished { outcome } => Some(match outcome {
+                    CompactionOutcome::Applied(_) => "applied",
+                    CompactionOutcome::NothingToCompact => "nothing to compact",
+                    CompactionOutcome::Failed(_) => "failed",
+                    CompactionOutcome::Discarded => "discarded",
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drives `run` to its end, keeping its events whether it fails or not.
+    async fn drain_with_result(
+        run: Run<impl Future<Output = Result<(), AgentError>>>,
+    ) -> (Vec<AgentEvent>, Result<(), AgentError>) {
+        let mut events = Vec::new();
+        let result = run
+            .drive(
+                &mut events,
+                std::future::pending(),
+                |events, timed| async move {
+                    events.push(timed.event);
+                    ControlFlow::<std::convert::Infallible, _>::Continue(events)
+                },
+            )
+            .await
+            .map(drop);
+        (events, result)
+    }
+
+    #[tokio::test]
+    async fn an_explicit_compaction_starts_once_and_finishes_applied() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::new(llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+        agent.push_message(Message::assistant("hi"));
+        let before = agent.context().len_recent();
+
+        let (events, result) = drain_with_result(agent.compact(None)).await;
+
+        result.expect("the compaction succeeds");
+        assert_eq!(compaction_lifecycle(&events), ["started", "applied"]);
+        let applied = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::CompactionFinished {
+                    outcome: CompactionOutcome::Applied(applied),
+                } => Some(applied),
+                _ => None,
+            })
+            .expect("the finish carries the result");
+        assert_eq!(applied.messages_compacted, before);
+        assert_eq!(applied.messages_remaining, agent.context().len_recent());
+        assert!(agent.context().handoff().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_explicit_compaction_of_nothing_finishes_with_nothing_to_compact() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let mut agent = Agent::new(llm.clone());
+        agent.ensure_initialized().await.expect("agent initializes");
+
+        let (events, result) = drain_with_result(agent.compact(None)).await;
+
+        result.expect("nothing to compact is no failure");
+        assert_eq!(
+            compaction_lifecycle(&events),
+            ["started", "nothing to compact"]
+        );
+        assert!(llm.recorded().is_empty(), "no compaction request went out");
+    }
+
+    #[tokio::test]
+    async fn a_failed_explicit_compaction_finishes_failed_and_returns_the_error() {
+        // The model never answers with a handoff.
+        let llm = ScriptedLlm::new(1_000_000, []);
+        let mut agent = Agent::new(llm);
+        agent.ensure_initialized().await.expect("agent initializes");
+        agent.push_message(Message::user("hello"));
+
+        let (events, result) = drain_with_result(agent.compact(None)).await;
+
+        let error = result.expect_err("the compaction fails");
+        assert_eq!(compaction_lifecycle(&events), ["started", "failed"]);
+        let Some(AgentEvent::CompactionFinished {
+            outcome: CompactionOutcome::Failed(reported),
+        }) = events.last()
+        else {
+            panic!("the failure is the last event: {events:?}");
+        };
+        assert_eq!(reported.to_string(), error.to_string());
+        assert!(
+            agent.context().handoff().is_none(),
+            "the window is as it was"
+        );
+    }
+
+    /// A compaction forked alongside the run that the pause point waits for
+    /// starts and finishes once on the run's stream, before the turn.
+    #[tokio::test]
+    async fn a_background_compaction_starts_and_finishes_once_on_the_run() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string(), "done".to_string()]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
+
+        let events = drain_run(agent.run("keep going", [])).await;
+
+        assert_eq!(compaction_lifecycle(&events), ["started", "applied"]);
+        let finished = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::CompactionFinished { .. }))
+            .expect("the compaction finished");
+        let reply = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Text(text) if text == "done"))
+            .expect("the turn ran");
+        assert!(
+            finished < reply,
+            "the turn went out on the compacted window"
+        );
+    }
+
+    /// A forked compaction that fails finishes failed; the recovery's rerun
+    /// is a compaction of its own.
+    #[tokio::test]
+    async fn a_failed_background_compaction_finishes_failed_before_its_rerun() {
+        let llm = ScriptedLlm::new(
+            1_000_000,
+            [
+                "bad".to_string(),
+                "bad".to_string(),
+                HANDOFF_JSON.to_string(),
+                "done".to_string(),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 400_000, dir.path()).await;
+
+        let events = drain_run(agent.run("keep going", [])).await;
+
+        assert_eq!(
+            compaction_lifecycle(&events),
+            ["started", "failed", "started", "applied"]
+        );
+        let failed = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::CompactionFinished {
+                        outcome: CompactionOutcome::Failed(_)
+                    }
+                )
+            })
+            .expect("the fork failed");
+        let recovery = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::CompactionRecovery { .. }))
+            .expect("the recovery ran");
+        let rerun = events
+            .iter()
+            .rposition(|event| matches!(event, AgentEvent::CompactionStarted))
+            .expect("the rerun started");
+        assert!(failed < recovery && recovery < rerun);
+    }
+
+    /// An explicit compaction retires the fork in flight: the fork finishes
+    /// discarded on the explicit compaction's stream before it starts.
+    #[tokio::test]
+    async fn an_explicit_compaction_discards_the_fork_in_flight_first() {
+        let llm = ScriptedLlm::new(1_000_000, [HANDOFF_JSON.to_string()]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 360_000, dir.path()).await;
+        let (sender, forked) = async_channel::unbounded();
+        agent
+            .prepare_request(&EventSink { sender })
+            .await
+            .expect("request boundary")
+            .expect("the request goes out");
+        let forked: Vec<_> = std::iter::from_fn(|| forked.try_recv().ok())
+            .map(|timed| timed.event)
+            .collect();
+        assert_eq!(compaction_lifecycle(&forked), ["started"]);
+
+        let (events, result) = drain_with_result(agent.compact(None)).await;
+
+        result.expect("the compaction succeeds");
+        assert_eq!(
+            compaction_lifecycle(&events),
+            ["discarded", "started", "applied"]
+        );
+    }
+
+    /// A fork retired where no stream was open finishes discarded first thing
+    /// on the next run, and nothing else about it is reported.
+    #[tokio::test]
+    async fn a_fork_retired_between_runs_finishes_discarded_on_the_next_run() {
+        let llm = ScriptedLlm::new(1_000_000, ["done".to_string(), "done".to_string()]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = agent_with_long_output(&llm, 360_000, dir.path()).await;
+        agent
+            .prepare_request(&EventSink::discarding())
+            .await
+            .expect("request boundary")
+            .expect("the request goes out");
+        assert!(agent.compaction.is_running(), "the fork started");
+
+        agent.clear_history();
+        let events = drain_run(agent.run("again", [])).await;
+
+        assert_eq!(compaction_lifecycle(&events), ["discarded"]);
+        assert!(
+            matches!(
+                events.get(1),
+                Some(AgentEvent::CompactionFinished {
+                    outcome: CompactionOutcome::Discarded
+                })
+            ),
+            "reported right after the run starts: {events:?}"
+        );
+        let again = drain_run(agent.run("and again", [])).await;
+        assert!(compaction_lifecycle(&again).is_empty(), "reported once");
     }
 }

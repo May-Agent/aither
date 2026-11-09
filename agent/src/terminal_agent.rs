@@ -1742,7 +1742,7 @@ mod tests {
         let _ = crate::test_support::finish_run(agent.run("Inspect the repository", [])).await;
         // The scripted compactor answers nothing, so the compaction fails
         // once its request is out; only that request matters here.
-        let _ = agent.compact(None).await;
+        let _ = crate::test_support::finish_compaction(agent.compact(None)).await;
 
         let turn = turns.try_recv().expect("the turn reached the model");
         assert_eq!(host_part(&turn), session, "the host's parameters arrive");

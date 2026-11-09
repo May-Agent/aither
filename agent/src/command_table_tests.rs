@@ -287,8 +287,7 @@ async fn an_mcp_tool_added_mid_session_runs_at_once_and_is_announced_once() {
         "the diff holds only the change"
     );
 
-    agent
-        .compact(None)
+    test_support::finish_compaction(agent.compact(None))
         .await
         .expect("the compaction succeeds")
         .expect("the compaction ran");

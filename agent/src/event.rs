@@ -39,6 +39,23 @@ pub enum RunPauseReason {
     ContextExhausted,
 }
 
+/// How a compaction announced by [`AgentEvent::CompactionStarted`] ended.
+#[derive(Debug, Clone)]
+pub enum CompactionOutcome {
+    /// The handoff replaced the conversation below its fork point.
+    Applied(crate::CompactResult),
+    /// There was no conversation to compact; the window is as it was.
+    NothingToCompact,
+    /// The compaction failed; the window is as it was.
+    Failed(AgentError),
+    /// The handoff was dropped unapplied: the window it was forked from was
+    /// replaced first, by an explicit compaction,
+    /// [`clear_history`](crate::Agent::clear_history),
+    /// [`restore_checkpoint`](crate::Agent::restore_checkpoint), or by
+    /// dropping the run that carried it.
+    Discarded,
+}
+
 /// Events emitted during agent execution.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -197,6 +214,27 @@ pub enum AgentEvent {
         reason: RunPauseReason,
         /// Tool call identifier responsible for the pause.
         tool_call_id: String,
+    },
+
+    /// A compaction started: one forked alongside the run, or one run by
+    /// [`Agent::compact`](crate::Agent::compact),
+    /// [`Agent::compact_when_idle`](crate::Agent::compact_when_idle) or the
+    /// run itself at the pause point, on recovery or on a cold cache.
+    ///
+    /// Exactly one [`CompactionFinished`](Self::CompactionFinished) follows,
+    /// and no other compaction starts before it. It is emitted on the stream
+    /// of whatever ends the compaction, which for one forked alongside a run
+    /// may be a later run or explicit compaction; one ended where no stream
+    /// is open — [`clear_history`](crate::Agent::clear_history),
+    /// [`restore_checkpoint`](crate::Agent::restore_checkpoint) or a dropped
+    /// run — finishes as [`CompactionOutcome::Discarded`] first thing on the
+    /// next stream the agent opens.
+    CompactionStarted,
+
+    /// The compaction last [started](Self::CompactionStarted) ended.
+    CompactionFinished {
+        /// How it ended.
+        outcome: CompactionOutcome,
     },
 
     /// A compaction failed with the window at the
