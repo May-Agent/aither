@@ -21,7 +21,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     };
     let pinned: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
-    let distribution = ToolDistribution::from_path(&PathBuf::from(manifest)).await?;
+    let mut distribution = ToolDistribution::from_path(&PathBuf::from(manifest)).await?;
+    // CI hands its job token down so release downloads are authenticated.
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        distribution = distribution.with_github_token(token);
+    }
     let terminal = TerminalTool::new_exact(
         PathBuf::from(workspace),
         NoopPermissionHandler,
@@ -30,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .initialize_tools(&distribution, &PathBuf::from(cache))
     .await?;
-    let registry = ToolRegistryBuilder::new().build(terminal.outputs_dir());
+    let registry = ToolRegistryBuilder::new().build(terminal.output_store().clone());
     let terminal = terminal.with_registry(std::sync::Arc::new(registry));
     let arguments: TerminalArgs = serde_json::from_value(serde_json::json!({
         "description": "Verify prepared search, JSON and edit commands",

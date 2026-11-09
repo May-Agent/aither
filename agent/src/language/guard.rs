@@ -1,7 +1,7 @@
 //! Enforcing the languages: the check every question, reply and record goes
 //! through, and the alerts it raises.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use aither_core::{
     LanguageModel,
@@ -12,7 +12,7 @@ use askama::Template;
 use futures_lite::StreamExt;
 
 use super::detect::{Detector, DetectorError};
-use super::prose::{self, Judgement};
+use super::prose;
 use super::{Language, Languages};
 use crate::error::AgentError;
 
@@ -35,9 +35,8 @@ pub enum LanguageRefusal {
     Question {
         /// The language the user is talked to in.
         communication: Language,
-        /// The first paragraph found in another language, counted from 1;
-        /// `None` when the prose as a whole is the offender.
-        paragraph: Option<usize>,
+        /// The first paragraph found in another language, counted from 1.
+        paragraph: usize,
     },
     /// A text for others not in the working language.
     Working {
@@ -45,9 +44,8 @@ pub enum LanguageRefusal {
         working: Language,
         /// Whether the text is public, which exempts no quote.
         public: bool,
-        /// The first paragraph found in another language, counted from 1;
-        /// `None` when the prose as a whole is the offender.
-        paragraph: Option<usize>,
+        /// The first paragraph found in another language, counted from 1.
+        paragraph: usize,
     },
 }
 
@@ -57,35 +55,43 @@ struct RefusalTemplate<'a> {
     refusal: &'a LanguageRefusal,
 }
 
-impl std::fmt::Display for LanguageRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let text = RefusalTemplate { refusal: self }
-            .render()
-            .expect("language refusal template must render");
-        f.write_str(&text)
-    }
+/// aither's wording of a language refusal.
+pub fn default_refusal(refusal: &LanguageRefusal) -> String {
+    crate::notices::rendered(&RefusalTemplate { refusal })
 }
 
-impl std::error::Error for LanguageRefusal {}
-
-/// A one-shot alert about a lapse of language.
+/// A one-shot alert about a lapse of language, rendered by
+/// [`Notices::language_alerts`](crate::Notices::language_alerts).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguageAlert {
     /// A question was refused; ask it again.
-    AskAgain { language: Language },
+    AskAgain {
+        /// The communication language.
+        language: Language,
+    },
     /// A reply was not in the communication language.
-    Reply { language: Language },
+    Reply {
+        /// The communication language.
+        language: Language,
+    },
     /// A change to a record was not in the working language.
     Record {
+        /// The working language.
         language: Language,
+        /// The record that changed: the working document's name.
         document: String,
     },
 }
 
 #[derive(Template)]
 #[template(path = "language_alert.txt", escape = "none")]
-pub struct LanguageAlertsTemplate<'a> {
-    pub alerts: &'a [LanguageAlert],
+struct LanguageAlertsTemplate<'a> {
+    alerts: &'a [LanguageAlert],
+}
+
+/// aither's wording of the language alerts raised since the last request.
+pub fn default_alerts(alerts: &[LanguageAlert]) -> String {
+    crate::notices::rendered(&LanguageAlertsTemplate { alerts })
 }
 
 #[derive(Template)]
@@ -96,7 +102,7 @@ struct TranslateTemplate {
 
 /// The language checks of one session, cloned into every place that writes.
 ///
-/// The agent loop checks replies and `tasks.md` with it; a harness command
+/// The agent loop checks replies and the working document with it; a harness command
 /// that takes text from the agent holds a clone and calls
 /// [`check_working`](Self::check_working) before it acts, as the `issue`,
 /// pull request and agent-message commands do. The clones share the user's
@@ -109,6 +115,9 @@ pub struct LanguageGuard {
     user: Arc<ArcSwap<Vec<Arc<str>>>>,
     alerts: async_channel::Sender<LanguageAlert>,
     raised: async_channel::Receiver<LanguageAlert>,
+    /// The statistical detector, loaded by the first check that needs it and
+    /// shared by the clones.
+    detector: Arc<OnceLock<Detector>>,
 }
 
 impl LanguageGuard {
@@ -121,7 +130,44 @@ impl LanguageGuard {
             user: Arc::default(),
             alerts,
             raised,
+            detector: Arc::default(),
         }
+    }
+
+    /// Loads the language detector, downloading its model on the first use
+    /// on this machine. Without this call the first check that reaches the
+    /// detector does it, blocking on the network and the disk; a host calls
+    /// this at session start to take that wait and its failure there.
+    ///
+    /// # Errors
+    ///
+    /// [`DetectorError`] when the model cannot be obtained or loaded.
+    pub async fn prepare(&self) -> Result<(), DetectorError> {
+        if self.detector.get().is_some() {
+            return Ok(());
+        }
+        let detector = blocking::unblock(Detector::load).await?;
+        // A concurrent call may have stored its own; either serves.
+        let _ = self.detector.set(detector);
+        Ok(())
+    }
+
+    /// The number of the first paragraph of `text` whose language is not
+    /// `target`. A check that reaches the detector loads it first.
+    ///
+    /// # Panics
+    ///
+    /// When the detector cannot be loaded or run; [`prepare`](Self::prepare)
+    /// is how a host learns of that beforehand.
+    fn first_paragraph_not_in(&self, text: &str, target: Language) -> Option<usize> {
+        prose::first_paragraph_not_in(text, target, |paragraph| {
+            let detector = self
+                .detector
+                .get_or_init(|| Detector::load().unwrap_or_else(|error| panic!("{error}")));
+            detector
+                .detect(paragraph)
+                .unwrap_or_else(|error| panic!("{error}"))
+        })
     }
 
     /// The languages this guard enforces. An application reads the session's
@@ -158,22 +204,24 @@ impl LanguageGuard {
             return Ok(());
         };
         let text = parts.into_iter().collect::<Vec<_>>().join("\n");
-        if prose::is_in(&text, communication, &[self.languages.working()]) {
+        let Some(paragraph) = self.first_paragraph_not_in(&text, communication) else {
             return Ok(());
-        }
+        };
         self.raise(LanguageAlert::AskAgain {
             language: communication,
         });
-        Err(LanguageRefusal::Question { communication })
+        Err(LanguageRefusal::Question {
+            communication,
+            paragraph,
+        })
     }
 
     /// Whether a reply to the user is in the communication language. Always
     /// true when no language is enforced.
     #[must_use]
     pub fn reply_in_language(&self, text: &str) -> bool {
-        self.communication().is_none_or(|communication| {
-            prose::is_in(text, communication, &[self.languages.working()])
-        })
+        self.communication()
+            .is_none_or(|communication| self.first_paragraph_not_in(text, communication).is_none())
     }
 
     /// Checks that `text`, written for others to read, is in the working
@@ -184,29 +232,24 @@ impl LanguageGuard {
     ///
     /// [`LanguageRefusal::Working`] when the prose is in another language.
     pub fn check_working(&self, text: &str, kind: WorkingText) -> Result<(), LanguageRefusal> {
-        let Some(communication) = self.communication() else {
+        if self.communication().is_none() {
             return Ok(());
-        };
+        }
         let working = self.languages.working();
-        let in_language = match kind {
+        let foreign = match kind {
             WorkingText::Internal => {
                 let user = self.user.load();
-                prose::is_in(
-                    &prose::without_quotes(text, user.as_slice()),
-                    working,
-                    &[communication],
-                )
+                self.first_paragraph_not_in(&prose::without_quotes(text, user.as_slice()), working)
             }
-            WorkingText::Public => prose::is_in(text, working, &[communication]),
+            WorkingText::Public => self.first_paragraph_not_in(text, working),
         };
-        if in_language {
-            Ok(())
-        } else {
+        foreign.map_or(Ok(()), |paragraph| {
             Err(LanguageRefusal::Working {
                 working,
                 public: kind == WorkingText::Public,
+                paragraph,
             })
-        }
+        })
     }
 
     /// The communication language, when languages are enforced.
@@ -270,7 +313,8 @@ mod tests {
         let refusal = guard
             .check_question(["Which database should we use?", "PostgreSQL", "MySQL"])
             .unwrap_err();
-        assert!(refusal.to_string().contains("Chinese"), "{refusal}");
+        let text = default_refusal(&refusal);
+        assert!(text.contains("Chinese"), "{text}");
         assert_eq!(guard.take_alerts().len(), 1);
 
         guard
@@ -303,7 +347,8 @@ mod tests {
         let refusal = guard
             .check_working("数据库迁移完成了，请检查结果。", WorkingText::Public)
             .unwrap_err();
-        assert!(refusal.to_string().contains("English"), "{refusal}");
+        let text = default_refusal(&refusal);
+        assert!(text.contains("English"), "{text}");
         guard
             .check_working(
                 "Migrate the database to `PostgreSQL` 16.",

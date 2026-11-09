@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use aither_core::llm::{
     Event, LLMRequest, Tool, ToolContext, ToolResult, model::Profile as ModelProfile,
 };
-use aither_sandbox::ToolRegistryBuilder;
+use aither_sandbox::{ScriptLanguage, ToolRegistryBuilder};
 use futures_core::Stream;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -356,7 +356,8 @@ async fn an_ipc_call_event_carries_the_resolved_name_arguments_and_result() {
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
     builder.observe_commands(hooks.command_observer());
-    let registry = builder.build(dir.path().join("outputs"));
+    let registry =
+        builder.build(crate::test_support::output_store(dir.path().join("outputs")).await);
 
     let args = ["--text".to_string(), "hi there".to_string()];
     let envelope = bounded(registry.query_tool_handler("echo", &args)).await;
@@ -421,7 +422,8 @@ async fn an_ipc_call_answers_before_a_slow_hook_finishes_and_its_context_arrives
     let mut builder = ToolRegistryBuilder::new();
     builder.configure_tool(EchoTool);
     builder.observe_commands(hooks.command_observer());
-    let registry = builder.build(dir.path().join("outputs"));
+    let registry =
+        builder.build(crate::test_support::output_store(dir.path().join("outputs")).await);
 
     let started = Instant::now();
     let args = ["--text".to_string(), "hi".to_string()];
@@ -666,6 +668,7 @@ printf '%s' "$2"
     pub const COMMAND: PermissionRequest<'static> = PermissionRequest::Command {
         mode: TerminalMode::Unsafe,
         script: "make install",
+        language: ScriptLanguage::Shell,
     };
 
     pub const DOMAIN: PermissionRequest<'static> = PermissionRequest::Domain {
@@ -678,6 +681,7 @@ printf '%s' "$2"
             &self,
             mode: TerminalMode,
             script: &str,
+            _language: ScriptLanguage,
         ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
             self.asked.lock().unwrap().push((mode, script.to_string()));
             std::future::ready(Ok(self.allow))
@@ -766,7 +770,7 @@ printf '%s' "$2"
         assert!(!second.exists(), "the first decision ends the chain");
         assert_eq!(
             logged(&first)[0],
-            serde_json::json!({"role": "main", "kind": "command", "mode": "unsafe", "script": "make install"})
+            serde_json::json!({"role": "main", "kind": "command", "mode": "unsafe", "script": "make install", "language": "shell"})
         );
     }
 
@@ -817,7 +821,7 @@ printf '%s' "$2"
         );
         assert_eq!(bounded(handler.review(&COMMAND)).await, Review::Passed);
         assert!(
-            bounded(handler.check(TerminalMode::Unsafe, "make install"))
+            bounded(handler.check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell))
                 .await
                 .unwrap()
         );
@@ -843,7 +847,7 @@ printf '%s' "$2"
             .for_subagent()
             .expect("a reviewed handler labels subagents");
         assert_eq!(bounded(subagent.review(&COMMAND)).await, Review::Passed);
-        bounded(subagent.check(TerminalMode::Unsafe, "make install"))
+        bounded(subagent.check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell))
             .await
             .unwrap();
         assert_eq!(logged(&log)[0]["role"], "subagent");

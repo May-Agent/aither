@@ -43,14 +43,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
-    ToolRegistryBuilder, cli_to_json,
+    ScriptLanguage, ToolRegistryBuilder, cli_to_json,
     permission::{PermissionError, PermissionHandler, TerminalMode},
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
 use aither_agent::{Agent, AgentOptions, Hook, TerminalAgentBuilder};
 use aither_core::LanguageModel;
-use aither_core::llm::{Role, ToolResult};
+use aither_core::llm::ToolResult;
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -114,6 +114,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         &self,
         mode: TerminalMode,
         script: &str,
+        language: ScriptLanguage,
     ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true), // Always allow
@@ -122,7 +123,7 @@ impl PermissionHandler for InteractivePermissionHandler {
                 let mode_desc = mode.description();
                 let display_script = script.trim().replace('\n', "; ");
                 eprintln!("\n\x1b[33m⚠ Permission request: {mode_desc}\x1b[0m");
-                eprintln!("\x1b[2mScript:\x1b[22m {display_script}");
+                eprintln!("\x1b[2mScript ({language:?}):\x1b[22m {display_script}");
                 eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
                 io::stderr().flush().ok();
 
@@ -151,6 +152,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         &self,
         _mode: TerminalMode,
         _script: &str,
+        _language: ScriptLanguage,
     ) -> impl std::future::Future<Output = bool> + Send {
         std::future::ready(true)
     }
@@ -486,7 +488,8 @@ async fn build_agent(
     args: &Args,
 ) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>>
 {
-    // Create terminal tool (creates random four-word working dir under system temp)
+    // Create terminal tool (heel names its working dir under system temp with
+    // four random words; the ids the model reads are leased words)
     // Uses interactive permission handler:
     // - Sandboxed: always allow (no prompt)
     // - Network: ask once, then remember
@@ -571,20 +574,10 @@ async fn build_agent(
         }
     }
 
-    // The bundled subagents are kept in the global subagents directory,
-    // overwritten so they match this build; only the main agent gets the
-    // `subagent` command.
-    let global_subagents = workdir_parent.join("subagents");
-    aither_agent::install_bundled_subagents(&global_subagents)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to install the bundled subagents into {}",
-                global_subagents.display()
-            )
-        })?;
-    let subagent_tool =
-        SubagentTool::new(cloud, global_subagents).with_base_dir(builder.sandbox_dir().to_string());
+    // aither defines no subagents: the CLI has the built-in routes and the
+    // working directory's `agents/`. Only the main agent gets the `subagent`
+    // command.
+    let subagent_tool = SubagentTool::new(cloud).with_base_dir(builder.sandbox_dir().to_string());
     builder = builder.subagents(subagent_tool, SUBAGENT_DESCRIPTION);
 
     // Add system prompt
@@ -602,7 +595,7 @@ const SUBAGENT_DESCRIPTION: &str = "Run a named subagent, fork your context, or 
 
 /// Run a single prompt and exit (headless mode).
 async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result<()> {
-    let mut agent = build_agent(cloud, args).await?;
+    let mut agent = Box::pin(build_agent(cloud, args)).await?;
 
     match Box::pin(agent.query(prompt)).await {
         Ok(response) => {
@@ -617,7 +610,7 @@ async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result
 }
 
 async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
-    let mut agent = build_agent(cloud, args).await?;
+    let mut agent = Box::pin(build_agent(cloud, args)).await?;
 
     println!("Agent ready. Type your message or a command.\n");
 
@@ -700,12 +693,7 @@ where
     } else {
         println!("Conversation history ({} messages):", history.len());
         for msg in &history {
-            let role = match msg.role() {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::System => "System",
-                Role::Tool => "Tool",
-            };
+            let role = msg.role();
             let content = truncate(msg.content(), 100);
             println!("  [{role}] {content}");
         }

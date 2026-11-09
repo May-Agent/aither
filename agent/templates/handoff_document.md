@@ -54,13 +54,21 @@
 - `{{ item }}`
 {% endfor %}
 {% endif %}
+{% if !handoff.attachments.is_empty() %}
+
+## Attachments
+These stay in the user messages they came with.
+{% for item in handoff.attachments %}
+- {{ item.why }}
+{% endfor %}
+{% endif %}
 
 ## Materials Already On Disk
-{% if handoff.file_index.is_empty() %}
+{% if file_index.is_empty() %}
 - None recorded.
 {% else %}
 These results were already produced and saved. Read the file instead of redoing the work.
-{% for item in handoff.file_index %}
+{% for item in file_index %}
 - {{ item }}
 {% endfor %}
 {% endif %}

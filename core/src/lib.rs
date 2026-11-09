@@ -166,6 +166,7 @@ extern crate alloc;
 pub mod audio;
 /// Text embeddings.
 pub mod embedding;
+pub mod ids;
 /// Text-to-image generation.
 ///
 /// Contains [`ImageGenerator`] trait for creating images from text.
@@ -173,6 +174,8 @@ pub mod image;
 pub mod llm;
 #[cfg(feature = "timer")]
 pub mod time;
+#[cfg(feature = "tokenizer")]
+pub mod tokenizer;
 
 /// Content moderation utilities.
 ///
@@ -186,9 +189,11 @@ pub use audio::{AudioGenerator, AudioTranscriber};
 #[doc(inline)]
 pub use embedding::EmbeddingModel;
 #[doc(inline)]
+pub use ids::{AnyIdAllocator, IdAllocator, IdLease, IdsExhausted, WeakIdLease, WordAllocator};
+#[doc(inline)]
 pub use image::ImageGenerator;
 #[doc(inline)]
-pub use llm::LanguageModel;
+pub use llm::{LanguageModel, TokenCounting};
 #[doc(inline)]
 pub use moderation::Moderation;
 

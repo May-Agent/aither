@@ -8,22 +8,23 @@
 //! merges increments into the next turn boundary and wakes an idle agent.
 
 use std::borrow::Cow;
-use std::fmt::{self, Display};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use aither_core::llm::{CommandOutcome, Tool, ToolContext, ToolResult};
-use askama::Template;
 use executor_core::{Executor, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::job_registry::{JobRegistry, JobStatus};
+use crate::notices::{MonitorStarted, Refused};
 use crate::output::{MediaResolution, OutputFormat};
 use crate::permission::PermissionHandler;
+use crate::script_language::ScriptLanguage;
 use crate::terminal::{Configured, JobAlert, TerminalArgs, TerminalExecutionMode, TerminalTool};
 
 /// The longest a monitor may run: two hours, the same cap `terminal` has.
-const MAX_TIMEOUT_SECS: u64 = 7200;
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 7200;
 
 const fn default_interval_secs() -> u64 {
     10
@@ -68,27 +69,15 @@ pub enum MonitorSource {
     Command {
         /// The source to run.
         command: String,
-        /// Its language: `shell` runs it directly, `python` through the
-        /// sandbox's `python3` on stdin. Default `shell`.
+        /// Its language: `shell` or `python`. Default `shell`.
         #[serde(default)]
-        language: MonitorLanguage,
+        language: ScriptLanguage,
     },
     /// A file whose appended lines are followed inside the sandbox.
     File {
         /// The path, resolved against the working directory when relative.
         file: String,
     },
-}
-
-/// The interpreter a monitored command runs under.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum MonitorLanguage {
-    /// The command is shell source.
-    #[default]
-    Shell,
-    /// The command is Python source, fed to `python3` on stdin.
-    Python,
 }
 
 /// New output a monitor collected since the last delivery.
@@ -170,39 +159,12 @@ pub enum MonitorRefusal {
     },
 }
 
-#[derive(Template)]
-#[template(path = "monitor_refused.txt", escape = "none")]
-struct MonitorRefusedTemplate<'a> {
-    reason: &'a str,
-}
-
-impl Display for MonitorRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let reason = match self {
-            Self::TimeoutOutOfRange => {
-                format!("timeout_secs must be between 1 and {MAX_TIMEOUT_SECS}")
-            }
-            Self::IntervalTooSmall => "interval_secs must be at least 1".to_string(),
-            Self::BadRegex { argument, reason } => {
-                format!("{argument} is not a valid regex: {reason}")
-            }
-            Self::UnreadableFile { file } => format!(
-                "`{file}` is not readable inside the sandbox: give a path under the working directory or a readable mount"
-            ),
-            Self::StartFailed { reason } => reason.clone(),
-        };
-        let rendered = MonitorRefusedTemplate { reason: &reason }
-            .render()
-            .map_err(|_| fmt::Error)?;
-        f.write_str(&rendered)
-    }
-}
-
-impl std::error::Error for MonitorRefusal {}
-
 /// Everything a running monitor needs to know to watch and report.
 struct Watch {
     task_id: String,
+    /// Keeps the job, and its word, until the pump reports its end, so a
+    /// completion the agent took first still leaves the pump its status.
+    held: Option<crate::job_registry::JobWatch>,
     registry: JobRegistry,
     alerts: async_channel::Sender<JobAlert>,
     interval: Duration,
@@ -240,9 +202,12 @@ fn single_quote(text: &str) -> String {
 }
 
 impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
-    /// The script the monitored job runs for `source`; `Ok(None)`'s inner
-    /// error refuses an unreadable file before anything spawns.
-    fn job_script(&self, source: &MonitorSource) -> Result<String, MonitorRefusal> {
+    /// The script the monitored job runs for `source` and its language; an
+    /// unreadable file is refused before anything spawns.
+    fn job_script(
+        &self,
+        source: &MonitorSource,
+    ) -> Result<(String, ScriptLanguage), MonitorRefusal> {
         match source {
             MonitorSource::Command { command, language } => {
                 if command.trim().is_empty() {
@@ -250,12 +215,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                         reason: "command must not be empty".to_string(),
                     });
                 }
-                Ok(match language {
-                    MonitorLanguage::Shell => command.clone(),
-                    MonitorLanguage::Python => format!(
-                        "python3 - <<'__AITHER_MONITOR_PY__'\n{command}\n__AITHER_MONITOR_PY__"
-                    ),
-                })
+                Ok((command.clone(), *language))
             }
             MonitorSource::File { file } => {
                 let mut path = std::path::PathBuf::from(file);
@@ -276,9 +236,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                 }
                 // `tail -F` follows appended lines and survives rotation
                 // (the name is reopened) and truncation.
-                Ok(format!(
-                    "tail -Fn0 {}",
-                    single_quote(&path.to_string_lossy())
+                Ok((
+                    format!("tail -Fn0 {}", single_quote(&path.to_string_lossy())),
+                    ScriptLanguage::Shell,
                 ))
             }
         }
@@ -313,11 +273,28 @@ where
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        let notices = self.terminal.notices();
+        let interval_secs = args.interval_secs;
+        match self.start(args).await {
+            Ok(task_id) => Ok(ToolResult::text(notices.monitor_started(&MonitorStarted {
+                task_id: &task_id,
+                interval_secs,
+            }))),
+            Err(refusal) => {
+                Err(Refused::rendered(refusal, |refusal| notices.monitor_refusal(refusal)).into())
+            }
+        }
+    }
+}
+
+impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
+    /// Starts the watched job and its pump; returns the job's task id.
+    async fn start(&self, args: MonitorArgs) -> Result<String, MonitorRefusal> {
         if args.timeout_secs == 0 || args.timeout_secs > MAX_TIMEOUT_SECS {
-            return Err(MonitorRefusal::TimeoutOutOfRange.into());
+            return Err(MonitorRefusal::TimeoutOutOfRange);
         }
         if args.interval_secs == 0 {
-            return Err(MonitorRefusal::IntervalTooSmall.into());
+            return Err(MonitorRefusal::IntervalTooSmall);
         }
         let compile = |argument: &'static str, pattern: &Option<String>| {
             pattern
@@ -332,7 +309,7 @@ where
         };
         let filter = compile("filter", &args.filter)?;
         let stop_on = compile("stop_on", &args.stop_on)?;
-        let script = self.job_script(&args.source)?;
+        let (script, language) = self.job_script(&args.source)?;
         let description = match &args.source {
             MonitorSource::Command { .. } => "monitored command".to_string(),
             MonitorSource::File { file } => format!("monitor file {file}"),
@@ -342,6 +319,7 @@ where
             .run_background(TerminalArgs {
                 description,
                 script,
+                language,
                 mode: TerminalExecutionMode::Default,
                 ssh_server_id: None,
                 expect: OutputFormat::Text,
@@ -363,13 +341,14 @@ where
             _ => {
                 return Err(MonitorRefusal::StartFailed {
                     reason: "the monitored job did not start detached".to_string(),
-                }
-                .into());
+                });
             }
         };
+        let registry = self.terminal.job_registry();
         let watch = Watch {
+            held: registry.watch(&task_id).await,
             task_id: task_id.clone(),
-            registry: self.terminal.job_registry(),
+            registry,
             alerts: self.terminal.job_alert_sender(),
             interval: Duration::from_secs(args.interval_secs),
             deadline: Instant::now() + Duration::from_secs(args.timeout_secs),
@@ -382,22 +361,8 @@ where
             .executor()
             .spawn(async move { watch_task(watch).await })
             .detach();
-        Ok(ToolResult::text(
-            MonitorStartedTemplate {
-                task_id: &task_id,
-                interval_secs: args.interval_secs,
-            }
-            .render()
-            .expect("monitor started template must render"),
-        ))
+        Ok(task_id)
     }
-}
-
-#[derive(Template)]
-#[template(path = "monitor_started.txt", escape = "none")]
-struct MonitorStartedTemplate<'a> {
-    task_id: &'a str,
-    interval_secs: u64,
 }
 
 /// Trailing bytes of a line without its `\n` yet; kept across polls.
@@ -419,6 +384,7 @@ async fn send(alerts: &async_channel::Sender<JobAlert>, alert: JobAlert) {
 async fn watch_task(watch: Watch) {
     let Watch {
         task_id,
+        held: _held,
         registry,
         alerts,
         interval,

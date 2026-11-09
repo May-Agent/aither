@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/agent-v0.23.0...agent-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(agent)* [**breaking**] the context keeps what the model saw of each state
+- *(agent)* [**breaking**] the host marks an interrupt with Agent::interrupt
+- *(agent)* [**breaking**] live, state and event context sources and a wake decision
+- *(agent)* [**breaking**] take subagent definitions from the embedder
+- *(agent)* stable-placement context sources with staged updates
+- *(agent)* route untiered subagents through an embedder-supplied SubagentRouter
+- *(sandbox)* [**breaking**] lease model-facing ids from an embedder-supplied allocator
+
+### Fixed
+
+- *(agent)* [**breaking**] compaction keeps only the attachments the handoff names
+- *(agent)* the pre-compaction alert leaves the warn distance to the work
+- *(agent)* count an item delivered once the provider answers the request
+- *(agent)* word a host condition alert from what the model saw
+- *(agent)* recovery keeps alerts no request has carried
+- *(agent)* name the host, not the embedder, in the subagent listing
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+
+### Other
+
+- Merge pull request #645 from May-Agent/fix/642-compaction-images
+- Merge pull request #640 from May-Agent/feat/617-context-kinds
+- *(agent)* share the alert append and the test helpers, pass levels by value
+- Merge origin/dev into feat/597-embedder-personas
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+- Merge pull request #633 from May-Agent/feat/101-stable-context-sources
+- Merge origin/dev into feat/625-id-allocator
+- Merge pull request #632 from May-Agent/chore/main-into-dev-0.23
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+
+## [0.23.0](https://github.com/May-Agent/aither/compare/agent-v0.22.0...agent-v0.23.0) - 2026-11-07
+
+### Added
+
+- *(agent)* [**breaking**] serialize the working-document checkpoint under its own names
+- *(sandbox)* [**breaking**] command refusals become embedder policies behind CommandPolicy
+- *(agent)* [**breaking**] replace the tasks.md protocol with a general working-document mechanism
+- *(agent)* [**breaking**] compact subagents into the main agent's handoff schema
+- *(agent)* [**breaking**] compact into the embedder's handoff schema
+- *(agent)* [**breaking**] render every alert, notice and refusal through embedder-supplied Notices
+
+### Fixed
+
+- *(sandbox)* [**breaking**] pin each tool artifact's byte size instead of capping at 64 MiB
+- *(agent)* return a refused compact request as a typed tool error
+- *(agent)* gate the working document's file accessor on languages
+- *(agent)* import PhantomData whether or not skills is enabled
+- *(claude)* index the sent message list and keep the live tail out of system
+
+### Other
+
+- Merge pull request #624 from May-Agent/fix/623-artifact-size
+- Merge remote-tracking branch 'origin/dev' into feat/596-tasks-protocol
+- Merge pull request #614 from May-Agent/feat/602-handoff
+- Merge pull request #615 from May-Agent/feat/598-command-policy
+- merge main into dev after v0.22.0
+- Merge pull request #612 from May-Agent/feat/595-notices
+
+## [0.22.0](https://github.com/May-Agent/aither/compare/agent-v0.21.0...agent-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(sandbox)* run Python through terminal's language argument
+- *(agent)* replace secrets in every model request before it is sent
+- *(agent)* a typed one-shot judgment that subagent routing and embedders share
+- *(agent)* [**breaking**] watch the disk of the home environment, a container's filesystem included, never a remote host's
+- *(agent)* warn the agent when its volume runs low on disk space
+
+### Fixed
+
+- clear the reasoning effort to the model's default on per-message models
+
+### Other
+
+- Merge pull request #591 from May-Agent/feat/589-in-place-changes
+- Merge pull request #587 from May-Agent/feat/214-python-language
+- Merge pull request #585 from May-Agent/feat/581-secret-guard
+- Merge pull request #579 from May-Agent/feat/545-disk-pressure
+- *(agent)* render the container volume's name from a template
+- Merge remote-tracking branch 'origin/dev' into feat/545-disk-pressure
+- Merge feat/171-runaway-guard into feat/545-disk-pressure
+- Merge branch 'feat/171-runaway-guard' into feat/545-disk-pressure
+
+## [0.21.0](https://github.com/May-Agent/aither/compare/agent-v0.20.0...agent-v0.21.0) - 2026-11-06
+
+### Fixed
+
+- *(agent)* let a waiting message end a run a stop-gate alert keeps going
+
 ## [0.20.0](https://github.com/May-Agent/aither/compare/agent-v0.19.0...agent-v0.20.0) - 2026-11-06
 
 ### Added

@@ -36,7 +36,7 @@ use crate::shell_session::{ContainerProbe, ContainerProbeError};
 pub const JOB_MARKER_ENV: &str = "AITHER_CONTAINER_JOB";
 
 /// Which memory a job competes for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MemoryDomain {
     /// The memory of the machine the embedder runs on.
     Machine,
@@ -1190,8 +1190,16 @@ mod tests {
                 (JobPlace::Container, 2, "boxed"),
                 (JobPlace::Remote, 3, "remote"),
             ] {
-                jobs.register_at(place, pid, task, "exec", task, TerminalMode::Sandboxed)
-                    .await;
+                jobs.register_at(
+                    place,
+                    pid,
+                    &crate::test_ids::lease(task),
+                    "exec",
+                    task,
+                    crate::ScriptLanguage::Shell,
+                    TerminalMode::Sandboxed,
+                )
+                .await;
             }
             // The remote and the container pid mean nothing to the host, yet
             // would read as huge if they were read there.

@@ -1,98 +1,165 @@
 //! Judging the language of a text's prose.
 //!
 //! Code blocks, code spans, URLs, paths and identifiers are removed first.
-//! The prose that is left must be detected as the expected language as a
-//! whole, and so must every paragraph long enough to judge. A shorter
-//! paragraph is a heading, a label or a one-line aside, and the detector is
-//! unreliable on it (FLORES-200 devtest: 88% on phrases of two to four words,
-//! 99.9% on sentences), so it is not judged; a short insertion inside a
-//! judged paragraph, such as an English term in Chinese prose, is carried by
-//! the paragraph's language.
+//! What is left is judged paragraph by paragraph, each by its matrix
+//! language, the language of the script that carries the paragraph. A
+//! paragraph is Chinese, Japanese or Korean when characters of those scripts
+//! outweigh the rest, and then English or any other Latin text inside it is an
+//! insertion of whatever length. Kana settle Japanese and Hangul settle
+//! Korean; Han alone settles Chinese when it carries Chinese function words.
+//! Those verdicts are deterministic. The paragraphs left (Han without such
+//! cues, Latin, Cyrillic, Arabic and other scripts) go to a statistical
+//! detector, and only when long enough to judge: it is unreliable on a short
+//! phrase (FLORES-200 devtest: 88% on two to four words, 99.9% on sentences),
+//! and a shorter paragraph is a heading, a label or a one-line aside.
 
 use std::sync::Arc;
 
 use super::Language;
-use super::detect::Detector;
 
-/// A paragraph is judged on its own from this weight: 40 letters of a spaced
-/// script, about eight words, or 20 characters of Chinese, Japanese or
-/// Korean, which weigh 2 each.
+/// A paragraph goes to the detector from this weight: 40 letters of a spaced
+/// script, about eight words, or 20 characters of Han without cues, which
+/// weigh 2 each.
 const JUDGED_WEIGHT: usize = 40;
+
+/// Characters that only Chinese uses for function words, in simplified and
+/// traditional forms: Japanese does not write them in kanji.
+const CHINESE_ONLY: &str = "们們这這么麼吗嗎没沒吧呢哪您咱啊嘛";
+/// Frequent Chinese function words that Japanese also writes in kanji. Chinese
+/// prose is dense with them, a kanji-only Japanese phrase is not.
+const CHINESE_COMMON: &str = "的了是不在有我你他她它也就都和把被";
+/// How many Han characters one shared function word must at most stand for
+/// when no Chinese-only character is there.
+const COMMON_SPAN: usize = 12;
+/// How many letters of other scripts one character of Chinese, Japanese or
+/// Korean holds in a paragraph's balance. Their characters carry the grammar
+/// (particles, endings, function words), so a paragraph with enough of them
+/// is a CJK paragraph even when an English phrase outweighs them; an English
+/// paragraph with a Chinese name or term in it has far fewer.
+const CJK_SPAN: usize = 8;
+/// Words in a script other than Chinese, Japanese or Korean that are more than
+/// a term: a paragraph of this many is not written in a CJK language.
+const TERM_WORDS: usize = 3;
 
 /// Collapses every run of whitespace to one space and trims the ends.
 pub(super) fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// How a text fared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Judgement {
-    /// The prose is in the expected language, or there is none.
-    InLanguage,
-    /// It is not. `paragraph` is the number, counted from 1 in the text, of
-    /// the first judged paragraph in another language; `None` when each is in
-    /// the language but the prose as a whole is not.
-    NotIn { paragraph: Option<usize> },
+/// Judges the prose of `text` against `target`: the number, counted from 1
+/// among the text's blank-line separated blocks, of the first paragraph whose
+/// matrix language is another one, or `None` when there is none. `detect`
+/// identifies the paragraphs the deterministic rules do not settle; it is
+/// CPU work.
+pub(super) fn first_paragraph_not_in(
+    text: &str,
+    target: Language,
+    mut detect: impl FnMut(&str) -> Language,
+) -> Option<usize> {
+    paragraphs(text).into_iter().find_map(|paragraph| {
+        let language = match Counts::of(&paragraph.text).matrix() {
+            Matrix::Settled(language) => language,
+            // Han alone is never a language of another script.
+            Matrix::Han { .. } if !target.is_chinese_or_japanese() => {
+                return Some(paragraph.number);
+            }
+            // Nor is a phrase of words in another script a CJK language.
+            Matrix::Other { .. }
+                if target.is_cjk()
+                    && paragraph
+                        .text
+                        .split_whitespace()
+                        .filter(|word| word.chars().any(char::is_alphabetic))
+                        .count()
+                        >= TERM_WORDS =>
+            {
+                return Some(paragraph.number);
+            }
+            Matrix::Han { weight } | Matrix::Other { weight } if weight >= JUDGED_WEIGHT => {
+                detect(&paragraph.text)
+            }
+            Matrix::Han { .. } | Matrix::Other { .. } => return None,
+        };
+        (language != target).then_some(paragraph.number)
+    })
 }
 
-/// Judges the prose of `text` against `target`. This runs the detector, which
-/// is CPU work.
-///
-/// # Panics
-///
-/// When the loaded detector fails to run on a text.
-pub(super) fn judge(detector: &Detector, text: &str, target: Language) -> Judgement {
-    let detect = |text: &str| {
-        detector
-            .detect(text)
-            .expect("the language detector runs on any text")
-    };
-    let paragraphs = paragraphs(text);
-    let mut judged = 0;
-    for paragraph in &paragraphs {
-        if weight(&paragraph.text) < JUDGED_WEIGHT {
-            continue;
+/// What decides the matrix language of a paragraph.
+#[derive(Debug, PartialEq, Eq)]
+enum Matrix {
+    /// A script and its function words settle the language.
+    Settled(Language),
+    /// Han without kana, Hangul or Chinese function words: only the detector
+    /// tells Chinese from Japanese. `weight` is how much prose there is.
+    Han { weight: usize },
+    /// Letters of another script outweigh Chinese, Japanese and Korean; only
+    /// the detector tells the language. `weight` is how much prose there is.
+    Other { weight: usize },
+}
+
+/// The letters of a paragraph by script.
+#[derive(Debug, Default)]
+struct Counts {
+    kana: usize,
+    hangul: usize,
+    han: usize,
+    /// Characters of Han that only Chinese uses for function words.
+    chinese_only: usize,
+    /// Han characters that are frequent Chinese function words.
+    chinese_common: usize,
+    /// Letters of every other script.
+    other: usize,
+}
+
+impl Counts {
+    fn of(text: &str) -> Self {
+        let mut counts = Self::default();
+        for c in text.chars().filter(|c| c.is_alphabetic()) {
+            match c {
+                '\u{3040}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9F}' => {
+                    counts.kana += 1;
+                }
+                '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{AC00}'..='\u{D7AF}' => {
+                    counts.hangul += 1;
+                }
+                '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{20000}'..='\u{2FA1F}' => {
+                    counts.han += 1;
+                    counts.chinese_only += usize::from(CHINESE_ONLY.contains(c));
+                    counts.chinese_common += usize::from(CHINESE_COMMON.contains(c));
+                }
+                _ => counts.other += 1,
+            }
         }
-        judged += 1;
-        if detect(&paragraph.text) != target {
-            return Judgement::NotIn {
-                paragraph: Some(paragraph.number),
-            };
+        counts
+    }
+
+    /// Characters of Chinese, Japanese or Korean.
+    const fn cjk(&self) -> usize {
+        self.kana + self.hangul + self.han
+    }
+
+    const fn matrix(&self) -> Matrix {
+        if self.cjk() * CJK_SPAN < self.other {
+            return Matrix::Other { weight: self.other };
+        }
+        if self.kana > 0 && self.kana >= self.hangul {
+            return Matrix::Settled(Language::JAPANESE);
+        }
+        if self.hangul > 0 {
+            return Matrix::Settled(Language::KOREAN);
+        }
+        if self.chinese_only > 0
+            || (self.chinese_common >= 2 && self.chinese_common * COMMON_SPAN >= self.han)
+        {
+            return Matrix::Settled(Language::CHINESE);
+        }
+        Matrix::Han {
+            weight: self.han * 2 + self.other,
         }
     }
-    if paragraphs.is_empty() || (paragraphs.len() == 1 && judged == 1) {
-        // No prose, or the one paragraph was the whole.
-        return Judgement::InLanguage;
-    }
-    let whole = paragraphs
-        .iter()
-        .map(|paragraph| paragraph.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if detect(&whole) == target {
-        Judgement::InLanguage
-    } else {
-        Judgement::NotIn { paragraph: None }
-    }
-}
-
-/// How much prose `text` holds: one for each letter, two for each Chinese,
-/// Japanese or Korean character.
-fn weight(text: &str) -> usize {
-    text.chars()
-        .filter(|c| c.is_alphabetic())
-        .map(|c| if is_wide(c) { 2 } else { 1 })
-        .sum()
-}
-
-const fn is_wide(c: char) -> bool {
-    matches!(
-        c,
-        '\u{3040}'..='\u{30FF}'
-            | '\u{3400}'..='\u{4DBF}'
-            | '\u{4E00}'..='\u{9FFF}'
-            | '\u{AC00}'..='\u{D7AF}'
-    )
 }
 
 /// Removes the quotes of `text` that match, after whitespace normalization,
@@ -290,21 +357,37 @@ fn is_identifier(chunk: &str) -> bool {
 // CC BY-SA 4.0), `https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz`,
 // named by language file and 1-based line.
 #[cfg(test)]
+#[allow(clippy::doc_markdown, reason = "FLORES-200 file names in comments")]
 mod tests {
+    use super::super::detect::Detector;
     use super::*;
 
     fn language(name: &str) -> Language {
         name.parse().unwrap()
     }
 
-    fn judge_text(text: &str, target: &str) -> Judgement {
-        judge(&Detector::load().unwrap(), text, language(target))
+    /// The first paragraph not in `target`, the statistical cases decided by
+    /// the real detector.
+    fn judge_text(text: &str, target: &str) -> Option<usize> {
+        let detector = Detector::load().unwrap();
+        first_paragraph_not_in(text, language(target), |paragraph| {
+            detector.detect(paragraph).unwrap()
+        })
+    }
+
+    /// The same, for text the deterministic rules settle: the detector must
+    /// not be asked.
+    fn settled(text: &str, target: &str) -> Option<usize> {
+        first_paragraph_not_in(text, language(target), |paragraph| {
+            panic!("the detector was asked about: {paragraph}")
+        })
     }
 
     /// zho_Hans line 12: Chinese with an English name.
     const ZH_ZMAPP: &str = "一种名为 ZMapp 的“抗体鸡尾酒”（多抗体联合）最初有望在该领域发挥作用，但正式研究表明，它在预防死亡方面的效果有些不尽人意。";
     /// zho_Hans line 13.
-    const ZH_PALM: &str = "在 PALM 实验中，ZMapp 用作参照。也就是科学家将其作为基线，把其他三种治疗方法与之作比较。";
+    const ZH_PALM: &str =
+        "在 PALM 实验中，ZMapp 用作参照。也就是科学家将其作为基线，把其他三种治疗方法与之作比较。";
     /// zho_Hant line 11.
     const ZH_HANT: &str = "儘管有一種實驗性的疫苗顯示能降低伊波拉病毒的致死率，但到目前為止，沒有藥物明確證實適合治療已受感染的人。";
     /// eng_Latn line 11.
@@ -320,77 +403,92 @@ mod tests {
     /// fra_Latn line 11.
     const FR_VACCINE: &str = "Même si un vaccin expérimental semble jusqu'ici capable de réduire le taux de mortalité d'Ebola, aucun remède n'a encore été suffisamment efficace pour traiter l'infection existante.";
 
+    /// A phrase of eng_Latn line 20, a longer English insertion than any term.
+    const EN_PHRASE: &str = "the Camp David Accords of 1978, the normalizing of US–China relations";
+
     #[test]
-    fn chinese_japanese_and_korean_prose_is_judged_in_its_own_language() {
+    fn kana_hangul_and_chinese_function_words_settle_their_language_without_the_detector() {
         for (text, target) in [
             (ZH_ZMAPP, "Chinese"),
             (ZH_PALM, "Chinese"),
             (ZH_HANT, "Chinese"),
             (JA_NSA, "Japanese"),
             (KO_VACCINE, "Korean"),
-            (EN_VACCINE, "English"),
-            (FR_VACCINE, "French"),
         ] {
-            assert_eq!(
-                judge_text(text, target),
-                Judgement::InLanguage,
-                "{target}: {text}"
-            );
+            assert_eq!(settled(text, target), None, "{target}: {text}");
         }
+        // The same text against another CJK language is refused, kanji-heavy
+        // Japanese as Chinese included.
+        assert_eq!(settled(JA_NSA, "Chinese"), Some(1));
+        assert_eq!(settled(ZH_PALM, "Japanese"), Some(1));
+        assert_eq!(settled(ZH_HANT, "Korean"), Some(1));
+        assert_eq!(settled(KO_VACCINE, "Japanese"), Some(1));
     }
 
     #[test]
-    fn kanji_heavy_japanese_is_japanese_and_not_chinese() {
-        assert_eq!(
-            judge_text(JA_NSA, "Chinese"),
-            Judgement::NotIn { paragraph: Some(1) }
-        );
+    fn latin_script_paragraphs_go_to_the_detector() {
+        for (text, target) in [(EN_VACCINE, "English"), (FR_VACCINE, "French")] {
+            assert_eq!(judge_text(text, target), None, "{target}: {text}");
+        }
+        assert_eq!(judge_text(EN_VACCINE, "French"), Some(1));
+        assert_eq!(judge_text(FR_VACCINE, "English"), Some(1));
+        assert_eq!(judge_text(EN_VACCINE, "Chinese"), Some(1));
+        assert_eq!(judge_text(ZH_HANT, "English"), Some(1));
     }
 
     #[test]
-    fn cjk_prose_with_english_terms_and_a_longer_english_phrase_is_accepted() {
-        // zho_Hans line 13 with a phrase of eng_Latn line 20 inserted.
-        let mixed = "在 PALM 实验中，ZMapp 用作参照 the Camp David Accords, 1978; normalizing US–China relations。也就是科学家将其作为基线，把其他三种治疗方法与之作比较。";
-        assert_eq!(judge_text(mixed, "Chinese"), Judgement::InLanguage);
+    fn kanji_only_japanese_without_cues_goes_to_the_detector() {
+        // The articles of the 1946 constitution's renunciation of war, written
+        // in kanji alone: no kana, no Hangul, no Chinese function word.
+        let kanji = "日本国憲法第九条戦争放棄軍備及交戦権否認";
+        assert_eq!(Counts::of(kanji).matrix(), Matrix::Han { weight: 40 });
+        assert_eq!(judge_text(kanji, "Japanese"), None);
+        assert_eq!(judge_text(kanji, "English"), Some(1));
+    }
+
+    #[test]
+    fn english_inside_cjk_prose_is_an_insertion_of_any_length() {
+        // zho_Hans line 13 with a phrase inserted, and the same for Japanese
+        // and Korean.
+        let chinese =
+            format!("在 PALM 实验中，ZMapp 用作参照，{EN_PHRASE}。也就是科学家将其作为基线。");
+        let japanese =
+            format!("NSAとしてカーターを補佐し、{EN_PHRASE} など、世界問題を外交的に処理した。");
+        let korean =
+            format!("한 실험용 백신이 {EN_PHRASE} 에볼라 사망률을 줄일 수 있을 것처럼 보입니다.");
+        assert_eq!(settled(&chinese, "Chinese"), None);
+        assert_eq!(settled(&japanese, "Japanese"), None);
+        assert_eq!(settled(&korean, "Korean"), None);
+        // An English sentence with a few Chinese words is English.
+        let english = format!("{EN_ZMAPP} It is called 抗体鸡尾酒 in Chinese.");
+        assert_eq!(judge_text(&english, "English"), None);
+        assert_eq!(judge_text(&english, "Chinese"), Some(1));
     }
 
     #[test]
     fn a_paragraph_in_another_language_is_refused_and_named() {
         let text = format!("{ZH_ZMAPP}\n\n{ZH_PALM}\n\n{EN_VACCINE}");
-        assert_eq!(
-            judge_text(&text, "Chinese"),
-            Judgement::NotIn { paragraph: Some(3) }
-        );
+        assert_eq!(judge_text(&text, "Chinese"), Some(3));
         let text = format!("{EN_ZMAPP}\n\n{ZH_ZMAPP}");
-        assert_eq!(
-            judge_text(&text, "English"),
-            Judgement::NotIn { paragraph: Some(2) }
-        );
+        assert_eq!(judge_text(&text, "English"), Some(2));
+        // A Japanese paragraph in a Chinese text, though each reads as a
+        // language of its own.
+        let text = format!("{ZH_PALM}\n\n{JA_NSA}");
+        assert_eq!(judge_text(&text, "Chinese"), Some(2));
     }
 
     #[test]
-    fn a_wholly_wrong_language_is_refused() {
-        assert_eq!(
-            judge_text(EN_VACCINE, "Chinese"),
-            Judgement::NotIn { paragraph: Some(1) }
-        );
-        assert_eq!(
-            judge_text(ZH_HANT, "English"),
-            Judgement::NotIn { paragraph: Some(1) }
-        );
-        assert_eq!(
-            judge_text(KO_VACCINE, "Japanese"),
-            Judgement::NotIn { paragraph: Some(1) }
-        );
-    }
-
-    #[test]
-    fn short_paragraphs_are_not_judged() {
+    fn short_paragraphs_of_the_detector_are_not_judged() {
+        // The detector is unreliable on a short French line, so it is not asked.
+        let fr_short = "Il l'a dit hier.";
+        assert!(Counts::of(fr_short).other < JUDGED_WEIGHT);
+        let text = format!("{EN_VACCINE}\n\n{fr_short}\n\n{EN_ZMAPP}");
+        assert_eq!(judge_text(&text, "English"), None);
+        // A phrase of Latin words is never Chinese, whatever its length.
         let text = format!("{ZH_ZMAPP}\n\n{EN_SHORT}\n\n{ZH_PALM}");
-        assert_eq!(judge_text(&text, "Chinese"), Judgement::InLanguage);
-        assert!(weight(EN_SHORT) < JUDGED_WEIGHT);
-        // A short sentence alone is not judged either.
-        assert_eq!(judge_text(EN_SHORT, "Chinese"), Judgement::InLanguage);
+        assert_eq!(settled(&text, "Chinese"), Some(2));
+        // A term or two in a paragraph of their own are not judged.
+        assert_eq!(settled("Summary\n\nPALM trial", "Chinese"), None);
     }
 
     #[test]
@@ -398,20 +496,17 @@ mod tests {
         let text = format!(
             "{ZH_PALM}\n\n```rust\n{EN_VACCINE}\n\nfn main() {{}}\n```\n\n请检查 `{EN_ZMAPP}` 和 spawn_blocking，见 src/agent/mod.rs 与 https://example.com/a。"
         );
-        assert_eq!(judge_text(&text, "Chinese"), Judgement::InLanguage);
+        assert_eq!(settled(&text, "Chinese"), None);
         assert_eq!(
-            judge_text("`cargo test` https://example.com 42", "Chinese"),
-            Judgement::InLanguage
+            settled("`cargo test` https://example.com 42", "Chinese"),
+            None
         );
     }
 
     #[test]
     fn code_between_paragraphs_still_counts_as_one_block_for_numbering() {
         let text = format!("{ZH_PALM}\n\n```\ncode\n\nmore\n```\n\n{EN_VACCINE}");
-        assert_eq!(
-            judge_text(&text, "Chinese"),
-            Judgement::NotIn { paragraph: Some(3) }
-        );
+        assert_eq!(judge_text(&text, "Chinese"), Some(3));
     }
 
     #[test]

@@ -3,6 +3,13 @@
 /// The `CPython` version the baseline fixture's `uv` installs and reports.
 const BASELINE_PYTHON_VERSION: &str = "3.13.1";
 
+/// An output store in `dir`, leasing from the default allocator.
+pub async fn output_store(dir: impl Into<std::path::PathBuf>) -> aither_sandbox::OutputStore {
+    aither_sandbox::OutputStore::new(dir, aither_core::AnyIdAllocator::default())
+        .await
+        .expect("the output directory can be created")
+}
+
 /// Drives `run` to its end without looking at its events.
 pub async fn finish_run(
     run: crate::Run<impl std::future::Future<Output = Result<(), crate::AgentError>>>,
@@ -158,6 +165,7 @@ async fn fixture_artifacts(
                 url::Url::from_file_path(binary).unwrap(),
             ),
             sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+            size: bytes.len() as u64,
             encoding: ToolArtifactFormat::Executable,
         })
         .collect()
@@ -233,7 +241,12 @@ pub async fn real_distribution(binary: &std::path::Path) -> aither_sandbox::Tool
         .iter()
         .map(|artifact| serde_json::to_value(artifact).unwrap()),
     );
-    distribution_of(&artifacts, pinned["python"].as_array().unwrap())
+    let distribution = distribution_of(&artifacts, pinned["python"].as_array().unwrap());
+    // CI hands its job token down so release downloads are authenticated.
+    match std::env::var("GITHUB_TOKEN") {
+        Ok(token) => distribution.with_github_token(token),
+        Err(_) => distribution,
+    }
 }
 
 /// Baseline tools prepared as a terminal prepares them, kept alive with

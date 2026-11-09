@@ -2,7 +2,7 @@ use aither_core::{
     LanguageModel,
     llm::{
         Attachment, Event, GenerateError, LLMRequest, Message, ReasoningState, RetryPolicy, Role,
-        Usage,
+        TokenCounting, Usage,
         model::{Ability, Parameters, Profile, ToolChoice},
         tool::ToolDefinition,
     },
@@ -29,6 +29,30 @@ use schemars::schema_for;
 
 impl LanguageModel for Gemini {
     type Error = GeminiError;
+
+    fn token_counting(&self) -> TokenCounting {
+        TokenCounting::Endpoint
+    }
+
+    /// `POST /v1beta/models/{model}:countTokens` carrying the same
+    /// `generateContent` body the request would send, so the count covers
+    /// tools and system instructions the way the call does.
+    async fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> Result<Option<u32>, GenerateError<Self::Error>> {
+        let cfg = self.config().clone();
+        let generate = build_generate_request(&cfg, request.clone())
+            .await
+            .map_err(GenerateError::Provider)?;
+        let body = serde_json::json!({ "generateContentRequest": generate });
+        let endpoint = cfg.model_endpoint(&cfg.text_model, "countTokens");
+        let response: crate::types::CountTokensResponse =
+            crate::client::post_json(&cfg, endpoint, &body)
+                .await
+                .map_err(GenerateError::Provider)?;
+        Ok(Some(response.total_tokens))
+    }
 
     fn respond(
         &self,
@@ -465,6 +489,11 @@ async fn messages_to_gemini(
             flush_tool_results(&mut contents, &mut pending_results);
         }
         match message.role() {
+            Role::Configuration => {
+                return Err(GeminiError::Api(
+                    "Gemini takes no per-message effort update".to_string(),
+                ));
+            }
             Role::System => system_parts.push(Part::text(message.content())),
             Role::User => {
                 let attachments = message.attachments();
@@ -775,6 +804,102 @@ mod tests {
         assert_eq!(
             value["fileData"]["fileUri"],
             "https://ai.google.dev/static/gemini-api/docs/files/sample.pdf"
+        );
+    }
+
+    /// A loopback server that records the request and answers `200` with
+    /// the given JSON body.
+    fn responding_server(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let addr = listener.local_addr().expect("stub server address");
+        let (sender, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            let body_start = loop {
+                let read = stream.read(&mut chunk).expect("read the request");
+                request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head_str =
+                String::from_utf8_lossy(request.get(..body_start).expect("head")).into_owned();
+            let length = head_str.lines().find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().expect("numeric length"))
+            });
+            let chunked = head_str
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked");
+            let complete = |request: &[u8]| {
+                if chunked {
+                    request.ends_with(b"0\r\n\r\n")
+                } else {
+                    request.len() >= body_start + length.unwrap_or(0)
+                }
+            };
+            while !complete(&request) {
+                let read = stream.read(&mut chunk).expect("read the body");
+                request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+            }
+            let raw =
+                String::from_utf8_lossy(request.get(body_start..).expect("body")).into_owned();
+            let decoded_body = if chunked {
+                // Strip the chunk-size lines: chunks are `hex\r\ndata`.
+                let mut out = String::new();
+                let mut rest = raw.as_str();
+                while let Some((size, after)) = rest.split_once("\r\n") {
+                    let size = usize::from_str_radix(size.trim(), 16).expect("hex size");
+                    if size == 0 {
+                        break;
+                    }
+                    out.push_str(after.get(..size).expect("full chunk"));
+                    rest = &after[size + 2..];
+                }
+                out
+            } else {
+                raw
+            };
+            sender
+                .send(format!("{head_str}{decoded_body}"))
+                .expect("the test is listening");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    /// `count_tokens` posts the converted contents to
+    /// `/v1beta/models/{model}:countTokens` and reads `totalTokens` back.
+    #[tokio::test]
+    async fn count_tokens_posts_to_the_count_endpoint() {
+        let (base_url, received) = responding_server("{\"totalTokens\": 2097}");
+        let client = Gemini::new("key").with_base_url(base_url);
+        assert_eq!(client.token_counting(), TokenCounting::Endpoint);
+        let request = LLMRequest::new(vec![Message::user("Plan the migration.")]);
+        let counted = client.count_tokens(&request).await.expect("count succeeds");
+        assert_eq!(counted, Some(2097));
+
+        let sent = received.recv().expect("the request arrives");
+        let (head, body) = sent.split_once("\r\n\r\n").expect("head and body");
+        assert!(
+            head.lines()
+                .next()
+                .is_some_and(|line| line.contains(":countTokens")),
+            "{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(
+            body["generateContentRequest"]["contents"][0]["role"], "user",
+            "{body}"
         );
     }
 

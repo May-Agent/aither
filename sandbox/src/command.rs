@@ -34,7 +34,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_core::llm::tool::ToolResultPart;
+use aither_core::IdLease;
+use aither_core::llm::tool::{Progress, ProgressSink, ToolResultPart};
 use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolContext, ToolResult};
 
 use crate::command_set::{AnyCommandSet, CommandSet};
@@ -164,15 +165,18 @@ fn push_help_line(help: &mut String, line: &str) {
     help.push('\n');
 }
 
-fn render_positional_usage(name: &str, required: bool) -> String {
+fn render_positional_usage(name: &str, required: bool, variadic: bool) -> String {
     let kebab = name.replace('_', "-");
-    let mut output = String::with_capacity(kebab.len() + 4);
+    let mut output = String::with_capacity(kebab.len() + 7);
     if !required {
         output.push('[');
     }
     output.push('<');
     output.push_str(kebab.as_str());
     output.push('>');
+    if variadic {
+        output.push_str("...");
+    }
     if !required {
         output.push(']');
     }
@@ -210,15 +214,16 @@ impl CommandPayload {
     }
 }
 
-/// Writes a binary payload into `output_dir` and renders the line that
+/// Writes a binary payload into `outputs` and renders the line that
 /// references the stored file, the way terminal output references stored
 /// images.
 async fn stored_binary_text(
     mime: &str,
     content: &[u8],
-    output_dir: &Path,
+    outputs: &OutputStore,
 ) -> Result<String, String> {
-    let (url, path) = crate::output::save_binary_to_file(output_dir, content, mime)
+    let (url, path) = outputs
+        .save_binary(content, mime)
         .await
         .map_err(|error| prefix_error("failed to store binary tool result: ", &error))?;
     Ok(StoredBinaryPartTemplate {
@@ -271,9 +276,55 @@ impl CommandEnvelope {
     }
 }
 
+/// The progress line a command's report becomes in its terminal job's output.
+#[derive(Template)]
+#[template(path = "command_progress.txt", escape = "none")]
+struct CommandProgressTemplate<'a> {
+    done: f64,
+    total: Option<f64>,
+    message: Option<&'a str>,
+}
+
+/// The output stream of the terminal job a registry serves, where the
+/// progress its commands report is written as it happens.
+///
+/// It holds the job's lease, so the job's word names no other job while a
+/// command can still report to it.
+#[derive(Debug, Clone)]
+pub struct JobOutput {
+    jobs: crate::job_registry::JobRegistry,
+    task_id: IdLease,
+}
+
+impl JobOutput {
+    pub const fn new(jobs: crate::job_registry::JobRegistry, task_id: IdLease) -> Self {
+        Self { jobs, task_id }
+    }
+}
+
+impl ProgressSink for JobOutput {
+    async fn report(&mut self, progress: Progress) {
+        let line = CommandProgressTemplate {
+            done: progress.progress(),
+            total: progress.total(),
+            message: progress.message(),
+        }
+        .render()
+        .expect("command progress template must render");
+        // A job still registering holds the line until it has, so no report
+        // is lost to the gap between its process starting and its registration.
+        self.jobs
+            .append_task_stdout(&self.task_id, line.into_bytes())
+            .await;
+    }
+}
+
 /// Who invoked a command and from where.
 #[derive(Debug, Clone, Default)]
 struct Caller {
+    /// The output of the terminal job whose script invoked the command; `None`
+    /// outside a terminal job.
+    output: Option<JobOutput>,
     /// The `terminal` call whose script invoked the command; `None` outside
     /// a terminal call.
     call: Option<CallIdentity>,
@@ -284,10 +335,12 @@ struct Caller {
 
 impl Caller {
     /// The context a tool runs with when this caller invoked it. A shell
-    /// invocation has nowhere to show progress, but the call whose script ran
-    /// it and the directory the script was in are known.
+    /// invocation shows progress in its terminal job's output, and the call
+    /// whose script ran it and the directory the script was in are known.
     fn into_context(self) -> ToolContext {
-        let mut cx = ToolContext::new();
+        let mut cx = self
+            .output
+            .map_or_else(ToolContext::new, ToolContext::with_progress);
         if let Some(identity) = self.call {
             cx = cx.with_identity(identity);
         }
@@ -485,31 +538,14 @@ pub enum GateDecision {
     },
 }
 
-/// A command the gate blocked, as the refusal the model reads in place of
-/// the command's result.
+/// A command the gate blocked; the model reads its refusal, rendered by
+/// [`SandboxNotices::command_blocked`](crate::SandboxNotices::command_blocked),
+/// in place of the command's result.
 #[derive(Debug)]
 pub struct CommandBlocked {
+    /// Why the gate blocked it.
     pub reason: String,
 }
-
-#[derive(Template)]
-#[template(path = "command_blocked.txt")]
-struct CommandBlockedTemplate<'a> {
-    reason: &'a str,
-}
-
-impl std::fmt::Display for CommandBlocked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let rendered = CommandBlockedTemplate {
-            reason: &self.reason,
-        }
-        .render()
-        .map_err(|_| std::fmt::Error)?;
-        f.write_str(&rendered)
-    }
-}
-
-impl std::error::Error for CommandBlocked {}
 
 /// Decides whether a shell command may run, before it does.
 ///
@@ -663,19 +699,7 @@ struct Resolved<'a> {
     stdin_arg: Option<&'a str>,
 }
 
-#[derive(Template)]
-#[template(path = "reserved_for_main.txt", escape = "none")]
-struct ReservedForMainTemplate<'a> {
-    name: &'a str,
-}
-
-fn reserved_for_main_text(name: &str) -> String {
-    ReservedForMainTemplate { name }
-        .render()
-        .expect("reserved-for-main template must render")
-}
-
-use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
+use crate::output::{INLINE_OUTPUT_LIMIT, OutputStore};
 use crate::permission::TerminalMode;
 use crate::terminal::TerminalBinding;
 
@@ -683,8 +707,8 @@ use crate::terminal::TerminalBinding;
 ///
 /// Returns the output as-is if small enough, or saves to file and returns
 /// a reference message if the output exceeds the limit.
-async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEnvelope {
-    let output = match tool_output_to_payload(output, output_dir).await {
+async fn handle_large_output(output: ToolResult, outputs: &OutputStore) -> CommandEnvelope {
+    let output = match tool_output_to_payload(output, outputs).await {
         Ok(Some(output)) => output,
         Ok(None) => return CommandEnvelope::success_empty(),
         Err(error) => return CommandEnvelope::failure(error),
@@ -700,23 +724,14 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
         return CommandEnvelope::success(output);
     }
 
-    // Generate four-random-words filename (consistent with rest of codebase)
-    let mut filename = generate_word_filename();
-    filename.push_str(".txt");
-    let filepath = output_dir.join(&filename);
-
     let line_count = rendered.lines().count();
 
-    if let Err(error) = async_fs::write(&filepath, &rendered).await {
-        let filepath_text = filepath.display().to_string();
-        let error_text = error.to_string();
-        let mut message = String::with_capacity(filepath_text.len() + error_text.len() + 25);
-        message.push_str("failed to write output to ");
-        message.push_str(filepath_text.as_str());
-        message.push_str(": ");
-        message.push_str(error_text.as_str());
-        return CommandEnvelope::failure(message);
-    }
+    let filepath = match outputs.save_raw(rendered.as_bytes()).await {
+        Ok((_, filepath)) => filepath,
+        Err(error) => {
+            return CommandEnvelope::failure(prefix_error("failed to store output: ", &error));
+        }
+    };
 
     CommandEnvelope::success(CommandPayload::Text {
         content: output_saved_text(
@@ -732,7 +747,7 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
 ///
 /// Everything becomes text for the model: text-like results pass through, a
 /// command result renders its prose, and every binary payload, a lone one
-/// included, is written to `output_dir` and replaced by a line naming the
+/// included, is written to `outputs` and replaced by a line naming the
 /// stored file. A typed tool error becomes the command's error.
 ///
 /// # Errors
@@ -742,7 +757,7 @@ async fn handle_large_output(output: ToolResult, output_dir: &Path) -> CommandEn
 /// error).
 pub async fn tool_output_to_payload(
     output: impl IntoToolResult,
-    output_dir: &Path,
+    outputs: &OutputStore,
 ) -> Result<Option<CommandPayload>, String> {
     let text = match output
         .into_tool_result()
@@ -751,14 +766,14 @@ pub async fn tool_output_to_payload(
         ToolResult::Done => return Ok(None),
         ToolResult::Error { message } => return Err(message),
         ToolResult::Binary { mime, content } => {
-            stored_binary_text(&mime, &content, output_dir).await?
+            stored_binary_text(&mime, &content, outputs).await?
         }
         ToolResult::Parts { parts } => {
             let mut rendered = String::new();
             for part in &parts {
                 let text = match part {
                     ToolResultPart::Binary { mime, content } => {
-                        stored_binary_text(mime, content, output_dir).await?
+                        stored_binary_text(mime, content, outputs).await?
                     }
                     ToolResultPart::Text { .. } | ToolResultPart::Tsv { .. } => {
                         part.render_for_model()
@@ -823,6 +838,8 @@ pub struct DynTerminalTool {
     pub(crate) commit_ledger: Option<crate::subagent::CommitLedger>,
     pub(crate) prepared_space: Option<crate::subagent::PreparedSpace>,
     pub(crate) role: CommandRole,
+    /// The terminal registry's notices, which its controls render through.
+    pub(crate) notices: crate::AnySandboxNotices,
 }
 
 impl DynTerminalTool {
@@ -906,7 +923,10 @@ impl DynTerminalTool {
         vec![
             erase_terminal_tool(KillTerminalTool::new(self.job_registry.clone())),
             erase_terminal_tool(InputTerminalTool::new(self.job_registry.clone())),
-            erase_terminal_tool(ReadTerminalDeltaTool::new(self.job_registry.clone())),
+            erase_terminal_tool(ReadTerminalDeltaTool::new(
+                self.job_registry.clone(),
+                self.notices.clone(),
+            )),
         ]
     }
 
@@ -944,7 +964,9 @@ pub struct ToolRegistryBuilder {
     sets: Vec<AnyCommandSet>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    policies: Vec<crate::AnyCommandPolicy>,
     kept: HashSet<String>,
+    notices: crate::AnySandboxNotices,
 }
 
 impl ToolRegistryBuilder {
@@ -1237,11 +1259,30 @@ impl ToolRegistryBuilder {
         self.gate = Some(gate);
     }
 
-    /// Builds an immutable main-agent registry with a concrete output
-    /// directory; [`ToolRegistry::for_subagent`] derives the subagent view.
-    /// Terminal-bound commands are built when a terminal serves it.
+    /// Puts every script the registry's terminals run, the main agent's and
+    /// every subagent's, to `policy` before it runs; see
+    /// [`CommandPolicy`](crate::CommandPolicy). Policies are asked in the
+    /// order they are added, and each agent's terminal binds every one to
+    /// fresh state.
+    pub fn command_policy(&mut self, policy: impl crate::CommandPolicy) {
+        self.policies.push(crate::AnyCommandPolicy::new(policy));
+    }
+
+    /// Renders every refusal and notice of the registry, and of the terminals
+    /// and terminal controls serving it, through `notices`; the sandbox's own
+    /// wording ([`DefaultSandboxNotices`](crate::DefaultSandboxNotices)) by
+    /// default. A subagent's registry keeps its parent's.
+    pub fn notices(&mut self, notices: crate::AnySandboxNotices) {
+        self.notices = notices;
+    }
+
+    /// Builds an immutable main-agent registry storing large and binary
+    /// command results in `outputs`; [`ToolRegistry::for_subagent`] derives
+    /// the subagent view. Terminal-bound commands are built when a terminal
+    /// serves it, and a terminal serving it stores results in its own
+    /// [`OutputStore`].
     #[must_use]
-    pub fn build(self, output_dir: impl Into<PathBuf>) -> ToolRegistry {
+    pub fn build(self, outputs: OutputStore) -> ToolRegistry {
         let (kept_tx, kept_rx) = async_channel::unbounded();
         ToolRegistry {
             kept: Arc::new(self.kept),
@@ -1251,20 +1292,38 @@ impl ToolRegistryBuilder {
             bound: self.bound,
             sets: self.sets.into(),
             instances: HashMap::new(),
-            output_dir: output_dir.into(),
+            outputs,
             role: CommandRole::Main,
             mode: None,
             observer: self.observer,
             gate: self.gate,
+            policies: crate::policy::CommandPolicies::new(self.policies),
+            notices: self.notices,
             call: None,
+            output: None,
             committed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
 
 /// The JSON schema of a tool's arguments.
+///
+/// # Panics
+/// Panics if the schema cannot be serialized or lays out its positional
+/// fields invalidly.
 fn tool_schema<A: JsonSchema>() -> Value {
-    serde_json::to_value(schemars::schema_for!(A)).expect("failed to serialize tool schema")
+    checked_schema(
+        serde_json::to_value(schemars::schema_for!(A)).expect("failed to serialize tool schema"),
+    )
+}
+
+/// Returns `schema` after checking its positional layout, so a bad command
+/// fails when it is built rather than when it is called.
+fn checked_schema(schema: Value) -> Value {
+    if let Err(error) = validate_positional_layout(&schema) {
+        panic!("invalid command schema: {error}");
+    }
+    schema
 }
 
 /// A terminal command whose valid arguments depend on what exists when it is
@@ -1372,7 +1431,7 @@ where
 {
     let name = definition.name().to_string();
     let description = definition.description().to_string();
-    let schema = definition.arguments_openai_schema();
+    let schema = checked_schema(definition.arguments_openai_schema());
     let stdin_arg = detect_stdin_arg(&schema);
     let help_text = if description.is_empty() {
         schema_to_help(&schema)
@@ -1451,16 +1510,24 @@ pub struct ToolRegistry {
     /// The terminal-bound commands built for the terminal serving this
     /// registry, in its role.
     instances: HashMap<String, Arc<ToolEntry>>,
-    output_dir: PathBuf,
+    outputs: OutputStore,
     role: CommandRole,
     /// The mode of the terminal execution this registry serves, once
     /// [`Self::in_mode`] has scoped it to one; `None` has every command.
     mode: Option<TerminalMode>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
+    /// The command policies, bound to the state of the agent this registry
+    /// serves; every view of the registry for that agent shares them.
+    policies: crate::policy::CommandPolicies,
+    /// Renders the refusals and notices of the registry and its terminals.
+    notices: crate::AnySandboxNotices,
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
     /// bound it to one.
     call: Option<CallIdentity>,
+    /// The output of the terminal job this registry serves, once
+    /// [`Self::for_job`] has bound it to one.
+    output: Option<JobOutput>,
     /// The commands whose exchanges are kept through compaction.
     kept: Arc<HashSet<String>>,
     /// Reports each `terminal` call a kept command succeeded in.
@@ -1502,14 +1569,17 @@ impl ToolRegistry {
     pub(crate) fn with_terminal_controls(
         mut self,
         jobs: crate::JobRegistry,
-        output_dir: PathBuf,
+        outputs: OutputStore,
     ) -> Self {
         let mut controls = ToolRegistryBuilder::new();
         controls.configure_tool(crate::builtin::KillTerminalTool::new(jobs.clone()));
         controls.configure_tool(crate::builtin::InputTerminalTool::new(jobs.clone()));
-        controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(jobs));
+        controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(
+            jobs,
+            self.notices.clone(),
+        ));
         self.entries.extend(controls.entries);
-        self.output_dir = output_dir;
+        self.outputs = outputs;
         self
     }
 
@@ -1550,6 +1620,13 @@ impl ToolRegistry {
         self.role
     }
 
+    /// What renders the refusals and notices of this registry and of the
+    /// terminals serving it.
+    #[must_use]
+    pub const fn notices(&self) -> &crate::AnySandboxNotices {
+        &self.notices
+    }
+
     /// The registry a subagent's terminal serves: the same commands, each
     /// resolved to its subagent-role handler, with terminal-bound commands
     /// left for the subagent's terminal to build. Asking a subagent registry
@@ -1576,13 +1653,26 @@ impl ToolRegistry {
             bound: self.bound.clone(),
             sets: self.sets.clone(),
             instances: HashMap::new(),
-            output_dir: self.output_dir.clone(),
+            outputs: self.outputs.clone(),
             role: CommandRole::Subagent,
             mode: None,
             observer,
             gate,
+            policies: self.policies.for_agent(),
+            notices: self.notices.clone(),
             call: None,
+            output: None,
             committed: self.committed.clone(),
+        }
+    }
+
+    /// The registry that serves one terminal job: this registry's commands,
+    /// each writing the progress it reports to `output`.
+    #[must_use]
+    pub fn for_job(&self, output: JobOutput) -> Self {
+        Self {
+            output: Some(output),
+            ..self.clone()
         }
     }
 
@@ -1625,6 +1715,12 @@ impl ToolRegistry {
     #[must_use]
     pub const fn gate(&self) -> Option<&AnyCommandGate> {
         self.gate.as_ref()
+    }
+
+    /// The command policies every script of the terminal serving this
+    /// registry is put to, bound to its agent's state.
+    pub(crate) const fn policies(&self) -> &crate::policy::CommandPolicies {
+        &self.policies
     }
 
     /// The observer told about the calls this registry serves.
@@ -1703,9 +1799,10 @@ impl ToolRegistry {
                 handler: Some(handler),
                 ..
             }) => self.run(tool_name, handler, args, working_dir).await,
-            Some(Resolved { handler: None, .. }) => {
-                CommandEnvelope::failure(reserved_for_main_text(tool_name))
-            }
+            Some(Resolved { handler: None, .. }) => CommandEnvelope::failure(
+                self.notices
+                    .reserved_for_main(&crate::notices::ReservedForMain { command: tool_name }),
+            ),
             None => match self.set_entry(tool_name) {
                 Some(entry) => self.run(tool_name, &entry.handler, args, working_dir).await,
                 None => CommandEnvelope::failure(unknown_command_text(tool_name)),
@@ -1723,12 +1820,16 @@ impl ToolRegistry {
         working_dir: Option<&Path>,
     ) -> CommandEnvelope {
         let caller = Caller {
+            output: self.output.clone(),
             call: self.call.clone(),
             working_dir: working_dir.map(|dir| dir.to_string_lossy().into_owned()),
         };
         let outcome = match handler(caller, args.to_vec()).await {
-            Ok(output) => handle_large_output(output, &self.output_dir).await,
-            Err(error) => CommandEnvelope::failure(error),
+            Ok(output) => handle_large_output(output, &self.outputs).await,
+            Err(error) => {
+                tracing::warn!(tool = %tool_name, %error, "command failed");
+                CommandEnvelope::failure(error)
+            }
         };
         if outcome.ok
             && self.kept.contains(tool_name)
@@ -2142,7 +2243,7 @@ pub fn register_ipc_gateway_command(
 pub struct ToolCommand<T: Tool> {
     tool: T,
     schema: Value,
-    output_dir: PathBuf,
+    outputs: OutputStore,
 }
 
 impl<T: Tool + std::fmt::Debug> std::fmt::Debug for ToolCommand<T> {
@@ -2158,17 +2259,16 @@ where
     T::Arguments: DeserializeOwned + JsonSchema,
 {
     /// Creates a new command wrapper for the given tool. Binary results are
-    /// stored in `output_dir`.
+    /// stored in `outputs`.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
-    pub fn new(tool: T, output_dir: impl Into<PathBuf>) -> Self {
-        let schema = schemars::schema_for!(T::Arguments);
-        let schema = serde_json::to_value(schema).expect("failed to serialize tool schema");
+    pub fn new(tool: T, outputs: OutputStore) -> Self {
+        let schema = tool_schema::<T::Arguments>();
         Self {
             tool,
             schema,
-            output_dir: output_dir.into(),
+            outputs,
         }
     }
 
@@ -2193,7 +2293,7 @@ where
         let parsed: T::Arguments = serde_json::from_value(json_args)?;
         // A CLI invocation has nowhere to show progress.
         let output = self.tool.call(parsed, ToolContext::new()).await?;
-        let payload = tool_output_to_payload(output, &self.output_dir)
+        let payload = tool_output_to_payload(output, &self.outputs)
             .await
             .map_err(anyhow::Error::msg)?;
         Ok(payload.map_or_else(String::new, |payload| payload.render_for_cli()))
@@ -2210,7 +2310,7 @@ pub struct IpcToolCommand<T: Tool> {
     name: String,
     stdin_arg: Option<String>,
     help: String,
-    output_dir: PathBuf,
+    outputs: OutputStore,
 }
 
 impl<T: Tool + std::fmt::Debug> std::fmt::Debug for IpcToolCommand<T> {
@@ -2230,7 +2330,7 @@ impl<T: Tool + Clone> Clone for IpcToolCommand<T> {
             name: self.name.clone(),
             stdin_arg: self.stdin_arg.clone(),
             help: self.help.clone(),
-            output_dir: self.output_dir.clone(),
+            outputs: self.outputs.clone(),
         }
     }
 }
@@ -2241,13 +2341,12 @@ where
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     /// Creates a new IPC command wrapper for the given tool. Binary results
-    /// are stored in `output_dir`.
+    /// are stored in `outputs`.
     ///
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
-    pub fn new(tool: T, output_dir: impl Into<PathBuf>) -> Self {
-        let schema = serde_json::to_value(schemars::schema_for!(T::Arguments))
-            .expect("failed to serialize tool schema");
+    pub fn new(tool: T, outputs: OutputStore) -> Self {
+        let schema = tool_schema::<T::Arguments>();
         let name = tool.name().to_string();
         let stdin_arg = detect_stdin_arg(&schema);
         let help = schema_to_help(&schema);
@@ -2258,7 +2357,7 @@ where
             name,
             stdin_arg,
             help,
-            output_dir: output_dir.into(),
+            outputs,
         }
     }
 }
@@ -2319,7 +2418,7 @@ where
         // it ran in is known.
         let cx = ToolContext::new().with_working_dir(context.working_dir().to_string_lossy());
         match self.tool.call(parsed, cx).await {
-            Ok(output) => tool_output_to_payload(output, &self.output_dir)
+            Ok(output) => tool_output_to_payload(output, &self.outputs)
                 .await
                 .map(|payload| payload.map_or_else(String::new, |payload| payload.render_for_cli()))
                 .map_err(IpcError::remote),
@@ -2340,18 +2439,18 @@ where
 /// use heel::IpcRouter;
 ///
 /// let router = IpcRouter::new();
-/// let router = register_tool_direct(router, my_tool, outputs_dir);
+/// let router = register_tool_direct(router, my_tool, outputs);
 /// ```
 pub fn register_tool_direct<T>(
     router: heel::IpcRouter,
     tool: T,
-    output_dir: impl Into<PathBuf>,
+    outputs: OutputStore,
 ) -> heel::IpcRouter
 where
     T: Tool + Send + Sync + Clone + Default + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
-    router.register(IpcToolCommand::new(tool, output_dir))
+    router.register(IpcToolCommand::new(tool, outputs))
 }
 
 /// Converts CLI arguments to JSON using schema information.
@@ -2565,7 +2664,7 @@ fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow:
     } else {
         args
     };
-    let schema = ObjectParseSchema::new(root_schema, schema);
+    let schema = ObjectParseSchema::new(root_schema, schema)?;
     let mut state = ObjectParseState::default();
     let mut i = 0;
     while i < args.len() {
@@ -2579,7 +2678,12 @@ fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow:
 
         if !state.end_of_options && arg.starts_with("--") {
             parse_long_option(root_schema, args, &mut i, &schema, &mut state)?;
-        } else if !state.end_of_options && arg.starts_with('-') && arg.len() > 1 && arg != "-" {
+        } else if !state.end_of_options
+            && arg.starts_with('-')
+            && arg.len() > 1
+            && arg != "-"
+            && !is_negative_number_operand(root_schema, &schema, &state, arg)
+        {
             parse_short_options(
                 root_schema,
                 arg,
@@ -2614,33 +2718,20 @@ struct ObjectParseSchema {
 }
 
 impl ObjectParseSchema {
-    fn new(root_schema: &Value, schema: &Value) -> Self {
+    fn new(root_schema: &Value, schema: &Value) -> Result<Self, PositionalLayoutError> {
         let resolved = resolved_schema(root_schema, schema);
-        let properties = resolved
-            .get("properties")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let required: Vec<String> = resolved
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        check_object_layout(root_schema, resolved)?;
+        let (properties, required) = object_fields(resolved);
         let positional_fields = positional_fields(root_schema, &properties, &required);
         let (short_to_field, _) = build_short_option_maps(&properties);
         let long_names = properties.keys().map(|k| k.replace('_', "-")).collect();
-        Self {
+        Ok(Self {
             properties,
             required,
             positional_fields,
             short_to_field,
             long_names,
-        }
+        })
     }
 }
 
@@ -2667,40 +2758,196 @@ struct ObjectParseState {
 /// }
 /// ```
 ///
-/// An array field is never positional; it is filled by repeated flags.
+/// An array field is filled by repeated flags and is not positional unless
+/// it carries this keyword. A marked array field is variadic: it collects
+/// every bare word left after the other positional fields, each parsed by
+/// the array's item type, and shows in usage as `<name>...`. At most one
+/// field is variadic and it must be the last positional field; a schema
+/// that breaks this is rejected when the command is built
+/// ([`validate_positional_layout`]).
 pub const POSITIONAL_KEYWORD: &str = "x-positional";
 
-/// The fields bare words bind to, in order: the required non-array fields,
-/// then the optional non-array fields marked with [`POSITIONAL_KEYWORD`].
+/// A schema whose variadic positional field breaks the layout rules.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PositionalLayoutError {
+    /// More than one array field is positional.
+    #[error("at most one positional field can be variadic, found `{first}` and `{second}`")]
+    MultipleVariadic {
+        /// The first variadic field.
+        first: String,
+        /// The second variadic field.
+        second: String,
+    },
+    /// A positional field follows the variadic one.
+    #[error("variadic positional field `{variadic}` must come last, but `{after}` follows it")]
+    VariadicNotLast {
+        /// The variadic field.
+        variadic: String,
+        /// The positional field after it.
+        after: String,
+    },
+}
+
+/// Checks the positional layout of a tool argument schema, including every
+/// variant of a tagged enum.
+///
+/// # Errors
+///
+/// Returns an error when a variadic positional field is not the only one or
+/// not the last positional field.
+pub fn validate_positional_layout(schema: &Value) -> Result<(), PositionalLayoutError> {
+    let resolved = resolved_schema(schema, schema);
+    if let Some(variants) = resolved.get("oneOf").and_then(Value::as_array) {
+        for variant in variants {
+            check_object_layout(schema, resolved_schema(schema, variant))?;
+        }
+    }
+    check_object_layout(schema, resolved)
+}
+
+fn check_object_layout(root_schema: &Value, object: &Value) -> Result<(), PositionalLayoutError> {
+    let (properties, required) = object_fields(object);
+    let fields = positional_fields(root_schema, &properties, &required);
+    let mut variadic = fields
+        .iter()
+        .filter(|name| is_array_field(root_schema, &properties, name));
+    let Some(first) = variadic.next() else {
+        return Ok(());
+    };
+    if let Some(second) = variadic.next() {
+        return Err(PositionalLayoutError::MultipleVariadic {
+            first: first.clone(),
+            second: second.clone(),
+        });
+    }
+    fields
+        .iter()
+        .skip_while(|name| *name != first)
+        .nth(1)
+        .map_or(Ok(()), |after| {
+            Err(PositionalLayoutError::VariadicNotLast {
+                variadic: first.clone(),
+                after: after.clone(),
+            })
+        })
+}
+
+/// The properties and required names of an object schema.
+fn object_fields(object: &Value) -> (serde_json::Map<String, Value>, Vec<String>) {
+    let properties = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    (properties, required)
+}
+
+fn is_array_field(
+    root_schema: &Value,
+    properties: &serde_json::Map<String, Value>,
+    name: &str,
+) -> bool {
+    properties
+        .get(name)
+        .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("array"))
+}
+
+/// The fields bare words bind to, in order: the required fields, then the
+/// optional fields marked with [`POSITIONAL_KEYWORD`]. An array field joins
+/// only when marked, and is then variadic.
 fn positional_fields(
     root_schema: &Value,
     properties: &serde_json::Map<String, Value>,
     required: &[String],
 ) -> Vec<String> {
-    let is_array = |name: &str| {
+    let marked = |name: &str| {
         properties
             .get(name)
-            .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("array"))
-    };
-    let marked = |schema: &Value| {
-        schema
-            .get(POSITIONAL_KEYWORD)
+            .and_then(|schema| schema.get(POSITIONAL_KEYWORD))
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
     required
         .iter()
-        .filter(|name| !is_array(name))
+        .filter(|name| !is_array_field(root_schema, properties, name) || marked(name))
         .cloned()
         .chain(
             properties
-                .iter()
-                .filter(|(name, schema)| {
-                    !required.contains(name) && marked(schema) && !is_array(name)
-                })
-                .map(|(name, _)| name.clone()),
+                .keys()
+                .filter(|name| !required.contains(name) && marked(name))
+                .cloned(),
         )
         .collect()
+}
+
+/// Where the next bare word goes.
+struct PositionalSlot<'a> {
+    field: &'a str,
+    /// The type the word is parsed as: the field's, or the item type of a
+    /// variadic field.
+    value_type: Option<&'a str>,
+    variadic: bool,
+}
+
+/// The slot the next bare word binds to, if any field is left.
+fn next_positional_slot<'a>(
+    root_schema: &'a Value,
+    schema: &'a ObjectParseSchema,
+    state: &ObjectParseState,
+) -> Option<PositionalSlot<'a>> {
+    let field = schema.positional_fields.get(state.positional_idx)?;
+    let prop_schema = schema.properties.get(field)?;
+    let variadic = is_array_field(root_schema, &schema.properties, field);
+    let value_type = if variadic {
+        resolved_schema(root_schema, prop_schema)
+            .get("items")
+            .and_then(|items| get_instance_type(root_schema, items))
+    } else {
+        get_instance_type(root_schema, prop_schema)
+    };
+    Some(PositionalSlot {
+        field,
+        value_type,
+        variadic,
+    })
+}
+
+/// Whether `arg` is a negative number the next positional field takes.
+///
+/// Short options are letters, so a number never collides with one unless it
+/// carries an exponent letter a declared short option names.
+fn is_negative_number_operand(
+    root_schema: &Value,
+    schema: &ObjectParseSchema,
+    state: &ObjectParseState,
+    arg: &str,
+) -> bool {
+    let Some(digits) = arg.strip_prefix('-') else {
+        return false;
+    };
+    if !digits.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        || arg.parse::<f64>().is_err()
+        || digits
+            .chars()
+            .any(|c| schema.short_to_field.contains_key(&c))
+    {
+        return false;
+    }
+    next_positional_slot(root_schema, schema, state).is_some_and(|slot| match slot.value_type {
+        Some("integer") => arg.parse::<i64>().is_ok(),
+        Some("number" | "string") | None => true,
+        Some(_) => false,
+    })
 }
 
 fn parse_positional_arg(
@@ -2709,17 +2956,22 @@ fn parse_positional_arg(
     state: &mut ObjectParseState,
     arg: &str,
 ) -> anyhow::Result<()> {
-    if state.positional_idx < schema.positional_fields.len() {
-        let field_name = &schema.positional_fields[state.positional_idx];
-        if let Some(prop_schema) = schema.properties.get(field_name) {
-            let prop_type = get_instance_type(root_schema, prop_schema);
-            state
-                .result
-                .insert(field_name.clone(), parse_value(arg, prop_type));
-        }
-        state.positional_idx += 1;
-    } else {
+    let Some(slot) = next_positional_slot(root_schema, schema, state) else {
         anyhow::bail!("unexpected positional argument: {arg}");
+    };
+    let value = parse_value(arg, slot.value_type);
+    let field = slot.field.to_string();
+    if slot.variadic {
+        insert_value(
+            root_schema,
+            &mut state.result,
+            &field,
+            value,
+            &schema.properties[&field],
+        );
+    } else {
+        state.result.insert(field, value);
+        state.positional_idx += 1;
     }
     Ok(())
 }
@@ -3049,17 +3301,23 @@ pub fn schema_to_help(schema: &Value) -> String {
         // Show positional usage: the fields bare words bind to, optional
         // ones in brackets.
         let required_names: Vec<String> = required.iter().map(|n| (*n).to_string()).collect();
-        let positional: Vec<_> = positional_fields(schema, props, &required_names)
+        let positional_names = positional_fields(schema, props, &required_names);
+        let positional: Vec<_> = positional_names
             .iter()
-            .map(|name| render_positional_usage(name, required.contains(&name.as_str())))
+            .map(|name| {
+                render_positional_usage(
+                    name,
+                    required.contains(&name.as_str()),
+                    is_array_field(schema, props, name),
+                )
+            })
             .collect();
-        // Show required array fields as repeatable flags in usage
+        // Show required array fields that are not positional as repeatable
+        // flags in usage
         let repeatable: Vec<_> = required
             .iter()
             .filter(|n| {
-                props
-                    .get(**n)
-                    .is_some_and(|s| get_instance_type(s, s) == Some("array"))
+                is_array_field(schema, props, n) && !positional_names.iter().any(|p| p == **n)
             })
             .map(|n| render_repeatable_usage(n))
             .collect();
@@ -3115,6 +3373,11 @@ mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
+    /// An output store in `dir` leasing from the default allocator.
+    fn test_outputs(dir: &Path) -> OutputStore {
+        OutputStore::at(dir.to_path_buf(), aither_core::AnyIdAllocator::default())
+    }
+
     fn single_stored_file(dir: &Path) -> PathBuf {
         let mut files = std::fs::read_dir(dir)
             .unwrap()
@@ -3133,7 +3396,7 @@ mod tests {
                 ToolResultPart::text("see below"),
                 ToolResultPart::image(png.clone(), "image/png"),
             ]),
-            dir.path(),
+            &test_outputs(dir.path()),
         )
         .await
         .unwrap()
@@ -3157,11 +3420,13 @@ mod tests {
     async fn lone_binary_tool_result_is_stored_and_referenced() {
         let dir = tempfile::tempdir().unwrap();
         let png = vec![0x89, 0x50, 0x4E, 0x47];
-        let payload =
-            tool_output_to_payload(ToolResult::image(png.clone(), "image/png"), dir.path())
-                .await
-                .unwrap()
-                .expect("a lone image produces a payload");
+        let payload = tool_output_to_payload(
+            ToolResult::image(png.clone(), "image/png"),
+            &test_outputs(dir.path()),
+        )
+        .await
+        .unwrap()
+        .expect("a lone image produces a payload");
 
         let CommandPayload::Text { content } = payload;
         let file = single_stored_file(dir.path());
@@ -3414,7 +3679,7 @@ mod tests {
         // Simulate IPC params (key-value pairs from `heel ipc`)
         let json = r#"{"query": "rust async", "max": 5}"#;
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let cmd = ToolCallCommand::new("websearch", Arc::new(registry));
         let args: std::collections::HashMap<String, Value> = serde_json::from_str(json).unwrap();
 
@@ -3432,7 +3697,7 @@ mod tests {
     #[test]
     fn test_tool_call_command_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let cmd = ToolCallCommand::new("my_tool", Arc::new(registry));
         assert_eq!(cmd.name(), "my_tool");
     }
@@ -3763,6 +4028,207 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct TextTailArgs {
+        action: String,
+        #[schemars(extend("x-positional" = true))]
+        words: Vec<String>,
+        verbose: Option<bool>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct NumberTailArgs {
+        action: String,
+        #[schemars(extend("x-positional" = true))]
+        amounts: Vec<i64>,
+        verbose: Option<bool>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct RealTailArgs {
+        #[schemars(extend("x-positional" = true))]
+        values: Vec<f64>,
+    }
+
+    fn schema_of<T: JsonSchema>() -> Value {
+        serde_json::to_value(schemars::schema_for!(T)).unwrap()
+    }
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn test_variadic_tail_collects_string_words() {
+        let schema = schema_of::<TextTailArgs>();
+        let value = cli_to_json(&schema, &words(&["type", "some", "longer", "text"])).unwrap();
+        assert_eq!(value["action"], "type");
+        assert_eq!(
+            value["words"],
+            serde_json::json!(["some", "longer", "text"])
+        );
+    }
+
+    #[test]
+    fn test_variadic_tail_collects_numbers_by_item_type() {
+        let schema = schema_of::<NumberTailArgs>();
+        let value = cli_to_json(&schema, &words(&["click", "10", "20"])).unwrap();
+        assert_eq!(value["action"], "click");
+        assert_eq!(value["amounts"], serde_json::json!([10, 20]));
+
+        let schema = schema_of::<RealTailArgs>();
+        let value = cli_to_json(&schema, &words(&["1.5", "2"])).unwrap();
+        assert_eq!(value["values"], serde_json::json!([1.5, 2.0]));
+    }
+
+    #[test]
+    fn test_variadic_tail_with_interleaved_flags() {
+        let schema = schema_of::<TextTailArgs>();
+        let value = cli_to_json(
+            &schema,
+            &words(&["type", "a", "--verbose", "b", "--words", "c", "d"]),
+        )
+        .unwrap();
+        assert_eq!(value["action"], "type");
+        assert_eq!(value["verbose"], true);
+        assert_eq!(value["words"], serde_json::json!(["a", "b", "c", "d"]));
+    }
+
+    #[test]
+    fn test_variadic_tail_after_double_dash() {
+        let schema = schema_of::<TextTailArgs>();
+        let value = cli_to_json(&schema, &words(&["type", "--", "--verbose", "-x", "-3"])).unwrap();
+        assert_eq!(value["words"], serde_json::json!(["--verbose", "-x", "-3"]));
+        assert!(value.get("verbose").is_none(), "got: {value}");
+
+        // After `--` a negative number is positional with no number check.
+        let schema = schema_of::<NumberTailArgs>();
+        let value = cli_to_json(&schema, &words(&["click", "--", "-5"])).unwrap();
+        assert_eq!(value["amounts"], serde_json::json!([-5]));
+    }
+
+    #[test]
+    fn test_empty_required_variadic_is_missing() {
+        let schema = schema_of::<TextTailArgs>();
+        let err = cli_to_json(&schema, &words(&["type"])).expect_err("the tail is required");
+        assert!(
+            err.to_string().contains("missing required argument: words"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_negative_numbers_are_positional() {
+        let schema = schema_of::<NumberTailArgs>();
+        let value = cli_to_json(&schema, &words(&["scroll", "0", "-300"])).unwrap();
+        assert_eq!(value["amounts"], serde_json::json!([0, -300]));
+
+        // A string-typed tail takes the word as a string.
+        let schema = schema_of::<TextTailArgs>();
+        let value = cli_to_json(&schema, &words(&["type", "-3", "-1.5"])).unwrap();
+        assert_eq!(value["words"], serde_json::json!(["-3", "-1.5"]));
+
+        // A plain positional field takes one too.
+        let schema = schema_of::<RealTailArgs>();
+        let value = cli_to_json(&schema, &words(&["-1.5", "-2"])).unwrap();
+        assert_eq!(value["values"], serde_json::json!([-1.5, -2.0]));
+
+        // An integer field does not accept a fraction, so it stays an option.
+        let schema = schema_of::<NumberTailArgs>();
+        let err = cli_to_json(&schema, &words(&["scroll", "-1.5"])).expect_err("not an integer");
+        assert!(err.to_string().contains("unknown option: -1"), "got: {err}");
+    }
+
+    #[test]
+    fn test_negative_number_next_to_short_option() {
+        let schema = schema_of::<NumberTailArgs>();
+        let value = cli_to_json(&schema, &words(&["scroll", "-v", "-3", "4"])).unwrap();
+        assert_eq!(value["verbose"], true);
+        assert_eq!(value["amounts"], serde_json::json!([-3, 4]));
+
+        // A number word carrying a declared short option's letter (`m`,
+        // `v`) stays an option cluster.
+        let schema = schema_of::<RealTailArgs>();
+        let value = cli_to_json(&schema, &words(&["-1e5"])).unwrap();
+        assert_eq!(value["values"], serde_json::json!([-100_000.0]));
+        let schema = schema_of::<NumberTailArgs>();
+        let err =
+            cli_to_json(&schema, &words(&["scroll", "-1v"])).expect_err("`-1v` is not a number");
+        assert!(err.to_string().contains("unknown option: -1"), "got: {err}");
+    }
+
+    #[test]
+    fn test_variadic_field_shows_in_usage() {
+        let help = schema_to_help(&schema_of::<TextTailArgs>());
+        assert!(help.contains("<action> <words>..."), "got:\n{help}");
+        assert!(!help.contains("--words <value>..."), "got:\n{help}");
+    }
+
+    #[test]
+    fn test_invalid_variadic_layout_is_rejected() {
+        let two = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "array", "items": {"type": "string"}, "x-positional": true},
+                "b": {"type": "array", "items": {"type": "string"}, "x-positional": true}
+            }
+        });
+        assert_eq!(
+            validate_positional_layout(&two),
+            Err(PositionalLayoutError::MultipleVariadic {
+                first: "a".into(),
+                second: "b".into()
+            })
+        );
+        assert!(cli_to_json(&two, &[]).is_err());
+
+        let not_last = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tail": {"type": "array", "items": {"type": "string"}, "x-positional": true},
+                "name": {"type": "string"}
+            },
+            "required": ["tail", "name"]
+        });
+        assert_eq!(
+            validate_positional_layout(&not_last),
+            Err(PositionalLayoutError::VariadicNotLast {
+                variadic: "tail".into(),
+                after: "name".into()
+            })
+        );
+
+        // A bad variant of a tagged enum is caught too.
+        let tagged = serde_json::json!({
+            "oneOf": [{
+                "type": "object",
+                "properties": {
+                    "op": {"const": "x"},
+                    "tail": {"type": "array", "items": {"type": "string"}, "x-positional": true},
+                    "name": {"type": "string"}
+                },
+                "required": ["op", "tail", "name"]
+            }]
+        });
+        assert!(validate_positional_layout(&tagged).is_err());
+
+        assert!(validate_positional_layout(&schema_of::<TextTailArgs>()).is_ok());
+        assert!(validate_positional_layout(&schema_of::<OptionalPositionalArgs>()).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid command schema")]
+    fn test_building_a_command_rejects_invalid_layout() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[expect(dead_code, reason = "only the schema is built")]
+        struct Bad {
+            #[schemars(extend("x-positional" = true))]
+            tail: Vec<String>,
+            name: String,
+        }
+        let _ = tool_schema::<Bad>();
+    }
+
     #[test]
     fn test_marked_optional_field_shows_in_usage() {
         let schema = schemars::schema_for!(OptionalPositionalArgs);
@@ -3783,7 +4249,7 @@ mod tests {
     #[test]
     fn test_tool_call_command_args_to_cli_with_array() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let _cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
         let args: std::collections::HashMap<String, Value> =
             serde_json::from_value(serde_json::json!({
@@ -3804,7 +4270,7 @@ mod tests {
     #[test]
     fn test_tool_call_command_raw_args_passthrough() {
         let tmp = tempfile::tempdir().unwrap();
-        let registry = ToolRegistryBuilder::new().build(tmp.path());
+        let registry = ToolRegistryBuilder::new().build(test_outputs(tmp.path()));
         let _cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
         // Simulates what `heel ipc` sends
         let args: std::collections::HashMap<String, Value> =
@@ -3885,14 +4351,14 @@ mod tests {
         std::fs::write(&output_dir, "occupied").unwrap();
         let output = ToolResult::text("x".repeat(INLINE_OUTPUT_LIMIT + 1));
 
-        let result = handle_large_output(output, &output_dir).await;
+        let result = handle_large_output(output, &test_outputs(&output_dir)).await;
         assert!(!result.ok);
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("failed to write output")
+                .contains("failed to store output")
         );
     }
 
@@ -3949,7 +4415,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(FakeAskUser);
-        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+        let registry = std::sync::Arc::new(builder.build(test_outputs(tmp.path())));
 
         // Simulate what `heel ipc` sends: all args in an "args" array
         let cmd = ToolCallCommand::new("ask_user", registry);
@@ -4010,7 +4476,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(FakeFileOps);
-        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+        let registry = std::sync::Arc::new(builder.build(test_outputs(tmp.path())));
         let cmd = ToolCallCommand::new("file_ops", registry);
 
         // `file_ops read input.txt` — the subcommand word and the variant's
@@ -4086,7 +4552,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(WhereTool);
-        let registry = std::sync::Arc::new(builder.build(tmp.path()));
+        let registry = std::sync::Arc::new(builder.build(test_outputs(tmp.path())));
 
         let none = registry.query_tool_handler("where_am_i", &[]).await;
         assert_eq!(envelope_to_cli(none).unwrap(), "none");
@@ -4133,6 +4599,68 @@ mod tests {
         registry.query_tool_handler(name, &[]).await
     }
 
+    struct FailingTool;
+
+    impl aither_core::llm::Tool for FailingTool {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "broken".into()
+        }
+        type Arguments = RoleArgs;
+        type Res = aither_core::llm::ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: aither_core::llm::ToolContext,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Err(anyhow::anyhow!("authentication rejected")))
+        }
+    }
+
+    /// Collects formatted log lines written while it is installed.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_handler_is_logged_at_warn_with_command_and_error() {
+        let log = LogBuffer::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(FailingTool);
+        let registry = builder.build(test_outputs(tmp.path()));
+
+        let envelope = run_command(&registry, "broken").await;
+
+        assert!(!envelope.ok);
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(logged.contains("tool=broken"), "{logged}");
+        assert!(logged.contains("authentication rejected"), "{logged}");
+    }
+
     #[tokio::test]
     async fn a_kept_command_reports_the_terminal_call_it_succeeded_in() {
         use aither_core::llm::{AgentIdentity, ToolCallId};
@@ -4151,7 +4679,7 @@ mod tests {
             name: "ordinary",
             answer: "ran",
         });
-        let registry = builder.build(tmp.path());
+        let registry = builder.build(test_outputs(tmp.path()));
         let receiver = registry.kept_receiver();
         let call = |id: &str| {
             registry.for_call(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
@@ -4237,7 +4765,7 @@ mod tests {
             answer: "fixed",
         });
         builder.command_set(set.clone());
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(None, None);
         let args = ["hi".to_string()];
 
@@ -4290,7 +4818,7 @@ mod tests {
             name: "shared",
             answer: "anyone ran it",
         });
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(None, None);
 
         let ok = run_command(&main, "reserved").await;
@@ -4332,7 +4860,7 @@ mod tests {
             name: "shared",
             answer: "every mode ran it",
         });
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
 
         let sandboxed = main.in_mode(TerminalMode::Sandboxed);
         let answered = run_command(&sandboxed, "gh").await;
@@ -4372,7 +4900,7 @@ mod tests {
                 answer: "subagent handler",
             },
         );
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(None, None);
 
         let answer =
@@ -4390,7 +4918,7 @@ mod tests {
     fn a_subagent_registry_delegates_the_subagent_registry() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = ToolRegistryBuilder::new()
-            .build(tmp.path())
+            .build(test_outputs(tmp.path()))
             .for_subagent(None, None)
             .for_subagent(None, None);
         assert_eq!(nested.role(), CommandRole::Subagent);
@@ -4418,7 +4946,7 @@ mod tests {
             answer: "anyone ran it",
         });
         builder.observe_commands(AnyCommandObserver::new(CallLog(Arc::clone(&main_calls))));
-        let main = builder.build(tmp.path());
+        let main = builder.build(test_outputs(tmp.path()));
         let subagent = main.for_subagent(
             Some(AnyCommandObserver::new(CallLog(Arc::clone(
                 &subagent_calls,

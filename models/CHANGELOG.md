@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/May-Agent/aither/compare/models-v0.22.0...models-v0.23.0) - 2026-11-07
+
+### Fixed
+
+- *(claude)* index the sent message list and keep the live tail out of system
+
+### Other
+
+- merge main into dev after v0.22.0
+
+## [0.22.0](https://github.com/May-Agent/aither/compare/models-v0.21.0...models-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+
+### Fixed
+
+- clear the reasoning effort to the model's default on per-message models
+
 ## [0.12.0](https://github.com/May-Agent/aither/compare/models-v0.11.0...models-v0.12.0) - 2026-11-03
 
 ### Fixed

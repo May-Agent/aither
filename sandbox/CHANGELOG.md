@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/sandbox-v0.23.0...sandbox-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(agent)* [**breaking**] the context keeps what the model saw of each state
+- *(sandbox)* [**breaking**] lease model-facing ids from an embedder-supplied allocator
+- *(sandbox)* show IPC command progress in the terminal job's output
+
+### Fixed
+
+- *(sandbox)* run approved unsafe commands under heel host access
+- *(sandbox)* feed a command fifo when it registers
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+- *(sandbox)* hold command progress for a job that is still registering
+
+### Other
+
+- Merge pull request #640 from May-Agent/feat/617-context-kinds
+- Merge pull request #635 from May-Agent/fix/634-feed-on-register
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+- Merge main into dev after v0.23.0
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+- Merge remote-tracking branch 'origin/dev' into feat/626-ipc-progress
+
+## [0.23.0](https://github.com/May-Agent/aither/compare/sandbox-v0.22.0...sandbox-v0.23.0) - 2026-11-07
+
+### Added
+
+- *(sandbox)* variadic positional arguments and negative numbers in the CLI bridge
+- *(sandbox)* [**breaking**] command refusals become embedder policies behind CommandPolicy
+- *(agent)* [**breaking**] render every alert, notice and refusal through embedder-supplied Notices
+
+### Fixed
+
+- *(sandbox)* [**breaking**] pin each tool artifact's byte size instead of capping at 64 MiB
+- *(sandbox)* count a process reaped mid-read of /proc as dead in the exec wrapper tests
+
+### Other
+
+- Merge pull request #615 from May-Agent/feat/598-command-policy
+- merge main into dev after v0.22.0
+- Merge pull request #612 from May-Agent/feat/595-notices
+
+## [0.22.0](https://github.com/May-Agent/aither/compare/sandbox-v0.21.0...sandbox-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(sandbox)* broker jobserver tokens into container sessions
+- *(sandbox)* run Python through terminal's language argument
+- *(agent)* [**breaking**] watch the disk of the home environment, a container's filesystem included, never a remote host's
+
+### Fixed
+
+- name the script language in the container jobserver test
+- *(sandbox)* resolve the terminal working directory once
+- *(sandbox)* log failed commands
+
+### Other
+
+- Merge pull request #591 from May-Agent/feat/589-in-place-changes
+- Merge remote-tracking branch 'origin/dev' into feat/221-container-jobserver
+- Merge pull request #587 from May-Agent/feat/214-python-language
+- Merge pull request #586 from May-Agent/fix/508-resolved-workdir
+- Merge pull request #584 from May-Agent/fix/583-command-failure-log
+- Merge remote-tracking branch 'origin/dev' into feat/545-disk-pressure
+- Merge branch 'feat/171-runaway-guard' into feat/545-disk-pressure
+
+## [0.21.0](https://github.com/May-Agent/aither/compare/sandbox-v0.20.0...sandbox-v0.21.0) - 2026-11-06
+
+### Fixed
+
+- *(sandbox)* give a subagent terminal read-only access to a worktree's git directory
+
 ## [0.20.0](https://github.com/May-Agent/aither/compare/sandbox-v0.19.0...sandbox-v0.20.0) - 2026-11-06
 
 ### Added

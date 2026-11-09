@@ -15,8 +15,8 @@ use std::fmt;
 use std::str::FromStr;
 
 pub use detect::DetectorError;
-pub(crate) use guard::{LanguageAlert, LanguageAlertsTemplate, translate};
-pub use guard::{LanguageGuard, LanguageRefusal, WorkingText};
+pub use guard::{LanguageAlert, LanguageGuard, LanguageRefusal, WorkingText};
+pub(crate) use guard::{default_alerts, default_refusal, translate};
 pub(crate) use watch::LanguageAlerts;
 
 /// A natural language the detector can identify.
@@ -63,6 +63,20 @@ fn macrolanguage(code: &str) -> &str {
 impl Language {
     /// English, the default working language.
     pub const ENGLISH: Self = Self(isolang::Language::Eng);
+    /// Chinese in either script, Cantonese included.
+    pub(crate) const CHINESE: Self = Self(isolang::Language::Zho);
+    pub(crate) const JAPANESE: Self = Self(isolang::Language::Jpn);
+    pub(crate) const KOREAN: Self = Self(isolang::Language::Kor);
+
+    /// Whether the language is written in Han, kana or Hangul.
+    pub(crate) fn is_cjk(self) -> bool {
+        self == Self::CHINESE || self == Self::JAPANESE || self == Self::KOREAN
+    }
+
+    /// Whether the language is one the Han script alone can leave undecided.
+    pub(crate) fn is_chinese_or_japanese(self) -> bool {
+        self == Self::CHINESE || self == Self::JAPANESE
+    }
 
     /// The language of a detector label such as `zho_Hans`, if this crate
     /// knows it.
@@ -124,7 +138,7 @@ impl FromStr for Language {
 ///
 /// The communication language is the one the agent talks to the user in:
 /// replies and the questions it asks. The working language, English by
-/// default, is the one it writes in for others to read: `tasks.md`, prompts
+/// default, is the one it writes in for others to read: its working document, prompts
 /// and messages to subagents and other agents, issue and pull request text.
 /// Both are inactive while the communication language is unset or English,
 /// and the working language is enforced only once the communication language

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/cli-v0.23.0...cli-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(agent)* [**breaking**] take subagent definitions from the embedder
+
+### Fixed
+
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+
+### Other
+
+- Merge origin/dev into feat/597-embedder-personas
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+
+## [0.23.0](https://github.com/May-Agent/aither/compare/cli-v0.22.0...cli-v0.23.0) - 2026-11-07
+
+### Added
+
+- *(agent)* [**breaking**] replace the tasks.md protocol with a general working-document mechanism
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/596-tasks-protocol
+- Merge pull request #607 from May-Agent/feat/606-patch-api
+
+## [0.22.0](https://github.com/May-Agent/aither/compare/cli-v0.21.0...cli-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(sandbox)* run Python through terminal's language argument
+
+### Other
+
+- Merge pull request #591 from May-Agent/feat/589-in-place-changes
+- release v0.21.0
+
+## [0.21.0](https://github.com/May-Agent/aither/compare/cli-v0.20.0...cli-v0.21.0) - 2026-11-06
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.20.0](https://github.com/May-Agent/aither/compare/cli-v0.19.0...cli-v0.20.0) - 2026-11-06
 
 ### Other

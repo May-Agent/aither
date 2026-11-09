@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "aither"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-agent",
  "aither-apple",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -92,8 +92,9 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
+ "aho-corasick",
  "aither-attachments",
  "aither-command",
  "aither-connectivity",
@@ -115,6 +116,7 @@ dependencies = [
  "async-stream",
  "basic-toml",
  "blocking",
+ "dirs 6.0.0",
  "dunce",
  "event-listener",
  "executor-core",
@@ -123,10 +125,13 @@ dependencies = [
  "futures-lite",
  "hex",
  "indexmap 2.14.2",
+ "isolang",
  "jiff",
  "libc",
  "notify",
  "num-traits",
+ "ort",
+ "regex",
  "rustix",
  "schemars 1.2.3",
  "serde",
@@ -136,17 +141,18 @@ dependencies = [
  "sync_wrapper",
  "tempfile",
  "thiserror 2.0.21",
+ "tokenizers",
  "tokio",
  "tracing",
+ "ureq",
  "url",
  "uuid",
- "whatlang",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "aither-apple"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "async-channel",
@@ -166,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -180,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "aither-browser"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -192,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "aither-claude"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -210,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "aither-cli"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-acp",
  "aither-agent",
@@ -230,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "aither-cloud"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -246,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "aither-codex"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -270,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "aither-command"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -284,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "aither-connectivity"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -309,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "aither-copilot"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -329,21 +335,26 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-derive",
  "anyhow",
  "askama 0.16.1",
  "async-channel",
  "async-io",
+ "base64 0.22.1",
  "futures-core",
  "futures-lite",
  "gloo-timers 0.4.0",
  "httpdate",
+ "image",
  "mime",
+ "num-traits",
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
+ "tiktoken",
  "tokio",
  "tokio-test",
  "url",
@@ -353,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -363,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "aither-fs"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -379,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "aither-gemini"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -403,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "aither-llama"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "async-channel",
@@ -420,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -445,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "aither-mem0"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "aither-gemini",
@@ -464,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "aither-models"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "async-fs",
@@ -475,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "aither-openai"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -483,6 +494,7 @@ dependencies = [
  "async-fs",
  "async-stream",
  "base64 0.23.1",
+ "blocking",
  "futures-core",
  "futures-lite",
  "mime_guess",
@@ -497,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "aither-ort"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "async-channel",
@@ -510,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "aither-patch"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.21",
@@ -518,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "aither-rag"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -546,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-connectivity",
  "aither-core",
@@ -570,13 +582,13 @@ dependencies = [
  "globset",
  "heel",
  "hex",
- "human-hash",
  "image",
  "jiff",
  "libc",
  "lzma-rust2 0.24.0",
  "magika",
  "ort",
+ "percent-encoding",
  "polling",
  "regex",
  "rmp-serde",
@@ -594,6 +606,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tree-sitter",
  "typed-path",
  "url",
@@ -606,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "aither-search"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "aither-rag",
@@ -632,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "aither-sed"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.21",
@@ -640,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "aither-skills"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -653,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "aither-webfetch"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -682,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "aither-websearch"
-version = "0.20.0"
+version = "0.24.0"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -4070,9 +4083,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9e8401f187045391a6494252c29da3663475e5819acd098e505ecd129455bd8"
+checksum = "c39ba724ff8c7e06342ef658b1154901d08eb58c84a60649b01de0177002c66a"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -4308,15 +4321,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "human-hash"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee5afc14f104d821c7dae9cabe97a19510b62532bf7d506ef14fab73c4bbf4fa"
-dependencies = [
- "uuid",
-]
 
 [[package]]
 name = "humansize"
@@ -4793,6 +4797,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "isolang"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe50d48c77760c55188549098b9a7f6e37ae980c586a24693d6b01c3b2010c3c"
+dependencies = [
+ "phf 0.11.3",
+]
 
 [[package]]
 name = "itertools"
@@ -6896,6 +6909,15 @@ dependencies = [
 
 [[package]]
 name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
@@ -6945,6 +6967,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
 ]
 
 [[package]]
@@ -7909,6 +7940,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8448,17 +8488,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "socks"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0c3dbbd9ae980613c6dd8e28a9407b50509d3803b57624d5dfe8315218cd58b"
-dependencies = [
- "byteorder",
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "spm_precompiled"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8774,6 +8803,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tiktoken"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40ba662e4a36f3db9561d09f1ba085f719aaf393b7dbd71e23a2e16b8e4e4e19"
+dependencies = [
+ "regex",
+ "rustc-hash",
+ "ruzstd",
 ]
 
 [[package]]
@@ -9306,9 +9346,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "3.4.2"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+checksum = "e7be76686bdf7198002062423ca0d8cf9b75a27c8e1de804513b97e97b555d9d"
 dependencies = [
  "base64 0.23.1",
  "der",
@@ -9317,7 +9357,6 @@ dependencies = [
  "percent-encoding",
  "rustls",
  "rustls-pki-types",
- "socks",
  "ureq-proto",
  "utf8-zero",
  "webpki-root-certs",
@@ -9326,9 +9365,9 @@ dependencies = [
 
 [[package]]
 name = "ureq-proto"
-version = "0.6.5"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841583fc36089d7d59419568ae157f43a5a03a2e5a81ba87c77d1596ef46e922"
+checksum = "622dce33c252115466d83f63e9744a18f12b4406aae51a01c15ad8fcf1185eb3"
 dependencies = [
  "base64 0.23.1",
  "http",
@@ -9622,15 +9661,6 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
-
-[[package]]
-name = "whatlang"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5e8f38b596e2a359b755342473520a99421e43658548c79489ee221b728c107"
-dependencies = [
- "hashbrown 0.15.5",
-]
 
 [[package]]
 name = "which"

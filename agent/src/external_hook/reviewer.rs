@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
+use aither_sandbox::ScriptLanguage;
 use aither_sandbox::permission::{
     PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
 };
-use askama::Template;
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::ExternalHooks;
@@ -25,7 +25,7 @@ pub struct ReviewerConfig {
 /// What a reviewer reads on stdin.
 ///
 /// The role of the agent that asked, and the request, which is either a command escalation (`"kind":"command"` with
-/// `mode` and `script`) or a network domain (`"kind":"domain"` with `domain`
+/// `mode`, `script` and its `language`) or a network domain (`"kind":"domain"` with `domain`
 /// and `port`).
 #[derive(Debug, Serialize)]
 pub struct ReviewRequest<'a> {
@@ -51,13 +51,6 @@ pub enum ReviewAnswer {
     },
     /// Leave the request to the next reviewer.
     Pass {},
-}
-
-#[derive(Template)]
-#[template(path = "reviewer_denial.txt", escape = "none")]
-struct ReviewerDenialTemplate<'a> {
-    reviewer: &'a str,
-    reason: &'a str,
 }
 
 impl ExternalHooks {
@@ -87,14 +80,12 @@ impl ExternalHooks {
             match answer {
                 Run::Answered(ReviewAnswer::Approve {}) => return Review::Approved,
                 Run::Answered(ReviewAnswer::Deny { reason }) => {
-                    return Review::Denied(
-                        ReviewerDenialTemplate {
+                    return Review::Denied(self.notices().reviewer_denial(
+                        &crate::ReviewerDenial {
                             reviewer: &reviewer.config.name,
                             reason: &reason,
-                        }
-                        .render()
-                        .expect("reviewer denial template must render"),
-                    );
+                        },
+                    ));
                 }
                 Run::Answered(ReviewAnswer::Pass {}) | Run::Gone => {}
                 Run::Failed(failure) => tracing::warn!(
@@ -149,16 +140,22 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         self.hooks.review(*request).await
     }
 
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        self.inner.check(mode, script).await
+    async fn check(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+        language: ScriptLanguage,
+    ) -> Result<bool, PermissionError> {
+        self.inner.check(mode, script, language).await
     }
 
     fn will_wait_for_approval(
         &self,
         mode: TerminalMode,
         script: &str,
+        language: ScriptLanguage,
     ) -> impl Future<Output = bool> + Send {
-        self.inner.will_wait_for_approval(mode, script)
+        self.inner.will_wait_for_approval(mode, script, language)
     }
 
     fn for_subagent(&self) -> Option<Self> {

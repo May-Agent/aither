@@ -9,6 +9,7 @@
 //! both implement over the same [`AgentSettings`]. An option added there is
 //! set the same way on either builder.
 
+use std::marker::PhantomData;
 #[cfg(feature = "skills")]
 use std::sync::Arc;
 
@@ -25,8 +26,9 @@ use crate::{
     agent::Agent,
     config::{AgentConfig, AgentKind},
     context::{
-        AnyContextSource, Context, ContextPolicy, ContextSource, ExternalContent, ExternalSlot,
-        InstructionSlot, SystemLayout,
+        AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, Context, ContextPolicy,
+        ContextSource, EventSource, ExternalContent, ExternalSlot, HandoffDocument, HandoffSchema,
+        InstructionSlot, LiveSource, StateSource, SystemLayout,
     },
     hook::{HCons, Hook},
     model_group::ModelTier,
@@ -74,6 +76,7 @@ pub struct AgentBuilder<
     Fast = Balanced,
     H = (),
     Compactor = Advanced,
+    Schema = HandoffDocument,
 > {
     advanced: Advanced,
     balanced: Balanced,
@@ -84,6 +87,8 @@ pub struct AgentBuilder<
     hooks: H,
     settings: AgentSettings,
     wiring: Wiring,
+    /// The handoff schema compactions ask for; no value is held.
+    handoff_schema: PhantomData<fn() -> Schema>,
 }
 
 /// What the [`AgentOptions`] of a builder set.
@@ -99,12 +104,20 @@ pub struct AgentSettings {
     pub(crate) prompt_cache: crate::context::PromptCache,
     pub(crate) clock: crate::AnyClock,
     pub(crate) context_sources: Vec<AnyContextSource>,
-    /// What the agent's `tasks.md` supervision is given by the host.
-    pub(crate) tasks: crate::tasks::TasksWiring,
+    pub(crate) live_sources: Vec<AnyLiveSource>,
+    pub(crate) state_sources: Vec<AnyStateSource>,
+    pub(crate) event_sources: Vec<AnyEventSource>,
+    /// The agent's working document and what the host gives it.
+    pub(crate) document: crate::working_document::DocumentWiring,
+    /// The embedder's stop rule; without one a run ends whenever the model
+    /// ends its turn and no context source objects.
+    pub(crate) stop_hook: Option<crate::AnyStopHook>,
     /// Where the built agent publishes each request for a fork to start from.
     pub(crate) fork_source: Option<crate::fork::ForkSource>,
     /// Who the built agent's tool calls are made by.
     pub(crate) identity: aither_core::llm::AgentIdentity,
+    /// What renders every alert, notice, reminder and refusal.
+    pub(crate) notices: crate::AnyNotices,
     #[cfg(feature = "skills")]
     pub(crate) skill_registry: Option<Arc<SkillRegistry>>,
 }
@@ -128,9 +141,14 @@ impl Default for AgentSettings {
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
-            tasks: crate::tasks::TasksWiring::default(),
+            live_sources: Vec::new(),
+            state_sources: Vec::new(),
+            event_sources: Vec::new(),
+            document: crate::working_document::DocumentWiring::default(),
+            stop_hook: None,
             fork_source: None,
             identity: aither_core::llm::AgentIdentity::Main,
+            notices: crate::AnyNotices::default(),
             #[cfg(feature = "skills")]
             skill_registry: None,
         }
@@ -149,29 +167,70 @@ struct Wiring {
     kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// The commands the terminal runs, kept current in the command table.
     commands: Option<crate::command_catalog::CommandCatalog>,
-    host_load_events: Option<async_channel::Receiver<crate::HostLoadEvent>>,
+    host_load: Option<crate::host_load::HostLoadChannels>,
     job_registry: Option<JobRegistry>,
-    /// Directory whose working documents (`tasks.md`) the agent supervises:
-    /// the main agent's sandbox.
+    /// Directory the agent's working document is kept in: the directory its
+    /// terminal works in.
     sandbox_dir: Option<std::path::PathBuf>,
     /// Directory files are restored from after a forked compaction: the
     /// directory the agent's terminal works in.
     restore_dir: Option<std::path::PathBuf>,
-    /// What the `compact` tool shares with the built agent, once registered.
+    /// What the `compact` tool shares with the built agent; the tool is
+    /// registered at build, over the notices the options settled on.
     compact_signal: Option<std::sync::Arc<crate::compact_tool::CompactSignal>>,
     /// The window state a fork inherits, which replaces initialization.
     inherited: Option<Inherited>,
+    /// The tools a fork runs, built at build over the notices the options
+    /// settled on; they replace every other tool.
+    fork_tools: Option<ForkTools>,
 }
 
-/// What a fork carries over from the main agent besides its context.
-#[derive(Clone)]
+/// The tools a fork inherits: the main agent's definitions, run by the
+/// fork's own terminal.
+struct ForkTools {
+    definitions: Vec<ToolDefinition>,
+    terminal: aither_sandbox::DynTerminalTool,
+}
+
+/// The built agent's tools: a fork's inherited set in place of `tools`, or
+/// `tools` with the `compact` tool over `compact`, each rendering through
+/// `notices`.
+///
+/// # Panics
+///
+/// Panics if `compact` is set and `tools` already holds a tool named
+/// `compact`.
+fn assemble_tools(
+    mut tools: AgentTools,
+    fork: Option<ForkTools>,
+    compact: Option<&std::sync::Arc<crate::compact_tool::CompactSignal>>,
+    notices: &crate::AnyNotices,
+) -> AgentTools {
+    if let Some(fork) = fork {
+        return AgentTools::forked(&fork.definitions, fork.terminal, compact, notices);
+    }
+    if let Some(signal) = compact {
+        tools
+            .register(crate::compact_tool::CompactTool::new(
+                std::sync::Arc::clone(signal),
+                notices.clone(),
+            ))
+            .expect("a tool named `compact` is already registered");
+    }
+    tools
+}
+
+/// What a fork carries over from the main agent besides its context; the
+/// default is what an agent that is no fork starts from.
+#[derive(Clone, Default)]
 struct Inherited {
     budget: crate::context::ContextBudget,
     profile: Option<aither_core::llm::model::Profile>,
+    effort: crate::effort::EffortAnchor,
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> std::fmt::Debug
-    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema> std::fmt::Debug
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentBuilder")
@@ -208,8 +267,8 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Create an explore subagent using the balanced model
-    /// let explore_agent = Agent::builder(opus)
+    /// // Create an agent that reasons on the balanced model
+    /// let balanced_agent = Agent::builder(opus)
     ///     .balanced_model(sonnet, Parameters::default())
     ///     .fast_model(haiku, Parameters::default())
     ///     .tier(ModelTier::Balanced)  // Use sonnet for reasoning
@@ -227,6 +286,26 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     #[must_use]
     fn identity(mut self, identity: aither_core::llm::AgentIdentity) -> Self {
         self.settings().identity = identity;
+        self
+    }
+
+    /// Renders every alert, notice, reminder and refusal the model reads
+    /// through `notices`: the agent's own, those of the tools the builder
+    /// registers (`compact`, the terminal controls, `monitor`) and, on a
+    /// [`TerminalAgentBuilder`](crate::TerminalAgentBuilder), the terminal's
+    /// and its subagents'. [`DefaultNotices`](crate::DefaultNotices) by
+    /// default.
+    ///
+    /// Objects built outside the builder take the same value themselves: a
+    /// hand-built [`ToolRegistryBuilder`](aither_sandbox::ToolRegistryBuilder)
+    /// through `notices(notices.sandbox())`, and
+    /// [`ExternalHooks::with_notices`](crate::ExternalHooks::with_notices).
+    /// A refusal a check returns to the embedder, such as a
+    /// [`SecretRefusal`](crate::SecretRefusal), is data the embedder renders
+    /// with the same value.
+    #[must_use]
+    fn notices(mut self, notices: crate::AnyNotices) -> Self {
+        self.settings().notices = notices;
         self
     }
 
@@ -252,7 +331,7 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     }
 
     /// Enforces the communication and working languages `guard` holds on the
-    /// agent's replies and on `tasks.md`, and states them in the system
+    /// agent's replies and on its working document, and states them in the system
     /// prompt. Give the same guard (a clone) to the tools and harness
     /// commands that take text from the agent, so their refusals reach it as
     /// alerts. Nothing happens while the communication language is unset or
@@ -293,6 +372,58 @@ pub trait AgentOptions: sealed::Sealed + Sized {
         self
     }
 
+    /// Registers live content: a source rendered into the cacheable prefix,
+    /// after the system prompt and before the handoff, for content too large
+    /// to resend uncached in every request's tail.
+    ///
+    /// Blocks render in registration order. A change after a request carried
+    /// the block reaches the model as the diff alert the source writes for
+    /// it, and the new block replaces the old one at the next reassembly or
+    /// compaction (see [`LiveSource`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a live source with the same [`TAG`](LiveSource::TAG) is
+    /// already registered.
+    #[must_use]
+    fn live_source<S: LiveSource>(mut self, source: S) -> Self {
+        let sources = &mut self.settings().live_sources;
+        assert!(
+            sources.iter().all(|registered| registered.tag() != S::TAG),
+            "live source `{}` is registered twice",
+            S::TAG
+        );
+        sources.push(AnyLiveSource::new(source));
+        self
+    }
+
+    /// Registers state: keyed conditions the model is told about, as a
+    /// request is assembled, only when a value differs from the one it last
+    /// saw (see [`StateSource`]).
+    ///
+    /// Sources are read in registration order, after the built-in host load
+    /// state.
+    #[must_use]
+    fn state_source<S: StateSource>(mut self, source: S) -> Self {
+        self.settings()
+            .state_sources
+            .push(AnyStateSource::new(source));
+        self
+    }
+
+    /// Registers events, each told to the model once with the next request
+    /// (see [`EventSource`]).
+    ///
+    /// Sources are read in registration order, after the built-in host
+    /// events.
+    #[must_use]
+    fn event_source<S: EventSource>(mut self, source: S) -> Self {
+        self.settings()
+            .event_sources
+            .push(AnyEventSource::new(source));
+        self
+    }
+
     /// Sets an optional persona overlay prompt.
     #[must_use]
     fn persona_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -307,33 +438,55 @@ pub trait AgentOptions: sealed::Sealed + Sized {
         self
     }
 
-    /// Resolves `BLOCKING` mark payloads in `tasks.md`: a mark it reports
-    /// dead no longer holds its row, which is then stale and keeps the turn
-    /// from ending. Without a resolver every mark is trusted.
+    /// Keeps the working document `spec` describes in the agent's sandbox:
+    /// it enters the conversation, its rows are held to the events and
+    /// items they track, and each agent with a sandbox, a subagent in its
+    /// own space, keeps its own. Without it the agent keeps none.
     #[must_use]
-    fn blocker_resolver(mut self, resolver: impl crate::working_docs::TaskBlockerResolver) -> Self {
-        self.settings().tasks.blocker_resolver =
-            Some(crate::working_docs::AnyTaskBlockerResolver::new(resolver));
+    fn working_document(mut self, spec: crate::working_document::DocumentSpec) -> Self {
+        self.settings().document.spec = Some(spec);
         self
     }
 
-    /// Reads the issues and pull requests `tasks.md` names through
-    /// `tracker`: a row naming a finished one is stale, a row whose issue is
-    /// blocked by an open one holds no turn open, and each root brings its
-    /// issue tree into the context.
+    /// Resolves the blockers the working document's rows wait on: a blocker
+    /// it reports dead no longer holds its row, which is then stale. Without
+    /// a resolver every blocker holds.
     #[must_use]
-    fn work_tracker(mut self, tracker: impl crate::tasks::WorkTracker) -> Self {
-        self.settings().tasks.tracker = Some(crate::tasks::AnyWorkTracker::new(tracker));
+    fn blocker_resolver(mut self, resolver: impl crate::working_document::BlockerResolver) -> Self {
+        self.settings().document.blocker_resolver =
+            Some(crate::working_document::AnyBlockerResolver::new(resolver));
         self
     }
 
-    /// Takes the state changes `tasks.md` rows track from `events`, the
-    /// inbox the host records its own on: issues, pull requests and
-    /// questions. The agent records its background jobs there itself.
-    /// Without it the agent keeps an inbox of its own.
+    /// Reads the issues and pull requests the working document names
+    /// through `tracker`: a row naming a finished one is stale, a row whose
+    /// issue is blocked by an open one waits, and each root brings its issue
+    /// tree into the context.
     #[must_use]
-    fn task_events(mut self, events: crate::tasks::TaskEvents) -> Self {
-        self.settings().tasks.events = events;
+    fn work_tracker(mut self, tracker: impl crate::working_document::WorkTracker) -> Self {
+        self.settings().document.tracker =
+            Some(crate::working_document::AnyWorkTracker::new(tracker));
+        self
+    }
+
+    /// Takes the state changes the working document's rows track from
+    /// `events`, the inbox the host records its own on: issues, pull
+    /// requests and questions. The agent records its background jobs there
+    /// itself. Without it the agent keeps an inbox of its own.
+    #[must_use]
+    fn work_events(mut self, events: crate::working_document::WorkEvents) -> Self {
+        self.settings().document.events = events;
+        self
+    }
+
+    /// Decides through `hook` whether the run ends each time the model ends
+    /// its turn. Without one, the run ends unless a context source objects,
+    /// whatever the working document holds. On a
+    /// [`TerminalAgentBuilder`](crate::TerminalAgentBuilder) its subagents
+    /// follow the same hook.
+    #[must_use]
+    fn stop_hook(mut self, hook: crate::AnyStopHook) -> Self {
+        self.settings().stop_hook = Some(hook);
         self
     }
 
@@ -496,16 +649,16 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> sealed::Sealed
-    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema> sealed::Sealed
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 {
     fn settings(&mut self) -> &mut AgentSettings {
         &mut self.settings
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> AgentOptions
-    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema> AgentOptions
+    for AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 {
 }
 
@@ -522,18 +675,42 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, (), LLM> {
             hooks: (),
             settings: AgentSettings::default(),
             wiring: Wiring::default(),
+            handoff_schema: PhantomData,
         }
     }
 }
 
-impl<Advanced, Balanced, Fast, H, Compactor> AgentBuilder<Advanced, Balanced, Fast, H, Compactor>
+impl<Advanced, Balanced, Fast, H, Compactor, Schema>
+    AgentBuilder<Advanced, Balanced, Fast, H, Compactor, Schema>
 where
     Advanced: LanguageModel,
     Balanced: LanguageModel,
     Fast: LanguageModel,
     Compactor: LanguageModel,
     H: Hook,
+    Schema: HandoffSchema,
 {
+    /// Sets the handoff schema every compaction asks the model for, in place
+    /// of [`HandoffDocument`].
+    ///
+    /// The schema's type is the structured output the model fills; its
+    /// [`HandoffSchema`] implementation gives the instruction, the retry,
+    /// the validation and the text the conversation reads after the handoff.
+    pub fn handoff<S2: HandoffSchema>(
+        self,
+    ) -> AgentBuilder<Advanced, Balanced, Fast, H, Compactor, S2> {
+        AgentBuilder {
+            advanced: self.advanced,
+            balanced: self.balanced,
+            fast: self.fast,
+            compaction_model: self.compaction_model,
+            hooks: self.hooks,
+            settings: self.settings,
+            wiring: self.wiring,
+            handoff_schema: PhantomData,
+        }
+    }
+
     /// Sets the balanced model for moderate tasks (e.g., subagents), and the
     /// parameters of the requests aither sends it.
     ///
@@ -543,7 +720,7 @@ where
         mut self,
         model: B2,
         parameters: Parameters,
-    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor> {
+    ) -> AgentBuilder<Advanced, B2, Fast, H, Compactor, Schema> {
         self.settings.parameters.set_balanced(parameters);
         AgentBuilder {
             advanced: self.advanced,
@@ -553,6 +730,7 @@ where
             hooks: self.hooks,
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -565,7 +743,7 @@ where
         mut self,
         model: F2,
         parameters: Parameters,
-    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor> {
+    ) -> AgentBuilder<Advanced, Balanced, F2, H, Compactor, Schema> {
         self.settings.parameters.set_fast(parameters);
         AgentBuilder {
             advanced: self.advanced,
@@ -575,6 +753,7 @@ where
             hooks: self.hooks,
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -594,7 +773,7 @@ where
         self,
         model: C2,
         parameters: Parameters,
-    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2> {
+    ) -> AgentBuilder<Advanced, Balanced, Fast, H, C2, Schema> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
@@ -606,6 +785,7 @@ where
             hooks: self.hooks,
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -626,7 +806,7 @@ where
     pub fn hook<NH: Hook>(
         self,
         hook: NH,
-    ) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>, Compactor> {
+    ) -> AgentBuilder<Advanced, Balanced, Fast, HCons<NH, H>, Compactor, Schema> {
         AgentBuilder {
             advanced: self.advanced,
             balanced: self.balanced,
@@ -635,6 +815,7 @@ where
             hooks: HCons::new(hook, self.hooks),
             settings: self.settings,
             wiring: self.wiring,
+            handoff_schema: PhantomData,
         }
     }
 
@@ -689,7 +870,7 @@ where
         wiring.permission_receiver = Some(dyn_tool.permission_receiver());
         wiring.kept_receiver = Some(dyn_tool.kept_receiver());
         wiring.job_registry = Some(dyn_tool.job_registry());
-        // Files are restored after compaction, and `tasks.md` is kept, in
+        // Files are restored after compaction, and the working document is kept, in
         // wherever the terminal works: a subagent's are in its own space,
         // never its parent's.
         wiring.restore_dir = Some(dyn_tool.working_dir().clone());
@@ -704,16 +885,25 @@ where
     /// next request boundary, through the same fork and apply path as
     /// automatic compaction; the call returns at once. When usage comes
     /// within [`ContextPolicy::warn_distance`](crate::ContextPolicy::warn_distance)
-    /// of the auto-compact point, one alert tells the model to save its work,
-    /// bring its `tasks.md` up to date and call `compact` itself.
+    /// of the auto-compact point, one alert tells the model to save its work
+    /// and call `compact` itself.
     ///
     /// # Panics
     ///
     /// Panics if a tool named `compact` is already registered.
     pub fn compact_tool(mut self) -> Self {
-        let signal = std::sync::Arc::new(crate::compact_tool::CompactSignal::default());
-        self.wiring.compact_signal = Some(std::sync::Arc::clone(&signal));
-        self.tool(crate::compact_tool::CompactTool::new(signal))
+        assert!(
+            self.wiring.compact_signal.is_none()
+                && !self
+                    .wiring
+                    .tools
+                    .definitions()
+                    .iter()
+                    .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME),
+            "a tool named `compact` is already registered"
+        );
+        self.wiring.compact_signal = Some(std::sync::Arc::default());
+        self
     }
 
     /// Makes the built agent a fork of the main agent that sent `fork`.
@@ -745,12 +935,13 @@ where
         wiring.inherited = Some(Inherited {
             budget: fork.budget,
             profile: Some(fork.profile.clone()),
+            effort: fork.effort,
         });
         wiring.background_receiver = Some(terminal.background_receiver());
         wiring.permission_receiver = Some(terminal.permission_receiver());
         wiring.kept_receiver = Some(terminal.kept_receiver());
         wiring.job_registry = Some(terminal.job_registry());
-        // A fork keeps its own `tasks.md` in its own space, like any
+        // A fork keeps its own working document in its own space, like any
         // subagent, not the main agent's it inherited the context of.
         wiring.restore_dir = Some(terminal.working_dir().clone());
         wiring.sandbox_dir = Some(terminal.working_dir().clone());
@@ -761,8 +952,10 @@ where
             .iter()
             .any(|definition| definition.name() == crate::compact_tool::COMPACT_TOOL_NAME)
             .then(std::sync::Arc::default);
-        wiring.tools =
-            AgentTools::forked(&fork.definitions, terminal, wiring.compact_signal.as_ref());
+        wiring.fork_tools = Some(ForkTools {
+            definitions: fork.definitions.clone(),
+            terminal,
+        });
         self
     }
 
@@ -773,6 +966,22 @@ where
         self.wiring.restore_dir = Some(path.clone());
         self.wiring.sandbox_dir = Some(path);
         self
+    }
+
+    /// What renders the built agent's notices, as the options set it so far.
+    pub(crate) const fn chosen_notices(&self) -> &crate::AnyNotices {
+        &self.settings.notices
+    }
+
+    /// The working document the options settled on, which the subagents
+    /// keep too.
+    pub(crate) const fn chosen_document(&self) -> Option<&crate::working_document::DocumentSpec> {
+        self.settings.document.spec.as_ref()
+    }
+
+    /// The stop rule the options settled on, which the subagents follow too.
+    pub(crate) const fn chosen_stop_hook(&self) -> Option<&crate::AnyStopHook> {
+        self.settings.stop_hook.as_ref()
     }
 
     /// Whether the instruction block in `slot` is already set.
@@ -852,8 +1061,9 @@ where
     /// Registers the terminal tool for command execution in a sandbox.
     ///
     /// The terminal tool enables command execution with configurable permission modes
-    /// (sandboxed, network, unsafe). It creates its own working directory with
-    /// four random words and manages output storage internally.
+    /// (sandboxed, network, unsafe). It creates its own working directory,
+    /// which heel names with four random words (not a leased id), and manages
+    /// output storage internally.
     ///
     /// This also captures the background task receiver for polling completed
     /// background tasks during the agent loop.
@@ -921,31 +1131,30 @@ where
         self
     }
 
-    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor` and
-    /// tells the agent, once per event, when machine load becomes high and when
-    /// it ends.
+    /// Starts a [`HostLoadMonitor`](crate::HostLoadMonitor) on `executor`
+    /// and keeps machine load, memory and disk pressure as state the agent
+    /// is told about when a level differs from the one it last saw (see
+    /// [`StateSource`]).
     ///
     /// With `memory`, the same readings drive the agent's
     /// [`RunawayGuard`](crate::RunawayGuard): memory warnings listing its
     /// jobs, a final warning before a runaway job is killed, and the kill.
     ///
-    /// The monitor lengthens `foreground_wait` while high load lasts and runs
-    /// until the agent is dropped. It reads the builder's
+    /// The monitor, which may also watch the agent's volume
+    /// ([`with_disk`](crate::HostLoadMonitor::with_disk)), runs until the
+    /// agent is dropped. It reads the builder's
     /// [`clock`](AgentOptions::clock), so set the clock first.
     pub fn host_load<R, E>(
         mut self,
         executor: &E,
-        reader: R,
-        config: crate::HostLoadConfig,
-        foreground_wait: aither_sandbox::ForegroundWait,
+        monitor: crate::HostLoadMonitor<R>,
         memory: Option<aither_sandbox::JobMemory>,
     ) -> Self
     where
         R: crate::HostReader,
         E: executor_core::Executor,
     {
-        let monitor = crate::HostLoadMonitor::new(reader, config, foreground_wait);
-        self.wiring.host_load_events = Some(crate::host_load::spawn(
+        self.wiring.host_load = Some(crate::host_load::spawn(
             executor,
             monitor,
             memory.map(crate::RunawayGuard::new),
@@ -976,11 +1185,25 @@ where
     /// order the tool registry holds them.
     #[must_use]
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.wiring.tools.active_definitions()
+        if let Some(fork) = &self.wiring.fork_tools {
+            return fork.definitions.clone();
+        }
+        let mut definitions = self.wiring.tools.active_definitions();
+        if let Some(signal) = &self.wiring.compact_signal {
+            definitions.push(ToolDefinition::new(&crate::compact_tool::CompactTool::new(
+                std::sync::Arc::clone(signal),
+                self.settings.notices.clone(),
+            )));
+            definitions.sort_by(|a, b| a.name().cmp(b.name()));
+        }
+        definitions
     }
 
     /// Builds the agent.
-    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor> {
+    // One line per field of the settings, the wiring and the agent they
+    // assemble; splitting it would only scatter that list.
+    #[allow(clippy::too_many_lines)]
+    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H, Compactor, Schema> {
         let AgentSettings {
             parameters,
             tier,
@@ -989,9 +1212,14 @@ where
             prompt_cache,
             clock,
             context_sources,
-            tasks,
+            live_sources,
+            mut state_sources,
+            mut event_sources,
+            document,
+            stop_hook,
             fork_source,
             identity,
+            notices,
             #[cfg(feature = "skills")]
             skill_registry,
         } = self.settings;
@@ -1002,18 +1230,21 @@ where
             permission_receiver,
             kept_receiver,
             commands,
-            host_load_events,
+            host_load,
             job_registry,
             sandbox_dir,
             restore_dir,
             compact_signal,
             inherited,
+            fork_tools,
         } = self.wiring;
-        // Every agent with a sandbox, a fork included, keeps its own
-        // `tasks.md` there.
-        let tasks_document = sandbox_dir
-            .clone()
-            .map(|dir| tasks.document(dir, config.tasks_line_limit));
+        if let Some(channels) = host_load {
+            channels.register(&notices, &mut state_sources, &mut event_sources);
+        }
+        let tools = assemble_tools(tools, fork_tools, compact_signal.as_ref(), &notices);
+        // A fork starts initialized, from what the main agent carried over.
+        let initialized = inherited.is_some();
+        let inherited = inherited.unwrap_or_default();
         Agent {
             warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock),
             advanced: std::sync::Arc::new(self.advanced),
@@ -1029,14 +1260,14 @@ where
             tier,
             tools,
             hooks: self.hooks,
-            budget: inherited
-                .as_ref()
-                .map_or_else(crate::context::ContextBudget::default, |inherited| {
-                    inherited.budget
-                }),
+            budget: inherited.budget,
             prompt_cache,
             context_sources,
+            live_sources,
+            state_sources,
+            event_sources,
             reassembled: false,
+            interrupted: false,
             prefix_rewrites: crate::context::PrefixRewrites::default(),
             requests_sent: 0,
             compaction: crate::compaction_state::CompactionState::default(),
@@ -1044,26 +1275,32 @@ where
             tool_results: std::collections::VecDeque::new(),
             config,
             context,
-            initialized: inherited.is_some(),
-            profile: inherited.and_then(|inherited| inherited.profile),
+            initialized,
+            effort: inherited.effort,
+            profile: inherited.profile,
+            compaction_profile: None,
             background_receiver,
             permission_receiver,
             kept_receiver,
             commands,
-            host_load_events,
             job_registry,
             detached_task_ids: std::collections::HashSet::new(),
+            // Every agent with a sandbox, a fork included, keeps its own
+            // working document there.
+            working_document: document.document(sandbox_dir.as_deref(), notices.clone()),
             sandbox_dir,
-            tasks,
-            tasks_document,
+            work_events: document.events,
+            stop_hook,
             restore_dir,
             fork_source,
             compact_signal,
             compaction_warning: crate::agent::CompactionWarning::Armed,
             kept_exchanges: std::collections::HashSet::new(),
             identity,
+            notices,
             connectivity,
             last_request: None,
+            delivering: None,
             cache_keep_alive: crate::agent::CacheKeepAliveState::default(),
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
@@ -1072,6 +1309,7 @@ where
             active_skills: crate::context::ActiveSkills::new(),
             #[cfg(feature = "skills")]
             active_allowed_tools: None,
+            handoff_schema: PhantomData,
         }
     }
 }
@@ -1214,7 +1452,7 @@ mod tests {
     #[test]
     fn options_survive_the_steps_that_change_the_builders_type() {
         let policy = ContextPolicy {
-            safe_buffer: 1_234,
+            handoff_reserve: 1_234,
             ..ContextPolicy::default()
         };
         let agent = AgentBuilder::new(MockLlm)
@@ -1302,7 +1540,7 @@ mod tests {
             .await
             .unwrap();
         let registry =
-            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.outputs_dir()));
+            std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
         let subagent = terminal
             .binding()
@@ -1326,7 +1564,7 @@ mod tests {
         assert_eq!(
             child.wiring.sandbox_dir.as_ref(),
             Some(&space),
-            "a subagent's tasks.md is in its own space, not its parent's"
+            "a subagent's working document is in its own space, not its parent's"
         );
         assert_eq!(
             child.wiring.restore_dir,

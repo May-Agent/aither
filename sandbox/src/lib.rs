@@ -12,10 +12,12 @@
 //! use aither_sandbox::{TerminalTool, ToolRegistryBuilder, permission::NoopPermissionHandler};
 //! use std::sync::Arc;
 //!
-//! // Creates a random four-word working directory (e.g., amber-forest-thunder-pearl/)
-//! // with outputs/ subdirectory and IPC command wrapper scripts
+//! // Creates a working directory heel names with four random words (e.g.,
+//! // amber-forest-thunder-pearl/), not a leased id, with an outputs/
+//! // subdirectory and IPC command wrapper scripts; the ids the model reads are
+//! // leased from `with_id_allocator`'s allocator
 //! let tool = TerminalTool::new_in(std::env::temp_dir(), NoopPermissionHandler, executor).await?;
-//! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+//! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
 //! let tool = tool.with_registry(registry);
 //!
 //! // Access the working directory path
@@ -56,20 +58,23 @@ mod bollard_exec;
 mod command;
 mod command_set;
 mod container;
+#[cfg(all(unix, feature = "jobserver"))]
+mod container_jobserver;
 mod foreground_wait;
 mod grants;
 mod heel_binary;
-mod kill_guard;
 mod memory;
 pub mod monitor;
-mod naming;
+mod notices;
 mod outage;
 mod output;
 mod output_compress;
-pub(crate) mod poll_guard;
+mod policy;
 mod process_tree;
+mod script_language;
 mod session_policy;
 mod shell_session;
+mod shell_syntax;
 mod stdin_watch;
 mod subagent;
 mod terminal;
@@ -99,14 +104,19 @@ pub mod permission;
 #[cfg(any(test, feature = "test-git"))]
 pub mod test_git;
 
+/// Id allocators for tests, shared with dependent crates through the
+/// `test-ids` feature.
+#[cfg(any(test, feature = "test-ids"))]
+pub mod test_ids;
+
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
     CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
-    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, ToolCallCommand, ToolCommand,
-    ToolRegistry, ToolRegistryBuilder, cli_to_json, output_saved_text,
-    register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
-    tool_output_to_payload,
+    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
+    ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
+    output_saved_text, register_ipc_gateway_command, register_tool_command, register_tool_direct,
+    schema_to_help, tool_output_to_payload, validate_positional_layout,
 };
 pub use command_set::{AnyCommandSet, CommandSet};
 pub use container::{
@@ -114,20 +124,20 @@ pub use container::{
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
 pub use foreground_wait::ForegroundWait;
-pub use grants::{GrantSet, TerminalGrants};
+pub use grants::{GitDirAccess, GrantSet, TerminalGrants};
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use job_registry::{
     Delivery, JobInfo, JobPlace, JobRegistry, JobRegistryService, JobStatus, KillCause,
-    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, job_registry_channel,
+    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, UnchangedTaskRead,
+    job_registry_channel,
 };
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
-pub use kill_guard::CommandRefusal;
 pub use memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
     ContainerSnapshot, FileFootprintRegistry, FootprintError, FootprintReader, FootprintRegistry,
@@ -135,18 +145,26 @@ pub use memory::{
     ProbedContainerMemory, ResponseWindow, SystemFootprints,
 };
 pub use monitor::{
-    MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorLanguage, MonitorRefusal,
-    MonitorSource, MonitorStalled, MonitorTool,
+    MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorRefusal, MonitorSource,
+    MonitorStalled, MonitorTool,
 };
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
 };
+pub use notices::{
+    AnySandboxNotices, CommandKilled, DefaultSandboxNotices, MonitorStarted, Refused,
+    ReservedForMain, SandboxNotices,
+};
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use permission::{PermissionHandler, PermissionRequest, Review, TerminalMode};
-pub use poll_guard::PollRefusal;
+pub use policy::{
+    AnyCommandPolicy, CommandPolicy, PolicyDecision, PolicyRefusal, ScriptCheck, ScriptEnd,
+    ScriptOrigin, ScriptOutcome,
+};
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
+pub use script_language::ScriptLanguage;
 pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
     AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
@@ -154,6 +172,9 @@ pub use shell_session::{
     ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
     ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile, SshServer,
     SshSessionAuthorizer, bootstrap_ssh_runtime,
+};
+pub use shell_syntax::{
+    CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
 };
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{

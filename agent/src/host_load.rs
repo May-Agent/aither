@@ -3,8 +3,13 @@
 //! A [`HostLoadMonitor`] reads the host through a [`HostReader`] and turns
 //! sustained machine load into events: the load *starts* when it stays
 //! above its threshold for the start window, and *ends* when it stays below
-//! for the end window, so a brief spike does not flap. The agent hears each
-//! event once; nothing is injected while a condition persists.
+//! for the end window, so a brief spike does not flap.
+//!
+//! Machine load, memory pressure and disk pressure reach the model as state
+//! ([`StateSource`](crate::StateSource)): as a request is assembled, and only
+//! when a condition's level differs from the one the model last saw, so a
+//! condition that rises and settles while the agent is idle says nothing.
+//! A final memory warning and a kill are events, each told once.
 //!
 //! While high load lasts, the monitor also lengthens the terminal's
 //! foreground window, because commands slowed by the load would otherwise
@@ -14,21 +19,24 @@
 
 mod system;
 
+use crate::disk::{AnyDiskReader, DiskPressure, DiskThresholds, DiskWatch};
 use crate::runaway::RunawayGuard;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
 use aither_sandbox::{ForegroundWait, JobFootprint, MemoryDomain, MemorySize};
 use askama::Template;
 use async_channel::{Receiver, Sender};
+use serde::{Deserialize, Serialize};
 
 use crate::clock::{AnyClock, Instant};
 
 pub use system::{SystemReader, psi_memory_pressure};
 
 /// How hard the host's memory is pressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MemoryPressure {
     /// Memory is plentiful.
     Normal,
@@ -95,6 +103,9 @@ pub enum ReadError {
         /// The source that is missing.
         what: &'static str,
     },
+    /// The container could not be read.
+    #[error(transparent)]
+    Container(#[from] aither_sandbox::ContainerProbeError),
 }
 
 /// Reads the host's memory pressure and machine load.
@@ -312,6 +323,24 @@ pub enum HostLoadEvent {
         /// container's limit.
         capacity: MemorySize,
     },
+    /// The free space of the agent's volume fell to a lower level.
+    DiskPressureRose {
+        /// The volume.
+        volume: String,
+        /// The level it reached.
+        level: DiskPressure,
+        /// The free space.
+        free: MemorySize,
+    },
+    /// The free space of the agent's volume rose to a higher level.
+    DiskPressureDroppedBack {
+        /// The volume.
+        volume: String,
+        /// The level it fell to.
+        level: DiskPressure,
+        /// The free space.
+        free: MemorySize,
+    },
 }
 
 /// The alert text for a host load event.
@@ -327,6 +356,308 @@ impl HostLoadEvent {
         HostLoadAlert { event: self }
             .render()
             .expect("host load alert template must render")
+    }
+
+    /// The condition this event sets and the level it leaves it at; `None`
+    /// for an event that is history rather than a condition: a final
+    /// memory warning, or a job killed for memory.
+    pub(crate) fn condition(&self) -> Option<(HostCondition, HostLevel)> {
+        match self {
+            Self::LoadHigh { .. } => Some((HostCondition::Load, HostLevel::Load { high: true })),
+            Self::LoadEnded { .. } => Some((HostCondition::Load, HostLevel::Load { high: false })),
+            Self::MemoryYellow { domain, .. } => Some((
+                HostCondition::Memory(*domain),
+                HostLevel::Memory(MemoryPressure::Warning),
+            )),
+            Self::MemoryRed { domain, .. } => Some((
+                HostCondition::Memory(*domain),
+                HostLevel::Memory(MemoryPressure::Critical),
+            )),
+            Self::MemoryDroppedBack { domain, level, .. } => {
+                Some((HostCondition::Memory(*domain), HostLevel::Memory(*level)))
+            }
+            Self::DiskPressureRose { volume, level, .. }
+            | Self::DiskPressureDroppedBack { volume, level, .. } => {
+                Some((HostCondition::Disk(volume.clone()), HostLevel::Disk(*level)))
+            }
+            Self::MemoryFinalWarning { .. } | Self::JobKilledForMemory { .. } => None,
+        }
+    }
+
+    /// The event that tells the model `condition` went from `seen` (what
+    /// it last saw; `None` when it assumes the normal level) to `now`,
+    /// filled with the readings of `reading`, the latest event of the
+    /// condition.
+    ///
+    /// The words depend on what the model saw, never on the path the
+    /// condition took meanwhile: a fall to warning is "dropped back" only
+    /// for a model that saw critical.
+    pub(crate) fn for_change(
+        condition: &HostCondition,
+        seen: Option<HostLevel>,
+        now: HostLevel,
+        reading: &Self,
+    ) -> Self {
+        match (condition, now) {
+            (_, HostLevel::Load { high }) => {
+                let (Self::LoadHigh {
+                    load,
+                    foreground_wait,
+                }
+                | Self::LoadEnded {
+                    load,
+                    foreground_wait,
+                }) = *reading
+                else {
+                    unreachable!("a load level comes from a load event")
+                };
+                if high {
+                    Self::LoadHigh {
+                        load,
+                        foreground_wait,
+                    }
+                } else {
+                    Self::LoadEnded {
+                        load,
+                        foreground_wait,
+                    }
+                }
+            }
+            (HostCondition::Memory(domain), HostLevel::Memory(level)) => {
+                let (Self::MemoryYellow { jobs, .. }
+                | Self::MemoryRed { jobs, .. }
+                | Self::MemoryDroppedBack { jobs, .. }) = reading
+                else {
+                    unreachable!("a memory level comes from a memory event")
+                };
+                let domain = *domain;
+                let jobs = jobs.clone();
+                match level {
+                    MemoryPressure::Normal => Self::MemoryDroppedBack {
+                        domain,
+                        level,
+                        jobs,
+                    },
+                    MemoryPressure::Warning
+                        if seen == Some(HostLevel::Memory(MemoryPressure::Critical)) =>
+                    {
+                        Self::MemoryDroppedBack {
+                            domain,
+                            level,
+                            jobs,
+                        }
+                    }
+                    MemoryPressure::Warning => Self::MemoryYellow { domain, jobs },
+                    MemoryPressure::Critical => Self::MemoryRed { domain, jobs },
+                }
+            }
+            (HostCondition::Disk(volume), HostLevel::Disk(level)) => {
+                let (Self::DiskPressureRose { free, .. }
+                | Self::DiskPressureDroppedBack { free, .. }) = *reading
+                else {
+                    unreachable!("a disk level comes from a disk event")
+                };
+                let volume = volume.clone();
+                let fell = matches!(seen, Some(HostLevel::Disk(before)) if before > level);
+                if fell || level == DiskPressure::Normal {
+                    Self::DiskPressureDroppedBack {
+                        volume,
+                        level,
+                        free,
+                    }
+                } else {
+                    Self::DiskPressureRose {
+                        volume,
+                        level,
+                        free,
+                    }
+                }
+            }
+            _ => unreachable!("a condition and its level are of one kind"),
+        }
+    }
+}
+
+/// A condition of the host the agent is told about as state: the
+/// machine's load, a domain's memory, or a volume's free space.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HostCondition {
+    /// The machine's CPU load.
+    Load,
+    /// The memory of the machine or of the container.
+    Memory(MemoryDomain),
+    /// The free space of the volume with this name.
+    Disk(String),
+}
+
+/// How a [`HostCondition`] stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostLevel {
+    /// The load is high or not.
+    Load {
+        /// Whether the load is high.
+        high: bool,
+    },
+    /// The memory pressure.
+    Memory(MemoryPressure),
+    /// The disk pressure.
+    Disk(DiskPressure),
+}
+
+impl HostLevel {
+    /// Whether the condition is at its normal level.
+    const fn is_normal(self) -> bool {
+        matches!(
+            self,
+            Self::Load { high: false }
+                | Self::Memory(MemoryPressure::Normal)
+                | Self::Disk(DiskPressure::Normal)
+        )
+    }
+}
+
+/// What the monitor sends: conditions to the state the agent keeps,
+/// everything else as events.
+#[derive(Debug, Clone)]
+pub struct HostLoadSenders {
+    conditions: Sender<HostLoadEvent>,
+    events: Sender<HostLoadEvent>,
+}
+
+impl HostLoadSenders {
+    /// Sends `event` to the channel its kind goes through. An event for an
+    /// agent that is gone is dropped.
+    pub async fn send(&self, event: HostLoadEvent) {
+        let channel = if event.condition().is_some() {
+            &self.conditions
+        } else {
+            &self.events
+        };
+        channel.send(event).await.ok();
+    }
+
+    /// Whether the agent is gone.
+    fn is_closed(&self) -> bool {
+        self.conditions.is_closed() && self.events.is_closed()
+    }
+}
+
+/// What the agent reads from a monitor.
+#[derive(Debug)]
+pub struct HostLoadChannels {
+    conditions: Receiver<HostLoadEvent>,
+    events: Receiver<HostLoadEvent>,
+}
+
+impl HostLoadChannels {
+    /// Registers the monitor's state and events ahead of every other state
+    /// and event source, rendering their alerts with `notices`.
+    pub fn register(
+        self,
+        notices: &crate::AnyNotices,
+        states: &mut Vec<crate::context::AnyStateSource>,
+        events: &mut Vec<crate::context::AnyEventSource>,
+    ) {
+        states.insert(
+            0,
+            crate::context::AnyStateSource::new(HostConditions {
+                receiver: self.conditions,
+                readings: HashMap::new(),
+                notices: notices.clone(),
+            }),
+        );
+        events.insert(
+            0,
+            crate::context::AnyEventSource::new(HostEvents {
+                receiver: self.events,
+                notices: notices.clone(),
+            }),
+        );
+    }
+}
+
+/// A monitor's channels: what it sends through, and what the agent reads.
+pub fn channels() -> (HostLoadSenders, HostLoadChannels) {
+    let (conditions, condition_receiver) = async_channel::unbounded();
+    let (events, event_receiver) = async_channel::unbounded();
+    (
+        HostLoadSenders { conditions, events },
+        HostLoadChannels {
+            conditions: condition_receiver,
+            events: event_receiver,
+        },
+    )
+}
+
+/// Host load, memory and disk pressure as state: the model hears of a
+/// condition only when its level differs from the one it last saw, in the
+/// words for that change.
+pub struct HostConditions {
+    receiver: Receiver<HostLoadEvent>,
+    /// The latest event of each condition: the readings (load, jobs, free
+    /// space) the alert quotes. Which words it gets depends on what the
+    /// model saw, not on this event.
+    readings: HashMap<HostCondition, HostLoadEvent>,
+    notices: crate::AnyNotices,
+}
+
+impl crate::context::StateSource for HostConditions {
+    const ID: &'static str = "host_conditions";
+    type Key = HostCondition;
+    type Value = HostLevel;
+
+    fn poll(&mut self) -> impl Future<Output = Vec<(HostCondition, HostLevel)>> + Send {
+        let mut changed = Vec::new();
+        while let Ok(event) = self.receiver.try_recv() {
+            let (condition, level) = event
+                .condition()
+                .expect("the monitor sends only conditions to the state channel");
+            changed.push((condition.clone(), level));
+            self.readings.insert(condition, event);
+        }
+        std::future::ready(changed)
+    }
+
+    fn is_normal(&self, _: &HostCondition, level: &HostLevel) -> bool {
+        level.is_normal()
+    }
+
+    fn announce(
+        &self,
+        change: &crate::context::StateChange<'_, HostCondition, HostLevel>,
+    ) -> crate::context::Block {
+        let reading = self
+            .readings
+            .get(change.key())
+            .expect("a condition with a level has the event that set it");
+        crate::context::Block::new(
+            "system-reminder",
+            self.notices.host_condition(
+                change.key(),
+                change.seen().copied(),
+                *change.now(),
+                reading,
+            ),
+        )
+    }
+}
+
+/// The host events that are history: a final memory warning, a job
+/// killed for memory. Each reaches the model once.
+pub struct HostEvents {
+    receiver: Receiver<HostLoadEvent>,
+    notices: crate::AnyNotices,
+}
+
+impl crate::context::EventSource for HostEvents {
+    type Event = HostLoadEvent;
+
+    fn take(&mut self) -> impl Future<Output = Vec<HostLoadEvent>> + Send {
+        std::future::ready(std::iter::from_fn(|| self.receiver.try_recv().ok()).collect())
+    }
+
+    fn announce(&self, event: &HostLoadEvent) -> crate::context::Block {
+        crate::context::Block::new("system-reminder", self.notices.host_load(event))
     }
 }
 
@@ -395,9 +726,41 @@ pub struct HostLoadMonitor<R> {
     config: HostLoadConfig,
     foreground_wait: ForegroundWait,
     load: Condition,
+    disk: Option<DiskWatch>,
 }
 
 impl<R: HostReader> HostLoadMonitor<R> {
+    /// Also watches the free space of the volumes `readers` read, judged by
+    /// `thresholds`: the agent hears once of each change of a volume's disk
+    /// pressure level, and nothing is ever killed for it. The volumes are
+    /// those of the agent's home environment alone; each monitor watches its
+    /// own.
+    #[must_use]
+    pub fn with_disk(
+        mut self,
+        thresholds: DiskThresholds,
+        readers: impl IntoIterator<Item = AnyDiskReader>,
+    ) -> Self {
+        self.disk = Some(DiskWatch::new(thresholds, readers));
+        self
+    }
+
+    /// The free space of each watched volume now, in the order they were
+    /// given; empty when no disk is watched. A volume that cannot be read is
+    /// `None`.
+    pub fn read_disks(&self) -> impl Future<Output = Vec<Option<u64>>> + Send + use<R> {
+        let readers = self.disk.as_ref().map(DiskWatch::readers);
+        async move { crate::disk::read_free_bytes(readers.unwrap_or_default()).await }
+    }
+
+    /// Applies readings of the volumes' free space, as [`Self::read_disks`]
+    /// returns them; returns the events their changes of level raise.
+    pub fn observe_disks(&mut self, free: &[Option<u64>]) -> Vec<HostLoadEvent> {
+        self.disk
+            .as_mut()
+            .map_or_else(Vec::new, |disk| disk.observe(free))
+    }
+
     /// A monitor reading `reader`, lengthening `foreground_wait` while high
     /// load lasts.
     #[must_use]
@@ -407,6 +770,7 @@ impl<R: HostReader> HostLoadMonitor<R> {
             config,
             foreground_wait,
             load: Condition::default(),
+            disk: None,
         }
     }
 
@@ -463,14 +827,15 @@ impl<R: HostReader> HostLoadMonitor<R> {
         events
     }
 
-    /// Reads and observes in one step, as the monitor task does.
+    /// Reads and observes the host in one step, as the monitor task does;
+    /// the disks are read apart, with [`Self::read_disks`].
     pub fn tick(&mut self, clock: &AnyClock) -> Vec<HostLoadEvent> {
         let sample = self.read();
         self.observe(clock.now(), sample)
     }
 }
 
-/// Runs `monitor` on `executor` until the returned receiver is dropped.
+/// Runs `monitor` on `executor` until the returned channels are dropped.
 ///
 /// The reads run on the blocking pool, so a slow host source never stalls
 /// the agent loop or the executor.
@@ -481,23 +846,23 @@ pub fn spawn<R, E>(
     monitor: HostLoadMonitor<R>,
     guard: Option<RunawayGuard>,
     clock: AnyClock,
-) -> Receiver<HostLoadEvent>
+) -> HostLoadChannels
 where
     R: HostReader,
     E: executor_core::Executor,
 {
     use executor_core::Task;
 
-    let (sender, receiver) = async_channel::unbounded();
-    executor.spawn(run(monitor, guard, clock, sender)).detach();
-    receiver
+    let (senders, channels) = channels();
+    executor.spawn(run(monitor, guard, clock, senders)).detach();
+    channels
 }
 
 async fn run<R: HostReader>(
     mut monitor: HostLoadMonitor<R>,
     mut guard: Option<RunawayGuard>,
     clock: AnyClock,
-    events: Sender<HostLoadEvent>,
+    events: HostLoadSenders,
 ) {
     let interval = monitor.config.poll_interval;
     while !events.is_closed() {
@@ -509,14 +874,18 @@ async fn run<R: HostReader>(
         monitor = back;
         let now = clock.now();
         let mut raised = monitor.observe(now, sample);
-        if let Some(guard) = guard.as_mut() {
-            raised.extend(guard.observe(now, sample.memory).await);
-        }
+        // The volumes and the jobs are read independently of each other.
+        let (disks, guarded) = futures::join!(monitor.read_disks(), async {
+            match guard.as_mut() {
+                Some(guard) => guard.observe(now, sample.memory).await,
+                None => Vec::new(),
+            }
+        });
+        raised.extend(guarded);
+        raised.extend(monitor.observe_disks(&disks));
         for event in raised {
             tracing::info!(?event, "host load condition changed");
-            if events.send(event).await.is_err() {
-                return;
-            }
+            events.send(event).await;
         }
         async_io::Timer::after(interval).await;
     }

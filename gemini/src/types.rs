@@ -6,6 +6,14 @@ use serde_json::Value;
 
 use crate::config::sanitize_model;
 
+/// The `countTokens` response.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct CountTokensResponse {
+    /// Tokens the model counts for the request input.
+    #[serde(rename = "totalTokens")]
+    pub total_tokens: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GenerateContentRequest {
     #[serde(

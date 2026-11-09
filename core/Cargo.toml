@@ -22,8 +22,13 @@ mime = "0.3"
 schemars = { version = "1.2", default-features = false, features = ["derive"] }
 serde = { version = "1.0", default-features = false}
 serde_json = { version = "1.0", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
 url = { version = "2.5", default-features = false }
 zenwave = { workspace = true, optional = true, features = ["hyper-backend", "rustls"] }
+tiktoken = { version = "4", optional = true, default-features = false }
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+base64 = { version = "0.22", optional = true }
+num-traits = { version = "0.2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-io = { version = "2.6", optional = true }
@@ -48,6 +53,15 @@ derive = ["aither-derive"]
 zenwave = ["dep:zenwave", "dep:httpdate"]
 # A runtime-agnostic `time::sleep` that also runs on wasm32.
 timer = ["dep:async-io", "dep:gloo-timers", "dep:wasm-bindgen-futures", "dep:async-channel"]
+# Exact in-process token counting; each vocab feature pulls its embedded
+# vocabulary from the `tiktoken` crate.
+tokenizer = ["dep:num-traits","dep:tiktoken", "dep:image", "dep:base64"]
+vocab-o200k = ["tokenizer", "tiktoken/vocab-o200k_base"]
+vocab-cl100k = ["tokenizer", "tiktoken/vocab-cl100k_base"]
+vocab-deepseek = ["tokenizer", "tiktoken/vocab-deepseek_v3"]
+vocab-llama = ["tokenizer", "tiktoken/vocab-llama3"]
+vocab-mistral = ["tokenizer", "tiktoken/vocab-mistral_v3"]
+vocab-qwen = ["tokenizer", "tiktoken/vocab-qwen2"]
 
 [lints]
 workspace = true

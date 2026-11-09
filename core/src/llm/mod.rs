@@ -279,6 +279,11 @@ impl<'tools> LLMRequestWithTools<'tools> {
         &self.inner
     }
 
+    /// Returns the inner request for modification, keeping its tool registry.
+    pub const fn request_mut(&mut self) -> &mut LLMRequest {
+        &mut self.inner
+    }
+
     /// Returns the tool registry.
     #[must_use]
     pub const fn tools(&mut self) -> &mut Tools {
@@ -306,6 +311,23 @@ impl<'tools> LLMRequestWithTools<'tools> {
     }
 }
 
+/// How a model can count the tokens a request costs, when it can.
+///
+/// [`LanguageModel::token_counting`] reports which kind of counting a model
+/// offers: `Local` counts in-process against a published vocabulary and is
+/// cheap enough to run on every assembly; `Endpoint` counts exactly over a
+/// network call and is worth its round trip only near a threshold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TokenCounting {
+    /// No counting: the caller falls back to its estimate.
+    #[default]
+    None,
+    /// In-process counting against an embedded vocabulary.
+    Local,
+    /// Counting through a provider endpoint.
+    Endpoint,
+}
+
 /// Language models for text generation and conversation.
 ///
 /// The `respond` method returns a stream of [`Event`]s. Tool calls are emitted
@@ -316,6 +338,30 @@ impl<'tools> LLMRequestWithTools<'tools> {
 pub trait LanguageModel: Sized + Send + Sync {
     /// The error type returned by this language model.
     type Error: core::error::Error + Classify + Send + Sync + 'static;
+
+    /// How this model counts prompt tokens, if at all. `None` by default.
+    fn token_counting(&self) -> TokenCounting {
+        TokenCounting::None
+    }
+
+    /// The prompt tokens `request` costs — messages, tool definitions, and
+    /// attachments where the counter supports them — or `None` when this
+    /// model cannot count. The default implementation counts nothing.
+    fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> impl Future<Output = Result<Option<u32>, GenerateError<Self::Error>>> + Send {
+        let _ = request;
+        async { Ok(None) }
+    }
+
+    /// The tokens `text` takes under a local vocabulary, used while
+    /// streaming to measure decode speed. `None` unless
+    /// [`token_counting`](Self::token_counting) is `Local`.
+    fn count_text(&self, text: &str) -> Option<u32> {
+        let _ = text;
+        None
+    }
 
     /// Generates a streaming response to a conversation.
     ///
@@ -456,6 +502,22 @@ macro_rules! impl_language_model {
                 fn retry_policy(&self) -> RetryPolicy {
                     T::retry_policy(self)
                 }
+
+                fn token_counting(&self) -> TokenCounting {
+                    T::token_counting(self)
+                }
+
+                fn count_tokens(
+                    &self,
+                    request: &LLMRequest,
+                ) -> impl Future<Output = Result<Option<u32>, GenerateError<Self::Error>>>
+                + Send {
+                    T::count_tokens(self, request)
+                }
+
+                fn count_text(&self, text: &str) -> Option<u32> {
+                    T::count_text(self, text)
+                }
             }
         )*
     };
@@ -506,6 +568,21 @@ impl<T: LanguageModel> LanguageModel for &T {
 
     fn retry_policy(&self) -> RetryPolicy {
         T::retry_policy(self)
+    }
+
+    fn token_counting(&self) -> TokenCounting {
+        T::token_counting(self)
+    }
+
+    fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> impl Future<Output = Result<Option<u32>, GenerateError<Self::Error>>> + Send {
+        T::count_tokens(self, request)
+    }
+
+    fn count_text(&self, text: &str) -> Option<u32> {
+        T::count_text(self, text)
     }
 }
 

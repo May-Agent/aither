@@ -32,6 +32,8 @@ async-channel = "2"
 async-io = "2"
 async-process = "2"
 arc-swap = "1"
+aho-corasick = { version = "1.1.5", default-features = false, features = ["std", "perf-literal"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }
 blocking = { version = "1.7.0", default-features = false }
 notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 event-listener = "5"
@@ -51,25 +53,25 @@ similar = "3"
 uuid = { version = "1", features = ["v4"] }
 num-traits = "0.2"
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
-# The language detector runs a small ONNX model (see build.rs). `ort` is held at
-# rc.12 to match `magika`, which pins it exactly; `download-binaries` obtains
-# ONNX Runtime the way sandbox's `code-folding` does.
+# The language detector runs a small ONNX model, downloaded on first use. `ort`
+# is held at rc.12 to match `magika`, which pins it exactly; `download-binaries`
+# obtains ONNX Runtime the way sandbox's `code-folding` does.
 ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 isolang = { version = "2.4", optional = true, default-features = false, features = ["english_names", "lowercase_names", "local_names"] }
+ureq = { version = "3.5.1", optional = true, default-features = false, features = ["rustls"] }
+dirs = { version = "6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["std", "time"] }
-
-[target.'cfg(target_vendor = "apple")'.dependencies]
-# Selects the ONNX Runtime build that includes the CoreML execution provider,
-# which runs the language detector on the Neural Engine.
-ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["coreml"] }
+# `statvfs` for the free space of a volume; macOS also reads its memory
+# pressure and load average through it.
 libc = { version = "0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
@@ -77,7 +79,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
 
 [dev-dependencies]
 hex = "0.4"
-aither-sandbox = { workspace = true, features = ["test-git"] }
+aither-sandbox = { workspace = true, features = ["test-git", "test-ids"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 url = "2.5.8"
@@ -93,14 +95,9 @@ filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
 mcp = ["dep:aither-mcp"]
 skills = ["dep:aither-skills"]
-languages = ["dep:ort", "dep:tokenizers", "dep:isolang", "dep:ureq"]
+languages = ["dep:ort", "dep:tokenizers", "dep:isolang", "dep:ureq", "dep:dirs"]
 connectivity = ["dep:aither-connectivity", "aither-sandbox/connectivity"]
 full = ["websearch", "webfetch", "filesystem", "command", "mcp", "skills", "languages", "connectivity"]
-[build-dependencies]
-# Fetch and verify the language model of the `languages` feature (build.rs).
-ureq = { version = "3.5.1", optional = true, default-features = false, features = ["rustls"] }
-sha2 = "0.11"
-serde_json = "1.0"
 
 [lints]
 workspace = true

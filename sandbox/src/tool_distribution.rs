@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -79,6 +80,8 @@ pub struct PinnedArtifact<P> {
     pub url: ToolArtifactLocation,
     /// SHA-256 of the complete artifact, before extraction.
     pub sha256: String,
+    /// Length in bytes of the complete artifact, before extraction.
+    pub size: u64,
     /// Artifact encoding and executable member.
     pub encoding: ToolArtifactFormat,
 }
@@ -108,9 +111,33 @@ pub struct ToolDistribution {
     /// The interpreter the pinned `uv` installs, per platform that has one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     python: Vec<PythonPin>,
+    /// Credential for GitHub release downloads; supplied by the caller, never
+    /// part of a manifest.
+    #[serde(skip)]
+    github_token: Option<GithubToken>,
+}
+
+/// A GitHub API token, kept out of `Debug` output.
+#[derive(Clone)]
+struct GithubToken(String);
+
+impl fmt::Debug for GithubToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GithubToken(..)")
+    }
 }
 
 impl ToolDistribution {
+    /// Downloads GitHub release artifacts through the authenticated REST API
+    /// with `token` instead of anonymously, so anonymous-only rate limits and
+    /// outages do not apply. Other URLs are fetched as before; the pinned size
+    /// and digest checks are the same either way.
+    #[must_use]
+    pub fn with_github_token(mut self, token: impl Into<String>) -> Self {
+        self.github_token = Some(GithubToken(token.into()));
+        self
+    }
+
     /// Loads a trusted, version-pinned manifest.
     ///
     /// # Errors
@@ -182,7 +209,12 @@ impl ToolDistribution {
         self.validate()?;
         async_fs::create_dir_all(directory.join("artifacts")).await?;
         let (artifacts, host_programs) = futures::future::try_join(
-            package_artifacts(&self.artifacts, directory, ManagedTool::ALL.len()),
+            package_artifacts(
+                &self.artifacts,
+                directory,
+                ManagedTool::ALL.len(),
+                self.github_token.as_ref(),
+            ),
             package_artifacts(
                 &self
                     .host_programs
@@ -191,6 +223,7 @@ impl ToolDistribution {
                     .collect::<Vec<_>>(),
                 directory,
                 HostProgram::ALL.len(),
+                self.github_token.as_ref(),
             ),
         )
         .await?;
@@ -219,6 +252,7 @@ impl ToolDistribution {
             artifacts,
             host_programs,
             python: self.python.clone(),
+            github_token: None,
         })?;
         let destination = manifest.clone();
         let directory = directory.to_path_buf();
@@ -343,11 +377,13 @@ impl ToolDistribution {
     ) -> Result<ToolBundle, ToolRuntimeError> {
         let selected = self.select_artifacts(target)?;
         async_fs::create_dir_all(cache_root).await?;
+        let token = self.github_token.clone();
         let binaries = stream::iter(selected)
             .map(|artifact| {
                 let cache_root = cache_root.to_path_buf();
+                let token = token.clone();
                 async move {
-                    let bytes = load_artifact(&artifact, &cache_root).await?;
+                    let bytes = load_artifact(&artifact, &cache_root, token.as_ref()).await?;
                     ToolBinary::verify(artifact.tool, &artifact.version, &digest(&bytes), bytes)
                 }
             })
@@ -370,7 +406,7 @@ impl ToolDistribution {
             .find(|artifact| artifact.tool == ManagedTool::Uv && artifact.target == native)
             .ok_or(ToolRuntimeError::MissingTool(ManagedTool::Uv))?;
         async_fs::create_dir_all(artifact_cache).await?;
-        load_artifact(artifact, artifact_cache).await
+        load_artifact(artifact, artifact_cache, self.github_token.as_ref()).await
     }
 
     /// Prepares one host program for the host's platform and returns the path
@@ -429,7 +465,7 @@ impl ToolDistribution {
         }
         let artifacts = cache_root.join("artifacts");
         async_fs::create_dir_all(&artifacts).await?;
-        let bytes = load_artifact(&pinned.artifact, &artifacts).await?;
+        let bytes = load_artifact(&pinned.artifact, &artifacts, self.github_token.as_ref()).await?;
         let target = target.clone();
         blocking::unblock(move || {
             if digest(&bytes) != executable_sha256 {
@@ -476,14 +512,16 @@ async fn package_artifacts<P: Distributed>(
     artifacts: &[PinnedArtifact<P>],
     directory: &Path,
     concurrency: usize,
+    token: Option<&GithubToken>,
 ) -> Result<Vec<PinnedArtifact<P>>, ToolRuntimeError> {
     stream::iter(artifacts.to_vec())
         .map(|mut artifact| {
             let directory = directory.to_path_buf();
             async move {
                 let tool = artifact.tool.into();
-                let bytes = load_artifact(&artifact, &directory.join("artifacts")).await?;
+                let bytes = load_artifact(&artifact, &directory.join("artifacts"), token).await?;
                 let sha256 = digest(&bytes);
+                let size = bytes.len() as u64;
                 let name = hex::encode(sha256);
                 let path = directory.join(&name);
                 blocking::unblock(move || {
@@ -512,6 +550,7 @@ async fn package_artifacts<P: Distributed>(
                 .await?;
                 artifact.url = ToolArtifactLocation::Bundled(name.clone().into());
                 artifact.sha256 = name;
+                artifact.size = size;
                 artifact.encoding = ToolArtifactFormat::Executable;
                 Ok::<_, ToolRuntimeError>(artifact)
             }
@@ -525,15 +564,16 @@ async fn package_artifacts<P: Distributed>(
 async fn load_artifact<P: Distributed>(
     artifact: &PinnedArtifact<P>,
     cache_root: &Path,
+    token: Option<&GithubToken>,
 ) -> Result<Vec<u8>, ToolRuntimeError> {
     let tool = artifact.tool.into();
     let mut expected = [0; 32];
     hex::decode_to_slice(&artifact.sha256, &mut expected)?;
     let path = cache_root.join(hex::encode(expected));
-    let encoded = match read_artifact_file(&path, tool).await {
+    let encoded = match read_artifact_file(&path, tool, artifact.size).await {
         Ok(encoded) => encoded,
         Err(ToolRuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            let encoded = download_artifact(tool, &artifact.url).await?;
+            let encoded = download_artifact(tool, &artifact.url, artifact.size, token).await?;
             if digest(&encoded) != expected {
                 return Err(ToolRuntimeError::Integrity { tool });
             }
@@ -550,7 +590,7 @@ async fn load_artifact<P: Distributed>(
                 }
             })
             .await?;
-            read_artifact_file(&path, tool).await?
+            read_artifact_file(&path, tool, artifact.size).await?
         }
         Err(error) => return Err(error),
     };
@@ -561,24 +601,46 @@ async fn load_artifact<P: Distributed>(
     blocking::unblock(move || extract_executable(&encoding, &encoded)).await
 }
 
+/// Reads a file the manifest pins at `size` bytes, rejecting any other length
+/// before the content is hashed.
 async fn read_artifact_file(
     path: &Path,
     tool: DistributedTool,
+    size: u64,
 ) -> Result<Vec<u8>, ToolRuntimeError> {
     let file = async_fs::File::open(path).await?;
     let mut bytes = Vec::new();
-    file.take(64 * 1024 * 1024 + 1)
+    file.take(size.saturating_add(1))
         .read_to_end(&mut bytes)
         .await?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
-    }
+    check_size(tool, size, &bytes)?;
     Ok(bytes)
+}
+
+/// Rejects `bytes` unless it is exactly the pinned `size`; a read bounded to
+/// `size + 1` bytes that overran reports that longer length.
+const fn check_size(
+    tool: DistributedTool,
+    size: u64,
+    bytes: &[u8],
+) -> Result<(), ToolRuntimeError> {
+    let actual = bytes.len() as u64;
+    if actual == size {
+        Ok(())
+    } else {
+        Err(ToolRuntimeError::ArtifactSize {
+            tool,
+            expected: size,
+            actual,
+        })
+    }
 }
 
 async fn download_artifact(
     tool: DistributedTool,
     location: &ToolArtifactLocation,
+    size: u64,
+    token: Option<&GithubToken>,
 ) -> Result<Vec<u8>, ToolRuntimeError> {
     let url = location.download_url(tool)?;
     let encoded = match url.scheme() {
@@ -586,15 +648,123 @@ async fn download_artifact(
             let path = url
                 .to_file_path()
                 .map_err(|()| ToolRuntimeError::ArtifactSource(tool))?;
-            read_artifact_file(&path, tool).await?
+            read_artifact_file(&path, tool, size).await?
         }
-        "https" => download_with_retry(url.as_str(), DOWNLOAD_RETRY).await?,
+        "https" => {
+            let source = match (token, GithubRelease::parse(url)) {
+                (Some(token), Some(release)) => Source::GithubApi {
+                    release,
+                    api: Url::parse(GITHUB_API).expect("the GitHub API base is a valid URL"),
+                    token,
+                },
+                _ => Source::Direct(url.as_str()),
+            };
+            download_with_retry(&source, size, DOWNLOAD_RETRY).await?
+        }
         _ => return Err(ToolRuntimeError::ArtifactSource(tool)),
     };
-    if encoded.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::ArtifactTooLarge(tool));
-    }
+    check_size(tool, size, &encoded)?;
     Ok(encoded)
+}
+
+/// Base of the GitHub REST API.
+const GITHUB_API: &str = "https://api.github.com/";
+
+/// Largest release metadata document read; a release lists its assets, and
+/// anything past this is not one.
+const RELEASE_METADATA_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// A `github.com/<owner>/<repo>/releases/download/<tag>/<asset>` URL, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubRelease {
+    owner: String,
+    repo: String,
+    tag: String,
+    asset: String,
+}
+
+impl GithubRelease {
+    /// The release asset a github.com download URL names; `None` for any
+    /// other URL.
+    fn parse(url: &Url) -> Option<Self> {
+        if url.scheme() != "https" || url.host_str() != Some("github.com") {
+            return None;
+        }
+        let segments = url
+            .path_segments()?
+            .map(|segment| {
+                percent_encoding::percent_decode_str(segment)
+                    .decode_utf8()
+                    .ok()
+                    .map(std::borrow::Cow::into_owned)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let [owner, repo, releases, download, tag, asset] =
+            <[String; 6]>::try_from(segments).ok()?;
+        let named = [&owner, &repo, &tag, &asset]
+            .iter()
+            .all(|segment| !segment.is_empty());
+        (named && releases == "releases" && download == "download").then_some(Self {
+            owner,
+            repo,
+            tag,
+            asset,
+        })
+    }
+
+    /// `GET /repos/{owner}/{repo}/releases/tags/{tag}` under `api`.
+    fn release_url(&self, api: &Url) -> Url {
+        self.api_url(api, &["releases", "tags", &self.tag])
+    }
+
+    /// `GET /repos/{owner}/{repo}/releases/assets/{id}` under `api`.
+    fn asset_url(&self, api: &Url, id: u64) -> Url {
+        self.api_url(api, &["releases", "assets", &id.to_string()])
+    }
+
+    fn api_url(&self, api: &Url, tail: &[&str]) -> Url {
+        let mut url = api.clone();
+        url.path_segments_mut()
+            .expect("the API base can be a base")
+            .clear()
+            .extend(["repos", &self.owner, &self.repo])
+            .extend(tail);
+        url
+    }
+}
+
+/// The part of a GitHub release the asset lookup reads.
+#[derive(Debug, Deserialize)]
+struct ReleaseMetadata {
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseAsset {
+    id: u64,
+    name: String,
+}
+
+impl ReleaseMetadata {
+    fn asset_id(&self, name: &str) -> Option<u64> {
+        self.assets
+            .iter()
+            .find(|asset| asset.name == name)
+            .map(|asset| asset.id)
+    }
+}
+
+/// Where a download attempt fetches the artifact from.
+enum Source<'a> {
+    /// A plain GET of the URL, with no credentials.
+    Direct(&'a str),
+    /// The release asset through the REST API at `api`, authenticated with
+    /// `token`.
+    GithubApi {
+        release: GithubRelease,
+        api: Url,
+        token: &'a GithubToken,
+    },
 }
 
 /// Retry schedule for transient artifact download failures.
@@ -617,23 +787,86 @@ const DOWNLOAD_RETRY: DownloadRetry = DownloadRetry {
     attempt_timeout: Duration::from_secs(60),
 };
 
-/// Fetches `url` once, bounded by the attempt deadline.
-async fn download_once(url: &str, timeout: Duration) -> Result<Vec<u8>, ToolRuntimeError> {
+/// Sent with API requests, which GitHub rejects without a `User-Agent`.
+const USER_AGENT: &str = "aither-sandbox";
+
+/// Reads at most `limit` bytes of a successful response.
+async fn read_response(
+    response: zenwave::Response,
+    limit: u64,
+) -> Result<Vec<u8>, ToolRuntimeError> {
+    if !response.status().is_success() {
+        return Err(ToolRuntimeError::DownloadStatus(response.status().as_u16()));
+    }
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
+}
+
+/// One authenticated API GET. The client follows redirects and drops
+/// `Authorization` when one leaves the origin, so the signed storage URL a
+/// asset download redirects to never sees the token.
+async fn api_get(
+    client: &mut zenwave::DefaultClient,
+    url: &Url,
+    accept: &str,
+    token: &GithubToken,
+) -> Result<zenwave::Response, ToolRuntimeError> {
+    Ok(client
+        .get(url.as_str())?
+        .header("Accept", accept)?
+        .header("User-Agent", USER_AGENT)?
+        .bearer_auth(token.0.as_str())
+        .await?)
+}
+
+/// Fetches the artifact once, bounded by the attempt deadline.
+async fn download_once(
+    source: &Source<'_>,
+    size: u64,
+    timeout: Duration,
+) -> Result<Vec<u8>, ToolRuntimeError> {
     futures_lite::future::or(
         async {
             let mut client = zenwave::client();
-            let response = client.get(url)?.await?;
-            if !response.status().is_success() {
-                return Err(ToolRuntimeError::DownloadStatus(response.status().as_u16()));
+            match source {
+                Source::Direct(url) => {
+                    let response = client.get(*url)?.await?;
+                    read_response(response, size.saturating_add(1)).await
+                }
+                Source::GithubApi {
+                    release,
+                    api,
+                    token,
+                } => {
+                    let response = api_get(
+                        &mut client,
+                        &release.release_url(api),
+                        "application/vnd.github+json",
+                        token,
+                    )
+                    .await?;
+                    let metadata = read_response(response, RELEASE_METADATA_LIMIT).await?;
+                    let metadata: ReleaseMetadata = serde_json::from_slice(&metadata)
+                        .map_err(ToolRuntimeError::ReleaseMetadata)?;
+                    let id = metadata.asset_id(&release.asset).ok_or_else(|| {
+                        ToolRuntimeError::ReleaseAssetMissing(release.asset.clone())
+                    })?;
+                    let response = api_get(
+                        &mut client,
+                        &release.asset_url(api, id),
+                        "application/octet-stream",
+                        token,
+                    )
+                    .await?;
+                    read_response(response, size.saturating_add(1)).await
+                }
             }
-            let mut bytes = Vec::new();
-            response
-                .into_body()
-                .into_reader()
-                .take(64 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .await?;
-            Ok(bytes)
         },
         async {
             async_io::Timer::after(timeout).await;
@@ -667,11 +900,15 @@ fn is_transient(error: &ToolRuntimeError) -> bool {
 
 /// Downloads `url`, retrying transient failures with exponential backoff and
 /// failing with the last error once the attempts are spent.
-async fn download_with_retry(url: &str, retry: DownloadRetry) -> Result<Vec<u8>, ToolRuntimeError> {
+async fn download_with_retry(
+    source: &Source<'_>,
+    size: u64,
+    retry: DownloadRetry,
+) -> Result<Vec<u8>, ToolRuntimeError> {
     let mut backoff = retry.initial_backoff;
     let mut attempt = 1;
     loop {
-        match download_once(url, retry.attempt_timeout).await {
+        match download_once(source, size, retry.attempt_timeout).await {
             Err(error) if attempt < retry.attempts && is_transient(&error) => {
                 tracing::warn!(
                     %error,
@@ -689,12 +926,10 @@ async fn download_with_retry(url: &str, retry: DownloadRetry) -> Result<Vec<u8>,
     }
 }
 
-fn read_executable(reader: impl Read) -> Result<Vec<u8>, ToolRuntimeError> {
+/// Reads an archive member in full: the archive's pinned hash fixes its content.
+fn read_executable(mut reader: impl Read) -> Result<Vec<u8>, ToolRuntimeError> {
     let mut bytes = Vec::new();
-    reader.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(ToolRuntimeError::InvalidArchive);
-    }
+    reader.read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -797,6 +1032,7 @@ pub mod tests {
                     target: target.clone(),
                     url: url(&path),
                     sha256: hex::encode(digest(&bytes)),
+                    size: bytes.len() as u64,
                     encoding: ToolArtifactFormat::Executable,
                 }
             })
@@ -805,6 +1041,7 @@ pub mod tests {
             artifacts,
             host_programs: Vec::new(),
             python: python_pins(target),
+            github_token: None,
         }
     }
 
@@ -1074,11 +1311,13 @@ pub mod tests {
                     target: ToolTarget::native().unwrap(),
                     url: ToolArtifactLocation::Download(Url::from_file_path(&binary).unwrap()),
                     sha256: hex::encode(digest(bytes)),
+                    size: bytes.len() as u64,
                     encoding: ToolArtifactFormat::Executable,
                 })
                 .collect(),
             host_programs: Vec::new(),
             python: python_pins(&ToolTarget::native().unwrap()),
+            github_token: None,
         };
         let manifest = distribution
             .package_into(installation.path())
@@ -1112,7 +1351,7 @@ pub mod tests {
                 .unwrap()
                 .catalog()
         );
-        async_fs::write(relocated.path().join(name), b"tampered")
+        async_fs::write(relocated.path().join(name), b"verified artifact fixtur3")
             .await
             .unwrap();
         assert!(matches!(
@@ -1136,10 +1375,12 @@ pub mod tests {
                 target: ToolTarget::native().unwrap(),
                 url: ToolArtifactLocation::Bundled("../outside".into()),
                 sha256: "00".repeat(32),
+                size: 1,
                 encoding: ToolArtifactFormat::Executable,
             }],
             host_programs: Vec::new(),
             python: Vec::new(),
+            github_token: None,
         };
         let path = root.path().join("distribution.json");
         async_fs::write(&path, serde_json::to_vec(&distribution).unwrap())
@@ -1162,10 +1403,12 @@ pub mod tests {
                     Url::parse("https://user:secret@example.com/tool").unwrap(),
                 ),
                 sha256: "00".repeat(32),
+                size: 1,
                 encoding: ToolArtifactFormat::Executable,
             }],
             host_programs: Vec::new(),
             python: Vec::new(),
+            github_token: None,
         };
         let error =
             ToolDistribution::from_json(&serde_json::to_vec(&manifest).unwrap()).unwrap_err();
@@ -1290,12 +1533,14 @@ pub mod tests {
                         target,
                         url: ToolArtifactLocation::Download(Url::from_file_path(&archive).unwrap()),
                         sha256: hex::encode(digest(&encoded)),
+                        size: encoded.len() as u64,
                         encoding: ToolArtifactFormat::TarXz {
                             executable: "repo-search/search".into(),
                         },
                     },
                     executable_sha256: hex::encode(digest(executable)),
                 }],
+                github_token: None,
             };
             Self {
                 directory,
@@ -1380,9 +1625,9 @@ pub mod tests {
         let fixture = HostFixture::new().await;
         let target = ToolTarget::native().unwrap();
         let cache = fixture.directory.path().join("cache");
-        async_fs::write(&fixture.archive, tar_xz("repo-search/search", b"tampered"))
-            .await
-            .unwrap();
+        let mut tampered = async_fs::read(&fixture.archive).await.unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        async_fs::write(&fixture.archive, tampered).await.unwrap();
         assert!(matches!(
             fixture
                 .distribution
@@ -1468,7 +1713,7 @@ pub mod tests {
             format!(
                 r#"{{"artifacts":[],"host_programs":[{{"tool":"repo_search","version":"0.0.3",
                 "target":{{"os":"linux","arch":"x86_64"}},"url":"https://example.com/search.tar.xz",
-                "sha256":"{}","encoding":{{"format":"executable"}}{entry}}}]}}"#,
+                "sha256":"{}","size":1,"encoding":{{"format":"executable"}}{entry}}}]}}"#,
                 "0".repeat(64)
             )
         };
@@ -1590,6 +1835,220 @@ pub mod tests {
         (url, handle)
     }
 
+    /// One scripted reply: status, extra headers, body.
+    type Reply = (u16, Vec<(&'static str, String)>, Vec<u8>);
+
+    /// Answers one reply per connection, in order, and resolves to the head
+    /// (request line and headers) of every request received.
+    async fn serve_recorded(replies: Vec<Reply>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let mut heads = Vec::new();
+            for (status, headers, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "the client closed before finishing its request");
+                    head.extend_from_slice(&chunk[..read]);
+                }
+                heads.push(String::from_utf8(head).unwrap().to_lowercase());
+                let mut reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for (name, value) in headers {
+                    std::fmt::Write::write_fmt(&mut reply, format_args!("{name}: {value}\r\n"))
+                        .unwrap();
+                }
+                reply.push_str("\r\n");
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            heads
+        });
+        (address, handle)
+    }
+
+    fn release(url: &str) -> Option<GithubRelease> {
+        GithubRelease::parse(&Url::parse(url).unwrap())
+    }
+
+    #[test]
+    fn only_github_release_download_urls_name_a_release_asset() {
+        assert_eq!(
+            release(
+                "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-aarch64-apple-darwin.tar.gz"
+            ),
+            Some(GithubRelease {
+                owner: "BurntSushi".into(),
+                repo: "ripgrep".into(),
+                tag: "15.1.0".into(),
+                asset: "ripgrep-15.1.0-aarch64-apple-darwin.tar.gz".into(),
+            })
+        );
+        assert_eq!(
+            release("https://github.com/o/r/releases/download/v%2B1/a%20b.zip?x=1")
+                .map(|r| (r.tag, r.asset)),
+            Some(("v+1".into(), "a b.zip".into()))
+        );
+        for other in [
+            "https://example.com/o/r/releases/download/v1/a.zip",
+            "http://github.com/o/r/releases/download/v1/a.zip",
+            "https://api.github.com/o/r/releases/download/v1/a.zip",
+            "https://github.com/o/r/releases/latest/download/a.zip",
+            "https://github.com/o/r/archive/v1.tar.gz",
+            "https://github.com/o/r/releases/download/v1",
+            "https://github.com/o/r/releases/download/v1/a/b.zip",
+            "https://github.com/o/r/releases/download//a.zip",
+        ] {
+            assert_eq!(release(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn api_urls_name_the_release_by_tag_and_the_asset_by_id() {
+        let release = GithubRelease {
+            owner: "o".into(),
+            repo: "r".into(),
+            tag: "rel/1 2".into(),
+            asset: "a".into(),
+        };
+        let api = Url::parse(GITHUB_API).unwrap();
+        assert_eq!(
+            release.release_url(&api).as_str(),
+            "https://api.github.com/repos/o/r/releases/tags/rel%2F1%202"
+        );
+        assert_eq!(
+            release.asset_url(&api, 42).as_str(),
+            "https://api.github.com/repos/o/r/releases/assets/42"
+        );
+    }
+
+    #[test]
+    fn the_token_never_appears_in_debug_output() {
+        let distribution = pinned_distribution().with_github_token("ghs_secret");
+        assert!(!format!("{distribution:?}").contains("ghs_secret"));
+        assert!(
+            !serde_json::to_string(&distribution)
+                .unwrap()
+                .contains("ghs_secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_download_sends_no_credentials() {
+        let (address, server) = serve_recorded(vec![(200, vec![], b"payload".to_vec())]).await;
+        let url = format!("http://{address}/artifact");
+        let bytes = download_with_retry(&Source::Direct(&url), 7, FAST_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"payload");
+        let heads = server.await.unwrap();
+        assert!(heads[0].starts_with("get /artifact "), "{}", heads[0]);
+        assert!(!heads[0].contains("authorization"), "{}", heads[0]);
+    }
+
+    fn api_source<'a>(address: &str, token: &'a GithubToken) -> Source<'a> {
+        Source::GithubApi {
+            release: GithubRelease {
+                owner: "o".into(),
+                repo: "r".into(),
+                tag: "v1".into(),
+                asset: "tool.tar.gz".into(),
+            },
+            api: Url::parse(&format!("http://{address}/")).unwrap(),
+            token,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_fetches_the_asset_through_the_api_and_keeps_it_from_the_redirect_host() {
+        let (storage, storage_server) =
+            serve_recorded(vec![(200, vec![], b"payload".to_vec())]).await;
+        let metadata = br#"{"id":1,"assets":[{"id":7,"name":"other"},{"id":42,"name":"tool.tar.gz","size":7}]}"#;
+        let (api, api_server) = serve_recorded(vec![
+            (200, vec![], metadata.to_vec()),
+            (
+                302,
+                vec![("Location", format!("http://{storage}/signed?sig=1"))],
+                Vec::new(),
+            ),
+        ])
+        .await;
+        let token = GithubToken("ghs_secret".into());
+        let bytes = download_with_retry(&api_source(&api, &token), 7, FAST_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"payload");
+
+        let heads = api_server.await.unwrap();
+        assert!(
+            heads[0].starts_with("get /repos/o/r/releases/tags/v1 "),
+            "{}",
+            heads[0]
+        );
+        assert!(heads[0].contains("accept: application/vnd.github+json"));
+        assert!(
+            heads[1].starts_with("get /repos/o/r/releases/assets/42 "),
+            "{}",
+            heads[1]
+        );
+        assert!(heads[1].contains("accept: application/octet-stream"));
+        for head in &heads {
+            assert!(head.contains("authorization: bearer ghs_secret"), "{head}");
+            assert!(head.contains("user-agent: aither-sandbox"), "{head}");
+        }
+        let heads = storage_server.await.unwrap();
+        assert!(heads[0].starts_with("get /signed?sig=1 "), "{}", heads[0]);
+        assert!(heads[0].contains("accept: application/octet-stream"));
+        assert!(!heads[0].contains("authorization"), "{}", heads[0]);
+        assert!(!heads[0].contains("ghs_secret"), "{}", heads[0]);
+    }
+
+    #[tokio::test]
+    async fn a_release_without_the_pinned_asset_fails_without_a_second_request() {
+        let (api, server) = serve_recorded(vec![(
+            200,
+            vec![],
+            br#"{"assets":[{"id":7,"name":"other"}]}"#.to_vec(),
+        )])
+        .await;
+        let token = GithubToken("t".into());
+        let error = download_with_retry(&api_source(&api, &token), 7, FAST_RETRY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ToolRuntimeError::ReleaseAssetMissing(name) if name == "tool.tar.gz"),
+            "{error:?}"
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_release_lookup_that_fails_with_a_server_fault_is_retried() {
+        let (api, server) = serve_recorded(vec![
+            (504, vec![], Vec::new()),
+            (
+                200,
+                vec![],
+                br#"{"assets":[{"id":42,"name":"tool.tar.gz"}]}"#.to_vec(),
+            ),
+            (200, vec![], b"payload".to_vec()),
+        ])
+        .await;
+        let token = GithubToken("t".into());
+        let bytes = download_with_retry(&api_source(&api, &token), 7, FAST_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"payload");
+        assert_eq!(server.await.unwrap().len(), 3);
+    }
+
     const FAST_RETRY: DownloadRetry = DownloadRetry {
         attempts: 4,
         initial_backoff: Duration::from_millis(5),
@@ -1605,7 +2064,9 @@ pub mod tests {
             Some((200, b"payload")),
         ])
         .await;
-        let bytes = download_with_retry(&url, FAST_RETRY).await.unwrap();
+        let bytes = download_with_retry(&Source::Direct(&url), 7, FAST_RETRY)
+            .await
+            .unwrap();
         assert_eq!(bytes, b"payload");
         assert_eq!(server.await.unwrap(), 4);
     }
@@ -1613,7 +2074,9 @@ pub mod tests {
     #[tokio::test]
     async fn a_permanent_status_is_tried_exactly_once() {
         let (url, server) = serve(vec![Some((404, b"missing"))]).await;
-        let error = download_with_retry(&url, FAST_RETRY).await.unwrap_err();
+        let error = download_with_retry(&Source::Direct(&url), 7, FAST_RETRY)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("404"), "{error}");
         assert!(!is_transient(&error));
         assert_eq!(server.await.unwrap(), 1);
@@ -1628,8 +2091,68 @@ pub mod tests {
             Some((502, b"")),
         ])
         .await;
-        let error = download_with_retry(&url, FAST_RETRY).await.unwrap_err();
+        let error = download_with_retry(&Source::Direct(&url), 7, FAST_RETRY)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("502"), "{error}");
         assert_eq!(server.await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_download_longer_than_its_pinned_size_is_rejected_before_hashing() {
+        let (url, server) = serve(vec![Some((200, b"payload and more"))]).await;
+        let tool = DistributedTool::Command(ManagedTool::Ripgrep);
+        // The body read stops one byte past the pin instead of buffering it all.
+        let bytes = download_with_retry(&Source::Direct(&url), 7, FAST_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 8);
+        let error = check_size(tool, 7, &bytes).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ToolRuntimeError::ArtifactSize {
+                    tool: DistributedTool::Command(ManagedTool::Ripgrep),
+                    expected: 7,
+                    actual: 8,
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cached_file_of_the_wrong_size_is_rejected_before_hashing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        let tool = DistributedTool::Command(ManagedTool::Ripgrep);
+        async_fs::write(&path, b"payload").await.unwrap();
+        assert_eq!(
+            read_artifact_file(&path, tool, 7).await.unwrap(),
+            b"payload"
+        );
+        for pinned in [6, 8] {
+            let error = read_artifact_file(&path, tool, pinned).await.unwrap_err();
+            assert!(
+                matches!(error, ToolRuntimeError::ArtifactSize { expected, .. } if expected == pinned),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::manual_assert_eq,
+        reason = "assert_eq! would print 64 MiB of bytes on failure"
+    )]
+    fn an_executable_over_64_mib_extracts_from_a_hash_verified_archive() {
+        let executable = vec![7_u8; 64 * 1024 * 1024 + 1];
+        let encoded = tar_xz("repo-search-x/search", &executable);
+        let encoding = ToolArtifactFormat::TarXz {
+            executable: "repo-search-x/search".into(),
+        };
+        let extracted = extract_executable(&encoding, &encoded).unwrap();
+        assert!(extracted == executable);
     }
 }

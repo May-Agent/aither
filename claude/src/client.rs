@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use aither_core::{
     LanguageModel,
     llm::{
-        Event, LLMRequest,
+        Event, GenerateError, LLMRequest, TokenCounting,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -17,15 +17,19 @@ use zenwave::{Client, client, header};
 
 use crate::{
     constant::{
-        ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
+        ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_TOKENS,
+        DEFAULT_MODEL, MID_CONVERSATION_OUTPUT_CONFIG_BETA,
     },
     error::ClaudeError,
     request::{
-        MessagesRequest, ParameterSnapshot, apply_cache_strategy, build_output_config,
-        build_thinking, convert_native_tools, convert_tools, filter_tool_definitions,
-        to_claude_messages, tool_choice_payload,
+        CountTokensRequest, MessagePayload, MessagesRequest, ParameterSnapshot,
+        apply_cache_strategy, build_output_config, build_thinking, convert_native_tools,
+        convert_tools, filter_tool_definitions, to_claude_messages, tool_choice_payload,
     },
-    response::{MessagesResponse, StreamState, parse_event, response_events, should_skip_event},
+    response::{
+        CountTokensResponse, MessagesResponse, StreamState, parse_event, response_events,
+        should_skip_event,
+    },
 };
 
 /// Claude chat model client for the Anthropic Messages API.
@@ -100,6 +104,63 @@ impl Claude {
 impl LanguageModel for Claude {
     type Error = ClaudeError;
 
+    fn token_counting(&self) -> TokenCounting {
+        TokenCounting::Endpoint
+    }
+
+    /// `POST /v1/messages/count_tokens` with the same body a messages call
+    /// would send, minus `max_tokens`, `stream`, and the sampling fields the
+    /// endpoint rejects. Cache control is omitted too — counting never
+    /// simulates the cache.
+    async fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> Result<Option<u32>, GenerateError<Self::Error>> {
+        let cfg = self.config();
+        let (core_messages, parameters, tool_definitions) = request.clone().into_parts();
+        {
+            let snapshot = ParameterSnapshot::from(&parameters);
+            let filtered_tool_definitions =
+                filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
+            let mut claude_tool_payloads = convert_tools(&filtered_tool_definitions);
+            claude_tool_payloads.extend(convert_native_tools(&snapshot.native_tools));
+            let has_tools = !claude_tool_payloads.is_empty();
+            let (system_prompt, claude_messages) =
+                to_claude_messages(&core_messages, takes_mid_conversation_system(&cfg))
+                    .await
+                    .map_err(|error| GenerateError::Provider(ClaudeError::Api(error)))?;
+            let request_body = CountTokensRequest {
+                model: cfg.model.clone(),
+                messages: claude_messages,
+                system: system_prompt,
+                tools: has_tools.then_some(claude_tool_payloads),
+                tool_choice: tool_choice_payload(
+                    &snapshot.tool_choice,
+                    has_tools,
+                    snapshot.parallel_tool_calls,
+                ),
+                thinking: build_thinking(&snapshot),
+                output_config: build_output_config(&snapshot).map_err(GenerateError::Provider)?,
+            };
+            let endpoint = cfg.request_url("/v1/messages/count_tokens");
+            let mut backend = client();
+            let response = backend
+                .post(endpoint)
+                .and_then(|b| b.header("x-api-key", cfg.api_key.clone()))
+                .and_then(|b| b.header("anthropic-version", ANTHROPIC_VERSION))
+                .and_then(|b| b.header(header::CONTENT_TYPE.as_str(), "application/json"))
+                .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-claude/0.1"))
+                .and_then(|b| b.json_body(&request_body))
+                .map_err(ClaudeError::Http)
+                .map_err(GenerateError::Provider)?
+                .json::<CountTokensResponse>()
+                .await
+                .map_err(ClaudeError::Http)
+                .map_err(GenerateError::Provider)?;
+            Ok(Some(response.input_tokens))
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn respond(
         &self,
@@ -133,7 +194,7 @@ impl LanguageModel for Claude {
 
         async_stream::stream! {
             let (mut system_prompt, mut claude_messages) =
-                match to_claude_messages(&core_messages).await {
+                match to_claude_messages(&core_messages, takes_mid_conversation_system(&cfg)).await {
                     Ok(payload) => payload,
                     Err(error) => {
                         yield Err(ClaudeError::Api(error));
@@ -194,6 +255,10 @@ impl LanguageModel for Claude {
             };
 
             debug!("Claude request: {:?}", request_body);
+            let effort_updates = request_body
+                .messages
+                .iter()
+                .any(MessagePayload::is_effort_update);
 
             let endpoint = cfg.request_url("/v1/messages");
             let mut backend = client();
@@ -212,6 +277,13 @@ impl LanguageModel for Claude {
                     }
                 })
                 .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-claude/0.1"))
+                .and_then(|b| {
+                    if effort_updates {
+                        b.header("anthropic-beta", MID_CONVERSATION_OUTPUT_CONFIG_BETA)
+                    } else {
+                        Ok(b)
+                    }
+                })
                 .and_then(|b| b.json_body(&request_body))
             {
                 Ok(b) => b,
@@ -334,6 +406,13 @@ impl LanguageModel for Claude {
                 context_length,
             )
             .with_abilities([Ability::ToolUse, Ability::Vision]);
+            if takes_per_message_effort(&cfg) {
+                profile.abilities.push(Ability::PerMessageEffort);
+            }
+            if takes_mid_conversation_system(&cfg) {
+                profile.abilities.push(Ability::MidConversationSystem);
+            }
+            profile.default_reasoning_effort = aither_models::default_reasoning_effort(&cfg.model);
 
             for ability in &cfg.native_abilities {
                 if !profile.abilities.contains(ability) {
@@ -343,6 +422,25 @@ impl LanguageModel for Claude {
             Ok(profile)
         }
     }
+}
+
+/// Whether this client's model takes a per-message effort change: the
+/// registry lists the model for it, and the client talks to the Claude API
+/// itself, one of the platforms Anthropic documents the beta on (a proxy
+/// behind another base URL is not).
+fn takes_per_message_effort(cfg: &Config) -> bool {
+    cfg.base_url.trim_end_matches('/') == CLAUDE_BASE_URL
+        && aither_models::lookup(&cfg.model)
+            .is_some_and(|entry| entry.has_ability(Ability::PerMessageEffort))
+}
+
+/// Whether this client's model takes a system message inside `messages`: the
+/// registry lists the model for it and the client talks to the Claude API
+/// itself.
+fn takes_mid_conversation_system(cfg: &Config) -> bool {
+    cfg.base_url.trim_end_matches('/') == CLAUDE_BASE_URL
+        && aither_models::lookup(&cfg.model)
+            .is_some_and(|entry| entry.has_ability(Ability::MidConversationSystem))
 }
 
 fn native_tool_name_enabled(snapshot: &ParameterSnapshot, name: &str) -> bool {
@@ -524,4 +622,229 @@ impl Config {
 
 fn sanitize_model(model: impl Into<String>) -> String {
     model.into().trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aither_core::llm::{Message, model::Parameters, model::ReasoningEffort};
+
+    /// A loopback server that records the one request it receives, headers
+    /// and body, and answers it with an error.
+    fn capturing_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let addr = listener.local_addr().expect("stub server address");
+        let (sender, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            let body_start = loop {
+                let read = stream.read(&mut chunk).expect("read the request");
+                request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head =
+                String::from_utf8_lossy(request.get(..body_start).expect("head")).into_owned();
+            let length = head.lines().find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|length| length.trim().parse::<usize>().expect("a numeric length"))
+            });
+            let complete = |request: &[u8]| {
+                length.map_or_else(
+                    || request.ends_with(b"0\r\n\r\n"),
+                    |length| request.len() >= body_start + length,
+                )
+            };
+            while !complete(&request) {
+                let read = stream.read(&mut chunk).expect("read the body");
+                request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+            }
+            let raw = String::from_utf8_lossy(request.get(body_start..).expect("body"));
+            let body = if length.is_some() {
+                raw.into_owned()
+            } else {
+                dechunk(&raw)
+            };
+            sender
+                .send(format!("{head}{body}"))
+                .expect("the test is listening");
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            );
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    /// The payload of a chunked transfer-encoded body.
+    fn dechunk(mut raw: &str) -> String {
+        let mut body = String::new();
+        loop {
+            let (size, rest) = raw.split_once("\r\n").expect("a chunk size line");
+            let size = usize::from_str_radix(size.trim(), 16).expect("a hex chunk size");
+            if size == 0 {
+                return body;
+            }
+            body.push_str(rest.get(..size).expect("the chunk is complete"));
+            raw = rest
+                .get(size..)
+                .and_then(|rest| rest.strip_prefix("\r\n"))
+                .expect("the chunk ends with CRLF");
+        }
+    }
+
+    /// A loopback server that records the request and answers `200` with
+    /// the given JSON body — the shape `count_tokens` needs.
+    fn responding_server(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let (base_url, received) = {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+            let addr = listener.local_addr().expect("stub server address");
+            let (sender, received) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept the request");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 8192];
+                let body_start = loop {
+                    let read = stream.read(&mut chunk).expect("read the request");
+                    request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let head_str =
+                    String::from_utf8_lossy(request.get(..body_start).expect("head")).into_owned();
+                let length = head_str.lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().expect("numeric length"))
+                });
+                let chunked = head_str
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked");
+                let complete = |request: &[u8]| {
+                    if chunked {
+                        request.ends_with(b"0\r\n\r\n")
+                    } else {
+                        request.len() >= body_start + length.unwrap_or(0)
+                    }
+                };
+                while !complete(&request) {
+                    let read = stream.read(&mut chunk).expect("read the body");
+                    request.extend_from_slice(chunk.get(..read).expect("read within the chunk"));
+                }
+                let raw =
+                    String::from_utf8_lossy(request.get(body_start..).expect("body")).into_owned();
+                let decoded_body = if chunked { dechunk(&raw) } else { raw };
+                sender
+                    .send(format!("{head_str}{decoded_body}"))
+                    .expect("the test is listening");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+            (format!("http://{addr}"), received)
+        };
+        (base_url, received)
+    }
+
+    /// `count_tokens` posts the messages payload — minus generation fields —
+    /// to `/v1/messages/count_tokens` and reads `input_tokens` back.
+    #[tokio::test]
+    async fn count_tokens_posts_to_the_count_endpoint() {
+        let (base_url, received) = responding_server("{\"input_tokens\": 2097}");
+        let client = Claude::builder("key")
+            .base_url(base_url)
+            .model("claude-opus-5-5")
+            .build();
+        assert_eq!(client.token_counting(), TokenCounting::Endpoint);
+        let request = LLMRequest::new(vec![Message::user("Plan the migration.")])
+            .with_parameters(Parameters::default().max_tokens(512));
+        let counted = client.count_tokens(&request).await.expect("count succeeds");
+        assert_eq!(counted, Some(2097));
+
+        let sent = received.recv().expect("the request arrives");
+        let (head, body) = sent.split_once("\r\n\r\n").expect("head and body");
+        assert!(
+            head.lines()
+                .next()
+                .is_some_and(|line| line.contains("POST /v1/messages/count_tokens")),
+            "{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(body["model"], "claude-opus-5-5");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(body.get("max_tokens").is_none(), "{body}");
+        assert!(body.get("stream").is_none(), "{body}");
+    }
+
+    /// A request carrying an effort update sends the beta header and the
+    /// effort-only system message, with the request-level effort as given.
+    #[tokio::test]
+    async fn an_effort_update_sends_the_beta_and_the_per_message_form() {
+        let (base_url, received) = capturing_server();
+        let client = Claude::builder("key")
+            .base_url(base_url)
+            .model("claude-opus-5-5")
+            .build();
+        let request = LLMRequest::new(vec![
+            Message::user("Plan the migration."),
+            Message::assistant("Here is the plan."),
+            Message::configuration(ReasoningEffort::Low),
+            Message::user("Now rename the config file."),
+        ])
+        .with_parameters(
+            Parameters::default()
+                .reasoning_effort(ReasoningEffort::High)
+                .stream(false),
+        );
+        let stream = client.respond(request);
+        futures_lite::pin!(stream);
+        let _ = stream.next().await;
+
+        let sent = received.recv().expect("the request arrives");
+        let (head, body) = sent.split_once("\r\n\r\n").expect("head and body");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("anthropic-beta: mid-conversation-output-config-2026-07-01"),
+            "{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(
+            body["messages"][2],
+            serde_json::json!({"role": "system", "content": [], "output_config": {"effort": "low"}})
+        );
+    }
+
+    #[test]
+    fn per_message_effort_is_the_claude_apis_on_the_listed_models() {
+        let config = |model: &str, base_url: &str| {
+            Claude::builder("key")
+                .model(model)
+                .base_url(base_url)
+                .build()
+                .config()
+        };
+        assert!(takes_per_message_effort(&config(
+            "claude-opus-5-5",
+            CLAUDE_BASE_URL
+        )));
+        assert!(!takes_per_message_effort(&config(
+            "claude-sonnet-5",
+            CLAUDE_BASE_URL
+        )));
+        assert!(!takes_per_message_effort(&config(
+            "claude-opus-5-5",
+            "https://openrouter.ai/api/v1"
+        )));
+    }
 }

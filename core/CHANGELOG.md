@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/May-Agent/aither/compare/core-v0.23.0...core-v0.24.0) - 2026-11-08
+
+### Added
+
+- *(sandbox)* [**breaking**] lease model-facing ids from an embedder-supplied allocator
+
+### Fixed
+
+- *(sandbox)* [**breaking**] release a job's id once nothing can address it
+
+### Other
+
+- Merge pull request #629 from May-Agent/feat/625-id-allocator
+- Merge remote-tracking branch 'origin/dev' into feat/625-id-allocator
+
+## [0.23.0](https://github.com/May-Agent/aither/compare/core-v0.22.0...core-v0.23.0) - 2026-11-07
+
+### Fixed
+
+- *(claude)* index the sent message list and keep the live tail out of system
+
+### Other
+
+- merge main into dev after v0.22.0
+
+## [0.22.0](https://github.com/May-Agent/aither/compare/core-v0.21.0...core-v0.22.0) - 2026-11-07
+
+### Added
+
+- change a running agent's model, effort and grants in place
+- *(core)* let a request carrying a tool registry be modified in place
+
+### Fixed
+
+- clear the reasoning effort to the model's default on per-message models
+
 ## [0.20.0](https://github.com/May-Agent/aither/compare/core-v0.19.0...core-v0.20.0) - 2026-11-06
 
 ### Fixed

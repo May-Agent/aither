@@ -57,26 +57,15 @@ Run `<command> -h` or `--help` for usage details. Use `--` to end option parsing
 
 **Syntax:** `subagent <name> --prompt-file "<path>"`
 
-`<name>` is a subagent definition: a global one first, else `agents/<name>.toml` in the working directory. `subagent` alone lists the names that resolve. The definition fixes the subagent's role, its model and what it may write:
+`<name>` is a subagent definition: one the host provides first, else `agents/<name>.toml` in the working directory. `subagent` alone lists the names that resolve, each with when to use it. The definition fixes the subagent's role, its model and what it may write: a read-only subagent writes only its own scratch directory, and one that may write worktrees also writes those granted with `--worktrees` / `--commit-worktrees`. `fork` runs on your model and continues your context, writing its own scratch directory and the worktrees granted.
 
-| Name | Model | Writes |
-| --- | --- | --- |
-| `explore` | fast | its own scratch directory |
-| `research` | fast | its own scratch directory |
-| `audit` | advanced | its own scratch directory |
-| `review` | advanced | its own scratch directory |
-| `plan` | advanced | its own scratch directory |
-| `general` | routed by the fast model | its own scratch directory and the worktrees granted with `--worktrees` / `--commit-worktrees` |
-| `fork` | yours, continuing your context | its own scratch directory and the worktrees granted |
-
-Every subagent reads the whole workspace and keeps its own `tasks.md`; it cannot start subagents. The brief is read from a file: write it to a file first, then pass its path via `--prompt-file`. Inline prompt text is rejected.
+Every subagent reads the whole workspace and keeps its own working files in its own scratch directory; it cannot start subagents. The brief is read from a file: write it to a file first, then pass its path via `--prompt-file`. Inline prompt text is rejected.
 
 **Examples:**
 
 ```bash
-subagent research --prompt-file "prompts/research.md"
-subagent explore --prompt-file "prompts/explore.md"
-subagent general --prompt-file "prompts/fix.md" --commit-worktrees "wt/fix"
+subagent <name> --prompt-file "prompts/task.md"
+subagent <name> --prompt-file "prompts/fix.md" --commit-worktrees "wt/fix"
 subagent external --agent codex --prompt-file "prompts/port.md" --worktrees "wt/port"
 ```
 
@@ -126,17 +115,3 @@ When a skill matches the user's request:
 2. Read the skill file first: `cat skills/<name>/SKILL.md`
 3. Follow the workflow exactly as documented (do not skip required phases)
 4. Use referenced files in `skills/<name>/references/` as needed
-
-## Long Tasks & Planning
-
-Use markdown working documents in sandbox for long tasks:
-
-- `tasks.md`: the canonical task and plan document. Use it for checklists, phased plans, and execution notes that must survive context resets.
-- `plans/`: for massive work. `tasks.md` references sub-plans under `plans/`.
-
-Rules:
-- `tasks.md` is guaranteed in context by the framework.
-- Sub-plans in `plans/` are not guaranteed; re-read them when needed.
-- If blocked by user decisions, call `ask_user` and continue.
-- If scope grows, deepen `tasks.md` and then fan out into `plans/`.
-- After compaction, recover by re-reading transcript and `tasks.md`.

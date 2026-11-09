@@ -59,6 +59,9 @@ pub struct ContextBudget {
     appended_chars: usize,
     /// Latest trustworthy provider measurement.
     calibration: Option<Calibration>,
+    /// Tokens an exact counter reported for the assembled prompt: its chars
+    /// and the count. Supersedes the estimate while the assembly stands.
+    counted: Option<(usize, u32)>,
 }
 
 impl Default for ContextBudget {
@@ -81,6 +84,7 @@ impl ContextBudget {
             assembled_chars: 0,
             appended_chars: 0,
             calibration: None,
+            counted: None,
         }
     }
 
@@ -104,6 +108,16 @@ impl ContextBudget {
     pub const fn observe_assembled(&mut self, chars: usize) {
         self.assembled_chars = chars;
         self.appended_chars = 0;
+    }
+
+    /// Records an exact count for the prompt that was just assembled.
+    ///
+    /// The count replaces the character estimate for this assembly;
+    /// [`append`](Self::append) still charges content added since at the
+    /// calibrated ratio, and a provider `Usage` report supersedes the count
+    /// through [`calibrate`](Self::calibrate).
+    pub const fn observe_counted(&mut self, tokens: u32) {
+        self.counted = Some((self.assembled_chars, tokens));
     }
 
     /// Counts content added to the window after the last assembly.
@@ -171,9 +185,14 @@ impl ContextBudget {
     /// only the characters added since are converted at the calibrated ratio.
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
-        match self.calibration {
-            Some(measured) if measured.chars == self.assembled_chars => {
+        match (self.calibration, self.counted) {
+            // The provider's usage report is the ground truth when both
+            // measurements cover this assembly.
+            (Some(measured), _) if measured.chars == self.assembled_chars => {
                 to_usize_u32(measured.tokens) + self.tokens_for_chars(self.appended_chars)
+            }
+            (_, Some((chars, counted))) if chars == self.assembled_chars => {
+                to_usize_u32(counted) + self.tokens_for_chars(self.appended_chars)
             }
             _ => self.tokens_for_chars(self.assembled_chars + self.appended_chars),
         }
@@ -317,6 +336,29 @@ mod tests {
         let mut budget = ContextBudget::new(0);
         budget.observe_assembled(1_000_000);
         assert!((budget.usage() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_counted_assembly_supersedes_the_estimate() {
+        let mut budget = ContextBudget::new(1000);
+        budget.observe_assembled(4000);
+        budget.observe_counted(900);
+        assert_eq!(budget.estimated_tokens(), 900);
+        // Chars appended since still charge at the default 4.0 ratio.
+        budget.append(400);
+        assert_eq!(budget.estimated_tokens(), 1000);
+        // A new assembly drops the stale count and the appended chars.
+        budget.observe_assembled(2000);
+        assert_eq!(budget.estimated_tokens(), 500);
+    }
+
+    #[test]
+    fn provider_usage_supersedes_a_counted_assembly() {
+        let mut budget = ContextBudget::new(1000);
+        budget.observe_assembled(4000);
+        budget.observe_counted(900);
+        budget.calibrate(&usage(800, 0));
+        assert_eq!(budget.estimated_tokens(), 800);
     }
 
     #[test]
