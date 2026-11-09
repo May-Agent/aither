@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/May-Agent/aither/compare/sandbox-v0.25.0...sandbox-v0.26.0) - 2026-11-09
+
+### Added
+
+- *(sandbox)* read everywhere but the credential denylist, which an embedder can extend ([#663](https://github.com/May-Agent/aither/pull/663))
+
+### Fixed
+
+- *(sandbox)* download GitHub release tools through the authenticated API
+- *(sandbox)* name the /proc stat line a snapshot cannot parse
+
+### Other
+
+- Merge pull request #639 from May-Agent/fix/638-proc-stat-line
+
 ## [0.24.0](https://github.com/May-Agent/aither/compare/sandbox-v0.23.0...sandbox-v0.24.0) - 2026-11-08
 
 ### Added
