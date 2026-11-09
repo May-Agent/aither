@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/May-Agent/aither/compare/agent-v0.25.0...agent-v0.26.0) - 2026-11-09
+
+### Fixed
+
+- *(sandbox)* download GitHub release tools through the authenticated API
+
+### Other
+
+- Merge main into dev after the v0.25.0 release
+
 ## [0.25.0](https://github.com/May-Agent/aither/compare/agent-v0.24.0...agent-v0.25.0) - 2026-11-08
 
 ### Added
