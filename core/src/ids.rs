@@ -26,7 +26,8 @@ use core::{
 /// [`release`](Self::release) takes it back once what it names can no longer
 /// be addressed. Callers lease through [`AnyIdAllocator::lease`], whose
 /// [`IdLease`] releases the word when its last clone drops, so every lease is
-/// released exactly once.
+/// released exactly once. [`claim`](Self::claim) leases one word by name, for
+/// an embedder that keeps a word naming the same thing across restarts.
 ///
 /// A word is one or more lowercase ASCII letters: it names files, is written
 /// into commands and is recognized in text the model wrote.
@@ -39,8 +40,18 @@ pub trait IdAllocator: Send + Sync + 'static {
     /// leased.
     fn lease(&self) -> Result<String, IdsExhausted>;
 
-    /// Ends the lease of `word`, which [`lease`](Self::lease) handed out and
-    /// which has not been released since.
+    /// Leases `word` itself, for an embedder that persisted a lease and
+    /// restores it after a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WordUnavailable`] when a live lease holds `word` or the
+    /// allocator never hands it out.
+    fn claim(&self, word: &str) -> Result<(), WordUnavailable>;
+
+    /// Ends the lease of `word`, which [`lease`](Self::lease) or
+    /// [`claim`](Self::claim) handed out and which has not been released
+    /// since.
     fn release(&self, word: &str);
 }
 
@@ -48,6 +59,12 @@ pub trait IdAllocator: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("every model-facing id is leased")]
 pub struct IdsExhausted;
+
+/// A word an [`IdAllocator`] cannot hand out on a claim: a live lease holds
+/// it, or it is not one of the allocator's words.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the model-facing id '{0}' is leased or not one this allocator hands out")]
+pub struct WordUnavailable(pub String);
 
 /// A shared [`IdAllocator`].
 ///
@@ -79,10 +96,26 @@ impl AnyIdAllocator {
             is_word(&word),
             "the id allocator handed out '{word}', which is not one or more lowercase ASCII letters"
         );
-        Ok(IdLease(Arc::new(Held {
+        Ok(self.held(word))
+    }
+
+    /// Leases `word` itself, as [`IdAllocator::claim`] does; it is released
+    /// when the last clone of the returned lease drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WordUnavailable`] when a live lease holds `word` or the
+    /// allocator never hands it out.
+    pub fn claim(&self, word: &str) -> Result<IdLease, WordUnavailable> {
+        self.0.claim(word)?;
+        Ok(self.held(String::from(word)))
+    }
+
+    fn held(&self, word: String) -> IdLease {
+        IdLease(Arc::new(Held {
             word,
             allocator: self.clone(),
-        })))
+        }))
     }
 }
 
@@ -275,6 +308,15 @@ impl IdAllocator for WordAllocator {
         Err(IdsExhausted)
     }
 
+    fn claim(&self, word: &str) -> Result<(), WordUnavailable> {
+        let unavailable = || WordUnavailable(String::from(word));
+        let position = *self.positions.get(word).ok_or_else(unavailable)?;
+        if self.leased[position].swap(true, Ordering::AcqRel) {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
     fn release(&self, word: &str) {
         let position = *self
             .positions
@@ -312,6 +354,10 @@ mod tests {
     impl IdAllocator for Numbered {
         fn lease(&self) -> Result<String, IdsExhausted> {
             Ok("7".to_string())
+        }
+
+        fn claim(&self, word: &str) -> Result<(), WordUnavailable> {
+            Err(WordUnavailable(word.to_string()))
         }
 
         fn release(&self, _word: &str) {}
@@ -392,6 +438,32 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "a word leased again names something else: {again}"
+        );
+    }
+
+    #[test]
+    fn a_claimed_word_is_leased_until_its_lease_drops() {
+        let ids = AnyIdAllocator::new(WordAllocator::new(["river", "stone"]));
+        let river = ids.claim("river").expect("river is free");
+        assert_eq!(river.as_str(), "river");
+        assert_eq!(
+            ids.claim("river").unwrap_err(),
+            WordUnavailable("river".to_string()),
+            "a live lease holds it"
+        );
+        let stone = ids.lease().expect("stone is free");
+        assert_eq!(stone.as_str(), "stone");
+        assert_eq!(ids.lease().unwrap_err(), IdsExhausted, "river is claimed");
+        drop(river);
+        assert_eq!(&*ids.claim("river").expect("released"), "river");
+    }
+
+    #[test]
+    fn a_word_outside_the_list_cannot_be_claimed() {
+        let ids = AnyIdAllocator::new(WordAllocator::new(["river"]));
+        assert_eq!(
+            ids.claim("stone").unwrap_err(),
+            WordUnavailable("stone".to_string())
         );
     }
 
