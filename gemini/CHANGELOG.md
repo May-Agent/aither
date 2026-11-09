@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0](https://github.com/May-Agent/aither/compare/gemini-v0.24.0...gemini-v0.25.0) - 2026-11-08
+
+### Added
+
+- exact token counting per model for the context budget
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/gemini-v0.21.0...gemini-v0.22.0) - 2026-11-07
 
 ### Added

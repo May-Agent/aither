@@ -1453,8 +1453,6 @@ pub enum PreparedEnvironment {
     HomeBackend,
     /// The container the home tools were mounted into.
     Container,
-    /// The set of SSH servers and their targets.
-    SshServers,
 }
 
 impl std::fmt::Display for PreparedEnvironment {
@@ -1462,7 +1460,6 @@ impl std::fmt::Display for PreparedEnvironment {
         formatter.write_str(match self {
             Self::HomeBackend => "the home execution backend",
             Self::Container => "the container runtime",
-            Self::SshServers => "the SSH server set",
         })
     }
 }
@@ -1486,12 +1483,6 @@ pub enum ToolRuntimeError {
     /// SSH runtime bootstrap failed.
     #[error("SSH runtime initialization failed: {0}")]
     SshBootstrap(String),
-    /// Installation was not authorized.
-    #[error("managed tool installation denied for {0}")]
-    InstallDenied(String),
-    /// Application authorizer failed.
-    #[error("tool installation authorization failed: {0}")]
-    Authorization(crate::SshAuthorizationError),
     /// Initialization transport was cancelled.
     #[error("tool initialization interrupted")]
     InitializationInterrupted,

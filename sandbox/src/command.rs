@@ -380,7 +380,8 @@ impl std::fmt::Debug for ToolEntry {
 /// The main agent's terminal serves [`CommandRole::Main`]; every terminal built
 /// for a subagent, at any nesting depth, serves [`CommandRole::Subagent`], so a
 /// subagent can never reach a handler reserved for the main agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandRole {
     /// The main agent.
     Main,

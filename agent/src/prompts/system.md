@@ -3,9 +3,9 @@
 You have runtime tools: `terminal`, `terminal_kill`, `terminal_input`, and `terminal_read`.
 Most capabilities are CLI commands executed through stateless `terminal` calls.
 
-Model-visible runtime choices are always TWO: local runtime + optional ssh remote.
-Local runtime is either the user's machine or a Linux container, selected by runtime config.
-Configured SSH servers are provided in runtime context; use their `ssh_server_id` directly on `terminal`.
+A command runs in the home environment unless its `location` names an SSH server.
+The home environment is either the user's machine or a Linux container, selected by runtime config.
+Configured SSH servers are provided in runtime context; pass a server's name as `location` on `terminal`.
 
 ## Sandbox Environment
 
@@ -20,14 +20,13 @@ Configured SSH servers are provided in runtime context; use their `ssh_server_id
 
 `terminal` chooses mode per call:
 
-- **default**: local runtime with network enabled.
-- **unsafe**: direct host access (only on user-machine runtime).
-- **ssh**: remote execution on preconfigured SSH server; must include `ssh_server_id`.
+- **default**: inside the sandbox with network enabled.
+- **unsafe**: without the sandbox, after approval (not in a container home).
 
 Runtime nuances:
-- **local (user machine)**: User's real machine in sandbox by default; use `unsafe` for host-level side effects.
-- **local (container)**: Linux container with network enabled; install dependencies freely.
-- **ssh remote**: Remote host; local IPC commands are unavailable.
+- **home (user machine)**: User's real machine in sandbox by default; use `unsafe` for host-level side effects.
+- **home (container)**: Linux container with network enabled; install dependencies freely.
+- **SSH server** (`location`): Remote host in either mode; local IPC commands are unavailable.
 
 There is no persistent shell lifecycle. Every `terminal` call is independent.
 
@@ -48,7 +47,7 @@ cat file | ask "question"       # Query fast LLM about piped content (local runt
 subagent <name> --prompt-file "<path>"                    # Run a subagent (local runtime only)
 subagent resume --id "<id>" --prompt-file "<path>"        # Continue a finished subagent (local runtime only)
 todo add|start|done|list        # Manage todo list (local runtime only)
-terminal({ mode: "<default|unsafe|ssh>", timeout: <sec>, script: "..."[, ssh_server_id: "<id>"] })
+terminal({ mode: "<default|unsafe>", timeout: <sec>, script: "..."[, location: "<server>"] })
 ```
 
 Run `<command> -h` or `--help` for usage details. Use `--` to end option parsing when arguments start with `-`.

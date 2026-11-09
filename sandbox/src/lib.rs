@@ -75,6 +75,7 @@ mod script_language;
 mod session_policy;
 mod shell_session;
 mod shell_syntax;
+mod ssh;
 mod stdin_watch;
 mod subagent;
 mod terminal;
@@ -172,15 +173,14 @@ pub use process_tree::{
 pub use script_language::ScriptLanguage;
 pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
-    AnyContainerExec, AnySshSessionAuthorizer, BridgeAddress, BridgeAddressError, ContainerExec,
-    ContainerExecOutcome, ContainerIpcRoute, ContainerProbe, ContainerProbeError,
-    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
-    ShellSessionRegistry, SshAuthorizationError, SshRuntimeProfile, SshServer,
-    SshSessionAuthorizer, bootstrap_ssh_runtime,
+    AnyContainerExec, BridgeAddress, BridgeAddressError, ContainerExec, ContainerExecOutcome,
+    ContainerIpcRoute, ContainerProbe, ContainerProbeError, ContainerShellRuntime, ExecLifetime,
+    ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry,
 };
 pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
 };
+pub use ssh::{SshPlatform, SshProbeError, SshServer, SshServerError, probe_ssh_os};
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{
     AnySubagentSpaces, CommitLedger, CommitLedgerError, CommitMark, ImportBudget, PreparedSpace,

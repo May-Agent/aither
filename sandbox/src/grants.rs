@@ -22,6 +22,9 @@ pub struct GrantSet {
     pub readable: Vec<PathBuf>,
     /// Paths sandboxed commands may write to (and therefore also read).
     pub writable: Vec<PathBuf>,
+    /// Absolute paths sandboxed commands may not read, on top of heel's
+    /// credential table. Everything else on the host stays readable.
+    pub read_denied: Vec<PathBuf>,
     /// The access to the common git directory of a writable linked worktree.
     pub git_dir: GitDirAccess,
 }
@@ -108,6 +111,7 @@ impl TerminalGrants {
                 grants: Arc::new(ArcSwap::from_pointee(GrantSet {
                     readable: extra_readable,
                     writable: own_writable,
+                    read_denied: Vec::new(),
                     git_dir: GitDirAccess::ReadOnly,
                 })),
             },
@@ -155,6 +159,20 @@ impl TerminalGrants {
         });
     }
 
+    /// Denies sandboxed commands reading `path` and everything beneath it,
+    /// beyond heel's credential table, whatever else is granted. The path
+    /// must be absolute. Same "from the next launch on" semantics as
+    /// [`Self::add_readable`]; a subagent's view also denies what its
+    /// parent denies.
+    pub fn deny_read(&self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        self.update_own(|set| {
+            if !set.read_denied.contains(&path) {
+                set.read_denied.push(path.clone());
+            }
+        });
+    }
+
     /// Takes back the readable grant of `path`, with the same "from the next
     /// launch on" semantics as [`Self::add_readable`]: commands and shells
     /// already running keep the grants they launched with. A writable grant
@@ -197,6 +215,12 @@ impl TerminalGrants {
                         .chain(own_set.readable.iter().cloned())
                         .collect(),
                     writable: own_set.writable.clone(),
+                    read_denied: parent_set
+                        .read_denied
+                        .iter()
+                        .cloned()
+                        .chain(own_set.read_denied.iter().cloned())
+                        .collect(),
                     git_dir: GitDirAccess::ReadOnly,
                 })
             }

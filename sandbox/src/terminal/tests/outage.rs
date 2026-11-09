@@ -26,7 +26,6 @@ async fn terminal(
     .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
         local: true,
         container: false,
-        ssh: false,
     })
     .with_connectivity(connectivity);
     let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));

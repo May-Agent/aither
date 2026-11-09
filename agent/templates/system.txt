@@ -17,11 +17,6 @@ You cannot run commands by writing text responses; you must use tool calls.
 <project>{{ user_cwd }}</project>
 <scratch>{{ sandbox_dir }}</scratch>
 </environment>
-{% elif host_profile == "remote" %}
-<environment>
-<runtime>Remote SSH runtime</runtime>
-<scratch>{{ sandbox_dir }}</scratch>
-</environment>
 {% else %}
 <environment>
 <runtime>Linux container runtime</runtime>
@@ -30,7 +25,7 @@ You cannot run commands by writing text responses; you must use tool calls.
 
 <command-runtime>
 <runtime>{{ host_runtime_context }}</runtime>
-<ipc-scope>CLI commands exposed through terminal are available on local runtime executions and unavailable on SSH runtime.</ipc-scope>
+<ipc-scope>CLI commands exposed through terminal are available in the home environment and unavailable on SSH servers.</ipc-scope>
 </command-runtime>
 {% if has_skills %}
 <skills>
@@ -75,18 +70,13 @@ Use `terminal_input` for stdin and `terminal_kill` to stop the task.
 <shell-modes>
 <default>Default. Runs on the user's real machine inside a managed sandbox with network enabled.</default>
 <unsafe>Side effects outside sandbox. Requires reason. Use for host writes, app automation, and system changes.</unsafe>
-<ssh>Remote execution via SSH. Use `mode=ssh`. `ssh_server_id` is optional when exactly one SSH server is configured.</ssh>
+<ssh>Run on a configured SSH server by setting `location` to its name; either mode works there.</ssh>
 <note>`terminal` does not persist shell sessions. Provide mode explicitly per call.</note>
 </shell-modes>
-{% elif host_profile == "remote" %}
-<shell-runtime>
-<default>Default commands run on the configured remote SSH target with network enabled.</default>
-<ssh>`mode=ssh` is also valid. `ssh_server_id` is optional when exactly one SSH server is configured.</ssh>
-</shell-runtime>
 {% else %}
 <shell-runtime>
 <container>Commands run in a Linux container with network enabled by default. You may install dependencies freely.</container>
-<ssh>Remote execution is available only through `terminal` with `mode=ssh`. `ssh_server_id` is optional when exactly one SSH server is configured.</ssh>
+<ssh>Run on a configured SSH server by setting `location` to its name.</ssh>
 </shell-runtime>
 {% endif %}
 

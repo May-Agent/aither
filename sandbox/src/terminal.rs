@@ -77,8 +77,9 @@ use crate::{
     script_language::ScriptLanguage,
     shell_session::{
         BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
-        ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
+        ShellRuntimeAvailability, ShellSessionRegistry,
     },
+    ssh::{SshClient, SshEnvironment, SshServer},
     stdin_watch::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
@@ -480,18 +481,16 @@ pub struct TerminalArgs {
     #[serde(default)]
     pub language: ScriptLanguage,
 
-    /// Runtime execution mode.
-    /// - "default": local runtime execution with network enabled
-    /// - "sandboxed": local runtime execution with network denied
-    /// - "unsafe": direct host execution (heel profile only)
-    /// - "ssh": execute on a preconfigured SSH server (`ssh_server_id` required when multiple are configured)
+    /// How the command runs.
+    /// - "default": inside the sandbox, with network enabled
+    /// - "unsafe": without the sandbox, after approval
     #[serde(default)]
     pub mode: TerminalExecutionMode,
 
-    /// SSH server identifier used when `mode` is `ssh`.
-    /// Optional when exactly one SSH server is configured.
+    /// Where the command runs: omitted or empty for the home environment,
+    /// otherwise the name of a configured SSH server.
     #[serde(default)]
-    pub ssh_server_id: Option<String>,
+    pub location: Option<String>,
 
     /// Expected output format for proper handling.
     /// - "text" (default): plain text
@@ -541,19 +540,33 @@ pub struct TerminalArgs {
     pub background: bool,
 }
 
-/// Requested terminal execution backend.
+/// How a `terminal` command runs, wherever its `location` is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalExecutionMode {
-    /// Use the tool default.
+    /// Inside the sandbox.
     #[default]
     Default,
-    /// Use the sandboxed backend.
-    Sandboxed,
-    /// Use unsafe local execution.
+    /// Without the sandbox, after the permission handler approves it.
     Unsafe,
-    /// Use SSH execution.
-    Ssh,
+}
+
+impl From<TerminalExecutionMode> for TerminalMode {
+    fn from(mode: TerminalExecutionMode) -> Self {
+        match mode {
+            TerminalExecutionMode::Default => Self::Sandboxed,
+            TerminalExecutionMode::Unsafe => Self::Unsafe,
+        }
+    }
+}
+
+impl From<TerminalMode> for TerminalExecutionMode {
+    fn from(mode: TerminalMode) -> Self {
+        match mode {
+            TerminalMode::Sandboxed => Self::Default,
+            TerminalMode::Unsafe => Self::Unsafe,
+        }
+    }
 }
 
 const fn default_max_lines() -> u32 {
@@ -850,6 +863,10 @@ pub struct PermissionEvent {
     pub script: String,
     /// The language of `script`.
     pub language: ScriptLanguage,
+    /// The SSH server the command names; `None` for the home environment.
+    /// A wait for a server's first-use approval carries it as well as a wait
+    /// for an `unsafe` approval there.
+    pub location: Option<String>,
     /// Permission lifecycle stage.
     pub stage: PermissionEventStage,
 }
@@ -2070,6 +2087,22 @@ where
         self
     }
 
+    /// Denies sandboxed local commands reading these absolute paths and
+    /// everything beneath them, in addition to heel's credential table
+    /// (`~/.ssh`, `~/.config/gh`, keychains and other credential stores).
+    /// Every other path on the host is readable; writes stay limited to the
+    /// granted paths.
+    #[must_use]
+    pub fn with_read_denied_paths(
+        self,
+        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> Self {
+        for path in paths {
+            self.grants.deny_read(path.into());
+        }
+        self
+    }
+
     /// Injects extra environment variables into every command this tool
     /// spawns in the home environment.
     ///
@@ -2314,13 +2347,15 @@ where
     ///
     /// Only the checks that depend on this terminal run again: its working
     /// directory and writable paths must not expose the managed tool
-    /// directory. Artifact downloads, integrity hashing, version probes and SSH
-    /// bootstrap — with its connection consent — are not repeated.
+    /// directory. Artifact downloads, integrity hashing and version probes
+    /// are not repeated. The registry's SSH servers come with it, shared:
+    /// a server already approved or prepared is not asked about or prepared
+    /// again.
     ///
     /// # Errors
-    /// Rejects a registry that is not prepared, one whose home backend,
-    /// container or SSH server set changed after preparation, and writable
-    /// grants that expose the managed tools.
+    /// Rejects a registry that is not prepared, one whose home backend or
+    /// container changed after preparation, and writable grants that expose
+    /// the managed tools.
     pub async fn adopt_prepared_tools(
         mut self,
         sessions: ShellSessionRegistry,
@@ -2857,25 +2892,19 @@ where
         self.registry.registry()
     }
 
-    fn resolve_execution_target(
+    /// The server `location` names, or `None` for the home environment.
+    fn resolve_location(
         &self,
-        mode: TerminalExecutionMode,
-        ssh_server_id: Option<&str>,
-    ) -> Result<ExecutionTarget, TerminalError> {
-        match mode {
-            TerminalExecutionMode::Default => self.resolve_default_target(),
-            TerminalExecutionMode::Sandboxed => self.resolve_home_target(TerminalMode::Sandboxed),
-            TerminalExecutionMode::Unsafe => self.resolve_home_target(TerminalMode::Unsafe),
-            TerminalExecutionMode::Ssh => self.resolve_ssh_target(ssh_server_id),
-        }
-    }
-
-    fn resolve_default_target(&self) -> Result<ExecutionTarget, TerminalError> {
-        if self.shell_sessions.resolve_local_backend().is_ok() {
-            self.resolve_home_target(TerminalMode::Sandboxed)
-        } else {
-            self.resolve_ssh_target(None)
-        }
+        location: Option<&str>,
+    ) -> Result<Option<Arc<SshEnvironment>>, TerminalError> {
+        let Some(name) = location.map(str::trim).filter(|name| !name.is_empty()) else {
+            return Ok(None);
+        };
+        self.shell_sessions
+            .ssh_environments()
+            .get(name)
+            .map(Some)
+            .ok_or_else(|| TerminalError::UnknownLocation(name.to_string()))
     }
 
     fn resolve_home_target(&self, mode: TerminalMode) -> Result<ExecutionTarget, TerminalError> {
@@ -2904,33 +2933,93 @@ where
                     .as_ref()
                     .and_then(|subagent| subagent.container.clone()),
             },
-            ShellBackend::Ssh => unreachable!("the home backend is never SSH"),
         };
         Ok(ExecutionTarget { mode, backend })
     }
 
-    fn resolve_ssh_target(
+    /// A command on `environment` in `mode`, the server prepared first when
+    /// this is its first command. Default mode needs the server's `heel`.
+    async fn resolve_ssh_target(
         &self,
-        ssh_server_id: Option<&str>,
+        environment: &SshEnvironment,
+        mode: TerminalMode,
     ) -> Result<ExecutionTarget, TerminalError> {
-        self.shell_sessions
-            .ensure_ssh_available()
-            .map_err(TerminalError::InvalidTarget)?;
-        let server = ssh_server_id
-            .map_or_else(
-                || self.shell_sessions.default_ssh_server(),
-                |id| self.shell_sessions.resolve_ssh_server(id),
-            )
-            .map_err(TerminalError::InvalidTarget)?;
-        let (runtime, tools) = self.shell_sessions.ssh_tools(&server)?;
+        let prepared = self.shell_sessions.ssh_tools(environment).await?;
+        let server = environment.server();
+        let heel = match (mode, &prepared.heel) {
+            (TerminalMode::Sandboxed, Some(heel)) => Some(heel.clone()),
+            (TerminalMode::Sandboxed, None) => {
+                return Err(TerminalError::NoRemoteSandbox(server.name.clone()));
+            }
+            (TerminalMode::Unsafe, _) => None,
+        };
         Ok(ExecutionTarget {
-            mode: TerminalMode::Sandboxed,
+            mode,
             backend: ExecutionBackend::Ssh {
-                target: server.target,
-                runtime: runtime.clone(),
-                tools: tools.clone(),
+                client: self.shell_sessions.ssh_environments().client().clone(),
+                server: server.clone(),
+                heel,
+                tools: prepared.tools.clone(),
             },
         })
+    }
+
+    /// Asks the permission handler whether commands may run on
+    /// `environment`, unless a command there was already approved.
+    async fn ensure_location_allowed(
+        &self,
+        environment: &SshEnvironment,
+        admission: &Admission<'_>,
+    ) -> Result<(), TerminalError> {
+        environment
+            .approve(|| async {
+                let server = environment.server();
+                let role = self.registry.registry().role();
+                match self
+                    .permission_handler
+                    .review(&PermissionRequest::Location { server, role })
+                    .await
+                {
+                    Review::Approved => return Ok(()),
+                    Review::Denied(reason) => {
+                        return Err(TerminalError::from(PermissionError::Denied(reason)));
+                    }
+                    Review::Passed => {}
+                }
+                let waits = self
+                    .permission_handler
+                    .will_wait_for_location(server, role)
+                    .await;
+                let mode = admission.mode.into();
+                let location = Some(server.name.as_str());
+                if waits {
+                    self.emit_permission_event(
+                        mode,
+                        admission.script,
+                        admission.language,
+                        location,
+                        PermissionEventStage::Waiting,
+                    )
+                    .await;
+                }
+                let allowed = self.permission_handler.check_location(server, role).await;
+                if waits {
+                    self.emit_permission_event(
+                        mode,
+                        admission.script,
+                        admission.language,
+                        location,
+                        PermissionEventStage::Resolved,
+                    )
+                    .await;
+                }
+                if allowed? {
+                    Ok(())
+                } else {
+                    Err(TerminalError::LocationDenied(server.name.clone()))
+                }
+            })
+            .await
     }
 
     async fn ensure_permission_allowed(
@@ -2938,6 +3027,7 @@ where
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: Option<&str>,
     ) -> Result<(), TerminalError> {
         if mode.requires_approval() {
             match self
@@ -2961,14 +3051,26 @@ where
             .will_wait_for_approval(mode, script, language)
             .await;
         if permission_waits {
-            self.emit_permission_event(mode, script, language, PermissionEventStage::Waiting)
-                .await;
+            self.emit_permission_event(
+                mode,
+                script,
+                language,
+                location,
+                PermissionEventStage::Waiting,
+            )
+            .await;
         }
         let permission_result =
             ensure_mode_allowed(self.permission_handler.as_ref(), mode, script, language).await;
         if permission_waits {
-            self.emit_permission_event(mode, script, language, PermissionEventStage::Resolved)
-                .await;
+            self.emit_permission_event(
+                mode,
+                script,
+                language,
+                location,
+                PermissionEventStage::Resolved,
+            )
+            .await;
         }
         permission_result
     }
@@ -2978,6 +3080,7 @@ where
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: Option<&str>,
         stage: PermissionEventStage,
     ) {
         let _ = self
@@ -2986,6 +3089,7 @@ where
                 mode,
                 script: script.to_string(),
                 language,
+                location: location.map(str::to_string),
                 stage,
             })
             .await;
@@ -3056,6 +3160,7 @@ where
                 working_dir: self.working_dir.clone(),
                 writable_paths: self.grants.snapshot().writable.clone(),
                 readable_paths: self.grants.snapshot().readable.clone(),
+                read_denied_paths: self.grants.snapshot().read_denied.clone(),
                 git_dir: self.grants.snapshot().git_dir,
                 env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
@@ -3493,7 +3598,7 @@ where
             script: &arguments.script,
             language: arguments.language,
             mode: arguments.mode,
-            ssh_server_id: arguments.ssh_server_id.as_deref(),
+            location: arguments.location.as_deref(),
             max_lines: arguments.max_lines,
             origin,
             call,
@@ -3586,19 +3691,49 @@ where
                 |blocked| self.notices().command_blocked(blocked),
             )));
         }
-        let target = self.resolve_execution_target(admission.mode, admission.ssh_server_id)?;
-        if let ExecutionBackend::Local(tools) = &target.backend {
-            tools
-                .ensure_readonly(
-                    std::iter::once(&self.working_dir)
-                        .chain(self.grants.snapshot().writable.iter()),
-                )
-                .await
-                .map_err(TerminalError::from)?;
-        }
-        self.ensure_permission_allowed(target.mode, admission.script, admission.language)
-            .await?;
+        let mode = TerminalMode::from(admission.mode);
+        let target = match self.resolve_location(admission.location)? {
+            None => {
+                let target = self.resolve_home_target(mode)?;
+                if let ExecutionBackend::Local(tools) = &target.backend {
+                    tools
+                        .ensure_readonly(
+                            std::iter::once(&self.working_dir)
+                                .chain(self.grants.snapshot().writable.iter()),
+                        )
+                        .await
+                        .map_err(TerminalError::from)?;
+                }
+                self.ensure_permission_allowed(mode, admission.script, admission.language, None)
+                    .await?;
+                target
+            }
+            // Boxed: a server's first command carries its preparation,
+            // which would otherwise inflate every command's future.
+            Some(environment) => {
+                Box::pin(self.admit_on_server(&environment, admission, mode)).await?
+            }
+        };
         Ok((target, admission.max_lines.min(MAX_LINES_CEILING) as usize))
+    }
+
+    /// Admission of a command on a server. Both questions are put before the
+    /// server is prepared, which may take a while on its first command.
+    async fn admit_on_server(
+        &self,
+        environment: &SshEnvironment,
+        admission: &Admission<'_>,
+        mode: TerminalMode,
+    ) -> Result<ExecutionTarget, TerminalError> {
+        self.ensure_location_allowed(environment, admission).await?;
+        self.ensure_permission_allowed(
+            mode,
+            admission.script,
+            admission.language,
+            Some(environment.server().name.as_str()),
+        )
+        .await?;
+        self.resolve_ssh_target(environment, mode).await
     }
 
     /// Runs `run` to its end on this terminal; see [`TerminalRunner::run`].
@@ -3609,16 +3744,12 @@ where
         }
         // A run starts in a host directory, so it resolves the terminal's
         // home backend, never an SSH server.
-        let mode = match run.mode {
-            TerminalMode::Sandboxed => TerminalExecutionMode::Sandboxed,
-            TerminalMode::Unsafe => TerminalExecutionMode::Unsafe,
-        };
         let prepared = self
             .admit_command(Admission {
                 script: &run.script,
                 language: ScriptLanguage::Shell,
-                mode,
-                ssh_server_id: None,
+                mode: run.mode.into(),
+                location: None,
                 max_lines: default_max_lines(),
                 origin: ScriptOrigin::Run,
                 call: None,
@@ -3753,7 +3884,8 @@ struct Admission<'a> {
     script: &'a str,
     language: ScriptLanguage,
     mode: TerminalExecutionMode,
-    ssh_server_id: Option<&'a str>,
+    /// The SSH server the command names; `None` or empty for home.
+    location: Option<&'a str>,
     max_lines: u32,
     origin: ScriptOrigin,
     call: Option<&'a CallIdentity>,
@@ -3907,6 +4039,7 @@ struct StandaloneExecution<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    read_denied_paths: Vec<PathBuf>,
     git_dir: GitDirAccess,
     env_source: Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
@@ -3942,6 +4075,7 @@ struct StandaloneStart<'a, P, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    read_denied_paths: &'a [PathBuf],
     git_dir: GitDirAccess,
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
@@ -3970,6 +4104,7 @@ struct LocalBackgroundExecution<'a, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    read_denied_paths: &'a [PathBuf],
     git_dir: GitDirAccess,
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
@@ -4022,8 +4157,9 @@ struct SshBackgroundExecution<'a> {
     script: &'a str,
     language: ScriptLanguage,
     mode: TerminalMode,
-    ssh_target: &'a str,
-    ssh_runtime: &'a SshRuntimeProfile,
+    client: &'a SshClient,
+    server: &'a SshServer,
+    heel: Option<&'a str>,
     job_registry: &'a JobRegistry,
     background_startup: &'a BackgroundStartup,
 }
@@ -4054,8 +4190,11 @@ enum ExecutionBackend {
     },
     /// A remote host over SSH.
     Ssh {
-        target: String,
-        runtime: SshRuntimeProfile,
+        client: SshClient,
+        server: SshServer,
+        /// The server's `heel`, which a default-mode command runs under; an
+        /// `unsafe` command has none.
+        heel: Option<String>,
         tools: PreparedTools<PathBuf>,
     },
 }
@@ -4109,6 +4248,7 @@ struct SpawnedTerminalTask<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    read_denied_paths: Vec<PathBuf>,
     git_dir: GitDirAccess,
     executor: E,
     registry: Arc<ToolRegistry>,
@@ -4157,6 +4297,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        read_denied_paths,
         git_dir,
         env_source,
         executor,
@@ -4199,6 +4340,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        read_denied_paths,
         git_dir,
         env_source,
         executor,
@@ -4302,6 +4444,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        read_denied_paths,
         git_dir,
         env_source,
         executor,
@@ -4343,6 +4486,7 @@ where
         working_dir: &working_dir,
         writable_paths: &writable_paths,
         readable_paths: &readable_paths,
+        read_denied_paths: &read_denied_paths,
         git_dir,
         env_source: &env_source,
         executor,
@@ -4405,6 +4549,7 @@ where
             grants: std::sync::Arc::new(GrantSet {
                 readable: readable_paths.clone(),
                 writable: writable_paths.clone(),
+                read_denied: read_denied_paths.clone(),
                 git_dir,
             }),
         };
@@ -4474,8 +4619,9 @@ where
             .await;
         }
         ExecutionBackend::Ssh {
-            target,
-            runtime,
+            client,
+            server,
+            heel,
             tools,
         } => {
             // The remote host is outside the pool's reach; running there
@@ -4493,8 +4639,9 @@ where
                 script: request.script,
                 language: request.language,
                 mode: request.mode,
-                ssh_target: target,
-                ssh_runtime: runtime,
+                client,
+                server,
+                heel: heel.as_deref(),
                 job_registry: request.job_registry,
                 background_startup: request.background_startup,
             })
@@ -4511,6 +4658,7 @@ where
         working_dir: request.working_dir,
         writable_paths: request.writable_paths,
         readable_paths: request.readable_paths,
+        read_denied_paths: request.read_denied_paths,
         git_dir: request.git_dir,
         env_source: request.env_source,
         executor: request.executor,
@@ -4981,6 +5129,17 @@ pub fn session_write_denylist(
     }
 }
 
+/// The paths a local sandbox must not read: heel's credential table plus the
+/// embedder's `denied` absolute paths. Everything else stays readable.
+#[cfg(not(windows))]
+fn session_read_denylist(denied: &[PathBuf]) -> heel::ReadDenylist {
+    denied
+        .iter()
+        .fold(heel::ReadDenylist::credentials(), |denylist, path| {
+            denylist.deny(path)
+        })
+}
+
 /// The toolchain directories a sandboxed build needs: package-manager
 /// installs, compilers, and their caches, each rwx since builds both run
 /// the binaries and write the caches. Credential files inside them stay
@@ -5010,8 +5169,13 @@ where
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
     let config_builder = SandboxConfig::builder().network(policy);
     // The Windows backend refuses a write denylist rather than run weaker.
+    // The same holds for the read denylist: reads are open everywhere except
+    // the credential table and the embedder's additions.
     #[cfg(not(windows))]
-    let config_builder = config_builder.write_denylist(write_denylist);
+    let config_builder = config_builder
+        .write_denylist(write_denylist)
+        .filesystem_strict(false)
+        .read_denylist(session_read_denylist(context.read_denied_paths));
     #[cfg(windows)]
     drop(write_denylist);
     let config_builder = config_builder
@@ -5870,15 +6034,16 @@ struct SshToolExecutionTemplate<'a> {
 async fn execute_ssh_background(
     context: SshBackgroundExecution<'_>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let target = context.ssh_target;
-    let remote_cmd = match (context.ssh_runtime, context.mode) {
-        (SshRuntimeProfile::Heel { binary }, TerminalMode::Sandboxed) => {
-            let script = context.prepared_tools.wrap_script(&launch_script(
-                context.language,
-                context.script,
-                context.task_id,
-            )?)?;
-            let (program, args) = shell_launch(&context.prepared_tools.shell()?, &script);
+    let script = context.prepared_tools.wrap_script(&launch_script(
+        context.language,
+        context.script,
+        context.task_id,
+    )?)?;
+    let (program, args) = shell_launch(&context.prepared_tools.shell()?, &script);
+    // A default-mode command runs the managed shell under the server's
+    // `heel`; an `unsafe` one runs it directly.
+    let remote_cmd = match context.heel {
+        Some(binary) => {
             let directory = context.prepared_tools.script_bin_dir()?;
             let uv_grant = context
                 .prepared_tools
@@ -5902,28 +6067,21 @@ async fn execute_ssh_background(
             .render()
             .map_err(ToolRuntimeError::from)?
         }
-        (SshRuntimeProfile::Heel { .. }, TerminalMode::Unsafe) => {
-            return Err(TerminalError::InvalidTarget(
-                "unsafe mode is not supported for ssh backend".into(),
-            ));
-        }
+        None => shell_words::join(
+            std::iter::once(program.as_str()).chain(args.iter().map(String::as_str)),
+        ),
     };
 
-    let mut command = std::process::Command::new("ssh");
-    command
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(target)
-        .arg(remote_cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = context.client.command(context.server, &remote_cmd);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
 
+    // The pipes are set on the async command: converting a std command
+    // resets them, and spawning would then inherit this process's stdio.
     let child = async_process::Command::from(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| TerminalError::Execution(e.to_string()))?;
 
@@ -6778,6 +6936,15 @@ pub enum TerminalError {
     /// Execution environment or mode is not configured.
     #[error("invalid terminal execution target: {0}")]
     InvalidTarget(String),
+    /// `location` names no configured SSH server.
+    #[error("no SSH server named `{0}` is configured")]
+    UnknownLocation(String),
+    /// The permission handler refused the first command on a server.
+    #[error("running commands on `{0}` was not approved")]
+    LocationDenied(String),
+    /// A default-mode command names a server that has no `heel` to sandbox it.
+    #[error("default mode runs under `heel`, which `{0}` does not have")]
+    NoRemoteSandbox(String),
     /// Required tool runtime is unavailable or unsafe to expose.
     #[error(transparent)]
     Tools(#[from] ToolRuntimeError),
@@ -6837,6 +7004,9 @@ mod tests {
 
     #[cfg(unix)]
     mod progress;
+
+    #[cfg(unix)]
+    mod ssh;
 
     /// An output store in `dir`, which exists, leasing from the default
     /// allocator.
@@ -6936,38 +7106,9 @@ mod tests {
         let registry = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: true,
             container: false,
-            ssh: false,
         })
         .with_test_tools(tools);
         (cache, registry)
-    }
-
-    /// Counts the consent prompts an SSH authorizer receives and denies each.
-    #[derive(Default)]
-    struct CountingSshAuthorizer {
-        connects: AtomicUsize,
-        installs: AtomicUsize,
-    }
-
-    impl crate::SshSessionAuthorizer for CountingSshAuthorizer {
-        fn authorize_connect(
-            &self,
-            _target: &str,
-        ) -> impl std::future::Future<Output = Result<bool, crate::SshAuthorizationError>> + Send
-        {
-            self.connects.fetch_add(1, AtomicOrdering::SeqCst);
-            std::future::ready(Ok(false))
-        }
-
-        fn authorize_runtime_install(
-            &self,
-            _target: &str,
-            _details: &str,
-        ) -> impl std::future::Future<Output = Result<bool, crate::SshAuthorizationError>> + Send
-        {
-            self.installs.fetch_add(1, AtomicOrdering::SeqCst);
-            std::future::ready(Ok(false))
-        }
     }
 
     /// A container executor for registries whose container is never reached.
@@ -7020,16 +7161,12 @@ mod tests {
         }
     }
 
-    /// Local and SSH configuration gated by `authorizer`, not yet prepared.
-    fn local_and_ssh_registry(authorizer: &Arc<CountingSshAuthorizer>) -> ShellSessionRegistry {
+    /// A local home, not yet prepared.
+    fn local_registry() -> ShellSessionRegistry {
         ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: true,
             container: false,
-            ssh: true,
         })
-        .with_ssh_servers(vec![build_server()])
-        .expect("ssh server should configure")
-        .with_ssh_authorizer(Arc::clone(authorizer))
     }
 
     async fn fresh_terminal(
@@ -7108,15 +7245,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn terminal_script_runs_in_the_managed_bash() {
-        let authorizer = Arc::new(CountingSshAuthorizer::default());
         let tools_cache = tempfile::tempdir().unwrap();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(tools_cache.path())
             .await
             .unwrap();
-        let prepared = local_and_ssh_registry(&authorizer)
-            .with_test_tools(tools.clone())
-            .with_test_ssh(build_server(), tools);
+        let prepared = local_registry().with_test_tools(tools);
         let directory = tempfile::tempdir().unwrap();
         let terminal = fresh_terminal(directory.path())
             .await
@@ -7132,8 +7266,8 @@ mod tests {
                     script: "[[ -n $BASH_VERSION ]] && echo \"managed=$AITHER_FIXTURE_BASH bash\""
                         .to_string(),
                     language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
+                    mode: TerminalExecutionMode::Default,
+                    location: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
@@ -7150,82 +7284,9 @@ mod tests {
         assert!(stdout.contains("managed=1.0.0 bash"), "{stdout}");
     }
 
-    /// A command run on an SSH server is a remote job: its local `ssh`
-    /// process stands for work whose memory is never judged here.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_command_run_over_ssh_is_a_remote_job() {
-        let authorizer = Arc::new(CountingSshAuthorizer::default());
-        let tools_cache = tempfile::tempdir().unwrap();
-        let tools = crate::tool_runtime::tests::bundle()
-            .prepare_local(tools_cache.path())
-            .await
-            .unwrap();
-        let prepared = local_and_ssh_registry(&authorizer)
-            .with_test_tools(tools.clone())
-            .with_test_ssh(build_server(), tools);
-        let directory = tempfile::tempdir().unwrap();
-        let terminal = fresh_terminal(directory.path())
-            .await
-            .adopt_prepared_tools(prepared)
-            .await
-            .expect("a prepared registry should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
-        let terminal = terminal.with_registry(registry);
-        let _ = terminal
-            .call(
-                TerminalArgs {
-                    description: "run remotely".to_string(),
-                    script: "echo remote-job".to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Ssh,
-                    ssh_server_id: None,
-                    expect: OutputFormat::Text,
-                    resolution: MediaResolution::Auto,
-                    max_lines: 50,
-                    raw: true,
-                    timeout: 30,
-                    background: true,
-                },
-                ToolContext::new(),
-            )
-            .await;
-
-        let jobs = terminal.job_registry().list().await;
-        let job = jobs
-            .iter()
-            .find(|job| job.script == "echo remote-job")
-            .expect("the remote job is registered");
-        assert_eq!(job.place, crate::JobPlace::Remote);
-        let machine = terminal.job_memory().snapshot().await.unwrap();
-        assert_eq!(machine.jobs, []);
-        // An SSH server is never a home environment: no container to watch.
-        assert!(terminal.container_probe().is_none());
-        terminal.job_registry().kill_running().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn adopted_registry_runs_baseline_tools_without_ssh_consent_or_version_probes() {
-        let authorizer = Arc::new(CountingSshAuthorizer::default());
-
-        // Full preparation asks the authorizer before connecting to every
-        // server; the denial ends it.
-        let artifacts = tempfile::tempdir().unwrap();
-        let distribution = script_distribution(artifacts.path()).await;
-        let first = tempfile::tempdir().unwrap();
-        let cache = crate::tool_runtime::tests::unlocking_tempdir();
-        let denied = fresh_terminal(first.path())
-            .await
-            .with_shell_sessions(local_and_ssh_registry(&authorizer))
-            .initialize_tools(&distribution, cache.path())
-            .await;
-        assert!(
-            matches!(denied, Err(ToolRuntimeError::SshBootstrap(_))),
-            "a denied connection must fail preparation"
-        );
-        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
-
+    async fn adopted_registry_runs_baseline_tools_without_version_probes() {
         // Tools pinned to a version their commands do not report: the version
         // probe of full preparation rejects them.
         let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
@@ -7242,18 +7303,14 @@ mod tests {
                 .await,
             Err(ToolRuntimeError::VersionMismatch(_))
         ));
-        let prepared = local_and_ssh_registry(&authorizer)
-            .with_test_tools(tools.clone())
-            .with_test_ssh(build_server(), tools);
+        let prepared = local_registry().with_test_tools(tools);
 
         let second = tempfile::tempdir().unwrap();
         let terminal = fresh_terminal(second.path())
             .await
             .adopt_prepared_tools(prepared)
             .await
-            .expect("a prepared registry should be adopted without probing or consent");
-        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(authorizer.installs.load(AtomicOrdering::SeqCst), 0);
+            .expect("a prepared registry should be adopted without probing");
 
         let registry = Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);
@@ -7264,8 +7321,8 @@ mod tests {
                     script: "apply_patch --version && rg --version && ast-grep --version && jq --version"
                         .to_string(),
                     language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
+                    mode: TerminalExecutionMode::Default,
+                    location: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
@@ -7285,8 +7342,6 @@ mod tests {
                 "{command} should run from the adopted tools; stdout: {stdout}"
             );
         }
-        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(authorizer.installs.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[cfg(unix)]
@@ -7295,7 +7350,6 @@ mod tests {
         let container = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
-            ssh: false,
         })
         .with_container_runtime(test_container_runtime("aither-host-tools"))
         .with_test_container_tools(
@@ -7333,27 +7387,21 @@ mod tests {
 
     #[tokio::test]
     async fn adoption_rejects_a_registry_changed_after_preparation() {
-        let authorizer = Arc::new(CountingSshAuthorizer::default());
         let tools_cache = crate::tool_runtime::tests::unlocking_tempdir();
         let tools = crate::tool_runtime::tests::bundle()
             .prepare_local(tools_cache.path())
             .await
             .unwrap();
-        let prepared = local_and_ssh_registry(&authorizer)
+        let prepared = local_registry()
             .with_test_tools(tools.clone())
-            .with_test_ssh(build_server(), tools.clone());
+            .with_test_ssh(build_server(), None, tools);
         let staging = crate::SshServer {
             name: "staging".to_string(),
             target: "deploy@staging.internal".to_string(),
         };
-        let retargeted = crate::SshServer {
-            target: "builder@build-2.internal".to_string(),
-            ..build_server()
-        };
         let container = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
-            ssh: false,
         })
         .with_container_runtime(test_container_runtime("aither-tools-a"))
         .with_test_container_tools(
@@ -7375,17 +7423,14 @@ mod tests {
         assert!(adopt(prepared.clone()).await.is_ok());
         assert!(adopt(container.clone()).await.is_ok());
         assert!(matches!(
-            adopt(local_and_ssh_registry(&authorizer)).await,
+            adopt(local_registry()).await,
             Err(ToolRuntimeError::NotInitialized(_))
         ));
-        for servers in [vec![build_server(), staging], Vec::new(), vec![retargeted]] {
-            assert!(matches!(
-                adopt(prepared.clone().with_ssh_servers(servers).unwrap()).await,
-                Err(ToolRuntimeError::EnvironmentChanged(
-                    crate::PreparedEnvironment::SshServers
-                ))
-            ));
-        }
+        // The server set is live: changing it changes nothing preparation
+        // is bound to.
+        prepared.add_ssh_server(staging).unwrap();
+        assert!(prepared.remove_ssh_server("build").is_some());
+        assert!(adopt(prepared.clone()).await.is_ok());
         assert!(matches!(
             adopt(container.with_container_runtime(test_container_runtime("aither-tools-b"))).await,
             Err(ToolRuntimeError::EnvironmentChanged(
@@ -7396,14 +7441,12 @@ mod tests {
             adopt(prepared.with_availability(ShellRuntimeAvailability {
                 local: true,
                 container: true,
-                ssh: true,
             }))
             .await,
             Err(ToolRuntimeError::EnvironmentChanged(
                 crate::PreparedEnvironment::HomeBackend
             ))
         ));
-        assert_eq!(authorizer.connects.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -8004,7 +8047,12 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let result = tool
-            .ensure_permission_allowed(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell)
+            .ensure_permission_allowed(
+                TerminalMode::Unsafe,
+                "make install",
+                ScriptLanguage::Shell,
+                None,
+            )
             .await
             .map_err(|error| error.to_string());
         let stages = tool
@@ -8113,10 +8161,31 @@ mod tests {
     }
 
     #[test]
-    fn sandboxed_execution_mode_deserializes() {
-        let mode: TerminalExecutionMode =
-            serde_json::from_str("\"sandboxed\"").expect("sandboxed mode must deserialize");
-        assert_eq!(mode, TerminalExecutionMode::Sandboxed);
+    fn mode_is_default_or_unsafe_and_location_replaces_the_ssh_arguments() {
+        for (text, mode) in [
+            ("\"default\"", TerminalExecutionMode::Default),
+            ("\"unsafe\"", TerminalExecutionMode::Unsafe),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<TerminalExecutionMode>(text).unwrap(),
+                mode
+            );
+        }
+        for removed in ["\"sandboxed\"", "\"ssh\""] {
+            assert!(serde_json::from_str::<TerminalExecutionMode>(removed).is_err());
+        }
+        let args: TerminalArgs = serde_json::from_value(serde_json::json!({
+            "description": "list the build host",
+            "script": "ls",
+            "timeout": 30,
+            "location": "build",
+        }))
+        .unwrap();
+        assert_eq!(args.location.as_deref(), Some("build"));
+        assert_eq!(args.mode, TerminalExecutionMode::Default);
+        let schema = serde_json::to_value(schemars::schema_for!(TerminalArgs)).unwrap();
+        assert!(schema["properties"].get("ssh_server_id").is_none());
+        assert!(schema["properties"].get("location").is_some());
     }
 
     #[tokio::test]
@@ -8136,7 +8205,7 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         assert!(matches!(
-            tool.resolve_default_target(),
+            tool.resolve_home_target(TerminalMode::Sandboxed),
             Err(TerminalError::Tools(ToolRuntimeError::NotInitialized(_)))
         ));
     }
@@ -8331,8 +8400,8 @@ mod tests {
             description: description.to_string(),
             script: script.to_string(),
             language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Sandboxed,
-            ssh_server_id: None,
+            mode: TerminalExecutionMode::Default,
+            location: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: 50,
@@ -8369,7 +8438,6 @@ mod tests {
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
-                ssh: false,
             });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let parent = tool.with_registry(registry);
@@ -8405,7 +8473,6 @@ mod tests {
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
-                ssh: false,
             });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let terminal = tool.with_registry(registry);
@@ -8484,7 +8551,6 @@ mod tests {
         .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
             local: true,
             container: false,
-            ssh: false,
         });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
@@ -8769,6 +8835,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            read_denied_paths: Vec::new(),
             git_dir: GitDirAccess::ReadWrite,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
@@ -8887,6 +8954,7 @@ mod tests {
             working_dir,
             writable_paths,
             readable_paths,
+            read_denied_paths: Vec::new(),
             git_dir: GitDirAccess::ReadWrite,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
@@ -8949,6 +9017,7 @@ mod tests {
             GitDirAccess::ReadWrite,
             writable_paths,
             readable_paths,
+            Vec::new(),
             script,
         )
         .await
@@ -8961,6 +9030,7 @@ mod tests {
         git_dir: GitDirAccess,
         writable_paths: Vec<PathBuf>,
         readable_paths: Vec<PathBuf>,
+        read_denied_paths: Vec<PathBuf>,
         script: String,
     ) -> String {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -8983,6 +9053,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths,
             readable_paths,
+            read_denied_paths,
             git_dir,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
@@ -9020,6 +9091,93 @@ mod tests {
         output_text(&result.stdout)
             .expect("inline stdout")
             .to_string()
+    }
+
+    /// A sandboxed command reads an ordinary file outside every granted path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandboxed_commands_read_outside_the_granted_paths() {
+        let outside = tempfile::tempdir().unwrap();
+        let file = std::fs::canonicalize(outside.path())
+            .unwrap()
+            .join("ordinary.txt");
+        std::fs::write(&file, "ordinary-content").unwrap();
+        let stdout = sandboxed_stdout(
+            Vec::new(),
+            Vec::new(),
+            format!("cat {} 2>&1; true", file.display()),
+        )
+        .await;
+        assert!(stdout.contains("ordinary-content"), "{stdout}");
+    }
+
+    /// The credential table applies by absolute path although the sandbox
+    /// sets `HOME` to the session directory. Checks the credential stores
+    /// that exist in the real home.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandboxed_commands_cannot_read_home_credentials() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        let stores: Vec<PathBuf> = [".ssh", ".config/gh"]
+            .into_iter()
+            .map(|store| home.join(store))
+            .filter(|store| store.is_dir())
+            .collect();
+        if stores.is_empty() {
+            eprintln!("no ~/.ssh or ~/.config/gh in this home; nothing to deny");
+            return;
+        }
+        for store in stores {
+            assert!(
+                std::fs::read_dir(&store).is_ok(),
+                "the host reads {}",
+                store.display()
+            );
+            let stdout = sandboxed_stdout(
+                Vec::new(),
+                Vec::new(),
+                format!("ls {} 2>&1; echo rc=$?", store.display()),
+            )
+            .await;
+            assert!(
+                stdout.contains("rc=1") || stdout.contains("rc=2"),
+                "{} must be unreadable: {stdout}",
+                store.display()
+            );
+            assert!(
+                stdout.to_lowercase().contains("not permitted")
+                    || stdout.to_lowercase().contains("denied"),
+                "{} must be refused by the sandbox: {stdout}",
+                store.display()
+            );
+        }
+    }
+
+    /// A path the embedder adds is denied, while a sibling stays readable.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandboxed_commands_cannot_read_embedder_denied_paths() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let fake_home = std::fs::canonicalize(fake_home.path()).unwrap();
+        let secret = fake_home.join("vault");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("key"), "vault-secret").unwrap();
+        std::fs::write(fake_home.join("notes"), "plain-notes").unwrap();
+        let stdout = sandboxed_stdout_with(
+            GitDirAccess::ReadWrite,
+            Vec::new(),
+            Vec::new(),
+            vec![secret.clone()],
+            format!(
+                "cat {}/key 2>&1; echo rc=$?; cat {}/notes 2>&1",
+                secret.display(),
+                fake_home.display()
+            ),
+        )
+        .await;
+        assert!(!stdout.contains("vault-secret"), "{stdout}");
+        assert!(!stdout.contains("rc=0"), "{stdout}");
+        assert!(stdout.contains("plain-notes"), "{stdout}");
     }
 
     /// Runs the host's `git` in `dir`; the caller's environment keeps the
@@ -9098,6 +9256,7 @@ mod tests {
         let stdout = sandboxed_stdout_with(
             GitDirAccess::ReadOnly,
             vec![linked.clone()],
+            Vec::new(),
             Vec::new(),
             script,
         )
@@ -9291,14 +9450,25 @@ mod tests {
             0
         );
 
+        // Reads are open under the read denylist policy, so the grant is
+        // probed by what it would make writable: the repository, directly and
+        // through git run in the forged worktree.
+        let planted = main.join(".git/forged_probe");
         let script = format!(
-            "cat {head} 2>&1 | head -c 200; git -C {forged} log -1 --format=%s 2>&1; true",
-            head = main.join(".git/HEAD").display(),
+            "echo x > {planted} 2>&1; git -C {forged} update-ref refs/heads/forged_probe HEAD 2>&1; \
+             git -C {direct} update-ref refs/heads/direct_probe HEAD 2>&1; true",
+            planted = planted.display(),
             forged = forged.display(),
+            direct = direct.display(),
         );
-        let stdout = sandboxed_stdout(writable, Vec::new(), script).await;
-        assert!(!stdout.contains("ref: refs/heads"), "{stdout}");
-        assert!(!stdout.lines().any(|line| line == "root"), "{stdout}");
+        sandboxed_stdout(writable, Vec::new(), script).await;
+        assert!(!planted.exists(), "the repository became writable");
+        for branch in ["forged_probe", "direct_probe"] {
+            assert!(
+                !main.join(".git/refs/heads").join(branch).exists(),
+                "git wrote {branch} into the repository through a forged pointer"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -9320,7 +9490,6 @@ mod tests {
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
-                ssh: false,
             });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
@@ -9331,8 +9500,8 @@ mod tests {
                     description: "exit with non-zero status".to_string(),
                     script: "exit 42".to_string(),
                     language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
+                    mode: TerminalExecutionMode::Default,
+                    location: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
@@ -9385,7 +9554,6 @@ mod tests {
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
-                ssh: false,
             });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
@@ -9396,8 +9564,8 @@ mod tests {
             description: "finish at once".to_string(),
             script: "exit 3".to_string(),
             language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Sandboxed,
-            ssh_server_id: None,
+            mode: TerminalExecutionMode::Default,
+            location: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: 50,
@@ -9457,7 +9625,6 @@ mod tests {
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
-                ssh: false,
             });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
@@ -9469,8 +9636,8 @@ mod tests {
                 description: "wait for terminal input and echo it back".to_string(),
                 script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
                 language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
+                mode: TerminalExecutionMode::Default,
+                location: None,
                 expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: 50,
@@ -9531,7 +9698,6 @@ mod tests {
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
-                ssh: false,
             });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
@@ -9542,8 +9708,8 @@ mod tests {
                 description: "start a descendant process".to_string(),
                 script: "sleep 30 & echo $! > child.pid; wait".to_string(),
                 language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
+                mode: TerminalExecutionMode::Default,
+                location: None,
                 expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: 50,
@@ -9634,8 +9800,8 @@ mod tests {
             description: description.to_string(),
             script: script.to_string(),
             language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Sandboxed,
-            ssh_server_id: None,
+            mode: TerminalExecutionMode::Default,
+            location: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: 50,
@@ -10292,8 +10458,8 @@ mod tests {
                     description: "start a descendant process".to_string(),
                     script: "sleep 30 & echo $! > child.pid; wait".to_string(),
                     language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
+                    mode: TerminalExecutionMode::Default,
+                    location: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
@@ -10368,8 +10534,8 @@ mod tests {
                         description: "outlast the normal window".to_string(),
                         script: "sleep 2 & wait; echo finished".to_string(),
                         language: ScriptLanguage::Shell,
-                        mode: TerminalExecutionMode::Sandboxed,
-                        ssh_server_id: None,
+                        mode: TerminalExecutionMode::Default,
+                        location: None,
                         expect: OutputFormat::Text,
                         resolution: MediaResolution::Auto,
                         max_lines: 50,
@@ -10853,8 +11019,8 @@ mod tests {
             description: "sleep in the background".to_string(),
             script: "sleep 30".to_string(),
             language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Sandboxed,
-            ssh_server_id: None,
+            mode: TerminalExecutionMode::Default,
+            location: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: 50,
@@ -10922,8 +11088,8 @@ mod tests {
             }
             .to_string(),
             language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Sandboxed,
-            ssh_server_id: None,
+            mode: TerminalExecutionMode::Default,
+            location: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: 50,
@@ -11051,8 +11217,8 @@ mod tests {
                 description: "sleep in the background".to_string(),
                 script: "sleep 30".to_string(),
                 language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
+                mode: TerminalExecutionMode::Default,
+                location: None,
                 expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: 50,
@@ -11134,8 +11300,8 @@ mod tests {
             )
             .to_string(),
             language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Sandboxed,
-            ssh_server_id: None,
+            mode: TerminalExecutionMode::Default,
+            location: None,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: 50,
@@ -11212,8 +11378,8 @@ mod tests {
                 description: "start a persistent shell".to_string(),
                 script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
                 language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Sandboxed,
-                ssh_server_id: None,
+                mode: TerminalExecutionMode::Default,
+                location: None,
                 expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: 50,
@@ -11684,7 +11850,6 @@ mod tests {
         ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
-            ssh: false,
         })
         .with_container_runtime(runtime)
         .with_test_container_tools(container_tools, container.0.clone())
@@ -11848,8 +12013,8 @@ mod tests {
                     )
                     .to_string(),
                     language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Sandboxed,
-                    ssh_server_id: None,
+                    mode: TerminalExecutionMode::Default,
+                    location: None,
                     expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: 50,
@@ -13166,6 +13331,11 @@ mod tests {
         crate::subagent::tests::git_in(outside.path(), &["add", "secret.txt"]);
         crate::subagent::tests::git_in(outside.path(), &["commit", "-m", "secret commit"]);
         let secret = crate::subagent::tests::git_in(outside.path(), &["rev-parse", "HEAD"]);
+        // Reads are open except the denylist, so the other repository is
+        // unreadable to the subagent only by an embedder denial.
+        child
+            .grants()
+            .deny_read(std::fs::canonicalize(outside.path()).unwrap());
         assert_ne!(
             exit_code_of(
                 &child,
@@ -14194,8 +14364,10 @@ mod tests {
             hold_tx.send(()).await.unwrap();
             hold_tx.send(()).await.unwrap();
         };
-        let (a, b, ()) =
-            within_deadline(async { futures::join!(run("call_a"), run("call_b"), release) }).await;
+        let (a, b, ()) = Box::pin(within_deadline(async {
+            futures::join!(run("call_a"), run("call_b"), release)
+        }))
+        .await;
 
         assert!(a.contains("seen=call_a") && !a.contains("call_b"), "{a}");
         assert!(b.contains("seen=call_b") && !b.contains("call_a"), "{b}");
@@ -14315,7 +14487,6 @@ mod tests {
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: false,
             container: true,
-            ssh: false,
         })
         .with_container_runtime(runtime)
         .with_test_container_tools(container_tools, "aither-test-confinement".to_string());
@@ -14541,7 +14712,6 @@ mod tests {
             .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
                 local: true,
                 container: false,
-                ssh: false,
             });
         let mut registry = ToolRegistryBuilder::new();
         configure(&mut registry);
@@ -15152,14 +15322,19 @@ mod tests {
             0,
             "a runtime readable grant on the parent reaches the subagent"
         );
+        let denied_dir = tempfile::tempdir().expect("denied dir");
+        std::fs::write(denied_dir.path().join("d.txt"), "data").unwrap();
+        parent
+            .grants()
+            .deny_read(std::fs::canonicalize(denied_dir.path()).unwrap());
         assert_ne!(
             exit_code_of(
                 &child,
-                &format!("cat '{}'", writable_dir.path().join("w.txt").display())
+                &format!("cat '{}'", denied_dir.path().join("d.txt").display())
             )
             .await,
             0,
-            "a writable grant added after launch grants the parent's sandbox alone"
+            "a read denial added to the parent after launch reaches the subagent"
         );
         assert_ne!(
             exit_code_of(

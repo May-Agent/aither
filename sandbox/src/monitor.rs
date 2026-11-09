@@ -321,7 +321,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                 script,
                 language,
                 mode: TerminalExecutionMode::Default,
-                ssh_server_id: None,
+                location: None,
                 expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: 1,
