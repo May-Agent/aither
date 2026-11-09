@@ -6,6 +6,7 @@
 //! enforcement ([`LanguageGuard`]) the agent loop and the harness commands
 //! share.
 
+mod detect;
 mod guard;
 mod prose;
 mod watch;
@@ -13,45 +14,98 @@ mod watch;
 use std::fmt;
 use std::str::FromStr;
 
+pub use detect::DetectorError;
 pub use guard::{LanguageAlert, LanguageGuard, LanguageRefusal, WorkingText};
 pub(crate) use guard::{default_alerts, default_refusal, translate};
 pub(crate) use watch::LanguageAlerts;
-use whatlang::Lang;
 
-/// A natural language, as the detector knows it.
+/// A natural language the detector can identify.
+///
+/// A language is the ISO 639-3 language the detector's labels name, with the
+/// variants it tells apart folded into their macrolanguage: Chinese in either
+/// script and Cantonese are Chinese, Gulf and Levantine Arabic are Arabic,
+/// Dari is Persian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Language(Lang);
+pub struct Language(isolang::Language);
 
 /// A language name the detector does not know.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown language `{0}`; use an English name, a native name or an ISO 639-3 code")]
+#[error(
+    "unknown language `{0}`; use an English name, a native name or a language code the detector identifies"
+)]
 pub struct UnknownLanguage(String);
+
+/// The ISO 639-3 code a detector label's language is known by: the
+/// macrolanguage where the label names one of its members.
+fn macrolanguage(code: &str) -> &str {
+    match code {
+        "arb" | "acm" | "acq" | "aeb" | "ajp" | "apc" | "ars" | "ary" | "arz" => "ara",
+        "pes" | "prs" => "fas",
+        "cmn" | "yue" => "zho",
+        "lvs" => "lav",
+        "zsm" => "msa",
+        "khk" => "mon",
+        "npi" => "nep",
+        "gaz" => "orm",
+        "swh" => "swa",
+        "uzn" => "uzb",
+        "azj" | "azb" => "aze",
+        "als" => "sqi",
+        "plt" => "mlg",
+        "pbt" => "pus",
+        "ydd" => "yid",
+        "ayr" => "aym",
+        "quy" => "que",
+        other => other,
+    }
+}
 
 impl Language {
     /// English, the default working language.
-    pub const ENGLISH: Self = Self(Lang::Eng);
+    pub const ENGLISH: Self = Self(isolang::Language::Eng);
+    /// Chinese in either script, Cantonese included.
+    pub(crate) const CHINESE: Self = Self(isolang::Language::Zho);
+    pub(crate) const JAPANESE: Self = Self(isolang::Language::Jpn);
+    pub(crate) const KOREAN: Self = Self(isolang::Language::Kor);
+
+    /// Whether the language is written in Han, kana or Hangul.
+    pub(crate) fn is_cjk(self) -> bool {
+        self == Self::CHINESE || self == Self::JAPANESE || self == Self::KOREAN
+    }
+
+    /// Whether the language is one the Han script alone can leave undecided.
+    pub(crate) fn is_chinese_or_japanese(self) -> bool {
+        self == Self::CHINESE || self == Self::JAPANESE
+    }
+
+    /// The language of a detector label such as `zho_Hans`, if this crate
+    /// knows it.
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        let code = label.split_once('_').map_or(label, |(code, _)| code);
+        isolang::Language::from_639_3(macrolanguage(code)).map(Self)
+    }
+
+    /// Whether the detector can answer with this language.
+    fn is_detectable(self) -> bool {
+        detect::LABELS
+            .lines()
+            .any(|label| Self::from_label(label) == Some(self))
+    }
 
     /// The language's English name, such as `Chinese` or `Spanish`.
     #[must_use]
     pub fn name(self) -> &'static str {
-        match self.0 {
-            Lang::Cmn => "Chinese",
-            lang => lang.eng_name(),
-        }
+        self.0.to_name()
     }
 
-    /// The language's ISO 639-3 code, such as `cmn` or `spa`.
+    /// The language's ISO 639-3 code, such as `zho` or `spa`.
     #[must_use]
     pub fn code(self) -> &'static str {
-        self.0.code()
-    }
-
-    pub(crate) const fn lang(self) -> Lang {
-        self.0
+        self.0.to_639_3()
     }
 
     pub(crate) fn is_english(self) -> bool {
-        self.0 == Lang::Eng
+        self == Self::ENGLISH
     }
 }
 
@@ -65,21 +119,17 @@ impl FromStr for Language {
     type Err = UnknownLanguage;
 
     /// Parses an English name (`Chinese`, `german`), a native name or an ISO
-    /// 639-3 code (`cmn`, `deu`), ignoring case. `zh` is accepted for Chinese.
+    /// 639-1 or 639-3 code (`zh`, `cmn`, `deu`), ignoring case. Only a
+    /// language the detector can identify parses.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let wanted = text.trim().to_lowercase();
-        if wanted == "chinese" || wanted == "zh" {
-            return Ok(Self(Lang::Cmn));
-        }
-        Lang::all()
-            .iter()
-            .copied()
-            .find(|lang| {
-                wanted == lang.code()
-                    || wanted == lang.eng_name().to_lowercase()
-                    || wanted == lang.name().to_lowercase()
-            })
+        let trimmed = text.trim();
+        let wanted = trimmed.to_lowercase();
+        isolang::Language::from_639_1(&wanted)
+            .or_else(|| isolang::Language::from_639_3(macrolanguage(&wanted)))
+            .or_else(|| isolang::Language::from_name_lowercase(&wanted))
+            .or_else(|| isolang::Language::from_autonym(trimmed))
             .map(Self)
+            .filter(|language| language.is_detectable())
             .ok_or_else(|| UnknownLanguage(text.to_string()))
     }
 }
@@ -161,10 +211,37 @@ mod tests {
 
     #[test]
     fn languages_parse_by_name_and_code() {
-        assert_eq!("Chinese".parse::<Language>().unwrap().code(), "cmn");
+        assert_eq!("Chinese".parse::<Language>().unwrap().code(), "zho");
+        assert_eq!("cmn".parse::<Language>().unwrap().name(), "Chinese");
         assert_eq!("zh".parse::<Language>().unwrap().name(), "Chinese");
         assert_eq!("deu".parse::<Language>().unwrap().name(), "German");
+        assert_eq!("日本語".parse::<Language>().unwrap().name(), "Japanese");
+        assert_eq!("한국어".parse::<Language>().unwrap().name(), "Korean");
         assert!("Klingonese".parse::<Language>().is_err());
+    }
+
+    #[test]
+    fn every_label_of_the_detector_is_a_language() {
+        for label in detect::LABELS.lines() {
+            let language = Language::from_label(label)
+                .unwrap_or_else(|| panic!("label {label} is not a language"));
+            assert!(language.is_detectable());
+            assert_eq!(
+                language.name().parse::<Language>(),
+                Ok(language),
+                "{label}: {}",
+                language.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_language_the_detector_cannot_output_does_not_parse() {
+        // Latin is a language, but the detector has no label for it.
+        assert_eq!(
+            "Latin".parse::<Language>(),
+            Err(UnknownLanguage("Latin".to_string()))
+        );
     }
 
     #[test]

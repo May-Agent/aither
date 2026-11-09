@@ -1,0 +1,29 @@
+[project]
+name = "aither-language-convert"
+version = "0.1.0"
+description = "Convert the language-detection BERT to a Core ML multifunction model and check it against the ONNX model the other platforms run"
+authors = [
+    { name = "Lexo Liu", email = "me@lexo.cool" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "coremltools>=9.0",
+    "huggingface-hub>=2.2.0",
+    "numpy>=2.5.4",
+    "onnxruntime>=1.31.1",
+    "tokenizers>=0.23.3",
+    "torch==2.7.0",
+    "transformers>=5.20.1",
+    "zstandard>=0.25.0",
+]
+
+[project.scripts]
+aither-language-convert = "language_convert.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.16,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "language_convert"
+module-root = "src"

@@ -5854,9 +5854,9 @@ mod tests {
         )
         .expect("write prompt file");
         let (tool, _runs, _log) = external_tool(&dir);
-        let tool = tool.with_languages(crate::LanguageGuard::new(crate::Languages::new(
-            "Chinese".parse().unwrap(),
-        )));
+        let guard = crate::LanguageGuard::new(crate::Languages::new("Chinese".parse().unwrap()));
+        guard.prepare_for_tests().await;
+        let tool = tool.with_languages(guard);
 
         let error = call_text(&tool, external_start("outside", &chinese))
             .await

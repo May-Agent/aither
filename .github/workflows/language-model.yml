@@ -1,0 +1,53 @@
+name: language-model
+
+# Converts the language-detection model to Core ML, verifies it against the ONNX
+# model the other platforms run, and packages it. Publishing the archive to the
+# Hugging Face repository the `MODEL` pin of `agent/src/language/detect/coreml.rs`
+# names is a separate, manual step: upload the artifact, then set that pin's URL
+# revision, digest and size to the uploaded archive's.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "agent/convert/**"
+      - ".github/workflows/language-model.yml"
+  push:
+    branches:
+      - dev
+    paths:
+      - "agent/convert/**"
+      - ".github/workflows/language-model.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: language-model-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  convert:
+    name: Convert and package the language detector
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Convert, verify and package
+        working-directory: agent/convert
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          uv run --locked aither-language-convert --work-dir "$RUNNER_TEMP/model"
+      - name: Upload archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: language-coreml-archive
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/model/*.tar.zst
+            ${{ runner.temp }}/model/*.tar.zst.sha256
+            ${{ runner.temp }}/model/verification.json

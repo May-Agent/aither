@@ -9060,7 +9060,7 @@ mod tests {
             .collect();
         assert_eq!(
             translated,
-            [(&"数据库迁移已经完成，所有测试都通过了。".to_string(), "cmn")]
+            [(&"数据库迁移已经完成，所有测试都通过了。".to_string(), "zho")]
         );
         assert_eq!(language_alerts(&agent), 1, "one alert per lapse");
         assert!(
