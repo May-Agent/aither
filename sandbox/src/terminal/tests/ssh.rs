@@ -130,7 +130,8 @@ fn refusing_client(dir: &Path) -> SshClient {
 }
 
 /// An `sshd` of this user on a loopback port, whose sessions have a home of
-/// their own holding this host's `heel`. Killed when dropped.
+/// their own, holding the pinned `heel` unless started without it. Killed
+/// when dropped.
 struct Sshd {
     dir: tempfile::TempDir,
     child: std::process::Child,
@@ -139,6 +140,10 @@ struct Sshd {
 
 impl Sshd {
     async fn start() -> Self {
+        Self::start_with_heel(true).await
+    }
+
+    async fn start_with_heel(has_heel: bool) -> Self {
         let sshd = Path::new("/usr/sbin/sshd");
         assert!(
             sshd.is_file(),
@@ -151,11 +156,10 @@ impl Sshd {
         std::fs::copy(root.join("client_key.pub"), root.join("authorized_keys")).unwrap();
         let home = root.join("home");
         std::fs::create_dir_all(home.join(".local/bin")).unwrap();
-        let heel = std::env::var_os("HEEL_BIN").map_or_else(
-            || PathBuf::from(stdout_of("sh", &["-c", "command -v heel"])),
-            PathBuf::from,
-        );
-        std::os::unix::fs::symlink(&heel, home.join(".local/bin/heel")).unwrap();
+        if has_heel {
+            let heel = crate::test_heel::pinned().await.unwrap();
+            std::os::unix::fs::symlink(heel.as_path(), home.join(".local/bin/heel")).unwrap();
+        }
 
         let port = free_port();
         let config = SshdConfig {
@@ -391,6 +395,39 @@ async fn a_server_added_live_is_approved_once_prepared_lazily_and_runs_both_mode
     assert_eq!(terminal.job_memory().snapshot().await.unwrap().jobs, []);
     assert!(terminal.container_probe().is_none());
     terminal.job_registry().kill_running().await;
+}
+
+/// A server without `heel` gets the distribution's pinned one for its own
+/// target on its first command, which then runs in default mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_without_heel_gets_the_pinned_one_installed() {
+    let sshd = Sshd::start_with_heel(false).await;
+    let artifacts = tempfile::tempdir().unwrap();
+    let distribution = script_distribution(artifacts.path()).await;
+    let cache = crate::tool_runtime::tests::unlocking_tempdir();
+    let registry = local_registry()
+        .with_ssh_client(sshd.client.clone())
+        .initialize_tools(&distribution, cache.path())
+        .await
+        .expect("the home prepares without touching any server");
+    let dir = tempfile::tempdir().unwrap();
+    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
+    terminal
+        .shell_sessions()
+        .add_ssh_server(Sshd::server())
+        .unwrap();
+    let installed = sshd.home().join(".local/bin/heel");
+    assert!(!installed.exists());
+
+    let output = terminal
+        .call(
+            args("echo installed", TerminalExecutionMode::Default, "fixture"),
+            ToolContext::new(),
+        )
+        .await
+        .expect("a default-mode command runs under the installed heel");
+    assert!(render_terminal_result(&output).contains("installed"));
+    assert!(installed.is_file(), "heel was installed on the server");
 }
 
 /// A refused first command is asked again by the next one and never

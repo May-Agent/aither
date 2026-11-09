@@ -242,17 +242,21 @@ impl ManagedTool {
 pub enum HostProgram {
     /// The `search` daemon of repo-search.
     RepoSearch,
+    /// The `heel` executable sandboxed commands launch through, always at the
+    /// version of the `heel` library this crate links.
+    Heel,
 }
 
 impl HostProgram {
     /// Every host program a distribution can provide.
-    pub const ALL: [Self; 1] = [Self::RepoSearch];
+    pub const ALL: [Self; 2] = [Self::RepoSearch, Self::Heel];
 
     /// Name of the program's executable.
     #[must_use]
     pub const fn command(self) -> &'static str {
         match self {
             Self::RepoSearch => "search",
+            Self::Heel => "heel",
         }
     }
 
@@ -452,6 +456,20 @@ impl HostProgramPath {
         let path = Self::location(root, program, target, sha256)?;
         let directory = path.parent().ok_or(ToolRuntimeError::InvalidArchive)?;
         std::fs::create_dir_all(directory)?;
+        // Preparers in other processes write the same executable; replacing
+        // one a peer is running or has just made read-only fails on Windows.
+        let mut lock = fd_lock::RwLock::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(root.join(format!(".{}.lock", hex::encode(sha256))))?,
+        );
+        let _guard = lock.write()?;
+        // A preparer holding the lock before us has already provided it.
+        if Self::is_prepared(&path, sha256)? {
+            return Ok(Self(path));
+        }
         let mut stage = tempfile::NamedTempFile::new_in(directory)?;
         std::io::Write::write_all(&mut stage, bytes)?;
         drop(stage.persist(&path).map_err(|error| error.error)?);
@@ -822,6 +840,7 @@ impl ToolBundle {
         Ok(PreparedTools {
             bin_dir,
             uv_dir: None,
+            heel: None,
             catalog: self.catalog(),
         })
     }
@@ -1069,7 +1088,31 @@ pub struct PreparedTools<D> {
     /// The shared writable directory of `uv`'s cache and project Python
     /// installs, when the environment provides one.
     pub(crate) uv_dir: Option<D>,
+    /// The pinned `heel` executable on the host, provided with the local
+    /// tools of a host that runs sandboxes itself.
+    pub(crate) heel: Option<HostProgramPath>,
     pub(crate) catalog: ToolCatalog,
+}
+
+impl PreparedTools<PathBuf> {
+    /// Attaches the host's pinned `heel` executable.
+    #[must_use]
+    pub(crate) fn with_heel(mut self, heel: HostProgramPath) -> Self {
+        self.heel = Some(heel);
+        self
+    }
+
+    /// The verified `heel` executable the distribution pins for this host,
+    /// at the version of the `heel` library this crate links.
+    ///
+    /// Present on the local tools of a registry initialized with
+    /// [`crate::ShellSessionRegistry::initialize_tools`]; tools of an SSH
+    /// server run the heel the server's bootstrap installed, so they carry
+    /// none. Pass its path to `heel::HeelBinary::verify` to build sandboxes.
+    #[must_use]
+    pub const fn heel(&self) -> Option<&HostProgramPath> {
+        self.heel.as_ref()
+    }
 }
 
 impl<D> PreparedTools<D> {
@@ -1585,6 +1628,9 @@ pub enum ToolRuntimeError {
     /// Filesystem preparation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The pinned `heel` executable does not run as the linked library's version.
+    #[error("the managed heel binary is unusable: {0}")]
+    Heel(#[from] heel::Error),
     /// Manifest version is not semantic versioning.
     #[error(transparent)]
     Version(#[from] semver::Error),
@@ -1883,6 +1929,7 @@ printf '%s\n' 'uv @VERSION@'
         PreparedTools {
             bin_dir: tools.container_bin_dir().unwrap(),
             uv_dir: None,
+            heel: None,
             catalog: tools.catalog(),
         }
     }
@@ -2833,6 +2880,7 @@ printf '%s\n' 'uv @VERSION@'
         let sandbox_path = heel::default_sandbox_path();
         let path = ready.prepend_path(Some(OsStr::new(&sandbox_path))).unwrap();
         let config = heel::SandboxConfig::builder()
+            .heel_binary(crate::test_heel::pinned().await.unwrap())
             .network(heel::DenyAll)
             .working_dir(
                 std::fs::canonicalize(workspace.path())

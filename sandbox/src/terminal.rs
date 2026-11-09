@@ -2331,11 +2331,10 @@ where
             .await?;
         if let Some(tools) = self.local_home_tools()? {
             tools.ensure_readonly(self.writable_grants().iter()).await?;
-            let heel = self
-                .heel
-                .get()
-                .await
-                .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?;
+            if let Some(pinned) = tools.heel() {
+                self.heel.provide(pinned).await?;
+            }
+            let heel = self.heel.get().await?;
             tools
                 .verify_local_versions(self.executor.clone(), heel)
                 .await?;
@@ -2369,6 +2368,9 @@ where
         self.shell_sessions = sessions;
         if let Some(tools) = self.local_home_tools()? {
             tools.ensure_readonly(self.writable_grants().iter()).await?;
+            if let Some(pinned) = tools.heel() {
+                self.heel.provide(pinned).await?;
+            }
         }
         Ok(self)
     }
@@ -7227,8 +7229,12 @@ mod tests {
             "3.13.1",
         );
         ToolDistribution::from_json(
-            &serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts, "python": python }))
-                .unwrap(),
+            &serde_json::to_vec(&serde_json::json!({
+                "artifacts": artifacts,
+                "host_programs": crate::test_heel::host_programs(),
+                "python": python,
+            }))
+            .unwrap(),
         )
         .unwrap()
     }
@@ -7292,7 +7298,7 @@ mod tests {
             tools
                 .verify_local_versions(
                     executor_core::tokio::TokioGlobal,
-                    heel::HeelBinary::locate().unwrap(),
+                    crate::test_heel::pinned().await.unwrap(),
                 )
                 .await,
             Err(ToolRuntimeError::VersionMismatch(_))
@@ -9000,7 +9006,7 @@ mod tests {
     }
 
     /// Runs `script` in a sandboxed session with the given grants and returns
-    /// its standard output. Needs a real `HEEL_BIN`.
+    /// its standard output. Runs the distribution's pinned heel.
     #[cfg(unix)]
     async fn sandboxed_stdout(
         writable_paths: Vec<PathBuf>,
@@ -14358,8 +14364,10 @@ mod tests {
             hold_tx.send(()).await.unwrap();
             hold_tx.send(()).await.unwrap();
         };
-        let (a, b, ()) =
-            within_deadline(async { futures::join!(run("call_a"), run("call_b"), release) }).await;
+        let (a, b, ()) = Box::pin(within_deadline(async {
+            futures::join!(run("call_a"), run("call_b"), release)
+        }))
+        .await;
 
         assert!(a.contains("seen=call_a") && !a.contains("call_b"), "{a}");
         assert!(b.contains("seen=call_b") && !b.contains("call_a"), "{b}");

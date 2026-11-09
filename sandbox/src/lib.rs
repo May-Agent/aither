@@ -105,6 +105,11 @@ pub mod permission;
 #[cfg(any(test, feature = "test-git"))]
 pub mod test_git;
 
+/// The distribution's pinned heel for tests, shared with dependent crates
+/// through the `test-heel` feature.
+#[cfg(any(test, feature = "test-heel"))]
+pub mod test_heel;
+
 /// Id allocators for tests, shared with dependent crates through the
 /// `test-ids` feature.
 #[cfg(any(test, feature = "test-ids"))]

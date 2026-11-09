@@ -1,0 +1,84 @@
+name: Update heel
+
+# A new heel release moves the `heel` library (sandbox/Cargo.toml, Cargo.lock)
+# and the pinned heel executable of the tool distribution
+# (patch/third-party-tools.json) together, in one pull request. Both must be
+# the same version, which the aither-sandbox test
+# `tool_distribution_pins_heel_at_the_linked_version` checks. A workflow rather
+# than Renovate: no dependency bot regenerates a pin from a release's assets.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 5 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-heel:
+    name: Upgrade to the latest heel release
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find a newer release
+        id: release
+        run: |
+          set -euo pipefail
+          latest="$(gh release list -R May-Agent/heel --exclude-pre-releases --limit 100 --json tagName \
+            --jq '.[].tagName | select(startswith("heel-v")) | ltrimstr("heel-v")' | sort -V | tail -n 1)"
+          current="$(awk '$0 == "name = \"heel\"" { getline; gsub(/^version = "|"$/, ""); print; exit }' Cargo.lock)"
+          if [[ -z "${latest}" || -z "${current}" ]]; then
+            echo "::error::no heel release (${latest:-none}) or no locked heel (${current:-none})"
+            exit 1
+          fi
+          echo "latest=${latest} current=${current}"
+          if [[ "${latest}" != "${current}" && "$(printf '%s\n%s\n' "${current}" "${latest}" | sort -V | tail -n 1)" == "${latest}" ]]; then
+            echo "version=${latest}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Install Rust
+        if: steps.release.outputs.version
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        if: steps.release.outputs.version
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: update-heel
+
+      - name: Move the library and the pin
+        if: steps.release.outputs.version
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -E -i "s/^heel = \"[^\"]+\"/heel = \"${VERSION}\"/" sandbox/Cargo.toml
+          cargo update -p heel --precise "${VERSION}"
+          patch/pin-heel.sh "${VERSION}"
+
+      - name: Validate the pin against the library
+        if: steps.release.outputs.version
+        run: cargo test --locked -p aither-sandbox tool_distribution_
+
+      - name: Create pull request
+        if: steps.release.outputs.version
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: chore/update-heel
+          delete-branch: true
+          sign-commits: true
+          commit-message: "chore(sandbox): upgrade heel to ${{ steps.release.outputs.version }}"
+          title: "chore(sandbox): upgrade heel to ${{ steps.release.outputs.version }}"
+          body: |
+            Moves the `heel` library and the distribution's pinned heel executables to ${{ steps.release.outputs.version }}.
+          add-paths: |
+            sandbox/Cargo.toml
+            Cargo.lock
+            patch/third-party-tools.json

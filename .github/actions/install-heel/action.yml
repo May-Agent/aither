@@ -1,43 +1,33 @@
 name: Install Heel Runtime
-description: Prepare the released heel executable required by sandbox IPC tests, at the version Cargo.lock pins, restored from the Actions cache and built from crates.io only on a miss.
-inputs:
-  save:
-    description: Whether a cache miss saves the build. Only dev saves caches, as in the Rust caches.
-    default: ${{ github.ref == 'refs/heads/dev' }}
+description: Download the heel executable the tool distribution pins for the runner (patch/third-party-tools.json), verify its SHA-256, and export it as HEEL_BIN for steps that run heel itself rather than through aither-sandbox.
 runs:
   using: composite
   steps:
-    - id: version
-      shell: bash
-      run: |
-        set -euo pipefail
-        version=$(awk '$0 == "name = \"heel\"" { getline; gsub(/^version = "|"$/, ""); print; exit }' Cargo.lock)
-        if [[ -z "${version}" ]]; then
-          echo "::error::Cargo.lock pins no heel package"
-          exit 1
-        fi
-        echo "version=${version}" >> "${GITHUB_OUTPUT}"
-    - id: restore
-      uses: actions/cache/restore@v4
-      with:
-        path: ${{ runner.temp }}/heel-runtime
-        key: heel-${{ steps.version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
-    - if: steps.restore.outputs.cache-hit != 'true'
-      shell: bash
-      env:
-        VERSION: ${{ steps.version.outputs.version }}
-      run: cargo install heel --version "${VERSION}" --locked --debug --root "${RUNNER_TEMP}/heel-runtime" --target-dir target/heel-runtime-build
-    - if: steps.restore.outputs.cache-hit != 'true' && inputs.save == 'true'
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ runner.temp }}/heel-runtime
-        key: heel-${{ steps.version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
     - shell: bash
       run: |
         set -euo pipefail
-        executable="${RUNNER_TEMP}/heel-runtime/bin/heel"
-        if [[ "${RUNNER_OS}" == Windows ]]; then
+        case "${RUNNER_OS}" in
+          Linux) os=linux ;;
+          macOS) os=macos ;;
+          Windows) os=windows ;;
+          *) echo "::error::no pinned heel for ${RUNNER_OS}"; exit 1 ;;
+        esac
+        case "${RUNNER_ARCH}" in
+          X64) arch=x86_64 ;;
+          ARM64) arch=aarch64 ;;
+          *) echo "::error::no pinned heel for ${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        pin="$(jq -c --arg os "${os}" --arg arch "${arch}" \
+          '[.host_programs[] | select(.tool == "heel" and .target.os == $os and .target.arch == $arch)]
+           | if length == 1 then .[0] else error("expected one heel pin") end' \
+          patch/third-party-tools.json)"
+        executable="${RUNNER_TEMP}/heel-runtime/heel"
+        if [[ "${os}" == windows ]]; then
           executable="${executable}.exe"
         fi
+        mkdir -p "${RUNNER_TEMP}/heel-runtime"
+        curl -fsSL "$(jq -r .url <<<"${pin}")" -o "${executable}"
+        echo "$(jq -r .sha256 <<<"${pin}")  ${executable}" | (sha256sum -c - 2>/dev/null || shasum -a 256 -c -)
+        chmod +x "${executable}"
         "${executable}" --version
         echo "HEEL_BIN=${executable}" >> "${GITHUB_ENV}"

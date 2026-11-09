@@ -409,9 +409,10 @@ impl ToolDistribution {
         load_artifact(artifact, artifact_cache, self.github_token.as_ref()).await
     }
 
-    /// Prepares one host program for the host's platform and returns the path
-    /// of its read-only executable, with the same pinning, download and
-    /// verification as the sandbox commands.
+    /// Prepares one host program for `target` and returns the path of its
+    /// read-only executable, with the same pinning, download and
+    /// verification as the sandbox commands. A target other than the host's
+    /// yields a file the host does not run, such as one streamed to a server.
     ///
     /// Archives are cached under `<cache_root>/artifacts` and executables
     /// under `<cache_root>/bin/<executable sha256>/<command>`. When that
@@ -422,8 +423,7 @@ impl ToolDistribution {
     /// # Errors
     /// Fails with [`ToolRuntimeError::MissingHostProgram`] naming the program
     /// and target when the distribution has no artifact for it,
-    /// [`ToolRuntimeError::TargetMismatch`] when `target` is not the host's
-    /// platform, [`ToolRuntimeError::Integrity`] when the extracted executable
+    /// [`ToolRuntimeError::Integrity`] when the extracted executable
     /// does not have the pinned digest, and on a failed download, archive
     /// digest mismatch, unsafe archive member or I/O failure.
     pub async fn prepare_host_program(
@@ -446,9 +446,6 @@ impl ToolDistribution {
             })?;
         if selected.next().is_some() {
             return Err(ToolRuntimeError::DuplicateHostProgram { program, os, arch });
-        }
-        if *target != ToolTarget::native()? {
-            return Err(ToolRuntimeError::TargetMismatch);
         }
         let mut executable_sha256 = [0; 32];
         hex::decode_to_slice(&pinned.executable_sha256, &mut executable_sha256)?;
@@ -1759,6 +1756,7 @@ pub mod tests {
         let mut targets = distribution
             .host_programs
             .iter()
+            .filter(|pinned| pinned.artifact.tool == HostProgram::RepoSearch)
             .map(|pinned| {
                 assert_eq!(pinned.executable_sha256.len(), 64);
                 let artifact = &pinned.artifact;
@@ -2154,5 +2152,77 @@ pub mod tests {
         };
         let extracted = extract_executable(&encoding, &encoded).unwrap();
         assert!(extracted == executable);
+    }
+
+    /// The version of the `heel` library `Cargo.lock` resolves.
+    fn locked_heel_version() -> String {
+        let lock =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock"))
+                .unwrap();
+        let mut lines = lock.lines();
+        while let Some(line) = lines.next() {
+            if line == "name = \"heel\"" {
+                let version = lines.next().expect("a locked package has a version");
+                return version
+                    .strip_prefix("version = \"")
+                    .and_then(|version| version.strip_suffix('"'))
+                    .expect("the version line is quoted")
+                    .into();
+            }
+        }
+        panic!("Cargo.lock locks no heel package");
+    }
+
+    /// The distribution's heel is the linked library's version on every
+    /// platform it serves, so the sandbox it launches matches the library.
+    #[test]
+    fn tool_distribution_pins_heel_at_the_linked_version() {
+        let version = locked_heel_version();
+        let pinned = crate::test_heel::host_programs();
+        let mut platforms = pinned
+            .iter()
+            .map(|program| {
+                assert_eq!(program["version"], version.as_str(), "{program}");
+                assert_eq!(program["sha256"], program["executable_sha256"], "{program}");
+                let url = program["url"].as_str().unwrap();
+                assert!(
+                    url.starts_with(&format!(
+                        "https://github.com/May-Agent/heel/releases/download/heel-v{version}/"
+                    )),
+                    "{url}"
+                );
+                format!("{}-{}", program["target"]["os"], program["target"]["arch"])
+            })
+            .collect::<Vec<_>>();
+        platforms.sort();
+        assert_eq!(
+            platforms,
+            [
+                "\"linux\"-\"aarch64\"",
+                "\"linux\"-\"x86_64\"",
+                "\"macos\"-\"aarch64\"",
+                "\"windows\"-\"aarch64\"",
+                "\"windows\"-\"x86_64\"",
+            ]
+        );
+    }
+
+    /// The distribution resolves heel for this platform without any
+    /// environment variable, and the binary it prepares runs as the linked
+    /// library's version.
+    #[tokio::test]
+    async fn tool_distribution_resolves_heel_on_this_platform() {
+        let cache = tempfile::tempdir().unwrap();
+        let target = ToolTarget::native().unwrap();
+        let heel = crate::test_heel::distribution()
+            .prepare_host_program(HostProgram::Heel, &target, cache.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            heel.path().file_name().unwrap(),
+            HostProgram::Heel.executable_name(&target).as_str()
+        );
+        let verified = heel::HeelBinary::verify(heel.path()).unwrap();
+        assert_eq!(verified.as_path(), heel.path());
     }
 }

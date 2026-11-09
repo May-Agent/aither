@@ -116,6 +116,9 @@ windows-sys = { version = "0.61", default-features = false, features = [
 default = []
 # Expose `test_git`, git isolated from the host configuration, to dependents' tests.
 test-git = []
+# Expose `test_heel`, the distribution's pinned heel, to dependents' tests; a
+# terminal whose tools were never initialized takes it.
+test-heel = []
 # Expose `test_ids`, id allocators for tests, to dependents' tests.
 test-ids = []
 # Detect source code in command output so it can be folded with tree-sitter.
