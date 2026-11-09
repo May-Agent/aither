@@ -21,7 +21,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     };
     let pinned: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
-    let distribution = ToolDistribution::from_path(&PathBuf::from(manifest)).await?;
+    let mut distribution = ToolDistribution::from_path(&PathBuf::from(manifest)).await?;
+    // CI hands its job token down so release downloads are authenticated.
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        distribution = distribution.with_github_token(token);
+    }
     let terminal = TerminalTool::new_exact(
         PathBuf::from(workspace),
         NoopPermissionHandler,
