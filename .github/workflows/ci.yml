@@ -205,7 +205,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-ubuntu
       - uses: ./.github/actions/install-protoc
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features --timings -- -D warnings
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-ci-lint
+          path: target/cargo-timings/
 
   wasm:
     name: WASM
@@ -226,9 +232,15 @@ jobs:
       # a filesystem and processes. Build the crates that are meant to run in a
       # browser, and deny warnings so a native-only helper cannot quietly rot
       # into dead code on this target.
-      - run: cargo build --target wasm32-unknown-unknown -p aither-core -p aither-openai -p aither-gemini -p aither-claude
+      - run: cargo build --target wasm32-unknown-unknown -p aither-core -p aither-openai -p aither-gemini -p aither-claude --timings
         env:
           RUSTFLAGS: "-D warnings"
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-ci-wasm
+          path: target/cargo-timings/
 
   # ------------------------------------------------------------------- testing
   # Split in two. Portability is what the three-platform matrix is for, and it
@@ -278,9 +290,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-apple
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --locked -p aither-apple --features test --run-ignored all
-      - run: cargo clippy -p aither-apple --all-targets --features test -- -D warnings
-      - run: cargo test --doc -p aither-apple
+      - run: cargo nextest run --locked -p aither-apple --features test --run-ignored all --timings
+      - run: cargo clippy -p aither-apple --all-targets --features test --timings -- -D warnings
+      - run: cargo test --doc -p aither-apple --timings
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-ci-test-apple
+          path: target/cargo-timings/
 
   test-full:
     name: Test (all features)
@@ -314,9 +332,15 @@ jobs:
       - uses: ./.github/actions/install-heel
       - run: >
           RUSTFLAGS="--cfg aither_container_acceptance"
-          cargo test -p aither-sandbox --all-features
+          cargo test -p aither-sandbox --all-features --timings
           terminal::tests::container_command_runs_with_configured_nice_and_reaches_ipc
           -- --exact --nocapture
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-ci-container-acceptance
+          path: target/cargo-timings/
 
   # Runs sandbox/templates/verify_baseline_tools.sh through the real sandboxed
   # terminal against real managed tools. The manifest is this change's
@@ -354,8 +378,14 @@ jobs:
         with:
           files: ${{ runner.temp }}/manifest.json
       - run: >
-          cargo run --locked -p aither-sandbox --example verify_tools --
+          cargo run --locked -p aither-sandbox --example verify_tools --timings --
           "${RUNNER_TEMP}/manifest.json" "${AITHER_TOOL_CACHE}" "${RUNNER_TEMP}/workspace"
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-ci-verify-tools-${{ matrix.os }}
+          path: target/cargo-timings/
       - if: success() && steps.tools.outputs.hit != 'true' && github.ref == 'refs/heads/dev'
         uses: actions/cache/save@v4
         with:
@@ -409,8 +439,8 @@ jobs:
       # feature alone. The depth-2 powerset below already runs the latter two
       # for every non-aggregate feature, so only `--all-features` and the
       # aggregates alone are left to run here.
-      - run: cargo hack check --all-features --no-dev-deps --partition ${{ matrix.part }}/8
-      - run: cargo hack check --each-feature --include-features "$AGGREGATE_FEATURES" --no-dev-deps --partition ${{ matrix.part }}/8
+      - run: cargo hack check --all-features --no-dev-deps --timings --partition ${{ matrix.part }}/8
+      - run: cargo hack check --each-feature --include-features "$AGGREGATE_FEATURES" --no-dev-deps --timings --partition ${{ matrix.part }}/8
       # The full powerset of this crate's 20 features is 89,766 `cargo check`
       # runs, which no CI job can finish. Depth 2 covers every pair of features
       # — where feature-interaction bugs actually live — in 209 runs. The three
@@ -418,8 +448,14 @@ jobs:
       # and pairwise, and are what makes the full powerset explode. The two
       # steps split that one list into the combinations with a heavy feature
       # and those without one, so together they run each combination once.
-      - run: cargo hack check --feature-powerset --depth 2 --exclude-features "$AGGREGATE_FEATURES" --at-least-one-of "$HEAVY_FEATURES" --no-dev-deps --partition ${{ matrix.part }}/8
-      - run: cargo hack check --feature-powerset --depth 2 --exclude-features "$AGGREGATE_FEATURES,$HEAVY_FEATURES" --no-dev-deps --partition ${{ matrix.part }}/8
+      - run: cargo hack check --feature-powerset --depth 2 --exclude-features "$AGGREGATE_FEATURES" --at-least-one-of "$HEAVY_FEATURES" --no-dev-deps --timings --partition ${{ matrix.part }}/8
+      - run: cargo hack check --feature-powerset --depth 2 --exclude-features "$AGGREGATE_FEATURES,$HEAVY_FEATURES" --no-dev-deps --timings --partition ${{ matrix.part }}/8
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-ci-features-${{ matrix.part }}
+          path: target/cargo-timings/
 
   # ------------------------------------------------------------------ coverage
   # Instrumented builds cost roughly double, and coverage of a crate that is
@@ -473,7 +509,15 @@ jobs:
           --no-default-features
           --features derive,serde,openai,claude,gemini,agent,rag,mem0,skills,mcp,browser,websearch,webfetch,search,fs,command
           --exclude aither-llama --exclude aither-ort
+          --timings
           ${FILTERSET:+--no-tests=pass -E "$FILTERSET"}
+      # cargo-llvm-cov builds into its own target directory.
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-ci-coverage
+          path: target/llvm-cov-target/cargo-timings/
       - if: success() && steps.tools.outputs.hit != 'true' && github.ref == 'refs/heads/dev'
         uses: actions/cache/save@v4
         with:
