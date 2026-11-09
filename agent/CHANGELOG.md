@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/May-Agent/aither/compare/agent-v0.26.0...agent-v0.27.0) - 2026-11-09
+
+### Added
+
+- *(sandbox)* [**breaking**] run terminal commands on SSH servers by location
+- *(sandbox)* heel is a managed host program pinned with the distribution
+
+### Other
+
+- Merge pull request #671 from May-Agent/chore/back-merge-0.26.0
+- Merge main into dev after the 0.26.0 release
+- Merge remote-tracking branch 'origin/dev' into feat/664-managed-heel
+- *(agent)* command hook tests run in the default mode
+- Merge remote-tracking branch 'origin/dev' into feat/662-ssh-location
+
 ## [0.26.0](https://github.com/May-Agent/aither/compare/agent-v0.25.0...agent-v0.26.0) - 2026-11-09
 
 ### Fixed

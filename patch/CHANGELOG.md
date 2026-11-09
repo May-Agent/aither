@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/May-Agent/aither/compare/patch-v0.26.0...patch-v0.27.0) - 2026-11-09
+
+### Added
+
+- *(sandbox)* heel is a managed host program pinned with the distribution
+
+### Other
+
+- Merge pull request #671 from May-Agent/chore/back-merge-0.26.0
+- Merge remote-tracking branch 'origin/dev' into feat/664-managed-heel
+
 ## [0.26.0](https://github.com/May-Agent/aither/compare/patch-v0.25.0...patch-v0.26.0) - 2026-11-09
 
 ### Other

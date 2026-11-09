@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/May-Agent/aither/compare/sandbox-v0.26.0...sandbox-v0.27.0) - 2026-11-09
+
+### Added
+
+- *(core)* [**breaking**] an id allocator leases a named word on claim
+- *(sandbox)* [**breaking**] run terminal commands on SSH servers by location
+- *(sandbox)* heel is a managed host program pinned with the distribution
+
+### Fixed
+
+- *(sandbox)* run SSH commands outside the jobserver pool
+- *(sandbox)* install the pinned heel for a server's own target
+- *(sandbox)* the shared heel getter has no unused self or async
+- *(sandbox)* tests take the pinned heel, host program writes are cross-process safe
+
+### Other
+
+- Merge pull request #674 from May-Agent/feat/842-one-token-ids
+- Merge pull request #673 from May-Agent/fix/672-ssh-pool
+- Merge pull request #671 from May-Agent/chore/back-merge-0.26.0
+- Merge main into dev after the 0.26.0 release
+- Merge remote-tracking branch 'origin/dev' into feat/664-managed-heel
+- Merge pull request #668 from May-Agent/feat/662-ssh-location
+
 ## [0.26.0](https://github.com/May-Agent/aither/compare/sandbox-v0.25.0...sandbox-v0.26.0) - 2026-11-09
 
 ### Added
