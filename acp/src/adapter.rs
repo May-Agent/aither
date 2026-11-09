@@ -124,6 +124,8 @@ impl SessionUpdateMapper {
             | AgentEvent::BackgroundTaskCompleted { .. }
             | AgentEvent::RunPaused { .. }
             | AgentEvent::RunResumed { .. }
+            | AgentEvent::CompactionStarted
+            | AgentEvent::CompactionFinished { .. }
             | AgentEvent::CompactionRecovery { .. }
             | AgentEvent::SkillActivated { .. }
             | AgentEvent::TurnComplete { .. }

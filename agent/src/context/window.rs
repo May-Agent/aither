@@ -550,6 +550,16 @@ impl Context {
         self.items.len()
     }
 
+    /// The number of conversation messages older than `fork_point`: those a
+    /// handoff forked there replaces.
+    #[must_use]
+    pub fn len_below(&self, fork_point: u64) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.seq < fork_point)
+            .count()
+    }
+
     /// Returns the number of system messages in the conversation.
     #[must_use]
     pub fn count_recent_system_messages(&self) -> usize {

@@ -8,7 +8,9 @@ use std::time::Duration;
 use crate::context::CacheLifetime;
 use crate::sandbox::TerminalTool;
 use crate::sandbox::permission::NoopPermissionHandler;
-use crate::{Agent, AgentOptions, ManualClock, TerminalAgentBuilder};
+use crate::{
+    Agent, AgentEvent, AgentOptions, CompactionOutcome, ManualClock, TerminalAgentBuilder,
+};
 use aither_core::LanguageModel;
 use aither_core::llm::{Event, LLMRequest, model::Profile as ModelProfile};
 use executor_core::tokio::TokioGlobal;
@@ -116,19 +118,28 @@ async fn a_limited_lifetime_schedules_one_idle_compaction_on_the_injected_clock(
         .idle_compaction_due_in()
         .expect("a compaction is scheduled");
     assert!(due_in > Duration::ZERO && due_in < Duration::from_secs(600));
-    assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+    assert!(
+        test_support::finish_compaction(agent.compact_when_idle())
+            .await
+            .expect("no-op")
+            .is_none()
+    );
     assert_eq!(llm.requests(), 1);
 
     // Just short of the due point: still not due.
     clock.advance(due_in.saturating_sub(Duration::from_secs(1)));
-    assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+    assert!(
+        test_support::finish_compaction(agent.compact_when_idle())
+            .await
+            .expect("no-op")
+            .is_none()
+    );
     assert_eq!(llm.requests(), 1);
 
     // At the due point: exactly one compaction.
     clock.advance(Duration::from_secs(1));
     assert_eq!(agent.idle_compaction_due_in(), Some(Duration::ZERO));
-    agent
-        .compact_when_idle()
+    test_support::finish_compaction(agent.compact_when_idle())
         .await
         .expect("the compaction succeeds")
         .expect("the compaction ran");
@@ -136,7 +147,64 @@ async fn a_limited_lifetime_schedules_one_idle_compaction_on_the_injected_clock(
 
     // Still idle, later in the same gap: nothing more.
     clock.advance(Duration::from_secs(30));
-    assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+    assert!(
+        test_support::finish_compaction(agent.compact_when_idle())
+            .await
+            .expect("no-op")
+            .is_none()
+    );
+    assert_eq!(llm.requests(), 2);
+}
+
+/// The compaction events a driven `run` emitted, in order.
+async fn compaction_events(
+    run: crate::Run<impl std::future::Future<Output = Result<(), crate::AgentError>>>,
+) -> Vec<&'static str> {
+    let std::ops::ControlFlow::Continue(seen) = run
+        .drive(
+            Vec::new(),
+            std::future::pending(),
+            |mut seen, timed| async move {
+                match timed.event {
+                    AgentEvent::CompactionStarted => seen.push("started"),
+                    AgentEvent::CompactionFinished { outcome } => seen.push(match outcome {
+                        CompactionOutcome::Applied(_) => "applied",
+                        CompactionOutcome::NothingToCompact => "nothing to compact",
+                        CompactionOutcome::Failed(_) => "failed",
+                        CompactionOutcome::Discarded => "discarded",
+                    }),
+                    _ => {}
+                }
+                std::ops::ControlFlow::<std::convert::Infallible, _>::Continue(seen)
+            },
+        )
+        .await
+        .expect("the idle compaction succeeds");
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_compaction_reports_its_start_and_finish_only_when_due() {
+    let llm = ScriptedLlm::default();
+    let clock = ManualClock::new();
+    let lifetime = CacheLifetime::Limited(Duration::from_secs(600));
+    let mut agent = agent_after_one_turn(llm.clone(), Some(lifetime), &clock).await;
+    let due_in = agent
+        .idle_compaction_due_in()
+        .expect("a compaction is scheduled");
+
+    assert!(
+        compaction_events(agent.compact_when_idle())
+            .await
+            .is_empty(),
+        "nothing is due, nothing starts"
+    );
+
+    clock.advance(due_in);
+    assert_eq!(
+        compaction_events(agent.compact_when_idle()).await,
+        ["started", "applied"]
+    );
     assert_eq!(llm.requests(), 2);
 }
 
@@ -149,7 +217,12 @@ async fn a_permanent_lifetime_schedules_no_idle_compaction() {
 
     clock.advance(Duration::from_secs(10 * 86_400));
     assert_eq!(agent.idle_compaction_due_in(), None);
-    assert!(agent.compact_when_idle().await.expect("no-op").is_none());
+    assert!(
+        test_support::finish_compaction(agent.compact_when_idle())
+            .await
+            .expect("no-op")
+            .is_none()
+    );
     assert_eq!(llm.requests(), 1);
 }
 
