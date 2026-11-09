@@ -76,10 +76,16 @@ jobs:
       - shell: bash
         env:
           FILTERSET: ${{ inputs.filterset }}
-        run: cargo nextest run ${{ inputs.flags }} ${FILTERSET:+--no-tests=pass -E "$FILTERSET"}
+        run: cargo nextest run ${{ inputs.flags }} --timings ${FILTERSET:+--no-tests=pass -E "$FILTERSET"}
       # cargo test never ran proc-macro doctests; keep aither-derive excluded so
       # this step covers exactly the doctests the previous job did.
-      - run: cargo test --doc ${{ inputs.flags }} --exclude aither-derive
+      - run: cargo test --doc ${{ inputs.flags }} --exclude aither-derive --timings
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-test-${{ inputs.cache-key }}-${{ matrix.os }}
+          path: target/cargo-timings/
       - if: success() && steps.tools.outputs.hit != 'true' && github.ref == 'refs/heads/dev'
         uses: actions/cache/save@v4
         with:
