@@ -9,7 +9,7 @@ use crate::shell_session::{
 };
 use crate::tool_distribution::ToolDistribution;
 use crate::tool_runtime::{
-    PreparedEnvironment, PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget,
+    HostProgram, PreparedEnvironment, PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget,
 };
 use crate::tool_transport::{
     ContainerToolTransport, LocalToolTransport, SshToolTransport, ensure_command_line_tools,
@@ -87,10 +87,15 @@ impl ShellSessionRegistry {
             } else if availability.local {
                 let target = ToolTarget::native()?;
                 ensure_command_line_tools(&LocalToolTransport, &target).await?;
-                let bundle = distribution
-                    .load(&target, &cache_root.join("artifacts"))
-                    .await?;
-                let tools = bundle.prepare_local(&cache_root.join("runtimes")).await?;
+                let artifacts = cache_root.join("artifacts");
+                let (bundle, heel) = futures::try_join!(
+                    distribution.load(&target, &artifacts),
+                    distribution.prepare_host_program(HostProgram::Heel, &target, cache_root),
+                )?;
+                let tools = bundle
+                    .prepare_local(&cache_root.join("runtimes"))
+                    .await?
+                    .with_heel(heel);
                 Ok(Some(PreparedHome::Local(tools)))
             } else {
                 Ok(None)

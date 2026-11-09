@@ -315,6 +315,7 @@ impl ImageTools {
         Ok(PreparedTools {
             bin_dir: self.container_bin_dir()?,
             uv_dir: None,
+            heel: None,
             catalog,
         })
     }
@@ -379,6 +380,7 @@ impl ToolBundle {
                 .python
                 .is_some()
                 .then(|| root.join(crate::tool_runtime::UV_STATE_DIRECTORY)),
+            heel: None,
             catalog: self.catalog(),
         })
     }

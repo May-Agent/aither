@@ -67,7 +67,6 @@ jobs:
           shared-key: test-${{ matrix.os }}-${{ inputs.cache-key }}
       - uses: ./.github/actions/install-protoc
       - uses: taiki-e/install-action@nextest
-      - uses: ./.github/actions/install-heel
       # The pinned tool artifacts and prepared runtimes the sandbox tests use.
       - id: tools
         uses: ./.github/actions/restore-tool-cache
