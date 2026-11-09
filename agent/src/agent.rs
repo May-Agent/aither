@@ -733,6 +733,8 @@ enum BackgroundOutcome<'a> {
 struct PermissionEventKey {
     mode: TerminalMode,
     script: String,
+    /// The SSH server the call names; `None` for the home environment.
+    location: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -762,6 +764,7 @@ impl PermissionPauseTracker {
         let key = PermissionEventKey {
             mode: event.mode,
             script: event.script,
+            location: event.location,
         };
         match event.stage {
             PermissionEventStage::Waiting => {
@@ -774,6 +777,12 @@ impl PermissionPauseTracker {
             }
             PermissionEventStage::Resolved => {
                 let tool_call_id = self.active.get_mut(&key)?.pop_front()?;
+                // A call on a server waits again for its `unsafe` approval
+                // once its first-use approval resolves.
+                self.pending
+                    .entry(key)
+                    .or_default()
+                    .push_front(tool_call_id.clone());
                 Some((RunPauseReason::PermissionRequest, tool_call_id))
             }
         }
@@ -4269,20 +4278,26 @@ fn permission_event_key_for_call(
     tool_name: &str,
     arguments: &serde_json::Value,
 ) -> Option<PermissionEventKey> {
-    let (mode, script) = match tool_name {
-        "terminal" => {
-            let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
-            (args.mode, args.script)
-        }
+    let args: TerminalArgs = match tool_name {
+        "terminal" => serde_json::from_value(arguments.clone()).ok()?,
         _ => return None,
     };
-    let mode = match mode {
-        TerminalExecutionMode::Sandboxed
-        | TerminalExecutionMode::Default
-        | TerminalExecutionMode::Ssh => return None,
-        TerminalExecutionMode::Unsafe => TerminalMode::Unsafe,
-    };
-    Some(PermissionEventKey { mode, script })
+    let location = args
+        .location
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    // A home call waits only for an `unsafe` approval; a call on a server
+    // may also wait for the server's first-use approval.
+    if args.mode == TerminalExecutionMode::Default && location.is_none() {
+        return None;
+    }
+    Some(PermissionEventKey {
+        mode: args.mode.into(),
+        script: args.script,
+        location,
+    })
 }
 
 /// Renders a background job's runtime the way the alert text states it.
@@ -4322,8 +4337,7 @@ fn emit_permission_event(
 
 fn tool_result_is_error(tool_result: &aither_core::llm::ToolResult, content: &str) -> bool {
     tool_result.is_error()
-        || content.contains("ssh_server_id is required")
-        || content.contains("unknown ssh_server_id")
+        || content.contains("no SSH server named")
         || content.contains("not found")
         || content.contains("Invalid arguments")
 }
@@ -5485,60 +5499,63 @@ mod tests {
         assert!(!prefix.contains(include_str!("prompts/permissions.txt")));
     }
 
+    fn terminal_args(
+        script: &str,
+        mode: TerminalExecutionMode,
+        location: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::to_value(TerminalArgs {
+            description: "run the demo".to_string(),
+            script: script.to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
+            mode,
+            location: location.map(str::to_string),
+            expect: aither_sandbox::OutputFormat::Text,
+            resolution: aither_sandbox::MediaResolution::Auto,
+            max_lines: 200,
+            raw: false,
+            timeout: 60,
+            background: false,
+        })
+        .expect("terminal args should serialize")
+    }
+
+    fn permission_event(
+        script: &str,
+        mode: TerminalMode,
+        location: Option<&str>,
+        stage: PermissionEventStage,
+    ) -> PermissionEvent {
+        PermissionEvent {
+            mode,
+            script: script.to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
+            location: location.map(str::to_string),
+            stage,
+        }
+    }
+
     #[test]
     fn permission_event_key_parses_terminal_modes() {
-        let default_args = serde_json::to_value(TerminalArgs {
-            description: "list the working directory".to_string(),
-            script: "ls".to_string(),
-            language: aither_sandbox::ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
-            ssh_server_id: None,
-            expect: aither_sandbox::OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            max_lines: 200,
-            raw: false,
-            timeout: 60,
-            background: false,
-        })
-        .expect("default args should serialize");
-        let unsafe_args = serde_json::to_value(TerminalArgs {
-            description: "remove the demo directory".to_string(),
-            script: "rm -rf /tmp/demo".to_string(),
-            language: aither_sandbox::ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Unsafe,
-            ssh_server_id: None,
-            expect: aither_sandbox::OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            max_lines: 200,
-            raw: false,
-            timeout: 60,
-            background: false,
-        })
-        .expect("unsafe args should serialize");
-        let sandboxed_args = serde_json::to_value(TerminalArgs {
-            description: "print the current working directory".to_string(),
-            script: "pwd".to_string(),
-            language: aither_sandbox::ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Sandboxed,
-            ssh_server_id: None,
-            expect: aither_sandbox::OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            max_lines: 200,
-            raw: false,
-            timeout: 60,
-            background: false,
-        })
-        .expect("sandboxed args should serialize");
+        let default_args = terminal_args("ls", TerminalExecutionMode::Default, None);
+        let home_args = terminal_args("pwd", TerminalExecutionMode::Default, Some(" "));
+        let unsafe_args = terminal_args("rm -rf /tmp/demo", TerminalExecutionMode::Unsafe, None);
+        let remote_args = terminal_args("make", TerminalExecutionMode::Default, Some(" build "));
 
         let unsafe_key = permission_event_key_for_call("terminal", &unsafe_args)
             .expect("unsafe terminal mode should require permission routing");
+        let remote_key = permission_event_key_for_call("terminal", &remote_args)
+            .expect("a server's first use may wait for approval");
 
-        // Default and sandboxed no longer require approval: network is
+        // A default-mode command at home waits for nothing: network is
         // available by default and only unsafe escalation is gated.
         assert!(permission_event_key_for_call("terminal", &default_args).is_none());
+        assert!(permission_event_key_for_call("terminal", &home_args).is_none());
         assert_eq!(unsafe_key.mode, TerminalMode::Unsafe);
         assert_eq!(unsafe_key.script, "rm -rf /tmp/demo");
-        assert!(permission_event_key_for_call("terminal", &sandboxed_args).is_none());
+        assert_eq!(unsafe_key.location, None);
+        assert_eq!(remote_key.mode, TerminalMode::Sandboxed);
+        assert_eq!(remote_key.location.as_deref(), Some("build"));
     }
 
     #[test]
@@ -5546,38 +5563,25 @@ mod tests {
         let tool_calls = vec![aither_core::llm::ToolCall::new(
             "tool-1",
             "terminal",
-            serde_json::to_value(TerminalArgs {
-                description: "remove the demo directory".to_string(),
-                script: "rm -rf /tmp/demo".to_string(),
-                language: aither_sandbox::ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Unsafe,
-                ssh_server_id: None,
-                expect: aither_sandbox::OutputFormat::Text,
-                resolution: aither_sandbox::MediaResolution::Auto,
-                max_lines: 200,
-                raw: false,
-                timeout: 60,
-                background: false,
-            })
-            .expect("tool args should serialize"),
+            terminal_args("rm -rf /tmp/demo", TerminalExecutionMode::Unsafe, None),
         )];
 
         let mut tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
         let waiting = tracker
-            .event_for(PermissionEvent {
-                mode: TerminalMode::Unsafe,
-                script: "rm -rf /tmp/demo".to_string(),
-                language: aither_sandbox::ScriptLanguage::Shell,
-                stage: PermissionEventStage::Waiting,
-            })
+            .event_for(permission_event(
+                "rm -rf /tmp/demo",
+                TerminalMode::Unsafe,
+                None,
+                PermissionEventStage::Waiting,
+            ))
             .expect("waiting event should map to tool call");
         let resolved = tracker
-            .event_for(PermissionEvent {
-                mode: TerminalMode::Unsafe,
-                script: "rm -rf /tmp/demo".to_string(),
-                language: aither_sandbox::ScriptLanguage::Shell,
-                stage: PermissionEventStage::Resolved,
-            })
+            .event_for(permission_event(
+                "rm -rf /tmp/demo",
+                TerminalMode::Unsafe,
+                None,
+                PermissionEventStage::Resolved,
+            ))
             .expect("resolved event should map to tool call");
 
         assert_eq!(
@@ -5587,6 +5591,44 @@ mod tests {
         assert_eq!(
             resolved,
             (RunPauseReason::PermissionRequest, "tool-1".to_string())
+        );
+    }
+
+    /// An `unsafe` call on a server waits twice: for the server's first-use
+    /// approval, then for its own.
+    #[test]
+    fn a_call_on_a_server_pauses_for_each_approval_it_waits_for() {
+        let tool_calls = vec![aither_core::llm::ToolCall::new(
+            "tool-1",
+            "terminal",
+            terminal_args("make", TerminalExecutionMode::Unsafe, Some("build")),
+        )];
+        let mut tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
+        for stage in [
+            PermissionEventStage::Waiting,
+            PermissionEventStage::Resolved,
+            PermissionEventStage::Waiting,
+            PermissionEventStage::Resolved,
+        ] {
+            assert_eq!(
+                tracker.event_for(permission_event(
+                    "make",
+                    TerminalMode::Unsafe,
+                    Some("build"),
+                    stage
+                )),
+                Some((RunPauseReason::PermissionRequest, "tool-1".to_string()))
+            );
+        }
+        assert_eq!(
+            tracker.event_for(permission_event(
+                "make",
+                TerminalMode::Unsafe,
+                None,
+                PermissionEventStage::Waiting
+            )),
+            None,
+            "the same script at home is another call"
         );
     }
 

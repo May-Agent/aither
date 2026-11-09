@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use aither_sandbox::ScriptLanguage;
 use aither_sandbox::permission::{
     PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
 };
+use aither_sandbox::{CommandRole, ScriptLanguage, SshServer};
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::ExternalHooks;
@@ -175,5 +175,21 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
 
     fn remember_domain(&self, domain: &str, port: u16) -> impl Future<Output = ()> + Send {
         self.inner.remember_domain(domain, port)
+    }
+
+    fn check_location(
+        &self,
+        server: &SshServer,
+        role: CommandRole,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        self.inner.check_location(server, role)
+    }
+
+    fn will_wait_for_location(
+        &self,
+        server: &SshServer,
+        role: CommandRole,
+    ) -> impl Future<Output = bool> + Send {
+        self.inner.will_wait_for_location(server, role)
     }
 }

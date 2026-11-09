@@ -63,8 +63,7 @@ use aither_core::llm::ToolResult;
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
     ContainerShellRuntime, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry,
-    SshServer, SshSessionAuthorizer, TerminalTool, ToolDistribution, ToolRegistryBuilder,
-    ToolRuntimeError, Unconfigured,
+    SshServer, TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolRuntimeError, Unconfigured,
 };
 
 /// System prompt template for terminal-first agents.
@@ -260,7 +259,6 @@ where
         let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: true,
             container: false,
-            ssh: false,
         });
 
         terminal_tool = terminal_tool.with_shell_sessions(shell_sessions);
@@ -600,7 +598,7 @@ where
     ///
     /// # Panics
     ///
-    /// Panics when no shell backend is available.
+    /// Panics when no home backend is available.
     #[must_use]
     pub fn with_default_prompt(mut self) -> Self {
         let availability = self.terminal_tool.shell_sessions().availability();
@@ -608,20 +606,18 @@ where
             "container"
         } else if availability.local {
             "heel"
-        } else if availability.ssh {
-            "remote"
         } else {
-            panic!("terminal agent requires at least one shell backend")
+            panic!("terminal agent requires a home backend")
         };
         let runtime_kind = match host_profile {
             "container" => "linux_container",
-            "remote" => "remote_ssh",
             "heel" => "user_local_machine",
             _ => unreachable!("validated host profile"),
         };
+        let servers = self.terminal_tool.shell_sessions().ssh_servers();
         let shell_context = ShellRuntimeContextTemplate {
-            local: availability.local || availability.container,
-            ssh: availability.ssh,
+            local: true,
+            ssh: !servers.is_empty(),
             runtime: runtime_kind,
         }
         .render()
@@ -630,10 +626,9 @@ where
             .inner
             .system_text(&InstructionSlot::SHELL_RUNTIME, shell_context);
 
-        let ssh_context =
-            describe_ssh_servers(&self.terminal_tool.shell_sessions().list_ssh_servers());
+        let ssh_context = describe_ssh_servers(&servers);
         let host_runtime_context =
-            describe_host_runtime_context(host_profile, &availability, ssh_context.as_str());
+            describe_host_runtime_context(host_profile, !servers.is_empty(), ssh_context.as_str());
 
         // Build skills description
         let has_skills = !self.skills.is_empty();
@@ -1084,32 +1079,22 @@ where
         self
     }
 
-    /// Sets preconfigured SSH targets that can be used by `terminal` with ssh mode.
+    /// Adds SSH servers a `terminal` command names as its `location`. The
+    /// registry's server set stays live: servers can be added and removed
+    /// later through [`ShellSessionRegistry::add_ssh_server`] and
+    /// [`ShellSessionRegistry::remove_ssh_server`].
     ///
     /// # Panics
     ///
-    /// Panics when the SSH server configuration is invalid.
+    /// Panics when a server is blank or its name is taken.
     #[must_use]
-    pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
-        let sessions = self
-            .terminal_tool
-            .shell_sessions()
-            .clone()
-            .with_ssh_servers(servers)
-            .expect("invalid ssh server configuration");
-        self.terminal_tool = self.terminal_tool.with_shell_sessions(sessions);
-        self
-    }
-
-    /// Sets the SSH session authorizer for interactive connect/install consent prompts.
-    #[must_use]
-    pub fn ssh_authorizer<T: SshSessionAuthorizer + 'static>(mut self, authorizer: Arc<T>) -> Self {
-        let sessions = self
-            .terminal_tool
-            .shell_sessions()
-            .clone()
-            .with_ssh_authorizer(authorizer);
-        self.terminal_tool = self.terminal_tool.with_shell_sessions(sessions);
+    pub fn ssh_servers(self, servers: Vec<SshServer>) -> Self {
+        for server in servers {
+            self.terminal_tool
+                .shell_sessions()
+                .add_ssh_server(server)
+                .expect("invalid ssh server configuration");
+        }
         self
     }
 
@@ -1148,14 +1133,14 @@ where
     /// [`Self::initialize_tools`], taking its shell backends with it.
     ///
     /// Only this terminal's own checks run: its working directory and writable
-    /// paths must not expose the managed tools. Downloads, integrity hashing,
-    /// version probes and SSH bootstrap — including its connection consent
-    /// prompt — are not repeated.
+    /// paths must not expose the managed tools. Downloads, integrity hashing
+    /// and version probes are not repeated, and the registry's SSH servers
+    /// come with it, with what their first use already settled.
     ///
     /// # Errors
-    /// Rejects a registry that is not prepared, one whose home backend,
-    /// container or SSH server set changed after preparation, and writable
-    /// grants that expose the managed tools.
+    /// Rejects a registry that is not prepared, one whose home backend or
+    /// container changed after preparation, and writable grants that expose
+    /// the managed tools.
     pub async fn prepared_shell_sessions(
         mut self,
         sessions: ShellSessionRegistry,
@@ -1203,34 +1188,23 @@ fn render_skill_descriptions(entries: &[SkillInfo]) -> String {
     output
 }
 
-fn describe_host_runtime_context(
-    host_profile: &str,
-    availability: &ShellRuntimeAvailability,
-    ssh_context: &str,
-) -> String {
+fn describe_host_runtime_context(host_profile: &str, ssh: bool, ssh_context: &str) -> String {
     let mut output = String::new();
     match host_profile {
         "container" => {
             output.push_str(
                 "Linux container runtime. Default mode has network enabled. You may install dependencies freely. SSH available: ",
             );
-            output.push_str(if availability.ssh { "true" } else { "false" });
-            output.push_str(". ");
-        }
-        "remote" => {
-            output.push_str(
-                "Remote SSH runtime. Default mode runs on the configured SSH target with network enabled. Local CLI commands exposed through terminal are unavailable unless a local backend also exists. ",
-            );
         }
         "heel" => {
             output.push_str(
                 "User machine runtime in sandbox. Default mode has network enabled. Use unsafe for host-level side effects. SSH available: ",
             );
-            output.push_str(if availability.ssh { "true" } else { "false" });
-            output.push_str(". ");
         }
         _ => unreachable!("validated host profile"),
     }
+    output.push_str(if ssh { "true" } else { "false" });
+    output.push_str(". ");
     output.push_str(ssh_context);
     output
 }
@@ -1238,15 +1212,6 @@ fn describe_host_runtime_context(
 fn describe_ssh_servers(servers: &[SshServer]) -> String {
     if servers.is_empty() {
         "No SSH servers are configured.".to_string()
-    } else if servers.len() == 1 {
-        let server = &servers[0];
-        let mut output = String::with_capacity(server.id().len() + server.target.len() + 89);
-        output.push_str("Configured SSH server: ");
-        output.push_str(server.id());
-        output.push_str(" (");
-        output.push_str(server.target.as_str());
-        output.push_str("). When using SSH backend, ssh_server_id may be omitted because only one server is configured.");
-        output
     } else {
         let mut listings = String::new();
         for server in servers {
@@ -1258,8 +1223,8 @@ fn describe_ssh_servers(servers: &[SshServer]) -> String {
             listings.push_str(server.target.as_str());
             listings.push(')');
         }
-        let mut output = String::with_capacity(listings.len() + 24);
-        output.push_str("Configured SSH servers: ");
+        let mut output = String::with_capacity(listings.len() + 64);
+        output.push_str("Configured SSH servers, named by `location`: ");
         output.push_str(listings.as_str());
         output.push('.');
         output
@@ -1544,7 +1509,7 @@ mod tests {
                     serde_json::json!({
                         "description": "Run every baseline command",
                         "script": "apply_patch --version && rg --version && ast-grep --version && jq --version",
-                        "mode": "sandboxed",
+                        "mode": "default",
                         "raw": true,
                         "timeout": 30
                     }),
@@ -2017,7 +1982,7 @@ mod tests {
                     serde_json::json!({
                         "description": "Wait for the build",
                         "script": "sleep 5",
-                        "mode": "sandboxed",
+                        "mode": "default",
                         "timeout": 30
                     }),
                 ))

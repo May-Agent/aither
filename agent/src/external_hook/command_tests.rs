@@ -189,7 +189,7 @@ fn terminal_handler(terminal: DynTerminalTool) -> DynToolHandler {
 async fn run_dyn(handler: &DynToolHandler, script: &str) -> String {
     let result: ToolResult = tokio::time::timeout(
         BOUND,
-        handler(&args(script, "sandboxed").to_string(), ToolContext::new()),
+        handler(&args(script, "default").to_string(), ToolContext::new()),
     )
     .await
     .expect("the call finishes within its bound");
@@ -216,7 +216,7 @@ async fn an_ast_grep_hook_blocks_nested_matches_and_allows_a_non_match() {
         "echo $(rm -rf /nowhere/substitution)",
         "rm -rf /nowhere/plain",
     ] {
-        let refusal = run(&terminal, nested, "sandboxed")
+        let refusal = run(&terminal, nested, "default")
             .await
             .expect_err(&format!("`{nested}` is blocked"));
         assert!(
@@ -228,7 +228,7 @@ async fn an_ast_grep_hook_blocks_nested_matches_and_allows_a_non_match() {
     let output = run(
         &terminal,
         "echo rm -rf is only text; echo ran-ok",
-        "sandboxed",
+        "default",
     )
     .await
     .expect("a non-match runs");
@@ -260,7 +260,7 @@ async fn a_background_command_is_gated_too() {
     )
     .await;
 
-    let mut background = args("echo $(rm -rf /nowhere)", "sandboxed");
+    let mut background = args("echo $(rm -rf /nowhere)", "default");
     background["timeout"] = 30.into();
     let arguments = serde_json::from_value(background).unwrap();
     let refusal = tokio::time::timeout(BOUND, terminal.run_background(arguments))
@@ -373,7 +373,7 @@ async fn a_command_hook_that_fails_blocks_the_command_naming_the_failure() {
     for (hook, failure) in cases {
         let name = hook.name.clone();
         let (terminal, _) = terminal(&tools, work.path(), SandboxOnly::default(), vec![hook]).await;
-        let refusal = run(&terminal, "echo should-not-run", "sandboxed")
+        let refusal = run(&terminal, "echo should-not-run", "default")
             .await
             .expect_err(&format!("the failing hook `{name}` blocks"));
         assert!(
@@ -456,7 +456,7 @@ printf '{"decision":"allow"}'
     .await;
     let prepared = terminal.shell_sessions().local_tools().unwrap().bin_dir();
 
-    run(&terminal, "echo ok", "sandboxed")
+    run(&terminal, "echo ok", "default")
         .await
         .expect("the hook allows");
 
