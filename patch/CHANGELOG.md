@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0](https://github.com/May-Agent/aither/compare/patch-v0.25.0...patch-v0.26.0) - 2026-11-09
+
+### Other
+
+- report cargo build timings and upload them per job
+
 ## [0.23.0](https://github.com/May-Agent/aither/compare/patch-v0.22.0...patch-v0.23.0) - 2026-11-07
 
 ### Added
