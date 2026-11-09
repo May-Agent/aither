@@ -1,0 +1,9 @@
+Host {{ alias }}
+  HostName 127.0.0.1
+  Port {{ port }}
+  User {{ user }}
+  IdentityFile {{ identity }}
+  IdentitiesOnly yes
+  UserKnownHostsFile /dev/null
+  StrictHostKeyChecking no
+  LogLevel ERROR

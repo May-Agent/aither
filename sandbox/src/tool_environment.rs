@@ -1,19 +1,16 @@
 use std::path::{Path, PathBuf};
-
-use futures::{StreamExt, TryStreamExt, stream};
+use std::sync::Arc;
 
 use crate::ContainerPath;
-use crate::shell_session::{
-    ShellBackend, ShellSessionRegistry, SshRuntimeProfile, SshServer, SshSessionAuthorizer,
-    bootstrap_ssh_runtime,
-};
+use crate::shell_session::{ShellBackend, ShellSessionRegistry};
+use crate::ssh::{PreparedSsh, SshEnvironment};
 use crate::tool_distribution::ToolDistribution;
 use crate::tool_runtime::{
     PreparedEnvironment, PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget,
 };
 use crate::tool_transport::{
-    ContainerToolTransport, LocalToolTransport, SshToolTransport, ensure_command_line_tools,
-    probe_tool_environment,
+    ContainerToolTransport, LocalToolTransport, SshToolTransport, ToolTransport,
+    ensure_command_line_tools, probe_tool_environment, successful_output,
 };
 
 /// The home backend's tools, typed by where that backend sees them.
@@ -42,120 +39,93 @@ impl PreparedHome {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PreparedSsh {
-    server: SshServer,
-    runtime: SshRuntimeProfile,
-    tools: PreparedTools<PathBuf>,
+/// What preparing an SSH server on its first command draws on: the
+/// distribution the home environment was prepared from and its cache.
+#[derive(Debug)]
+struct ToolSource {
+    distribution: ToolDistribution,
+    cache_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 pub struct PreparedToolEnvironments {
-    home: Option<PreparedHome>,
-    ssh: Vec<PreparedSsh>,
+    home: PreparedHome,
     catalog: ToolCatalog,
+    /// `None` only for registries tests prepare by hand.
+    source: Option<Arc<ToolSource>>,
 }
 
 impl ShellSessionRegistry {
-    /// Prepares every configured environment before an agent can use this registry.
+    /// Prepares the home environment before an agent can use this registry.
+    ///
+    /// SSH servers are not prepared here: each is prepared on its first
+    /// command, from the same distribution and cache.
     ///
     /// # Errors
-    /// Fails on unsupported platforms, missing artifacts, denied SSH provisioning,
-    /// integrity failures or inconsistent command versions across environments.
+    /// Fails on unsupported platforms, missing artifacts, integrity failures
+    /// and a registry with no home backend.
     pub async fn initialize_tools(
         mut self,
         distribution: &ToolDistribution,
         cache_root: &Path,
     ) -> Result<Self, ToolRuntimeError> {
         let availability = self.availability();
-        let home = async {
-            if availability.container {
-                let runtime = self
-                    .container_runtime()
-                    .cloned()
-                    .ok_or(ToolRuntimeError::MissingContainerRuntime)?;
-                let transport = ContainerToolTransport::new(runtime.clone());
-                let info = probe_tool_environment(&transport).await?;
-                let tools = distribution
-                    .image_tools(&info.target)?
-                    .verify(&transport)
-                    .await?;
-                Ok::<_, ToolRuntimeError>(Some(PreparedHome::Container {
-                    container_id: runtime.container_id().into(),
-                    tools,
-                }))
-            } else if availability.local {
-                let target = ToolTarget::native()?;
-                ensure_command_line_tools(&LocalToolTransport, &target).await?;
-                let bundle = distribution
-                    .load(&target, &cache_root.join("artifacts"))
-                    .await?;
-                let tools = bundle.prepare_local(&cache_root.join("runtimes")).await?;
-                Ok(Some(PreparedHome::Local(tools)))
-            } else {
-                Ok(None)
+        let home = if availability.container {
+            let runtime = self
+                .container_runtime()
+                .cloned()
+                .ok_or(ToolRuntimeError::MissingContainerRuntime)?;
+            let transport = ContainerToolTransport::new(runtime.clone());
+            let info = probe_tool_environment(&transport).await?;
+            let tools = distribution
+                .image_tools(&info.target)?
+                .verify(&transport)
+                .await?;
+            PreparedHome::Container {
+                container_id: runtime.container_id().into(),
+                tools,
             }
+        } else if availability.local {
+            let target = ToolTarget::native()?;
+            ensure_command_line_tools(&LocalToolTransport, &target).await?;
+            let bundle = distribution
+                .load(&target, &cache_root.join("artifacts"))
+                .await?;
+            PreparedHome::Local(bundle.prepare_local(&cache_root.join("runtimes")).await?)
+        } else {
+            return Err(ToolRuntimeError::NotInitialized(
+                "no configured home environment".into(),
+            ));
         };
-        let remote = async {
-            if !availability.ssh {
-                return Ok::<_, ToolRuntimeError>(Vec::new());
-            }
-            let authorizer = self.ssh_authorizer();
-            stream::iter(self.list_ssh_servers())
-                .map(|server| {
-                    let authorizer = authorizer.clone();
-                    async move {
-                        let runtime = bootstrap_ssh_runtime(&server.target, &authorizer).await.map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?;
-                        let transport = SshToolTransport::new(server.clone());
-                        let info = probe_tool_environment(&transport).await?;
-                        ensure_command_line_tools(&transport, &info.target).await?;
-                        let bundle = distribution.load(&info.target, &cache_root.join("artifacts")).await?;
-                        let tools = bundle.prepare_remote(&transport, &info.cache_root, || async {
-                            let authorizer = authorizer.as_ref().ok_or_else(|| ToolRuntimeError::InstallDenied(server.target.clone()))?;
-                            let approved = authorizer.authorize_runtime_install(&server.target, "Prepare verified apply_patch, rg, ast-grep and jq in the managed tools directory.").await.map_err(ToolRuntimeError::Authorization)?;
-                            if !approved { return Err(ToolRuntimeError::InstallDenied(server.target.clone())); }
-                            Ok(())
-                        }).await?;
-                        Ok(PreparedSsh { server, runtime, tools })
-                    }
-                })
-                .buffer_unordered(4)
-                .try_collect::<Vec<_>>()
-                .await
-        };
-        let (home, mut ssh) = futures::try_join!(home, remote)?;
-        ssh.sort_by(|left, right| left.server.id().cmp(right.server.id()));
-        let catalog = home
-            .as_ref()
-            .map(PreparedHome::catalog)
-            .or_else(|| ssh.first().map(|ssh| ssh.tools.catalog()))
-            .ok_or_else(|| {
-                ToolRuntimeError::NotInitialized("no configured execution environment".into())
-            })?
-            .clone();
-        if ssh.iter().any(|ssh| ssh.tools.catalog() != &catalog) {
-            return Err(ToolRuntimeError::CatalogMismatch);
-        }
-        self.prepared_tools = Some(PreparedToolEnvironments { home, ssh, catalog });
+        let catalog = home.catalog().clone();
+        self.prepared_tools = Some(PreparedToolEnvironments {
+            home,
+            catalog,
+            source: Some(Arc::new(ToolSource {
+                distribution: distribution.clone(),
+                cache_root: cache_root.to_path_buf(),
+            })),
+        });
         Ok(self)
     }
 
-    /// Prepared environments, provided they are exactly the configured backends.
+    /// Prepared environments, provided they are exactly the configured home
+    /// backend.
     ///
-    /// Preparation is bound to the home backend, the container it mounted
-    /// into and the SSH server set; a registry whose configuration changed
-    /// after preparation describes environments nobody prepared.
+    /// Preparation is bound to the home backend and the container it mounted
+    /// into; a registry whose home changed after preparation describes an
+    /// environment nobody prepared.
     fn prepared_environments(&self) -> Result<&PreparedToolEnvironments, ToolRuntimeError> {
         let prepared = self
             .prepared_tools
             .as_ref()
             .ok_or_else(|| ToolRuntimeError::NotInitialized("execution environments".into()))?;
-        if prepared.home.as_ref().map(PreparedHome::backend) != self.resolve_local_backend().ok() {
+        if Some(prepared.home.backend()) != self.resolve_local_backend().ok() {
             return Err(ToolRuntimeError::EnvironmentChanged(
                 PreparedEnvironment::HomeBackend,
             ));
         }
-        if let Some(PreparedHome::Container { container_id, .. }) = prepared.home.as_ref()
+        if let PreparedHome::Container { container_id, .. } = &prepared.home
             && self
                 .container_runtime()
                 .map(crate::ContainerShellRuntime::container_id)
@@ -163,22 +133,6 @@ impl ShellSessionRegistry {
         {
             return Err(ToolRuntimeError::EnvironmentChanged(
                 PreparedEnvironment::Container,
-            ));
-        }
-        let mut configured = if self.availability().ssh {
-            self.ssh_servers().iter().collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        configured.sort_by(|left, right| left.id().cmp(right.id()));
-        if !prepared
-            .ssh
-            .iter()
-            .map(|ready| &ready.server)
-            .eq(configured)
-        {
-            return Err(ToolRuntimeError::EnvironmentChanged(
-                PreparedEnvironment::SshServers,
             ));
         }
         Ok(prepared)
@@ -197,17 +151,19 @@ impl ShellSessionRegistry {
     /// the host runs.
     pub fn local_tools(&self) -> Result<&PreparedTools<PathBuf>, ToolRuntimeError> {
         match &self.prepared_environments()?.home {
-            Some(PreparedHome::Local(tools)) => Ok(tools),
-            _ => Err(ToolRuntimeError::NotInitialized("local environment".into())),
+            PreparedHome::Local(tools) => Ok(tools),
+            PreparedHome::Container { .. } => {
+                Err(ToolRuntimeError::NotInitialized("local environment".into()))
+            }
         }
     }
 
     /// Baseline tools runnable on the host, for programs the host itself runs.
     ///
     /// A local home backend's prepared tools are returned as they are. When
-    /// the home backend is a container, or there is none, its tools target
-    /// another platform, so the same distribution prepares the host target
-    /// into the same cache with the same pinning and verification.
+    /// the home backend is a container, its tools target another platform,
+    /// so the same distribution prepares the host target into the same cache
+    /// with the same pinning and verification.
     ///
     /// # Errors
     /// Rejects an uninitialized registry and one whose configuration changed
@@ -218,7 +174,7 @@ impl ShellSessionRegistry {
         distribution: &ToolDistribution,
         cache_root: &Path,
     ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
-        if let Some(PreparedHome::Local(tools)) = &self.prepared_environments()?.home {
+        if let PreparedHome::Local(tools) = &self.prepared_environments()?.home {
             return Ok(tools.clone());
         }
         distribution
@@ -232,30 +188,53 @@ impl ShellSessionRegistry {
         &self,
     ) -> Result<&PreparedTools<ContainerPath>, ToolRuntimeError> {
         match &self.prepared_environments()?.home {
-            Some(PreparedHome::Container { tools, .. }) => Ok(tools),
-            _ => Err(ToolRuntimeError::NotInitialized(
+            PreparedHome::Container { tools, .. } => Ok(tools),
+            PreparedHome::Local(_) => Err(ToolRuntimeError::NotInitialized(
                 "container environment".into(),
             )),
         }
     }
 
-    pub(crate) fn ssh_tools(
+    /// The server's tools and `heel`, prepared the first time a command
+    /// needs them: concurrent first commands wait for one preparation, and a
+    /// failed one is tried again by the next command.
+    pub(crate) async fn ssh_tools<'e>(
         &self,
-        server: &SshServer,
-    ) -> Result<(&SshRuntimeProfile, &PreparedTools<PathBuf>), ToolRuntimeError> {
-        self.prepared_environments()?
-            .ssh
-            .iter()
-            .find(|ready| &ready.server == server)
-            .map(|ready| (&ready.runtime, &ready.tools))
-            .ok_or_else(|| ToolRuntimeError::NotInitialized(server.id().into()))
+        environment: &'e SshEnvironment,
+    ) -> Result<&'e PreparedSsh, ToolRuntimeError> {
+        let prepared = self.prepared_environments()?;
+        let catalog = prepared.catalog.clone();
+        let source = prepared.source.clone();
+        let client = self.ssh_environments().client().clone();
+        environment
+            .prepared(|| async move {
+                let source = source.ok_or_else(|| {
+                    ToolRuntimeError::NotInitialized("the tool distribution".into())
+                })?;
+                let transport = SshToolTransport::over(client, environment.server().clone());
+                let info = probe_tool_environment(&transport).await?;
+                ensure_command_line_tools(&transport, &info.target).await?;
+                let bundle = source
+                    .distribution
+                    .load(&info.target, &source.cache_root.join("artifacts"))
+                    .await?;
+                let (tools, heel) = futures::try_join!(
+                    bundle.prepare_remote(&transport, &info.cache_root),
+                    remote_heel(&transport, &info.target),
+                )?;
+                if tools.catalog() != &catalog {
+                    return Err(ToolRuntimeError::CatalogMismatch);
+                }
+                Ok(PreparedSsh { heel, tools })
+            })
+            .await
     }
 
     /// Catalog derived only from environments that completed initialization.
     ///
     /// # Errors
-    /// Rejects an uninitialized registry, or one whose home backend, container
-    /// or SSH server set changed after preparation.
+    /// Rejects an uninitialized registry, or one whose home backend or
+    /// container changed after preparation.
     pub fn prepared_catalog(&self) -> Result<&ToolCatalog, ToolRuntimeError> {
         self.prepared_environments()
             .map(|prepared| &prepared.catalog)
@@ -282,34 +261,73 @@ impl ShellSessionRegistry {
     fn with_test_home(mut self, home: PreparedHome) -> Self {
         let catalog = home.catalog().clone();
         self.prepared_tools = Some(PreparedToolEnvironments {
-            home: Some(home),
-            ssh: Vec::new(),
+            home,
             catalog,
+            source: None,
         });
         self
     }
 
-    /// Records `server` as prepared with `tools`, as SSH bootstrap would.
+    /// Adds `server` already prepared with `tools` and `heel`, as its first
+    /// command would leave it; its approval is still asked.
     #[cfg(test)]
     pub(crate) fn with_test_ssh(
-        mut self,
-        server: SshServer,
+        self,
+        server: crate::SshServer,
+        heel: Option<String>,
         tools: PreparedTools<PathBuf>,
     ) -> Self {
-        let prepared = self
-            .prepared_tools
-            .as_mut()
-            .expect("prepare the home environment before an SSH server");
-        prepared.ssh.push(PreparedSsh {
-            server,
-            runtime: SshRuntimeProfile::Heel {
-                binary: "/usr/local/bin/heel".into(),
-            },
-            tools,
-        });
-        prepared
-            .ssh
-            .sort_by(|left, right| left.server.id().cmp(right.server.id()));
+        let name = server.name.clone();
+        self.add_ssh_server(server).expect("a test server is valid");
+        self.ssh_environments()
+            .get(&name)
+            .expect("the server was just added")
+            .set_prepared(PreparedSsh { heel, tools });
         self
     }
+}
+
+/// The server's `heel`: the one it has, or this host's copied there when the
+/// server runs this host's platform; `None` when neither holds.
+async fn remote_heel(
+    transport: &SshToolTransport,
+    target: &ToolTarget,
+) -> Result<Option<String>, ToolRuntimeError> {
+    let found = successful_output(
+        transport
+            .run(include_str!("../templates/ssh_heel_probe.sh"), None)
+            .await?,
+    )?;
+    if let Some(path) = found.lines().next() {
+        return Ok(Some(path.to_string()));
+    }
+    if *target != ToolTarget::native()? {
+        return Ok(None);
+    }
+    let Some(local) = local_heel().await? else {
+        return Ok(None);
+    };
+    let binary = async_fs::read(&local).await?;
+    let installed = successful_output(
+        transport
+            .run(
+                include_str!("../templates/ssh_heel_install.sh"),
+                Some(binary),
+            )
+            .await?,
+    )?;
+    let path = installed
+        .lines()
+        .next()
+        .ok_or(ToolRuntimeError::InvalidProbe)?;
+    Ok(Some(path.to_string()))
+}
+
+/// The `heel` on this host's `PATH`, when there is one.
+async fn local_heel() -> Result<Option<PathBuf>, ToolRuntimeError> {
+    let output = LocalToolTransport
+        .run("command -v heel || true", None)
+        .await?;
+    let path = successful_output(output)?;
+    Ok(path.lines().next().map(PathBuf::from))
 }
