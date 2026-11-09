@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0](https://github.com/May-Agent/aither/compare/agent-v0.27.0...agent-v0.28.0) - 2026-11-09
+
+### Added
+
+- *(agent)* [**breaking**] emit compaction start and finish events
+
+### Other
+
+- Merge pull request #677 from May-Agent/chore/back-merge-0.27
+
 ## [0.27.0](https://github.com/May-Agent/aither/compare/agent-v0.26.0...agent-v0.27.0) - 2026-11-09
 
 ### Added
