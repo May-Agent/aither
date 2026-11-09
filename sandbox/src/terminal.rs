@@ -2154,9 +2154,9 @@ where
     ///
     /// A container command's fifo is made inside the container, where its
     /// `MAKEFLAGS` names it, and brokered against the same pool by a relay
-    /// run with the image's managed `python3`, with the same accounting. SSH
-    /// commands fail while a pool is configured rather than running
-    /// unbounded.
+    /// run with the image's managed `python3`, with the same accounting. An
+    /// SSH command runs on another machine, outside the pool: it takes no
+    /// token and gets no fifo.
     ///
     /// # Errors
     /// Returns an error when the fifo directory cannot be created or the
@@ -4624,14 +4624,8 @@ where
             heel,
             tools,
         } => {
-            // The remote host is outside the pool's reach; running there
-            // unbounded would defeat it.
-            #[cfg(all(unix, feature = "jobserver"))]
-            if request.jobserver.is_some() {
-                return Err(TerminalError::Execution(
-                    "jobserver token pools are not supported for SSH executions".into(),
-                ));
-            }
+            // The pool bounds the jobs of this machine; the server is another
+            // machine, so its commands take no token and get no fifo.
             return execute_ssh_background(SshBackgroundExecution {
                 prepared_tools: tools,
                 task_id: request.task_id,

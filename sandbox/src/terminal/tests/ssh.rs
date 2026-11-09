@@ -566,3 +566,51 @@ async fn the_public_probe_reports_an_unreachable_server() {
     .expect_err("nothing answers");
     assert!(matches!(error, SshProbeError::Failed { .. }), "{error}");
 }
+
+/// The pool bounds this machine's jobs: a server's command runs outside it,
+/// while a local command of the same terminal still draws from it.
+#[cfg(feature = "jobserver")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
+    let sshd = Sshd::start().await;
+    let artifacts = tempfile::tempdir().unwrap();
+    let distribution = script_distribution(artifacts.path()).await;
+    let cache = crate::tool_runtime::tests::unlocking_tempdir();
+    let registry = local_registry()
+        .with_ssh_client(sshd.client.clone())
+        .initialize_tools(&distribution, cache.path())
+        .await
+        .expect("the home prepares");
+    let dir = tempfile::tempdir().unwrap();
+    let pool_dir = tempfile::tempdir().unwrap();
+    let pool = crate::jobserver::JobPool::create_fifo(pool_dir.path().join("pool.fifo"), 2)
+        .expect("a pool");
+    let terminal = terminal(dir.path(), registry, CommandRole::Main)
+        .await
+        .with_jobserver_pool(pool, pool_dir.path().join("commands"))
+        .expect("the pool attaches");
+    terminal
+        .shell_sessions()
+        .add_ssh_server(Sshd::server())
+        .unwrap();
+    let script = "printenv MAKEFLAGS || echo jobs=none";
+
+    let remote = terminal
+        .call(
+            args(script, TerminalExecutionMode::Default, "fixture"),
+            ToolContext::new(),
+        )
+        .await
+        .expect("a server's command runs while a pool is configured");
+    let remote = render_terminal_result(&remote);
+    assert!(remote.contains("jobs=none"), "{remote}");
+
+    let mut local = args(script, TerminalExecutionMode::Default, "fixture");
+    local.location = None;
+    let local = terminal
+        .call(local, ToolContext::new())
+        .await
+        .expect("a local command runs");
+    let local = render_terminal_result(&local);
+    assert!(local.contains("--jobserver-auth=fifo:"), "{local}");
+}
