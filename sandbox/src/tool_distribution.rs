@@ -409,9 +409,10 @@ impl ToolDistribution {
         load_artifact(artifact, artifact_cache, self.github_token.as_ref()).await
     }
 
-    /// Prepares one host program for the host's platform and returns the path
-    /// of its read-only executable, with the same pinning, download and
-    /// verification as the sandbox commands.
+    /// Prepares one host program for `target` and returns the path of its
+    /// read-only executable, with the same pinning, download and
+    /// verification as the sandbox commands. A target other than the host's
+    /// yields a file the host does not run, such as one streamed to a server.
     ///
     /// Archives are cached under `<cache_root>/artifacts` and executables
     /// under `<cache_root>/bin/<executable sha256>/<command>`. When that
@@ -422,8 +423,7 @@ impl ToolDistribution {
     /// # Errors
     /// Fails with [`ToolRuntimeError::MissingHostProgram`] naming the program
     /// and target when the distribution has no artifact for it,
-    /// [`ToolRuntimeError::TargetMismatch`] when `target` is not the host's
-    /// platform, [`ToolRuntimeError::Integrity`] when the extracted executable
+    /// [`ToolRuntimeError::Integrity`] when the extracted executable
     /// does not have the pinned digest, and on a failed download, archive
     /// digest mismatch, unsafe archive member or I/O failure.
     pub async fn prepare_host_program(
@@ -446,9 +446,6 @@ impl ToolDistribution {
             })?;
         if selected.next().is_some() {
             return Err(ToolRuntimeError::DuplicateHostProgram { program, os, arch });
-        }
-        if *target != ToolTarget::native()? {
-            return Err(ToolRuntimeError::TargetMismatch);
         }
         let mut executable_sha256 = [0; 32];
         hex::decode_to_slice(&pinned.executable_sha256, &mut executable_sha256)?;

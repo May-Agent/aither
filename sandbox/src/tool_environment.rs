@@ -227,7 +227,7 @@ impl ShellSessionRegistry {
                     .await?;
                 let (tools, heel) = futures::try_join!(
                     bundle.prepare_remote(&transport, &info.cache_root),
-                    remote_heel(&transport, &info.target),
+                    remote_heel(&transport, &info.target, &source),
                 )?;
                 if tools.catalog() != &catalog {
                     return Err(ToolRuntimeError::CatalogMismatch);
@@ -294,11 +294,16 @@ impl ShellSessionRegistry {
     }
 }
 
-/// The server's `heel`: the one it has, or this host's copied there when the
-/// server runs this host's platform; `None` when neither holds.
+/// The server's `heel`: the one it has, or the distribution's pinned `heel`
+/// for the server's own target, installed there.
+///
+/// # Errors
+/// Fails when the server has no `heel` and the distribution pins none for its
+/// target.
 async fn remote_heel(
     transport: &SshToolTransport,
     target: &ToolTarget,
+    source: &ToolSource,
 ) -> Result<Option<String>, ToolRuntimeError> {
     let found = successful_output(
         transport
@@ -308,13 +313,11 @@ async fn remote_heel(
     if let Some(path) = found.lines().next() {
         return Ok(Some(path.to_string()));
     }
-    if *target != ToolTarget::native()? {
-        return Ok(None);
-    }
-    let Some(local) = local_heel().await? else {
-        return Ok(None);
-    };
-    let binary = async_fs::read(&local).await?;
+    let local = source
+        .distribution
+        .prepare_host_program(HostProgram::Heel, target, &source.cache_root)
+        .await?;
+    let binary = async_fs::read(local.path()).await?;
     let installed = successful_output(
         transport
             .run(
@@ -328,13 +331,4 @@ async fn remote_heel(
         .next()
         .ok_or(ToolRuntimeError::InvalidProbe)?;
     Ok(Some(path.to_string()))
-}
-
-/// The `heel` on this host's `PATH`, when there is one.
-async fn local_heel() -> Result<Option<PathBuf>, ToolRuntimeError> {
-    let output = LocalToolTransport
-        .run("command -v heel || true", None)
-        .await?;
-    let path = successful_output(output)?;
-    Ok(path.lines().next().map(PathBuf::from))
 }

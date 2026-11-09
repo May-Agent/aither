@@ -77,8 +77,8 @@ pub enum PermissionRequest<'a> {
     },
     /// The first command on an SSH server: whether commands may run there at
     /// all. Approving it lets the terminal connect and prepare the server:
-    /// the managed tools in its cache directory and, when it has no `heel`
-    /// but runs this host's platform, this host's `heel` in
+    /// the managed tools in its cache directory and, when it has no `heel`,
+    /// the distribution's pinned `heel` for its platform in
     /// `~/.local/bin`. Once approved, the server's later commands, a
     /// subagent's included, are not asked about again while it stays in the
     /// registry; each still passes the admission its mode needs.
