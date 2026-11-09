@@ -32,25 +32,21 @@ impl SharedHeelBinary {
             .map_err(ToolRuntimeError::Heel)
     }
 
-    /// The provided binary.
-    pub(crate) async fn get(&self) -> Result<HeelBinary, ToolRuntimeError> {
-        if let Some(binary) = self.0.get() {
-            return Ok(binary.clone());
-        }
-        self.unprovided().await
-    }
-
-    /// Without initialized tools, production has no binary; tests take the
-    /// one the repository's distribution pins, as an embedder would.
+    /// The provided binary. Without initialized tools, production has none;
+    /// tests take the one the repository's distribution pins, as an embedder
+    /// would.
     #[cfg(not(any(test, feature = "test-heel")))]
-    fn unprovided(&self) -> std::future::Ready<Result<HeelBinary, ToolRuntimeError>> {
-        std::future::ready(Err(ToolRuntimeError::NotInitialized(
-            "the heel binary: initialize the terminal's tools".into(),
-        )))
+    pub(crate) fn get(&self) -> std::future::Ready<Result<HeelBinary, ToolRuntimeError>> {
+        std::future::ready(self.0.get().cloned().ok_or_else(|| {
+            ToolRuntimeError::NotInitialized(
+                "the heel binary: initialize the terminal's tools".into(),
+            )
+        }))
     }
 
+    /// The provided binary, or the distribution's pinned one in tests.
     #[cfg(any(test, feature = "test-heel"))]
-    async fn unprovided(&self) -> Result<HeelBinary, ToolRuntimeError> {
+    pub(crate) async fn get(&self) -> Result<HeelBinary, ToolRuntimeError> {
         self.0
             .get_or_try_init(crate::test_heel::pinned)
             .await
