@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0](https://github.com/May-Agent/aither/compare/claude-v0.24.0...claude-v0.25.0) - 2026-11-08
+
+### Added
+
+- exact token counting per model for the context budget
+
 ## [0.23.0](https://github.com/May-Agent/aither/compare/claude-v0.22.0...claude-v0.23.0) - 2026-11-07
 
 ### Fixed
