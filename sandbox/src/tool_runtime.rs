@@ -1612,6 +1612,12 @@ pub enum ToolRuntimeError {
     /// Artifact transfer failed.
     #[error(transparent)]
     Download(#[from] zenwave::Error),
+    /// The GitHub release API answered with something that is not a release.
+    #[error("GitHub release metadata is malformed: {0}")]
+    ReleaseMetadata(serde_json::Error),
+    /// The tagged release has no asset of the pinned name.
+    #[error("GitHub release has no asset named {0}")]
+    ReleaseAssetMissing(String),
     /// Artifact checksum is not a SHA-256 hexadecimal value.
     #[error(transparent)]
     Digest(#[from] hex::FromHexError),

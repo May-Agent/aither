@@ -39,6 +39,10 @@ jobs:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      # The sandbox tests download pinned tools from GitHub releases; the job
+      # token authenticates them.
+      GITHUB_TOKEN: ${{ github.token }}
     strategy:
       # One platform failing must not hide the others: a sandbox that behaves
       # differently on Linux than on macOS is exactly what this matrix is for,

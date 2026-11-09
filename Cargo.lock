@@ -584,6 +584,7 @@ dependencies = [
  "lzma-rust2 0.24.0",
  "magika",
  "ort",
+ "percent-encoding",
  "polling",
  "regex",
  "rmp-serde",
