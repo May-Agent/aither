@@ -456,6 +456,20 @@ impl HostProgramPath {
         let path = Self::location(root, program, target, sha256)?;
         let directory = path.parent().ok_or(ToolRuntimeError::InvalidArchive)?;
         std::fs::create_dir_all(directory)?;
+        // Preparers in other processes write the same executable; replacing
+        // one a peer is running or has just made read-only fails on Windows.
+        let mut lock = fd_lock::RwLock::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(root.join(format!(".{}.lock", hex::encode(sha256))))?,
+        );
+        let _guard = lock.write()?;
+        // A preparer holding the lock before us has already provided it.
+        if Self::is_prepared(&path, sha256)? {
+            return Ok(Self(path));
+        }
         let mut stage = tempfile::NamedTempFile::new_in(directory)?;
         std::io::Write::write_all(&mut stage, bytes)?;
         drop(stage.persist(&path).map_err(|error| error.error)?);

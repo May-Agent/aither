@@ -43,11 +43,10 @@ impl SharedHeelBinary {
     /// Without initialized tools, production has no binary; tests take the
     /// one the repository's distribution pins, as an embedder would.
     #[cfg(not(any(test, feature = "test-heel")))]
-    #[allow(clippy::unused_async)]
-    async fn unprovided(&self) -> Result<HeelBinary, ToolRuntimeError> {
-        Err(ToolRuntimeError::NotInitialized(
+    fn unprovided(&self) -> std::future::Ready<Result<HeelBinary, ToolRuntimeError>> {
+        std::future::ready(Err(ToolRuntimeError::NotInitialized(
             "the heel binary: initialize the terminal's tools".into(),
-        ))
+        )))
     }
 
     #[cfg(any(test, feature = "test-heel"))]

@@ -7237,7 +7237,7 @@ mod tests {
             tools
                 .verify_local_versions(
                     executor_core::tokio::TokioGlobal,
-                    heel::HeelBinary::locate().unwrap(),
+                    crate::test_heel::pinned().await.unwrap(),
                 )
                 .await,
             Err(ToolRuntimeError::VersionMismatch(_))
