@@ -63,7 +63,7 @@ export RUSTFLAGS="${flags[*]-} ${linker_flags[*]-}"
 export CARGO_TARGET_DIR="$out_dir/build"
 
 cargo +"$nightly" build "${packages[@]}" --profile artifact \
-    --target "$target" -Zbuild-std=std,panic_abort \
+    --target "$target" -Zbuild-std=std,panic_abort --timings \
     --manifest-path "$root/Cargo.toml"
 
 mkdir -p "$out_dir"

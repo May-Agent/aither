@@ -2070,6 +2070,22 @@ where
         self
     }
 
+    /// Denies sandboxed local commands reading these absolute paths and
+    /// everything beneath them, in addition to heel's credential table
+    /// (`~/.ssh`, `~/.config/gh`, keychains and other credential stores).
+    /// Every other path on the host is readable; writes stay limited to the
+    /// granted paths.
+    #[must_use]
+    pub fn with_read_denied_paths(
+        self,
+        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> Self {
+        for path in paths {
+            self.grants.deny_read(path.into());
+        }
+        self
+    }
+
     /// Injects extra environment variables into every command this tool
     /// spawns in the home environment.
     ///
@@ -3054,6 +3070,7 @@ where
                 working_dir: self.working_dir.clone(),
                 writable_paths: self.grants.snapshot().writable.clone(),
                 readable_paths: self.grants.snapshot().readable.clone(),
+                read_denied_paths: self.grants.snapshot().read_denied.clone(),
                 git_dir: self.grants.snapshot().git_dir,
                 env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
@@ -3905,6 +3922,7 @@ struct StandaloneExecution<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    read_denied_paths: Vec<PathBuf>,
     git_dir: GitDirAccess,
     env_source: Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
@@ -3940,6 +3958,7 @@ struct StandaloneStart<'a, P, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    read_denied_paths: &'a [PathBuf],
     git_dir: GitDirAccess,
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
@@ -3968,6 +3987,7 @@ struct LocalBackgroundExecution<'a, E> {
     working_dir: &'a Path,
     writable_paths: &'a [PathBuf],
     readable_paths: &'a [PathBuf],
+    read_denied_paths: &'a [PathBuf],
     git_dir: GitDirAccess,
     env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
     executor: E,
@@ -4107,6 +4127,7 @@ struct SpawnedTerminalTask<P, E> {
     working_dir: PathBuf,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    read_denied_paths: Vec<PathBuf>,
     git_dir: GitDirAccess,
     executor: E,
     registry: Arc<ToolRegistry>,
@@ -4155,6 +4176,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        read_denied_paths,
         git_dir,
         env_source,
         executor,
@@ -4197,6 +4219,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        read_denied_paths,
         git_dir,
         env_source,
         executor,
@@ -4300,6 +4323,7 @@ where
         working_dir,
         writable_paths,
         readable_paths,
+        read_denied_paths,
         git_dir,
         env_source,
         executor,
@@ -4341,6 +4365,7 @@ where
         working_dir: &working_dir,
         writable_paths: &writable_paths,
         readable_paths: &readable_paths,
+        read_denied_paths: &read_denied_paths,
         git_dir,
         env_source: &env_source,
         executor,
@@ -4403,6 +4428,7 @@ where
             grants: std::sync::Arc::new(GrantSet {
                 readable: readable_paths.clone(),
                 writable: writable_paths.clone(),
+                read_denied: read_denied_paths.clone(),
                 git_dir,
             }),
         };
@@ -4509,6 +4535,7 @@ where
         working_dir: request.working_dir,
         writable_paths: request.writable_paths,
         readable_paths: request.readable_paths,
+        read_denied_paths: request.read_denied_paths,
         git_dir: request.git_dir,
         env_source: request.env_source,
         executor: request.executor,
@@ -4979,6 +5006,17 @@ pub fn session_write_denylist(
     }
 }
 
+/// The paths a local sandbox must not read: heel's credential table plus the
+/// embedder's `denied` absolute paths. Everything else stays readable.
+#[cfg(not(windows))]
+fn session_read_denylist(denied: &[PathBuf]) -> heel::ReadDenylist {
+    denied
+        .iter()
+        .fold(heel::ReadDenylist::credentials(), |denylist, path| {
+            denylist.deny(path)
+        })
+}
+
 /// The toolchain directories a sandboxed build needs: package-manager
 /// installs, compilers, and their caches, each rwx since builds both run
 /// the binaries and write the caches. Credential files inside them stay
@@ -5008,8 +5046,13 @@ where
         .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
     let config_builder = SandboxConfig::builder().network(policy);
     // The Windows backend refuses a write denylist rather than run weaker.
+    // The same holds for the read denylist: reads are open everywhere except
+    // the credential table and the embedder's additions.
     #[cfg(not(windows))]
-    let config_builder = config_builder.write_denylist(write_denylist);
+    let config_builder = config_builder
+        .write_denylist(write_denylist)
+        .filesystem_strict(false)
+        .read_denylist(session_read_denylist(context.read_denied_paths));
     #[cfg(windows)]
     drop(write_denylist);
     let config_builder = config_builder
@@ -8763,6 +8806,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
+            read_denied_paths: Vec::new(),
             git_dir: GitDirAccess::ReadWrite,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
@@ -8881,6 +8925,7 @@ mod tests {
             working_dir,
             writable_paths,
             readable_paths,
+            read_denied_paths: Vec::new(),
             git_dir: GitDirAccess::ReadWrite,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
@@ -8943,6 +8988,7 @@ mod tests {
             GitDirAccess::ReadWrite,
             writable_paths,
             readable_paths,
+            Vec::new(),
             script,
         )
         .await
@@ -8955,6 +9001,7 @@ mod tests {
         git_dir: GitDirAccess,
         writable_paths: Vec<PathBuf>,
         readable_paths: Vec<PathBuf>,
+        read_denied_paths: Vec<PathBuf>,
         script: String,
     ) -> String {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -8977,6 +9024,7 @@ mod tests {
             working_dir: tool.working_dir().clone(),
             writable_paths,
             readable_paths,
+            read_denied_paths,
             git_dir,
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
@@ -9014,6 +9062,93 @@ mod tests {
         output_text(&result.stdout)
             .expect("inline stdout")
             .to_string()
+    }
+
+    /// A sandboxed command reads an ordinary file outside every granted path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandboxed_commands_read_outside_the_granted_paths() {
+        let outside = tempfile::tempdir().unwrap();
+        let file = std::fs::canonicalize(outside.path())
+            .unwrap()
+            .join("ordinary.txt");
+        std::fs::write(&file, "ordinary-content").unwrap();
+        let stdout = sandboxed_stdout(
+            Vec::new(),
+            Vec::new(),
+            format!("cat {} 2>&1; true", file.display()),
+        )
+        .await;
+        assert!(stdout.contains("ordinary-content"), "{stdout}");
+    }
+
+    /// The credential table applies by absolute path although the sandbox
+    /// sets `HOME` to the session directory. Checks the credential stores
+    /// that exist in the real home.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandboxed_commands_cannot_read_home_credentials() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        let stores: Vec<PathBuf> = [".ssh", ".config/gh"]
+            .into_iter()
+            .map(|store| home.join(store))
+            .filter(|store| store.is_dir())
+            .collect();
+        if stores.is_empty() {
+            eprintln!("no ~/.ssh or ~/.config/gh in this home; nothing to deny");
+            return;
+        }
+        for store in stores {
+            assert!(
+                std::fs::read_dir(&store).is_ok(),
+                "the host reads {}",
+                store.display()
+            );
+            let stdout = sandboxed_stdout(
+                Vec::new(),
+                Vec::new(),
+                format!("ls {} 2>&1; echo rc=$?", store.display()),
+            )
+            .await;
+            assert!(
+                stdout.contains("rc=1") || stdout.contains("rc=2"),
+                "{} must be unreadable: {stdout}",
+                store.display()
+            );
+            assert!(
+                stdout.to_lowercase().contains("not permitted")
+                    || stdout.to_lowercase().contains("denied"),
+                "{} must be refused by the sandbox: {stdout}",
+                store.display()
+            );
+        }
+    }
+
+    /// A path the embedder adds is denied, while a sibling stays readable.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandboxed_commands_cannot_read_embedder_denied_paths() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let fake_home = std::fs::canonicalize(fake_home.path()).unwrap();
+        let secret = fake_home.join("vault");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("key"), "vault-secret").unwrap();
+        std::fs::write(fake_home.join("notes"), "plain-notes").unwrap();
+        let stdout = sandboxed_stdout_with(
+            GitDirAccess::ReadWrite,
+            Vec::new(),
+            Vec::new(),
+            vec![secret.clone()],
+            format!(
+                "cat {}/key 2>&1; echo rc=$?; cat {}/notes 2>&1",
+                secret.display(),
+                fake_home.display()
+            ),
+        )
+        .await;
+        assert!(!stdout.contains("vault-secret"), "{stdout}");
+        assert!(!stdout.contains("rc=0"), "{stdout}");
+        assert!(stdout.contains("plain-notes"), "{stdout}");
     }
 
     /// Runs the host's `git` in `dir`; the caller's environment keeps the
@@ -9092,6 +9227,7 @@ mod tests {
         let stdout = sandboxed_stdout_with(
             GitDirAccess::ReadOnly,
             vec![linked.clone()],
+            Vec::new(),
             Vec::new(),
             script,
         )
@@ -9285,14 +9421,25 @@ mod tests {
             0
         );
 
+        // Reads are open under the read denylist policy, so the grant is
+        // probed by what it would make writable: the repository, directly and
+        // through git run in the forged worktree.
+        let planted = main.join(".git/forged_probe");
         let script = format!(
-            "cat {head} 2>&1 | head -c 200; git -C {forged} log -1 --format=%s 2>&1; true",
-            head = main.join(".git/HEAD").display(),
+            "echo x > {planted} 2>&1; git -C {forged} update-ref refs/heads/forged_probe HEAD 2>&1; \
+             git -C {direct} update-ref refs/heads/direct_probe HEAD 2>&1; true",
+            planted = planted.display(),
             forged = forged.display(),
+            direct = direct.display(),
         );
-        let stdout = sandboxed_stdout(writable, Vec::new(), script).await;
-        assert!(!stdout.contains("ref: refs/heads"), "{stdout}");
-        assert!(!stdout.lines().any(|line| line == "root"), "{stdout}");
+        sandboxed_stdout(writable, Vec::new(), script).await;
+        assert!(!planted.exists(), "the repository became writable");
+        for branch in ["forged_probe", "direct_probe"] {
+            assert!(
+                !main.join(".git/refs/heads").join(branch).exists(),
+                "git wrote {branch} into the repository through a forged pointer"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -13160,6 +13307,11 @@ mod tests {
         crate::subagent::tests::git_in(outside.path(), &["add", "secret.txt"]);
         crate::subagent::tests::git_in(outside.path(), &["commit", "-m", "secret commit"]);
         let secret = crate::subagent::tests::git_in(outside.path(), &["rev-parse", "HEAD"]);
+        // Reads are open except the denylist, so the other repository is
+        // unreadable to the subagent only by an embedder denial.
+        child
+            .grants()
+            .deny_read(std::fs::canonicalize(outside.path()).unwrap());
         assert_ne!(
             exit_code_of(
                 &child,
@@ -15146,14 +15298,19 @@ mod tests {
             0,
             "a runtime readable grant on the parent reaches the subagent"
         );
+        let denied_dir = tempfile::tempdir().expect("denied dir");
+        std::fs::write(denied_dir.path().join("d.txt"), "data").unwrap();
+        parent
+            .grants()
+            .deny_read(std::fs::canonicalize(denied_dir.path()).unwrap());
         assert_ne!(
             exit_code_of(
                 &child,
-                &format!("cat '{}'", writable_dir.path().join("w.txt").display())
+                &format!("cat '{}'", denied_dir.path().join("d.txt").display())
             )
             .await,
             0,
-            "a writable grant added after launch grants the parent's sandbox alone"
+            "a read denial added to the parent after launch reaches the subagent"
         );
         assert_ne!(
             exit_code_of(

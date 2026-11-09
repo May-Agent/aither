@@ -137,7 +137,7 @@ jobs:
         timeout-minutes: 5
         env:
           APPLY_PATCH_TEST_BIN: ${{ runner.temp }}/patch-artifacts/build/${{ matrix.target }}/artifact/apply_patch${{ matrix.suffix }}
-        run: cargo +stable test --locked -p aither-patch --test e2e
+        run: cargo +stable test --locked -p aither-patch --test e2e --timings
       - name: Verify the packaged aither-sed
         if: contains(fromJSON(steps.tools.outputs.tools), 'aither-sed')
         timeout-minutes: 5
@@ -180,3 +180,13 @@ jobs:
             ${{ runner.temp }}/patch-artifacts/*.tar.gz
             ${{ runner.temp }}/patch-artifacts/*.sha256
             ${{ runner.temp }}/patch-artifacts/*.json
+      # The rebuilt-std build writes to the script's target directory, the
+      # e2e test to the workspace's.
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-patch-artifact-${{ matrix.target }}-${{ matrix.abort }}
+          path: |
+            ${{ runner.temp }}/patch-artifacts/build/cargo-timings/
+            target/cargo-timings/
