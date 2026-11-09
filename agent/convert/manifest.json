@@ -1,0 +1,37 @@
+{
+  "hub": [
+    {
+      "repo_id": "alexneakameni/language_detection",
+      "revision": "41e397970e2e598b90837a3e2000d885e59414f3",
+      "files": {
+        "config.json": {
+          "size": 9399,
+          "git_blob_sha1": "8dff982c9f789c0d8accbd9f903fc1711e58c284"
+        },
+        "model.safetensors": {
+          "size": 97838484,
+          "sha256": "f977fe14d104079f0b2139601f7c821cde1a7935a5ca21337b853f30a8bafa35"
+        }
+      }
+    },
+    {
+      "repo_id": "onnx-community/language_detection-ONNX",
+      "revision": "859bc93be10a6f8ad4a070911a4caaa092cdcd2e",
+      "files": {
+        "onnx/model_int8.onnx": {
+          "size": 24714523,
+          "sha256": "ee8599c721d24f678ef10cee403f4deda3a40e7e237e9983b3df11bf3f34ec2e"
+        },
+        "tokenizer.json": {
+          "size": 1109464,
+          "git_blob_sha1": "9d723c74399dc2043ee353951e67c5e08b8c568d"
+        }
+      }
+    }
+  ],
+  "flores": {
+    "url": "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz",
+    "size": 25585843,
+    "sha256": "b8b0b76783024b85797e5cc75064eb83fc5288b41e9654dabc7be6ae944011f6"
+  }
+}

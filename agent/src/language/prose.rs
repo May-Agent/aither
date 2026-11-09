@@ -366,13 +366,20 @@ mod tests {
         name.parse().unwrap()
     }
 
-    /// The first paragraph not in `target`, the statistical cases decided by
-    /// the real detector.
-    fn judge_text(text: &str, target: &str) -> Option<usize> {
-        let detector = Detector::load().unwrap();
-        first_paragraph_not_in(text, language(target), |paragraph| {
-            detector.detect(paragraph).unwrap()
-        })
+    /// The real detector, deciding the statistical cases.
+    struct Judge(Detector);
+
+    impl Judge {
+        async fn load() -> Self {
+            Self(Detector::for_tests().await)
+        }
+
+        /// The first paragraph not in `target`.
+        fn text(&self, text: &str, target: &str) -> Option<usize> {
+            first_paragraph_not_in(text, language(target), |paragraph| {
+                self.0.detect(paragraph).unwrap()
+            })
+        }
     }
 
     /// The same, for text the deterministic rules settle: the detector must
@@ -425,29 +432,32 @@ mod tests {
         assert_eq!(settled(KO_VACCINE, "Japanese"), Some(1));
     }
 
-    #[test]
-    fn latin_script_paragraphs_go_to_the_detector() {
+    #[tokio::test]
+    async fn latin_script_paragraphs_go_to_the_detector() {
+        let judge = Judge::load().await;
         for (text, target) in [(EN_VACCINE, "English"), (FR_VACCINE, "French")] {
-            assert_eq!(judge_text(text, target), None, "{target}: {text}");
+            assert_eq!(judge.text(text, target), None, "{target}: {text}");
         }
-        assert_eq!(judge_text(EN_VACCINE, "French"), Some(1));
-        assert_eq!(judge_text(FR_VACCINE, "English"), Some(1));
-        assert_eq!(judge_text(EN_VACCINE, "Chinese"), Some(1));
-        assert_eq!(judge_text(ZH_HANT, "English"), Some(1));
+        assert_eq!(judge.text(EN_VACCINE, "French"), Some(1));
+        assert_eq!(judge.text(FR_VACCINE, "English"), Some(1));
+        assert_eq!(judge.text(EN_VACCINE, "Chinese"), Some(1));
+        assert_eq!(judge.text(ZH_HANT, "English"), Some(1));
     }
 
-    #[test]
-    fn kanji_only_japanese_without_cues_goes_to_the_detector() {
+    #[tokio::test]
+    async fn kanji_only_japanese_without_cues_goes_to_the_detector() {
+        let judge = Judge::load().await;
         // The articles of the 1946 constitution's renunciation of war, written
         // in kanji alone: no kana, no Hangul, no Chinese function word.
         let kanji = "日本国憲法第九条戦争放棄軍備及交戦権否認";
         assert_eq!(Counts::of(kanji).matrix(), Matrix::Han { weight: 40 });
-        assert_eq!(judge_text(kanji, "Japanese"), None);
-        assert_eq!(judge_text(kanji, "English"), Some(1));
+        assert_eq!(judge.text(kanji, "Japanese"), None);
+        assert_eq!(judge.text(kanji, "English"), Some(1));
     }
 
-    #[test]
-    fn english_inside_cjk_prose_is_an_insertion_of_any_length() {
+    #[tokio::test]
+    async fn english_inside_cjk_prose_is_an_insertion_of_any_length() {
+        let judge = Judge::load().await;
         // zho_Hans line 13 with a phrase inserted, and the same for Japanese
         // and Korean.
         let chinese =
@@ -461,29 +471,31 @@ mod tests {
         assert_eq!(settled(&korean, "Korean"), None);
         // An English sentence with a few Chinese words is English.
         let english = format!("{EN_ZMAPP} It is called 抗体鸡尾酒 in Chinese.");
-        assert_eq!(judge_text(&english, "English"), None);
-        assert_eq!(judge_text(&english, "Chinese"), Some(1));
+        assert_eq!(judge.text(&english, "English"), None);
+        assert_eq!(judge.text(&english, "Chinese"), Some(1));
     }
 
-    #[test]
-    fn a_paragraph_in_another_language_is_refused_and_named() {
+    #[tokio::test]
+    async fn a_paragraph_in_another_language_is_refused_and_named() {
+        let judge = Judge::load().await;
         let text = format!("{ZH_ZMAPP}\n\n{ZH_PALM}\n\n{EN_VACCINE}");
-        assert_eq!(judge_text(&text, "Chinese"), Some(3));
+        assert_eq!(judge.text(&text, "Chinese"), Some(3));
         let text = format!("{EN_ZMAPP}\n\n{ZH_ZMAPP}");
-        assert_eq!(judge_text(&text, "English"), Some(2));
+        assert_eq!(judge.text(&text, "English"), Some(2));
         // A Japanese paragraph in a Chinese text, though each reads as a
         // language of its own.
         let text = format!("{ZH_PALM}\n\n{JA_NSA}");
-        assert_eq!(judge_text(&text, "Chinese"), Some(2));
+        assert_eq!(judge.text(&text, "Chinese"), Some(2));
     }
 
-    #[test]
-    fn short_paragraphs_of_the_detector_are_not_judged() {
+    #[tokio::test]
+    async fn short_paragraphs_of_the_detector_are_not_judged() {
+        let judge = Judge::load().await;
         // The detector is unreliable on a short French line, so it is not asked.
         let fr_short = "Il l'a dit hier.";
         assert!(Counts::of(fr_short).other < JUDGED_WEIGHT);
         let text = format!("{EN_VACCINE}\n\n{fr_short}\n\n{EN_ZMAPP}");
-        assert_eq!(judge_text(&text, "English"), None);
+        assert_eq!(judge.text(&text, "English"), None);
         // A phrase of Latin words is never Chinese, whatever its length.
         let text = format!("{ZH_ZMAPP}\n\n{EN_SHORT}\n\n{ZH_PALM}");
         assert_eq!(settled(&text, "Chinese"), Some(2));
@@ -503,10 +515,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn code_between_paragraphs_still_counts_as_one_block_for_numbering() {
+    #[tokio::test]
+    async fn code_between_paragraphs_still_counts_as_one_block_for_numbering() {
+        let judge = Judge::load().await;
         let text = format!("{ZH_PALM}\n\n```\ncode\n\nmore\n```\n\n{EN_VACCINE}");
-        assert_eq!(judge_text(&text, "Chinese"), Some(3));
+        assert_eq!(judge.text(&text, "Chinese"), Some(3));
     }
 
     #[test]

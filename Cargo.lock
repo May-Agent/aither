@@ -130,6 +130,8 @@ dependencies = [
  "libc",
  "notify",
  "num-traits",
+ "ondevice",
+ "ondevice-coreml",
  "ort",
  "regex",
  "rustix",
@@ -144,7 +146,6 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
- "ureq",
  "url",
  "uuid",
  "windows-sys 0.61.2",
@@ -167,7 +168,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "url",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -211,7 +212,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -271,7 +272,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -330,7 +331,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -359,7 +360,7 @@ dependencies = [
  "tokio-test",
  "url",
  "wasm-bindgen-futures",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -409,7 +410,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -451,7 +452,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -481,7 +482,7 @@ dependencies = [
  "async-fs",
  "serde",
  "serde_json",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -504,7 +505,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -613,7 +614,7 @@ dependencies = [
  "uuid",
  "vte",
  "windows-sys 0.61.2",
- "zenwave",
+ "zenwave 0.7.1",
  "zip",
 ]
 
@@ -690,7 +691,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -708,7 +709,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "zenwave",
+ "zenwave 0.7.1",
 ]
 
 [[package]]
@@ -987,7 +988,7 @@ dependencies = [
  "arrow-select",
  "flatbuffers",
  "lz4_flex",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -2218,8 +2219,26 @@ version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
 dependencies = [
+ "percent-encoding",
  "time",
  "version_check",
+]
+
+[[package]]
+name = "cookie_store"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
+dependencies = [
+ "cookie",
+ "document-features",
+ "idna",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "time",
+ "url",
 ]
 
 [[package]]
@@ -3368,6 +3387,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-lookup"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "263c0ccfc6b3b6a93e959edad4f985779e76c0b36dbb2e13e3d27c690974adf1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "doctest-file"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4291,9 +4322,9 @@ dependencies = [
 
 [[package]]
 name = "http-kit"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae6c75e9030cb6c33d85e0f15c54f832496ef4a6cfdc80ad45b6e93149dd73a7"
+checksum = "bff6ef8e035130f9587ce10f3a3b6ca47e2fd7f30c035defc49d8250a6674f1b"
 dependencies = [
  "bytes",
  "bytestr",
@@ -5330,7 +5361,7 @@ dependencies = [
  "tokio",
  "tracing",
  "xxhash-rust",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6554,6 +6585,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-ml"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201b055e6acfa0f9f15568255d3f03ce2b54bc86d1814442dc69138e36813e18"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-core-services"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6576,6 +6618,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
  "objc2",
  "objc2-core-foundation",
 ]
@@ -6670,6 +6713,43 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "ondevice"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2ed3c861324ab4e50ef077681c748a179f6b63ea9200f12b46848f175e1899d"
+dependencies = [
+ "async-fs",
+ "async-io",
+ "blocking",
+ "const-hex",
+ "futures-lite",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "zenwave 0.8.0",
+ "zstd 0.14.3",
+]
+
+[[package]]
+name = "ondevice-coreml"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ec4af1d47db93f72f58d244b6a0a66d6c1a877db75219a510cd465e5f015bfd"
+dependencies = [
+ "block2",
+ "half",
+ "objc2",
+ "objc2-core-ml",
+ "objc2-foundation",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "onig"
@@ -8823,6 +8903,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
+ "js-sys",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -9640,9 +9721,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -10166,7 +10247,7 @@ dependencies = [
  "base64 0.22.1",
  "cfg_aliases",
  "dirs 6.0.0",
- "dns-lookup",
+ "dns-lookup 3.0.1",
  "executor-core",
  "futures-channel",
  "futures-io",
@@ -10202,6 +10283,61 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.5.0",
  "web-sys",
+]
+
+[[package]]
+name = "zenwave"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "469f30a767bca9ba0adfc5e0239f58122dfc6bfb5f6586fdfe7a6cc5cd92a8f0"
+dependencies = [
+ "anyhow",
+ "async-fs",
+ "async-io",
+ "async-lock",
+ "async-net",
+ "async-trait",
+ "base64 0.23.1",
+ "cfg_aliases",
+ "cookie_store",
+ "dirs 7.0.0",
+ "dns-lookup 4.0.2",
+ "executor-core",
+ "futures-channel",
+ "futures-io",
+ "futures-rustls",
+ "futures-util",
+ "gloo-timers 0.4.0",
+ "hickory-proto",
+ "hickory-resolver",
+ "http",
+ "http-body-util",
+ "http-kit",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "jni",
+ "jni-min-helper",
+ "js-sys",
+ "libc",
+ "ndk-context",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.21",
+ "time",
+ "tower-service",
+ "tracing",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
+ "web-sys",
+ "webpki-root-certs",
 ]
 
 [[package]]
@@ -10331,7 +10467,16 @@ version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
- "zstd-safe",
+ "zstd-safe 7.3.0",
+]
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+dependencies = [
+ "zstd-safe 8.2.0",
 ]
 
 [[package]]
@@ -10339,6 +10484,15 @@ name = "zstd-safe"
 version = "7.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]

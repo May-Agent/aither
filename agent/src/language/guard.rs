@@ -115,7 +115,7 @@ pub struct LanguageGuard {
     user: Arc<ArcSwap<Vec<Arc<str>>>>,
     alerts: async_channel::Sender<LanguageAlert>,
     raised: async_channel::Receiver<LanguageAlert>,
-    /// The statistical detector, loaded by the first check that needs it and
+    /// The statistical detector, loaded by [`prepare`](Self::prepare) and
     /// shared by the clones.
     detector: Arc<OnceLock<Detector>>,
 }
@@ -135,9 +135,8 @@ impl LanguageGuard {
     }
 
     /// Loads the language detector, downloading its model on the first use
-    /// on this machine. Without this call the first check that reaches the
-    /// detector does it, blocking on the network and the disk; a host calls
-    /// this at session start to take that wait and its failure there.
+    /// on this machine. A host calls this at session start, and a check that
+    /// reaches the detector before it has completed panics.
     ///
     /// # Errors
     ///
@@ -146,24 +145,31 @@ impl LanguageGuard {
         if self.detector.get().is_some() {
             return Ok(());
         }
-        let detector = blocking::unblock(Detector::load).await?;
+        let detector = Detector::load_async().await?;
         // A concurrent call may have stored its own; either serves.
         let _ = self.detector.set(detector);
         Ok(())
     }
 
+    /// [`prepare`](Self::prepare) through the tests' model source.
+    #[cfg(test)]
+    pub(crate) async fn prepare_for_tests(&self) {
+        let _ = self.detector.set(Detector::for_tests().await);
+    }
+
     /// The number of the first paragraph of `text` whose language is not
-    /// `target`. A check that reaches the detector loads it first.
+    /// `target`.
     ///
     /// # Panics
     ///
-    /// When the detector cannot be loaded or run; [`prepare`](Self::prepare)
-    /// is how a host learns of that beforehand.
+    /// When a paragraph reaches the detector before [`prepare`](Self::prepare)
+    /// has completed, or the detector cannot run.
     fn first_paragraph_not_in(&self, text: &str, target: Language) -> Option<usize> {
         prose::first_paragraph_not_in(text, target, |paragraph| {
             let detector = self
                 .detector
-                .get_or_init(|| Detector::load().unwrap_or_else(|error| panic!("{error}")));
+                .get()
+                .expect("LanguageGuard::prepare must complete before a check reaches the detector");
             detector
                 .detect(paragraph)
                 .unwrap_or_else(|error| panic!("{error}"))

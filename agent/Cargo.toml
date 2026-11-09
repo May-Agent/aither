@@ -10,6 +10,8 @@ description = "AI agent framework with planning, memory, and tool execution for 
 readme = "../README.md"
 keywords = ["ai", "agent", "llm", "planning"]
 categories = ["api-bindings"]
+# The model conversion tooling is not part of the crate.
+exclude = ["convert"]
 
 [dependencies]
 dunce = { version = "1.0.5", default-features = false }
@@ -53,14 +55,24 @@ similar = "3"
 uuid = { version = "1", features = ["v4"] }
 num-traits = "0.2"
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
-# The language detector runs a small ONNX model, downloaded on first use. `ort`
-# is held at rc.12 to match `magika`, which pins it exactly; `download-binaries`
-# obtains ONNX Runtime the way sandbox's `code-folding` does.
-ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
+# The language detector runs a small model, downloaded on first use through
+# `ondevice`'s pinned, verified store: Core ML on Apple platforms, ONNX Runtime
+# elsewhere (below).
+ondevice = { version = "0.0.1", optional = true, default-features = false, features = ["zenwave"] }
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 isolang = { version = "2.4", optional = true, default-features = false, features = ["english_names", "lowercase_names", "local_names"] }
-ureq = { version = "3.5.1", optional = true, default-features = false, features = ["rustls"] }
+# The per-user cache directory the model is kept in.
 dirs = { version = "6", optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# The compiled model is an archive.
+ondevice = { version = "0.0.1", optional = true, default-features = false, features = ["archive", "zenwave"] }
+ondevice-coreml = { version = "0.0.1", optional = true, default-features = false }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+# `ort` is held at rc.12 to match `magika`, which pins it exactly;
+# `download-binaries` obtains ONNX Runtime the way sandbox's `code-folding` does.
+ort = { version = "=2.0.0-rc.12", optional = true, default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["std", "time"] }
@@ -95,7 +107,7 @@ filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
 mcp = ["dep:aither-mcp"]
 skills = ["dep:aither-skills"]
-languages = ["dep:ort", "dep:tokenizers", "dep:isolang", "dep:ureq", "dep:dirs"]
+languages = ["dep:ondevice", "dep:ort", "dep:ondevice-coreml", "dep:tokenizers", "dep:isolang", "dep:dirs"]
 connectivity = ["dep:aither-connectivity", "aither-sandbox/connectivity"]
 full = ["websearch", "webfetch", "filesystem", "command", "mcp", "skills", "languages", "connectivity"]
 
