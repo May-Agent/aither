@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0](https://github.com/May-Agent/aither/compare/core-v0.26.0...core-v0.27.0) - 2026-11-09
+
+### Added
+
+- *(core)* [**breaking**] an id allocator leases a named word on claim
+
 ## [0.25.0](https://github.com/May-Agent/aither/compare/core-v0.24.0...core-v0.25.0) - 2026-11-08
 
 ### Added
