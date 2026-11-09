@@ -51,7 +51,14 @@ jobs:
 
       - name: Validate models crate
         if: steps.snapshot.outputs.changed == 'true'
-        run: cargo nextest run --package aither-models --all-features
+        run: cargo nextest run --package aither-models --all-features --timings
+
+      - name: Upload cargo timings
+        if: always() && steps.snapshot.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-update-models
+          path: target/cargo-timings/
 
       - name: Create pull request
         if: steps.snapshot.outputs.changed == 'true'
