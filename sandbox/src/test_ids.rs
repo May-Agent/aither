@@ -4,7 +4,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use aither_core::{AnyIdAllocator, IdAllocator, IdLease, IdsExhausted, WordAllocator};
+use aither_core::{
+    AnyIdAllocator, IdAllocator, IdLease, IdsExhausted, WordAllocator, WordUnavailable,
+};
 
 /// A lease on `word` alone, for tests that name a job themselves.
 pub fn lease(word: &str) -> IdLease {
@@ -68,6 +70,11 @@ impl IdAllocator for RecordingIds {
         record.leased.push(word.clone());
         drop(record);
         Ok(word)
+    }
+
+    /// Hands out its words only in order, so it claims none.
+    fn claim(&self, word: &str) -> Result<(), WordUnavailable> {
+        Err(WordUnavailable(word.to_string()))
     }
 
     fn release(&self, word: &str) {

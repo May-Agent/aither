@@ -176,8 +176,12 @@ fn distribution_of(
     python: &[serde_json::Value],
 ) -> aither_sandbox::ToolDistribution {
     aither_sandbox::ToolDistribution::from_json(
-        &serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts, "python": python }))
-            .unwrap(),
+        &serde_json::to_vec(&serde_json::json!({
+            "artifacts": artifacts,
+            "host_programs": aither_sandbox::test_heel::host_programs(),
+            "python": python,
+        }))
+        .unwrap(),
     )
     .unwrap()
 }

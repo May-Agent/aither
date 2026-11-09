@@ -11,7 +11,9 @@ use std::future::Future;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::CommandRole;
 use crate::script_language::ScriptLanguage;
+use crate::ssh::SshServer;
 
 /// Permission mode for terminal execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -72,6 +74,19 @@ pub enum PermissionRequest<'a> {
         domain: &'a str,
         /// The port being connected to.
         port: u16,
+    },
+    /// The first command on an SSH server: whether commands may run there at
+    /// all. Approving it lets the terminal connect and prepare the server:
+    /// the managed tools in its cache directory and, when it has no `heel`,
+    /// the distribution's pinned `heel` for its platform in
+    /// `~/.local/bin`. Once approved, the server's later commands, a
+    /// subagent's included, are not asked about again while it stays in the
+    /// registry; each still passes the admission its mode needs.
+    Location {
+        /// The server the command names.
+        server: &'a SshServer,
+        /// Who asks: the main agent or a subagent.
+        role: CommandRole,
     },
 }
 
@@ -141,6 +156,33 @@ pub trait PermissionHandler: Send + Sync {
         Self: Sized,
     {
         None
+    }
+
+    /// Whether commands may run on `server`, asked once by the first command
+    /// that names it, after [`review`](Self::review) passed the
+    /// [`PermissionRequest::Location`]. `role` says whether a subagent asks,
+    /// so the handler can put a subagent's request to its main agent.
+    ///
+    /// Default implementation denies every server (fail-safe).
+    fn check_location(
+        &self,
+        server: &SshServer,
+        role: CommandRole,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        let _ = (server, role);
+        async { Ok(false) }
+    }
+
+    /// Whether [`check_location`](Self::check_location) will suspend waiting
+    /// for someone's decision, as opposed to answering from a decision it
+    /// remembers or a fixed policy. The default is `false`.
+    fn will_wait_for_location(
+        &self,
+        server: &SshServer,
+        role: CommandRole,
+    ) -> impl Future<Output = bool> + Send {
+        let _ = (server, role);
+        async { false }
     }
 
     /// Checks if a network domain is allowed.
@@ -276,6 +318,14 @@ impl PermissionHandler for NoopPermissionHandler {
     fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
         std::future::ready(true)
     }
+
+    fn check_location(
+        &self,
+        _server: &SshServer,
+        _role: CommandRole,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(Ok(true))
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +378,46 @@ mod tests {
         // Default implementation denies all domains
         assert!(!handler.check_domain("example.com", 443).await);
         assert!(!handler.check_domain("api.github.com", 80).await);
+    }
+
+    #[tokio::test]
+    async fn only_the_noop_handler_allows_a_location_by_default() {
+        let server = SshServer {
+            name: "build".to_string(),
+            target: "builder@build.internal".to_string(),
+        };
+        assert!(
+            !DenyUnsafe
+                .check_location(&server, CommandRole::Main)
+                .await
+                .unwrap()
+        );
+        assert!(
+            NoopPermissionHandler
+                .check_location(&server, CommandRole::Subagent)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_location_request_names_the_server_and_who_asks() {
+        let server = SshServer {
+            name: "build".to_string(),
+            target: "builder@build.internal".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(PermissionRequest::Location {
+                server: &server,
+                role: CommandRole::Subagent,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "location",
+                "server": { "name": "build", "target": "builder@build.internal" },
+                "role": "subagent",
+            })
+        );
     }
 
     #[tokio::test]

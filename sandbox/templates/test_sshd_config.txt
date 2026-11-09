@@ -1,0 +1,10 @@
+Port {{ port }}
+ListenAddress 127.0.0.1
+HostKey {{ host_key }}
+AuthorizedKeysFile {{ authorized_keys }}
+PidFile {{ pid_file }}
+StrictModes no
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+SetEnv HOME={{ home }}

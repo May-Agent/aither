@@ -172,7 +172,7 @@ impl LanguageModel for ScriptedLlm {
                         json!({
                             "description": "Run the tool the server just added",
                             "script": "gamma",
-                            "mode": "sandboxed",
+                            "mode": "default",
                             "timeout": GAMMA_TIMEOUT.as_secs()
                         }),
                     ))

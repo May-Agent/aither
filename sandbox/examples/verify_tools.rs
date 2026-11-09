@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: TerminalArgs = serde_json::from_value(serde_json::json!({
         "description": "Verify prepared search, JSON and edit commands",
         "script": include_str!("../templates/verify_baseline_tools.sh"),
-        "mode": "sandboxed",
+        "mode": "default",
         "raw": true,
         "timeout": 120
     }))?;

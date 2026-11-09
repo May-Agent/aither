@@ -7,7 +7,8 @@ use askama::Template;
 use futures_lite::io::AsyncWriteExt;
 
 use crate::ContainerPath;
-use crate::shell_session::{ContainerShellRuntime, SshServer};
+use crate::shell_session::ContainerShellRuntime;
+use crate::ssh::{SshClient, SshServer};
 use crate::tool_python::PythonScript;
 use crate::tool_runtime::{
     ImageToolDefect, ImageTools, PreparedTools, ToolBundle, ToolRuntimeError, ToolTarget,
@@ -26,24 +27,25 @@ pub trait ToolTransport: Send + Sync {
 /// Tool initialization over an already authorized SSH destination.
 #[derive(Debug, Clone)]
 pub struct SshToolTransport {
+    client: SshClient,
     server: SshServer,
 }
 
 impl SshToolTransport {
     /// Binds provisioning to the configured SSH server, not a model-provided target.
     #[must_use]
-    pub const fn new(server: SshServer) -> Self {
-        Self { server }
+    pub fn new(server: SshServer) -> Self {
+        Self::over(SshClient::default(), server)
+    }
+
+    pub(crate) const fn over(client: SshClient, server: SshServer) -> Self {
+        Self { client, server }
     }
 }
 
 impl ToolTransport for SshToolTransport {
     async fn run(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output, ToolRuntimeError> {
-        let mut command = async_process::Command::new("ssh");
-        command
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
-            .arg(&self.server.target)
-            .arg(shell_words::join(["sh", "-c", script]));
+        let command = async_process::Command::from(self.client.command(&self.server, script));
         run_command(command, input).await
     }
 }
@@ -315,6 +317,7 @@ impl ImageTools {
         Ok(PreparedTools {
             bin_dir: self.container_bin_dir()?,
             uv_dir: None,
+            heel: None,
             catalog,
         })
     }
@@ -325,16 +328,11 @@ impl ToolBundle {
     ///
     /// # Errors
     /// Rejects failed transfers, a tampered cache or invalid activation output.
-    pub async fn prepare_remote<F, Fut>(
+    pub async fn prepare_remote(
         &self,
         transport: &impl ToolTransport,
         root: &Path,
-        authorize: F,
-    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError>
-    where
-        F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = Result<(), ToolRuntimeError>> + Send,
-    {
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
         let root_text = root.to_str().ok_or(ToolRuntimeError::InvalidProbe)?;
         let mut template = ToolInstallTemplate {
             root: shell_words::quote(root_text),
@@ -358,7 +356,6 @@ impl ToolBundle {
         };
         let probe = transport.run(&template.render()?, None).await?;
         let output = if probe.status.code() == Some(3) {
-            authorize().await?;
             template.probe_only = false;
             let bundle = self.clone();
             let archive = blocking::unblock(move || bundle.archive()).await?;
@@ -379,6 +376,7 @@ impl ToolBundle {
                 .python
                 .is_some()
                 .then(|| root.join(crate::tool_runtime::UV_STATE_DIRECTORY)),
+            heel: None,
             catalog: self.catalog(),
         })
     }
@@ -411,7 +409,7 @@ impl ToolBundle {
     }
 }
 
-fn successful_output(output: Output) -> Result<String, ToolRuntimeError> {
+pub fn successful_output(output: Output) -> Result<String, ToolRuntimeError> {
     if !output.status.success() {
         return Err(ToolRuntimeError::InitializationCommand {
             status: output.status.code(),
@@ -599,22 +597,41 @@ mod tests {
         }
     }
 
+    /// Runs locally like [`LocalTransport`] and counts the archives sent.
+    #[derive(Default)]
+    struct CountingTransport(std::sync::atomic::AtomicUsize);
+
+    impl ToolTransport for CountingTransport {
+        async fn run(
+            &self,
+            script: &str,
+            input: Option<Vec<u8>>,
+        ) -> Result<Output, ToolRuntimeError> {
+            if input.is_some() {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            LocalTransport.run(script, input).await
+        }
+    }
+
     #[tokio::test]
     async fn initialization_script_installs_and_warm_cache_skips_transfer() {
         let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
+        let transport = CountingTransport::default();
         let first = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .prepare_remote(&transport, root.path())
             .await
             .unwrap();
         let second = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async {
-                Err(ToolRuntimeError::InstallDenied(
-                    "warm cache must not ask".into(),
-                ))
-            })
+            .prepare_remote(&transport, root.path())
             .await
             .unwrap();
+        assert_eq!(
+            transport.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the cold cache receives the archive"
+        );
         assert_eq!(first.bin_dir(), second.bin_dir());
         for &tool in crate::tool_runtime::tests::native_tools() {
             assert!(first.bin_dir().join(tool.command()).is_file());
@@ -633,7 +650,7 @@ mod tests {
         let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let installed = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .prepare_remote(&LocalTransport, root.path())
             .await
             .unwrap();
         let alias = installed.bin_dir().join("date");
@@ -644,9 +661,7 @@ mod tests {
         }
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink("rg", &alias).unwrap();
-        let result = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
-            .await;
+        let result = bundle.prepare_remote(&LocalTransport, root.path()).await;
         assert!(
             matches!(
                 result,
@@ -694,7 +709,7 @@ mod tests {
         let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let prepared = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .prepare_remote(&LocalTransport, root.path())
             .await
             .unwrap();
         let request = bundle
@@ -738,7 +753,7 @@ mod tests {
         let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let installed = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
+            .prepare_remote(&LocalTransport, root.path())
             .await
             .unwrap();
         let python = installed.bin_dir().join("python3");
@@ -758,18 +773,14 @@ mod tests {
         std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(&interpreter, b"#!/bin/sh\necho Python 9.9.9\n").unwrap();
         std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let result = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
-            .await;
+        let result = bundle.prepare_remote(&LocalTransport, root.path()).await;
         assert!(rejected(result), "a replaced interpreter was accepted");
         // The link points elsewhere.
         std::fs::set_permissions(installed.bin_dir(), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         std::fs::remove_file(&python).unwrap();
         std::os::unix::fs::symlink("../elsewhere", &python).unwrap();
-        let result = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
-            .await;
+        let result = bundle.prepare_remote(&LocalTransport, root.path()).await;
         assert!(rejected(result), "a retargeted python3 was accepted");
     }
 
@@ -788,9 +799,7 @@ mod tests {
             let bundle = crate::tool_runtime::tests::bundle_with_uv(
                 crate::tool_runtime::tests::fixture_uv("1.0.0", extra),
             );
-            let result = bundle
-                .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
-                .await;
+            let result = bundle.prepare_remote(&LocalTransport, root.path()).await;
             assert!(
                 matches!(
                     result,
@@ -816,9 +825,7 @@ mod tests {
                 "1.0.0",
                 r#"printf 'other' > "$dir/bin/python3.13""#,
             ));
-        let result = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async { Ok(()) })
-            .await;
+        let result = bundle.prepare_remote(&LocalTransport, root.path()).await;
         assert!(
             matches!(
                 result,
@@ -870,32 +877,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_remote_install_never_activates_tools() {
-        let root = crate::tool_runtime::tests::unlocking_tempdir();
-        let bundle = crate::tool_runtime::tests::bundle();
-        let result = bundle
-            .prepare_remote(&LocalTransport, root.path(), || async {
-                Err(ToolRuntimeError::InstallDenied("test server".into()))
-            })
-            .await;
-        assert!(matches!(result, Err(ToolRuntimeError::InstallDenied(_))));
-        let activation = root.path().join(bundle.cache_key().unwrap());
-        assert_eq!(
-            async_fs::symlink_metadata(activation)
-                .await
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::NotFound
-        );
-    }
-
-    #[tokio::test]
     async fn concurrent_remote_activation_is_atomic() {
         let root = crate::tool_runtime::tests::unlocking_tempdir();
         let bundle = crate::tool_runtime::tests::bundle();
         let (first, second) = futures_lite::future::zip(
-            bundle.prepare_remote(&LocalTransport, root.path(), || async { Ok(()) }),
-            bundle.prepare_remote(&LocalTransport, root.path(), || async { Ok(()) }),
+            bundle.prepare_remote(&LocalTransport, root.path()),
+            bundle.prepare_remote(&LocalTransport, root.path()),
         )
         .await;
         assert_eq!(first.unwrap().bin_dir(), second.unwrap().bin_dir());

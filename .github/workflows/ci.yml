@@ -367,7 +367,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           shared-key: ci-verify-tools
-      - uses: ./.github/actions/install-heel
       - name: Compose the manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -488,7 +487,6 @@ jobs:
           shared-key: ci-coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      - uses: ./.github/actions/install-heel
       - uses: ./.github/actions/install-protoc
       - id: tools
         uses: ./.github/actions/restore-tool-cache
