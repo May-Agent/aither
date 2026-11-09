@@ -11,7 +11,9 @@ use arc_swap::ArcSwap;
 use askama::Template;
 use futures_lite::StreamExt;
 
-use super::{Language, Languages, prose};
+use super::detect::{Detector, DetectorError};
+use super::prose::{self, Judgement};
+use super::{Language, Languages};
 use crate::error::AgentError;
 
 /// Who reads a text the agent writes in the working language.
@@ -33,6 +35,9 @@ pub enum LanguageRefusal {
     Question {
         /// The language the user is talked to in.
         communication: Language,
+        /// The first paragraph found in another language, counted from 1;
+        /// `None` when the prose as a whole is the offender.
+        paragraph: Option<usize>,
     },
     /// A text for others not in the working language.
     Working {
@@ -40,6 +45,9 @@ pub enum LanguageRefusal {
         working: Language,
         /// Whether the text is public, which exempts no quote.
         public: bool,
+        /// The first paragraph found in another language, counted from 1;
+        /// `None` when the prose as a whole is the offender.
+        paragraph: Option<usize>,
     },
 }
 

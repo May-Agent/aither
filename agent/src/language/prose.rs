@@ -1,53 +1,98 @@
 //! Judging the language of a text's prose.
 //!
 //! Code blocks, code spans, URLs, paths and identifiers are removed first.
-//! What is left is split into runs of one script family; a short run is a
-//! technical term of another language and does not change the verdict, as
-//! long as a longer run exists to judge. Each judged run is identified by
-//! `whatlang`, restricted to the languages a session can use so that short
-//! runs are not confused with unrelated ones.
+//! The prose that is left must be detected as the expected language as a
+//! whole, and so must every paragraph long enough to judge. A shorter
+//! paragraph is a heading, a label or a one-line aside, and the detector is
+//! unreliable on it (FLORES-200 devtest: 88% on phrases of two to four words,
+//! 99.9% on sentences), so it is not judged; a short insertion inside a
+//! judged paragraph, such as an English term in Chinese prose, is carried by
+//! the paragraph's language.
 
 use std::sync::Arc;
 
-use whatlang::{Detector, Lang};
-
 use super::Language;
+use super::detect::Detector;
 
-/// A Latin-script run of at most this many words is a term.
-const LATIN_TERM_WORDS: usize = 3;
-/// A run of any other script of at most this many letters is a term.
-const OTHER_TERM_LETTERS: usize = 4;
+/// A paragraph is judged on its own from this weight: 40 letters of a spaced
+/// script, about eight words, or 20 characters of Chinese, Japanese or
+/// Korean, which weigh 2 each.
+const JUDGED_WEIGHT: usize = 40;
 
 /// Collapses every run of whitespace to one space and trims the ends.
 pub(super) fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whether the prose of `text` is in `target`; `others` are the other
-/// languages the session uses, which the detector may also answer. A text
-/// with no prose is in every language.
-pub(super) fn is_in(text: &str, target: Language, others: &[Language]) -> bool {
-    let prose = prose(text);
-    let segments = segments(&prose);
-    if segments.is_empty() {
-        return true;
-    }
-    let mut allowed = vec![target.lang(), Lang::Eng];
-    allowed.extend(others.iter().map(|language| language.lang()));
-    allowed.dedup();
-    let detector = Detector::with_allowlist(allowed);
-    let judged: Vec<&Segment> = if segments.iter().all(Segment::is_term) {
-        // Nothing but terms: the text itself is the verdict.
-        return detector.detect_lang(&prose) == Some(target.lang());
-    } else {
-        segments
-            .iter()
-            .filter(|segment| !segment.is_term())
-            .collect()
+/// How a text fared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Judgement {
+    /// The prose is in the expected language, or there is none.
+    InLanguage,
+    /// It is not. `paragraph` is the number, counted from 1 in the text, of
+    /// the first judged paragraph in another language; `None` when each is in
+    /// the language but the prose as a whole is not.
+    NotIn { paragraph: Option<usize> },
+}
+
+/// Judges the prose of `text` against `target`. This runs the detector, which
+/// is CPU work.
+///
+/// # Panics
+///
+/// When the loaded detector fails to run on a text.
+pub(super) fn judge(detector: &Detector, text: &str, target: Language) -> Judgement {
+    let detect = |text: &str| {
+        detector
+            .detect(text)
+            .expect("the language detector runs on any text")
     };
-    judged
+    let paragraphs = paragraphs(text);
+    let mut judged = 0;
+    for paragraph in &paragraphs {
+        if weight(&paragraph.text) < JUDGED_WEIGHT {
+            continue;
+        }
+        judged += 1;
+        if detect(&paragraph.text) != target {
+            return Judgement::NotIn {
+                paragraph: Some(paragraph.number),
+            };
+        }
+    }
+    if paragraphs.is_empty() || (paragraphs.len() == 1 && judged == 1) {
+        // No prose, or the one paragraph was the whole.
+        return Judgement::InLanguage;
+    }
+    let whole = paragraphs
         .iter()
-        .all(|segment| detector.detect_lang(&segment.text) == Some(target.lang()))
+        .map(|paragraph| paragraph.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if detect(&whole) == target {
+        Judgement::InLanguage
+    } else {
+        Judgement::NotIn { paragraph: None }
+    }
+}
+
+/// How much prose `text` holds: one for each letter, two for each Chinese,
+/// Japanese or Korean character.
+fn weight(text: &str) -> usize {
+    text.chars()
+        .filter(|c| c.is_alphabetic())
+        .map(|c| if is_wide(c) { 2 } else { 1 })
+        .sum()
+}
+
+const fn is_wide(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+    )
 }
 
 /// Removes the quotes of `text` that match, after whitespace normalization,
@@ -108,12 +153,42 @@ const fn closing_quote(open: char) -> Option<char> {
     }
 }
 
-/// The text with code, URLs, paths and identifiers removed.
-fn prose(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// A blank-line separated block of the text, reduced to its prose.
+struct Paragraph {
+    /// Its place among the blocks of the text, counted from 1.
+    number: usize,
+    text: String,
+}
+
+/// The paragraphs of `text` that hold prose, with code, URLs, paths and
+/// identifiers removed.
+fn paragraphs(text: &str) -> Vec<Paragraph> {
+    let mut paragraphs = Vec::new();
+    let mut number = 0;
+    let mut current = String::new();
     let mut fenced = false;
+    let mut after_blank = true;
+    let mut finish = |number: usize, current: &mut String| {
+        if current.chars().any(char::is_alphabetic) {
+            paragraphs.push(Paragraph {
+                number,
+                text: std::mem::take(current),
+            });
+        } else {
+            current.clear();
+        }
+    };
     for line in text.lines() {
         let trimmed = line.trim_start();
+        if !fenced && trimmed.is_empty() {
+            finish(number, &mut current);
+            after_blank = true;
+            continue;
+        }
+        if after_blank {
+            number += 1;
+            after_blank = false;
+        }
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced = !fenced;
             continue;
@@ -123,12 +198,13 @@ fn prose(text: &str) -> String {
         }
         for (index, part) in line.split('`').enumerate() {
             if index % 2 == 0 {
-                push_words(part, &mut out);
+                push_words(part, &mut current);
             }
         }
-        out.push('\n');
+        current.push('\n');
     }
-    out
+    finish(number, &mut current);
+    paragraphs
 }
 
 fn push_words(text: &str, out: &mut String) {
@@ -210,92 +286,132 @@ fn is_identifier(chunk: &str) -> bool {
     core.chars().count() >= 2 && core.chars().all(char::is_uppercase)
 }
 
-/// A run of letters of one script family and the text between them.
-struct Segment {
-    text: String,
-    latin: bool,
-    letters: usize,
-}
-
-impl Segment {
-    fn is_term(&self) -> bool {
-        if self.latin {
-            self.text.split_whitespace().count() <= LATIN_TERM_WORDS
-        } else {
-            self.letters <= OTHER_TERM_LETTERS
-        }
-    }
-}
-
-fn segments(prose: &str) -> Vec<Segment> {
-    let mut segments: Vec<Segment> = Vec::new();
-    for c in prose.chars() {
-        if c.is_alphabetic() {
-            let latin = (c as u32) < 0x250;
-            match segments.last_mut() {
-                Some(segment) if segment.latin == latin => {
-                    segment.letters += 1;
-                    segment.text.push(c);
-                }
-                _ => segments.push(Segment {
-                    text: c.to_string(),
-                    latin,
-                    letters: 1,
-                }),
-            }
-        } else if let Some(segment) = segments.last_mut() {
-            segment.text.push(c);
-        }
-    }
-    segments
-}
-
+// The test sentences are lines of FLORES-200 devtest (NLLB Team, Meta AI;
+// CC BY-SA 4.0), `https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz`,
+// named by language file and 1-based line.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn chinese() -> Language {
-        "Chinese".parse().unwrap()
+    fn language(name: &str) -> Language {
+        name.parse().unwrap()
+    }
+
+    fn judge_text(text: &str, target: &str) -> Judgement {
+        judge(&Detector::load().unwrap(), text, language(target))
+    }
+
+    /// zho_Hans line 12: Chinese with an English name.
+    const ZH_ZMAPP: &str = "一种名为 ZMapp 的“抗体鸡尾酒”（多抗体联合）最初有望在该领域发挥作用，但正式研究表明，它在预防死亡方面的效果有些不尽人意。";
+    /// zho_Hans line 13.
+    const ZH_PALM: &str = "在 PALM 实验中，ZMapp 用作参照。也就是科学家将其作为基线，把其他三种治疗方法与之作比较。";
+    /// zho_Hant line 11.
+    const ZH_HANT: &str = "儘管有一種實驗性的疫苗顯示能降低伊波拉病毒的致死率，但到目前為止，沒有藥物明確證實適合治療已受感染的人。";
+    /// eng_Latn line 11.
+    const EN_VACCINE: &str = "While one experimental vaccine appears able to reduce Ebola mortality, up until now, no drugs have been clearly demonstrated suitable for treating existing infection.";
+    /// eng_Latn line 12.
+    const EN_ZMAPP: &str = "One antibody cocktail, ZMapp, initially showed promise in the field, but formal studies indicated it had less benefit than sought in preventing death.";
+    /// eng_Latn line 7, too short to be judged.
+    const EN_SHORT: &str = "He built a WiFi door bell, he said.";
+    /// jpn_Jpan line 20: mostly kanji, with kana.
+    const JA_NSA: &str = "NSAとしてカーターを補佐し、1978年のキャンプ・デイビッド合意、1970年代後半の米中関係の正常化、1979年のイラン人質事件につながったイラン革命、1979年のソビエトのアフガニスタン侵攻など、世界問題を外交的に処理した。";
+    /// kor_Hang line 11.
+    const KO_VACCINE: &str = "한 실험용 백신이 에볼라 사망률을 줄일 수 있을 것처럼 보이지만, 지금까지 어떤 약도 기존의 감염을 치료하는데 적합하다고 명확하게 입증되지 않았습니다.";
+    /// fra_Latn line 11.
+    const FR_VACCINE: &str = "Même si un vaccin expérimental semble jusqu'ici capable de réduire le taux de mortalité d'Ebola, aucun remède n'a encore été suffisamment efficace pour traiter l'infection existante.";
+
+    #[test]
+    fn chinese_japanese_and_korean_prose_is_judged_in_its_own_language() {
+        for (text, target) in [
+            (ZH_ZMAPP, "Chinese"),
+            (ZH_PALM, "Chinese"),
+            (ZH_HANT, "Chinese"),
+            (JA_NSA, "Japanese"),
+            (KO_VACCINE, "Korean"),
+            (EN_VACCINE, "English"),
+            (FR_VACCINE, "French"),
+        ] {
+            assert_eq!(
+                judge_text(text, target),
+                Judgement::InLanguage,
+                "{target}: {text}"
+            );
+        }
     }
 
     #[test]
-    fn code_identifiers_and_paths_are_not_prose() {
-        let text = "请检查 `tokio::spawn` 和 spawn_blocking，见 src/agent/mod.rs 与 https://example.com/a。\n```rust\nfn main() {}\n```";
-        assert!(is_in(text, chinese(), &[]));
+    fn kanji_heavy_japanese_is_japanese_and_not_chinese() {
+        assert_eq!(
+            judge_text(JA_NSA, "Chinese"),
+            Judgement::NotIn { paragraph: Some(1) }
+        );
     }
 
     #[test]
-    fn a_short_foreign_term_does_not_change_the_verdict() {
-        assert!(is_in(
-            "好的，我来用 Rust 的 trait object 实现这个功能。",
-            chinese(),
-            &[]
-        ));
-        assert!(is_in(
-            "Use the 数据库 here to store the results.",
-            Language::ENGLISH,
-            &[chinese()]
-        ));
+    fn cjk_prose_with_english_terms_and_a_longer_english_phrase_is_accepted() {
+        // zho_Hans line 13 with a phrase of eng_Latn line 20 inserted.
+        let mixed = "在 PALM 实验中，ZMapp 用作参照 the Camp David Accords, 1978; normalizing US–China relations。也就是科学家将其作为基线，把其他三种治疗方法与之作比较。";
+        assert_eq!(judge_text(mixed, "Chinese"), Judgement::InLanguage);
     }
 
     #[test]
-    fn a_foreign_sentence_is_prose() {
-        assert!(!is_in("Which database should we use?", chinese(), &[]));
-        assert!(!is_in(
-            "好的。 Please update the tasks file now.",
-            chinese(),
-            &[]
-        ));
-        assert!(!is_in(
-            "我们需要更新这个文件",
-            Language::ENGLISH,
-            &[chinese()]
-        ));
+    fn a_paragraph_in_another_language_is_refused_and_named() {
+        let text = format!("{ZH_ZMAPP}\n\n{ZH_PALM}\n\n{EN_VACCINE}");
+        assert_eq!(
+            judge_text(&text, "Chinese"),
+            Judgement::NotIn { paragraph: Some(3) }
+        );
+        let text = format!("{EN_ZMAPP}\n\n{ZH_ZMAPP}");
+        assert_eq!(
+            judge_text(&text, "English"),
+            Judgement::NotIn { paragraph: Some(2) }
+        );
     }
 
     #[test]
-    fn a_text_without_prose_is_in_every_language() {
-        assert!(is_in("`cargo test` https://example.com 42", chinese(), &[]));
+    fn a_wholly_wrong_language_is_refused() {
+        assert_eq!(
+            judge_text(EN_VACCINE, "Chinese"),
+            Judgement::NotIn { paragraph: Some(1) }
+        );
+        assert_eq!(
+            judge_text(ZH_HANT, "English"),
+            Judgement::NotIn { paragraph: Some(1) }
+        );
+        assert_eq!(
+            judge_text(KO_VACCINE, "Japanese"),
+            Judgement::NotIn { paragraph: Some(1) }
+        );
+    }
+
+    #[test]
+    fn short_paragraphs_are_not_judged() {
+        let text = format!("{ZH_ZMAPP}\n\n{EN_SHORT}\n\n{ZH_PALM}");
+        assert_eq!(judge_text(&text, "Chinese"), Judgement::InLanguage);
+        assert!(weight(EN_SHORT) < JUDGED_WEIGHT);
+        // A short sentence alone is not judged either.
+        assert_eq!(judge_text(EN_SHORT, "Chinese"), Judgement::InLanguage);
+    }
+
+    #[test]
+    fn code_identifiers_paths_and_quotes_are_not_prose() {
+        let text = format!(
+            "{ZH_PALM}\n\n```rust\n{EN_VACCINE}\n\nfn main() {{}}\n```\n\n请检查 `{EN_ZMAPP}` 和 spawn_blocking，见 src/agent/mod.rs 与 https://example.com/a。"
+        );
+        assert_eq!(judge_text(&text, "Chinese"), Judgement::InLanguage);
+        assert_eq!(
+            judge_text("`cargo test` https://example.com 42", "Chinese"),
+            Judgement::InLanguage
+        );
+    }
+
+    #[test]
+    fn code_between_paragraphs_still_counts_as_one_block_for_numbering() {
+        let text = format!("{ZH_PALM}\n\n```\ncode\n\nmore\n```\n\n{EN_VACCINE}");
+        assert_eq!(
+            judge_text(&text, "Chinese"),
+            Judgement::NotIn { paragraph: Some(3) }
+        );
     }
 
     #[test]
