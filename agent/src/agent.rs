@@ -3243,4 +3243,10 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod call_identity_tests;
+#[cfg(test)]
+mod idle_compaction_tests;
+#[cfg(test)]
+mod keep_warm_tests;
+#[cfg(test)]
 mod tests;

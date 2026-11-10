@@ -710,6 +710,7 @@ mod serde_tests {
         all
     }
 
+    #[allow(clippy::too_many_lines)]
     fn events() -> Vec<AgentEvent> {
         let run = || RunId::new("run-1");
         let request = || RequestId::new(3);
