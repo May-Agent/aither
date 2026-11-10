@@ -1,0 +1,74 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Vec in std::vec - Rust</title><script>window.SIDEBAR_ITEMS={};</script><style>.sidebar{width:200px}</style></head><body><nav class="sidebar"><h2><a href="index.html">Vec</a></h2><ul><li><a href="#method.retain">retain</a></li><li><a href="#method.retain_mut">retain_mut</a></li></ul></nav>
+<main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">std</a>::<wbr><a href="index.html">vec</a></div><h1>Struct <span class="struct">Vec</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><div class="notable-trait-badge-container"><a class="badge-4"href="../io/trait.Write.html" title="std::io::Write">Write</a></div><span class="since" title="Stable since Rust version 1.0.0">1.0.0</span> · <a class="src" href="../../src/alloc/vec/mod.rs.html#436">Source</a> </span></div><pre class="rust item-decl"><code>pub struct Vec&lt;T, A = <a class="struct" href="../alloc/struct.Global.html" title="struct std::alloc::Global">Global</a>&gt;<div class="where">where
+    A: <a class="trait" href="../alloc/trait.Allocator.html" title="trait std::alloc::Allocator">Allocator</a>,</div>{ <span class="comment">/* private fields */</span> }</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>A contiguous growable array type, written as <code>Vec&lt;T&gt;</code>, short for ‘vector’.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>vec = Vec::new();
+vec.push(<span class="number">1</span>);
+vec.push(<span class="number">2</span>);
+<span class="macro">assert_eq!</span>(vec.len(), <span class="number">2</span>);
+<span class="macro">assert_eq!</span>(vec[<span class="number">0</span>], <span class="number">1</span>);
+<span class="macro">assert_eq!</span>(vec.pop(), <span class="prelude-val">Some</span>(<span class="number">2</span>));
+<span class="macro">assert_eq!</span>(vec.len(), <span class="number">1</span>);
+vec[<span class="number">0</span>] = <span class="number">7</span>;
+<span class="macro">assert_eq!</span>(vec[<span class="number">0</span>], <span class="number">7</span>);
+vec.extend([<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>]);
+<span class="kw">for </span>x <span class="kw">in </span><span class="kw-2">&amp;</span>vec {
+    <span class="macro">println!</span>(<span class="string">"{x}"</span>);
+}
+<span class="macro">assert_eq!</span>(vec, [<span class="number">7</span>, <span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>]);</code></pre><a class="test-arrow" target="_blank" title="Run code" href="https://play.rust-lang.org/?code=%23!%5Ballow(unused)%5D%0Afn+main()+%7B%0A++++let+mut+vec+=+Vec::new();%0A++++vec.push(1);%0A++++vec.push(2);%0A++++%0A++++assert_eq!(vec.len(),+2);%0A++++assert_eq!(vec%5B0%5D,+1);%0A++++%0A++++assert_eq!(vec.pop(),+Some(2));%0A++++assert_eq!(vec.len(),+1);%0A++++%0A++++vec%5B0%5D+=+7;%0A++++assert_eq!(vec%5B0%5D,+7);%0A++++%0A++++vec.extend(%5B1,+2,+3%5D);%0A++++%0A++++for+x+in+%26vec+%7B%0A++++++++println!(%22%7Bx%7D%22);%0A++++%7D%0A++++assert_eq!(vec,+%5B7,+1,+2,+3%5D);%0A%7D&amp;edition=2024"></a></div>
+<p>The <a href="../macro.vec.html" title="macro std::vec"><code>vec!</code></a> macro is provided for convenient initialization:</p>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>vec1 = <span class="macro">vec!</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>];
+vec1.push(<span class="number">4</span>);
+<span class="kw">let </span>vec2 = Vec::from([<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>, <span class="number">4</span>]);
+<span class="macro">assert_eq!</span>(vec1, vec2);</code></pre><a class="test-arrow" target="_blank" title="Run code" href="https://play.rust-lang.org/?code=%23!%5Ballow(unused)%5D%0Afn+main()+%7B%0A++++let+mut+vec1+=+vec!%5B1,+2,+3%5D;%0A++++vec1.push(4);%0A++++let+vec2+=+Vec::from(%5B1,+2,+3,+4%5D);%0A++++assert_eq!(vec1,+vec2);%0A%7D&amp;edition=2024"></a></div>
+<p>It can also initialize each element of a <code>Vec&lt;T&gt;</code> with a given value.
+This may be more efficient than performing allocation and initialization
+in separate steps, especially when initializing a vector of zeros:</p>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span>vec = <span class="macro">vec!</span>[<span class="number">0</span>; <span class="number">5</span>];
+<span class="macro">assert_eq!</span>(vec, [<span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>]);
+<span class="comment">// The following is equivalent, but potentially slower:
+</span><span class="kw">let </span><span class="kw-2">mut </span>vec = Vec::with_capacity(<span class="number">5</span>);
+vec.resize(<span class="number">5</span>, <span class="number">0</span>);
+<span class="macro">assert_eq!</span>(vec, [<span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>, <span class="number">0</span>]);</code></pre><a class="test-arrow" target="_blank" title="Run code" href="https://play.rust-lang.org/?code=%23!%5Ballow(unused)%5D%0Afn+main()+%7B%0A++++let+vec+=+vec!%5B0;+5%5D;%0A++++assert_eq!(vec,+%5B0,+0,+0,+0,+0%5D);%0A++++%0A++++//+The+following+is+equivalent,+but+potentially+slower:%0A++++let+mut+vec+=+Vec::with_capacity(5);%0A++++vec.resize(5,+0);%0A++++assert_eq!(vec,+%5B0,+0,+0,+0,+0%5D);%0A%7D&amp;edition=2024"></a></div>
+<p>For more information, see
+<a href="#capacity-and-reallocation">Capacity and Reallocation</a>.</p>
+<p>Use a <code>Vec&lt;T&gt;</code> as an efficient stack:</p>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>stack = Vec::new();
+stack.push(<span class="number">1</span>);
+stack.push(<span class="number">2</span>);
+stack.push(<span class="number">3</span>);
+<span class="kw">while let </span><span class="prelude-val">Some</span>(top) = stack.pop() {
+    <span class="comment">// Prints 3, 2, 1
+    </span><span class="macro">println!</span>(<span class="string">"{top}"</span>);
+}</code></pre><a class="test-arrow" target="_blank" title="Run code" href="https://play.rust-lang.org/?code=%23!%5Ballow(unused)%5D%0Afn+main()+%7B%0A++++let+mut+stack+=+Vec::new();%0A++++%0A++++stack.push(1);%0A++++stack.push(2);%0A++++stack.push(3);%0A++++%0A++++while+let+Some(top)+=+stack.pop()+%7B%0A++++++++//+Prints+3,+2,+1%0A++++++++println!(%22%7Btop%7D%22);%0A++++%7D%0A%7D&amp;edition=2024"></a></div>
+</div></details><h2 id="implementations" class="section-header">Implementations<a href="#implementations" class="anchor">§</a></h2><div id="implementations-list"><details class="toggle implementors-toggle" open><summary><section id="impl-Vec%3CT,+A%3E" class="impl"><h3 class="code-header">impl&lt;T, A&gt; Vec&lt;T, A&gt;</h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.retain" class="method"><span class="rightside"><span class="since" title="Stable since Rust version 1.0.0">1.0.0</span> · <a class="src" href="../../src/alloc/vec/mod.rs.html#2481-2483">Source</a></span><h4 class="code-header">pub fn <a href="#method.retain" class="fn">retain</a>&lt;F&gt;(&amp;mut self, f: F)<div class="where">where
+    F: <a class="trait" href="../ops/trait.FnMut.html" title="trait std::ops::FnMut">FnMut</a>(<a class="primitive" href="../primitive.reference.html">&amp;T</a>) -&gt; <a class="primitive" href="../primitive.bool.html">bool</a>,</div></h4></section></summary><div class="docblock"><p>Retains only the elements specified by the predicate.</p>
+<p>In other words, remove all elements <code>e</code> for which <code>f(&amp;e)</code> returns <code>false</code>.
+This method operates in place, visiting each element exactly once in the
+original order, and preserves the order of the retained elements.</p>
+<h5 id="examples-38"><a class="doc-anchor" href="#examples-38">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>vec = <span class="macro">vec!</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>, <span class="number">4</span>];
+vec.retain(|<span class="kw-2">&amp;</span>x| x % <span class="number">2 </span>== <span class="number">0</span>);
+<span class="macro">assert_eq!</span>(vec, [<span class="number">2</span>, <span class="number">4</span>]);</code></pre><a class="test-arrow" target="_blank" title="Run code" href="https://play.rust-lang.org/?code=%23!%5Ballow(unused)%5D%0Afn+main()+%7B%0A++++let+mut+vec+=+vec!%5B1,+2,+3,+4%5D;%0A++++vec.retain(%7C%26x%7C+x+%25+2+==+0);%0A++++assert_eq!(vec,+%5B2,+4%5D);%0A%7D&amp;edition=2024"></a></div>
+<p>Because the elements are visited exactly once in the original order,
+external state may be used to decide which elements to keep.</p>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>vec = <span class="macro">vec!</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>, <span class="number">4</span>, <span class="number">5</span>];
+<span class="kw">let </span>keep = [<span class="bool-val">false</span>, <span class="bool-val">true</span>, <span class="bool-val">true</span>, <span class="bool-val">false</span>, <span class="bool-val">true</span>];
+<span class="kw">let </span><span class="kw-2">mut </span>iter = keep.iter();
+vec.retain(|<span class="kw">_</span>| <span class="kw-2">*</span>iter.next().unwrap());
+<span class="macro">assert_eq!</span>(vec, [<span class="number">2</span>, <span class="number">3</span>, <span class="number">5</span>]);</code></pre><a class="test-arrow" target="_blank" title="Run code" href="https://play.rust-lang.org/?code=%23!%5Ballow(unused)%5D%0Afn+main()+%7B%0A++++let+mut+vec+=+vec!%5B1,+2,+3,+4,+5%5D;%0A++++let+keep+=+%5Bfalse,+true,+true,+false,+true%5D;%0A++++let+mut+iter+=+keep.iter();%0A++++vec.retain(%7C_%7C+*iter.next().unwrap());%0A++++assert_eq!(vec,+%5B2,+3,+5%5D);%0A%7D&amp;edition=2024"></a></div></div></details>
+<details class="toggle method-toggle" open><summary><section id="method.retain_mut" class="method"><span class="rightside"><span class="since" title="Stable since Rust version 1.61.0">1.61.0</span> · <a class="src" href="../../src/alloc/vec/mod.rs.html#2507-2509">Source</a></span><h4 class="code-header">pub fn <a href="#method.retain_mut" class="fn">retain_mut</a>&lt;F&gt;(&amp;mut self, f: F)<div class="where">where
+    F: <a class="trait" href="../ops/trait.FnMut.html" title="trait std::ops::FnMut">FnMut</a>(<a class="primitive" href="../primitive.reference.html">&amp;mut T</a>) -&gt; <a class="primitive" href="../primitive.bool.html">bool</a>,</div></h4></section></summary><div class="docblock"><p>Retains only the elements specified by the predicate, passing a mutable reference to it.</p>
+<p>In other words, remove all elements <code>e</code> such that <code>f(&amp;mut e)</code> returns <code>false</code>.
+This method operates in place, visiting each element exactly once in the
+original order, and preserves the order of the retained elements.</p>
+<h5 id="examples-39"><a class="doc-anchor" href="#examples-39">§</a>Examples</h5>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>vec = <span class="macro">vec!</span>[<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>, <span class="number">4</span>];
+vec.retain_mut(|x| <span class="kw">if </span><span class="kw-2">*</span>x &lt;= <span class="number">3 </span>{
+    <span class="kw-2">*</span>x += <span class="number">1</span>;
+    <span class="bool-val">true
+</span>} <span class="kw">else </span>{
+    <span class="bool-val">false
+</span>});
+<span class="macro">assert_eq!</span>(vec, [<span class="number">2</span>, <span class="number">3</span>, <span class="number">4</span>]);</code></pre><a class="test-arrow" target="_blank" title="Run code" href="https://play.rust-lang.org/?code=%23!%5Ballow(unused)%5D%0Afn+main()+%7B%0A++++let+mut+vec+=+vec!%5B1,+2,+3,+4%5D;%0A++++vec.retain_mut(%7Cx%7C+if+*x+%3C=+3+%7B%0A++++++++*x+%2B=+1;%0A++++++++true%0A++++%7D+else+%7B%0A++++++++false%0A++++%7D);%0A++++assert_eq!(vec,+%5B2,+3,+4%5D);%0A%7D&amp;edition=2024"></a></div></div></details>
+</div></details></div></section></div></main><script>init();</script></body></html>
