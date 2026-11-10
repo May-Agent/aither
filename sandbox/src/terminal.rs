@@ -25,7 +25,6 @@ use crate::{AnyShellWording, OutputPolicy};
 use std::{
     borrow::Cow,
     io::Read,
-    net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -34,6 +33,7 @@ use std::{
     time::Duration,
 };
 
+use crate::spawn::container_ipc::ExecSetup;
 use aither_core::llm::tool::{
     AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
 };
@@ -45,9 +45,8 @@ use aither_core::llm::{
 use aither_core::{AnyIdAllocator, IdLease, IdsExhausted};
 use askama::Template;
 use async_channel::{Receiver, Sender};
-use async_io::Async;
 use executor_core::{Executor, Task};
-use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+use futures_lite::io::AsyncWriteExt;
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
 use heel::{Access, CpuPriority, Grant, IoPriority, IpcRouter, NetworkAuditLog, ProcessPriority};
@@ -82,8 +81,8 @@ use crate::{
     shell_session::{ContainerShellRuntime, ShellSessionRegistry},
     spawn::stdio::{read_chunks, write_chunks},
     spawn::{
-        ContainerSetup, Descendants, EnvSource, GrantSnapshot, Grants, LocalSpawn, Pipe, Sandbox,
-        SpawnSpec, Stdio as SpawnStdio, TreeLifetime,
+        Descendants, EnvSource, GrantSnapshot, Grants, LocalSpawn, Pipe, Sandbox, SpawnSpec,
+        Stdio as SpawnStdio, TreeLifetime,
     },
     ssh::{SshClient, SshEnvironment, SshServer},
     stdin_watch::{
@@ -1893,10 +1892,10 @@ fn container_confinement_for(
     };
     Ok(ContainerConfinement {
         working_dir: map(space)?,
-        writable: writable
+        grants: writable
             .iter()
-            .map(|path| map(path))
-            .collect::<Result<_, _>>()?,
+            .map(|path| Ok((map(path)?, heel::Access::WRITE)))
+            .collect::<Result<_, SubagentGrantError>>()?,
     })
 }
 
@@ -3430,7 +3429,6 @@ struct ContainerJobExecution<'a, E> {
     container_runtime: &'a ContainerShellRuntime,
     prepared_tools: &'a PreparedTools<ContainerPath>,
     carry: Option<&'a CwdCarry>,
-    ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -3868,7 +3866,6 @@ where
                 ),
                 None => None,
             };
-            let ipc_commands = request.registry.registered_tool_names();
             return execute_container_job(ContainerJobExecution {
                 executor: request.executor,
                 sandbox: request.sandbox,
@@ -3881,7 +3878,6 @@ where
                 container_runtime: runtime,
                 prepared_tools: tools,
                 carry: request.carry,
-                ipc_commands: &ipc_commands,
                 job_registry: request.job_registry,
                 stdin_alerts: request.stdin_alerts,
                 lifetime: request.lifetime,
@@ -4369,8 +4365,9 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             },
             ..SpawnStdio::default()
         });
-    spec.ipc = ipc;
-    spec = spec.grants(additions.grants);
+    spec = spec
+        .ipc(ipc)
+        .grants(additions.grants.into_iter().map(crate::SpawnGrant::Host));
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         spec = spec.cwd(start);
     }
@@ -4847,64 +4844,12 @@ fn container_job_script(
     }
 }
 
-/// What a container command adds to its spawn: the marker its processes carry
-/// for the container's memory reader and its jobserver fifo, the write access
-/// the fifo needs, and the way back to the host's IPC commands.
-struct ContainerJobAdditions {
-    environment: Vec<(String, String)>,
-    setup: ContainerSetup,
-}
-
 /// Runs a command in a container through a [`Sandbox`] on the container's
 /// backend, and answers what the job produced.
 async fn execute_container_job<E: Executor + Clone + 'static>(
     context: ContainerJobExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let runtime = context.container_runtime;
-    let ipc_bridge = if context.ipc_commands.is_empty() {
-        None
-    } else {
-        Some(start_container_ipc_bridge(
-            context.executor.clone(),
-            Arc::clone(context.registry),
-            runtime.workspace_mount().cloned(),
-            runtime.host_route().address(),
-        )?)
-    };
-
-    let mut additions = ContainerJobAdditions {
-        // Exported by the sandbox ahead of the embedder's variables, which win
-        // as they do for a local command.
-        environment: vec![(
-            crate::memory::JOB_MARKER_ENV.to_string(),
-            context.task_id.to_string(),
-        )],
-        setup: ContainerSetup::default(),
-    };
-    #[cfg(all(unix, feature = "jobserver"))]
-    if let Some(fifo) = &context.job_fifo {
-        additions.environment.extend(fifo.environment());
-        // The build tools write tokens back to the fifo.
-        additions.setup.writable.push(fifo.path().clone());
-    }
-    if let Some(bridge) = &ipc_bridge {
-        let ipc = container_ipc_setup(
-            context.ipc_commands,
-            ContainerIpcEndpoint {
-                host: runtime.host_route().name(),
-                port: bridge.port(),
-            },
-        )?;
-        additions.setup = ContainerSetup {
-            writable: additions.setup.writable,
-            ..ipc
-        };
-    }
-
-    let result = spawn_container_job(&context, additions).await;
-    if let Some(bridge) = ipc_bridge {
-        bridge.stop().await;
-    }
+    let result = spawn_container_job(&context).await;
     // The exec has ended, killed or not: the relay stops feeding the fifo and
     // returns its tokens once the job's last process holding it is gone.
     #[cfg(all(unix, feature = "jobserver"))]
@@ -4914,8 +4859,25 @@ async fn execute_container_job<E: Executor + Clone + 'static>(
 
 async fn spawn_container_job<E: Executor + Clone + 'static>(
     context: &ContainerJobExecution<'_, E>,
-    additions: ContainerJobAdditions,
 ) -> Result<(u32, std::process::Output), TerminalError> {
+    // Exported by the sandbox ahead of the embedder's variables, which win as
+    // they do for a local command.
+    #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
+    let mut environment = vec![(
+        crate::memory::JOB_MARKER_ENV.to_string(),
+        context.task_id.to_string(),
+    )];
+    #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
+    let mut grants = Vec::new();
+    #[cfg(all(unix, feature = "jobserver"))]
+    if let Some(fifo) = &context.job_fifo {
+        environment.extend(fifo.environment());
+        // The build tools write tokens back to the fifo.
+        grants.push(crate::SpawnGrant::Container {
+            path: fifo.path().clone(),
+            access: Access::WRITE,
+        });
+    }
     let runtime = context.container_runtime;
     // The sandbox's grants, priority and environment source, on the container
     // whose tools the home environment prepared.
@@ -4938,8 +4900,9 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
     )?;
     let foreground = matches!(context.lifetime, JobLifetime::Foreground { .. });
     let mut spec = SpawnSpec::script(script)
-        .env(additions.environment)
-        .container_setup(additions.setup)
+        .env(environment)
+        .grants(grants)
+        .ipc(create_ipc_router(context.registry))
         .lifetime(if foreground {
             TreeLifetime::Foreground
         } else {
@@ -5198,7 +5161,7 @@ pub fn inject_env_exports(
     Ok(rendered)
 }
 
-fn shell_escape(value: &str) -> String {
+pub(crate) fn shell_escape(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     let mut output = String::with_capacity(escaped.len() + 2);
     output.push('\'');
@@ -5382,14 +5345,6 @@ fn path_environment_value(name: &str, path: &Path) -> Result<String, TerminalErr
 }
 
 #[derive(Template)]
-#[template(path = "container_ipc_prelude.sh", escape = "none")]
-struct ContainerIpcPreludeTemplate<'a> {
-    escaped_commands: &'a str,
-    ipc_host: &'a str,
-    ipc_port: u16,
-}
-
-#[derive(Template)]
 #[template(path = "container_setup.sh", escape = "none")]
 struct ContainerSetupTemplate<'a> {
     setup: &'a str,
@@ -5422,13 +5377,6 @@ pub fn start_in_container_directory(
     })
 }
 
-/// Where a container's commands reach the host's IPC bridge.
-#[derive(Clone, Copy)]
-struct ContainerIpcEndpoint<'a> {
-    host: &'a str,
-    port: u16,
-}
-
 /// Working directory container executions run their scripts in.
 pub const CONTAINER_EXEC_WORKING_DIR: &str = "/workspace";
 
@@ -5439,7 +5387,8 @@ pub const CONTAINER_EXEC_WORKING_DIR: &str = "/workspace";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerConfinement {
     pub(crate) working_dir: ContainerPath,
-    pub(crate) writable: Vec<ContainerPath>,
+    /// What the sandbox may reach beyond the working directory.
+    pub(crate) grants: Vec<(ContainerPath, heel::Access)>,
 }
 
 /// Where a container command runs: the mounted tools, the exec's working
@@ -5510,9 +5459,9 @@ fn heel_run_container_command(
         confinement.map_or(working_dir, |confinement| confinement.working_dir.as_str());
     let escaped_grants = confinement.map(|confinement| {
         confinement
-            .writable
+            .grants
             .iter()
-            .map(|path| shell_escape(&format!("{path}=rw")))
+            .map(|(path, access)| shell_escape(&format!("{path}={access}")))
             .collect()
     });
     let escaped_working_dir = shell_escape(working_dir);
@@ -5558,9 +5507,9 @@ fn prioritized_container_script(
 /// The script a container exec runs for `script`: `setup` first, outside the
 /// sandbox, and then `script` in the sandbox the priority and confinement ask
 /// for, with the setup's sandbox arguments.
-pub fn wrap_container_script(
+pub(crate) fn wrap_container_script(
     script: &str,
-    setup: Option<&ContainerSetup>,
+    setup: Option<&ExecSetup>,
     priority: ProcessPriority,
     tools_dir: &ContainerPath,
     working_dir: &str,
@@ -5589,288 +5538,6 @@ pub fn wrap_container_script(
     }
     .render()
     .map_err(|error| TerminalError::Execution(format!("failed to render container setup: {error}")))
-}
-
-/// The setup a container command needs to reach the host's IPC commands: the
-/// shims for `commands` in a directory of their own, and the endpoint the
-/// sandbox relays to. The sandbox may read and run the shims.
-fn container_ipc_setup(
-    commands: &[String],
-    endpoint: ContainerIpcEndpoint<'_>,
-) -> Result<ContainerSetup, TerminalError> {
-    for name in commands {
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(TerminalError::Execution(format!(
-                "invalid ipc command name for container wrapper: {name}"
-            )));
-        }
-    }
-    let escaped_commands = commands
-        .iter()
-        .map(|name| shell_escape(name))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let script = ContainerIpcPreludeTemplate {
-        escaped_commands: &escaped_commands,
-        ipc_host: endpoint.host,
-        ipc_port: endpoint.port,
-    }
-    .render()
-    .map_err(|error| {
-        TerminalError::Execution(format!("failed to render container IPC setup: {error}"))
-    })?;
-    // The shims are written under the shared temp directory, which stays
-    // execute-denied even at `permissive` isolation, so the sandbox is granted
-    // them read-and-execute; the setup writes them before the sandbox starts,
-    // so the sandbox itself never writes the directory. `--ipc-endpoint` has
-    // heel relay the sandbox's local IPC socket to the bridge from outside
-    // it, so the sandboxed `heel ipc` needs no TCP access of its own.
-    Ok(ContainerSetup {
-        script,
-        sandbox_args: vec![
-            "--ipc-endpoint".to_string(),
-            shell_escape(&format!("tcp://{}:{}", endpoint.host, endpoint.port)),
-            "--grant".to_string(),
-            "\"$MAY_IPC_DIR=rx\"".to_string(),
-        ],
-        ..ContainerSetup::default()
-    })
-}
-
-struct ContainerIpcBridge {
-    shutdown_tx: Sender<()>,
-    port: u16,
-}
-
-impl ContainerIpcBridge {
-    const fn port(&self) -> u16 {
-        self.port
-    }
-
-    async fn stop(self) {
-        tracing::debug!("stopping container IPC bridge");
-        let _ = self.shutdown_tx.send(()).await;
-    }
-}
-
-fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
-    executor: E,
-    registry: Arc<ToolRegistry>,
-    workspace: Option<MountRoot>,
-    bind: std::net::IpAddr,
-) -> Result<ContainerIpcBridge, TerminalError> {
-    // The bridge executes host IPC commands for whoever connects, so it binds
-    // only the address the container route names — never a wildcard.
-    let listener = StdTcpListener::bind(SocketAddr::new(bind, 0)).map_err(|e| {
-        TerminalError::Execution(format!("failed to bind container IPC tcp port: {e}"))
-    })?;
-    let local_addr = listener.local_addr().map_err(|e| {
-        TerminalError::Execution(format!("failed to resolve container IPC tcp endpoint: {e}"))
-    })?;
-    tracing::debug!(
-        bind = %local_addr,
-        "starting container IPC bridge"
-    );
-    listener.set_nonblocking(true).map_err(|e| {
-        TerminalError::Execution(format!(
-            "failed to set IPC tcp listener nonblocking mode: {e}"
-        ))
-    })?;
-    let listener = Async::new(listener).map_err(|e| {
-        TerminalError::Execution(format!(
-            "failed to register IPC tcp listener with async reactor: {e}"
-        ))
-    })?;
-
-    let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
-    let bridge_executor = executor.clone();
-    executor
-        .spawn(async move {
-            tracing::debug!(bind = %local_addr, "container IPC bridge listening");
-            if let Err(error) = run_container_ipc_bridge(
-                listener,
-                registry,
-                workspace,
-                shutdown_rx,
-                bridge_executor,
-            )
-            .await
-            {
-                tracing::debug!(error = %error, "container IPC bridge stopped with error");
-            }
-            tracing::debug!(bind = %local_addr, "container IPC bridge stopped");
-        })
-        .detach();
-
-    Ok(ContainerIpcBridge {
-        shutdown_tx,
-        port: local_addr.port(),
-    })
-}
-
-enum ContainerIpcBridgeEvent {
-    Accept(std::io::Result<(Async<StdTcpStream>, std::net::SocketAddr)>),
-    Shutdown,
-}
-
-async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
-    listener: Async<StdTcpListener>,
-    registry: Arc<ToolRegistry>,
-    workspace: Option<MountRoot>,
-    shutdown_rx: Receiver<()>,
-    executor: E,
-) -> Result<(), String> {
-    loop {
-        let event = futures_lite::future::or(
-            async { ContainerIpcBridgeEvent::Accept(listener.accept().await) },
-            async {
-                let _ = shutdown_rx.recv().await;
-                ContainerIpcBridgeEvent::Shutdown
-            },
-        )
-        .await;
-
-        match event {
-            ContainerIpcBridgeEvent::Shutdown => break,
-            ContainerIpcBridgeEvent::Accept(Ok((stream, _addr))) => {
-                tracing::debug!("container IPC bridge accepted connection");
-                let registry = registry.clone();
-                let workspace = workspace.clone();
-                executor
-                    .spawn(async move {
-                        if let Err(error) =
-                            handle_container_ipc_connection(stream, registry, workspace).await
-                        {
-                            tracing::debug!(error = %error, "container IPC connection failed");
-                        }
-                    })
-                    .detach();
-            }
-            ContainerIpcBridgeEvent::Accept(Err(error))
-                if error.kind() == std::io::ErrorKind::Interrupted => {}
-            ContainerIpcBridgeEvent::Accept(Err(error)) => {
-                return Err(format!("container IPC accept failed: {error}"));
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn handle_container_ipc_connection(
-    mut stream: Async<StdTcpStream>,
-    registry: Arc<ToolRegistry>,
-    workspace: Option<MountRoot>,
-) -> Result<(), String> {
-    loop {
-        let mut length_bytes = [0_u8; 4];
-        match stream.read_exact(&mut length_bytes).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(format!("failed to read IPC request length: {error}")),
-        }
-        let body_length = u32::from_be_bytes(length_bytes) as usize;
-        if body_length == 0 || body_length > 16 * 1024 * 1024 {
-            return Err(format!("invalid IPC request length: {body_length}"));
-        }
-
-        let mut body = vec![0_u8; body_length];
-        stream
-            .read_exact(&mut body)
-            .await
-            .map_err(|e| format!("failed to read IPC request body: {e}"))?;
-
-        let request = match heel::ipc::IpcRequest::decode(&body) {
-            Ok(request) if !request.method.is_empty() => request,
-            Ok(_) => {
-                write_container_ipc_error(&mut stream, "empty IPC method name").await?;
-                continue;
-            }
-            Err(error) => {
-                write_container_ipc_error(&mut stream, &error.to_string()).await?;
-                continue;
-            }
-        };
-        let cli_args = decode_container_ipc_args(&request.params)?;
-        // The caller reports its directory as the container sees it; the
-        // host resolves relative paths in the directory that is mounted at.
-        // A directory outside the workspace mount has no host spelling.
-        let working_dir = workspace.as_ref().and_then(|workspace| {
-            let container_dir = ContainerPath::new(request.working_dir.to_str()?).ok()?;
-            workspace.host_path(&container_dir).ok()
-        });
-        let envelope = registry
-            .query_tool_handler_from(&request.method, &cli_args, working_dir.as_deref())
-            .await;
-        match crate::command::envelope_to_cli(envelope) {
-            Ok(rendered) => write_container_ipc_success(&mut stream, &rendered).await?,
-            Err(error) => {
-                write_container_ipc_error(&mut stream, &error.to_string()).await?;
-            }
-        }
-    }
-}
-
-fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
-    let parsed: serde_json::Value =
-        rmp_serde::from_slice(params).map_err(|e| format!("invalid IPC params: {e}"))?;
-    let args = parsed
-        .as_object()
-        .ok_or_else(|| "container IPC params must be a map".to_string())?;
-    let args = args
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<std::collections::HashMap<_, _>>();
-    Ok(crate::command::flatten_args_to_cli(&args))
-}
-
-async fn write_container_ipc_success(
-    stream: &mut Async<StdTcpStream>,
-    rendered: &str,
-) -> Result<(), String> {
-    let payload = rmp_serde::to_vec_named(rendered)
-        .map_err(|e| format!("failed to encode IPC success payload: {e}"))?;
-    write_container_ipc_response(stream, true, &payload).await
-}
-
-async fn write_container_ipc_error(
-    stream: &mut Async<StdTcpStream>,
-    message: &str,
-) -> Result<(), String> {
-    let payload = rmp_serde::to_vec_named(&message.to_string())
-        .map_err(|e| format!("failed to encode IPC error payload: {e}"))?;
-    write_container_ipc_response(stream, false, &payload).await
-}
-
-async fn write_container_ipc_response(
-    stream: &mut Async<StdTcpStream>,
-    success: bool,
-    payload: &[u8],
-) -> Result<(), String> {
-    let body_length = 1usize
-        .checked_add(payload.len())
-        .ok_or_else(|| "IPC response payload length overflow".to_string())?;
-    let response_length = u32::try_from(body_length)
-        .map_err(|_| format!("IPC response body too large: {body_length} bytes"))?;
-
-    stream
-        .write_all(&response_length.to_be_bytes())
-        .await
-        .map_err(|e| format!("failed to write IPC response length: {e}"))?;
-    stream
-        .write_all(&[u8::from(success)])
-        .await
-        .map_err(|e| format!("failed to write IPC success flag: {e}"))?;
-    stream
-        .write_all(payload)
-        .await
-        .map_err(|e| format!("failed to write IPC payload: {e}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("failed to flush IPC payload: {e}"))
 }
 
 fn preview_first_lines(data: &[u8], max_lines: usize) -> (String, bool) {
@@ -6022,6 +5689,7 @@ impl From<crate::SpawnError> for TerminalError {
         match error {
             crate::SpawnError::Setup(message) => Self::SandboxSetup(message),
             crate::SpawnError::Start(message) => Self::Execution(message),
+            error @ crate::SpawnError::Unsupported { .. } => Self::Execution(error.to_string()),
         }
     }
 }
@@ -6915,14 +6583,14 @@ mod tests {
             .clone()
     }
 
-    /// `script` wrapped with the IPC setup for `commands` at `endpoint`.
+    /// `script` wrapped with the IPC setup for `commands` at `host:port`.
     fn wrap_with_ipc(
         script: &str,
         commands: &[String],
-        endpoint: ContainerIpcEndpoint<'_>,
+        endpoint: (&str, u16),
         priority: ProcessPriority,
     ) -> Result<String, TerminalError> {
-        let setup = container_ipc_setup(commands, endpoint)?;
+        let setup = crate::spawn::container_ipc::exec_setup(commands, endpoint.0, endpoint.1)?;
         wrap_container_script(
             script,
             Some(&setup),
@@ -6938,15 +6606,12 @@ mod tests {
         let wrapped = wrap_with_ipc(
             "websearch \"gold price\"",
             &[String::from("websearch")],
-            ContainerIpcEndpoint {
-                host: "host.docker.internal",
-                port: 9000,
-            },
+            ("host.docker.internal", 9000),
             ProcessPriority::default(),
         )
         .expect("wrap script");
         assert!(wrapped.contains("hash -r;"));
-        assert!(wrapped.contains("MAY_IPC_DIR"));
+        assert!(wrapped.contains("AITHER_IPC_DIR"));
         assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
     }
 
@@ -6956,10 +6621,7 @@ mod tests {
         let wrapped = wrap_with_ipc(
             script,
             &[String::from("subagent")],
-            ContainerIpcEndpoint {
-                host: "host.docker.internal",
-                port: 9000,
-            },
+            ("host.docker.internal", 9000),
             ProcessPriority::default(),
         )
         .expect("wrap script");
@@ -6972,17 +6634,14 @@ mod tests {
         let error = wrap_with_ipc(
             "echo ok",
             &[String::from("bad name")],
-            ContainerIpcEndpoint {
-                host: "host.docker.internal",
-                port: 9000,
-            },
+            ("host.docker.internal", 9000),
             ProcessPriority::default(),
         )
         .expect_err("invalid command name must fail");
         assert!(
             error
                 .to_string()
-                .contains("invalid ipc command name for container wrapper")
+                .contains("cannot be a shim in a container")
         );
     }
 
@@ -6991,10 +6650,7 @@ mod tests {
         let wrapped = wrap_with_ipc(
             "environment --query deployment",
             &[String::from("environment"), String::from("session")],
-            ContainerIpcEndpoint {
-                host: "host.containers.internal",
-                port: 43123,
-            },
+            ("host.containers.internal", 43123),
             ProcessPriority::default(),
         )
         .expect("wrap script");
@@ -9276,7 +8932,6 @@ mod tests {
             mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             prepared_tools: &container_tools,
-            ipc_commands: &[],
             job_registry: &job_registry,
             stdin_alerts: Some(StdinAlerts {
                 tx: alert_tx.clone(),
@@ -9412,7 +9067,6 @@ mod tests {
             mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             prepared_tools: &container_tools,
-            ipc_commands: &[],
             job_registry: &job_registry,
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground { alerts: alert_tx },
@@ -10644,12 +10298,10 @@ mod tests {
         );
         let tools_dir = container_tools_dir();
         let executable = format!("--executable {}", shell_escape(tools_dir.as_str()));
-        let setup = container_ipc_setup(
+        let setup = crate::spawn::container_ipc::exec_setup(
             &[String::from("websearch")],
-            ContainerIpcEndpoint {
-                host: "host.docker.internal",
-                port: 9000,
-            },
+            "host.docker.internal",
+            9000,
         )
         .expect("ipc setup");
         let wrapped = wrap_container_script(
@@ -10662,21 +10314,21 @@ mod tests {
         )
         .expect("wrap script");
         assert!(wrapped.contains(
-            "\"$MAY_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
+            "\"$AITHER_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
              --env-passthrough PATH --env-passthrough HOME"
         ));
         assert!(wrapped.contains(&executable));
         assert!(wrapped.contains(
-            "--ipc-endpoint 'tcp://host.docker.internal:9000' --grant \"$MAY_IPC_DIR=rx\" \
+            "--ipc-endpoint 'tcp://host.docker.internal:9000' --grant \"$AITHER_IPC_DIR=rx\" \
              --nice 5 --io-priority background -- sh -c 'echo ok'"
         ));
         assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
 
         let bare = wrap_container_script("echo ok", None, priority, &tools_dir, "/workspace", None)
             .expect("wrap script");
-        assert!(bare.contains("MAY_HEEL_BIN=\"$(command -v heel || true)\""));
+        assert!(bare.contains("AITHER_HEEL_BIN=\"$(command -v heel || true)\""));
         assert!(bare.contains(
-            "\"$MAY_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
+            "\"$AITHER_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
              --env-passthrough PATH --env-passthrough HOME"
         ));
         assert!(bare.contains(&executable));
@@ -10760,18 +10412,32 @@ mod tests {
     /// live handler and gets its envelope back.
     #[tokio::test(flavor = "multi_thread")]
     async fn container_ipc_bridge_round_trips_a_command_over_tcp() {
+        use futures_lite::io::AsyncReadExt;
         let outputs = tempfile::tempdir().expect("outputs dir should be created");
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(ProbeEchoTool);
         let registry = Arc::new(builder.build(test_outputs(outputs.path())));
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
-        let bridge =
-            start_container_ipc_bridge(executor_core::tokio::TokioGlobal, registry, None, loopback)
-                .expect("bridge should start on loopback");
+        let runtime = crate::ContainerShellRuntime::new(
+            "aither-test-ipc",
+            crate::HostRoute::new("host.docker.internal", loopback).expect("loopback is routable"),
+            crate::AnyContainerExec::new(Arc::new(UnreachableContainerExec)),
+        );
+        let executor = Arc::new(executor_core::AnyExecutor::new(
+            executor_core::tokio::TokioGlobal,
+        ));
+        let bridge = crate::spawn::container_ipc::ContainerIpc::serve(
+            &executor,
+            create_ipc_router(&registry).expect("the registry has a command"),
+            &runtime,
+        )
+        .expect("bridge should start on loopback");
 
-        let mut stream = Async::<StdTcpStream>::connect(SocketAddr::new(loopback, bridge.port()))
-            .await
-            .expect("client should connect to the bridge");
+        let mut stream = async_io::Async::<std::net::TcpStream>::connect(
+            std::net::SocketAddr::new(loopback, bridge.port()),
+        )
+        .await
+        .expect("client should connect to the bridge");
 
         let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "pong" }))
             .expect("params should encode");
@@ -13769,7 +13435,10 @@ mod tests {
             !main.contains(" run --"),
             "the container is the main agent's boundary: {main}"
         );
-        assert!(sub.contains("\"$MAY_HEEL_BIN\" run --working-dir"), "{sub}");
+        assert!(
+            sub.contains("\"$AITHER_HEEL_BIN\" run --working-dir"),
+            "{sub}"
+        );
         assert!(!sub.contains("--isolation permissive"), "{sub}");
         let root = dunce::canonicalize(dir.path()).unwrap();
         let space = child

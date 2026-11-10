@@ -4,9 +4,14 @@ use std::sync::Arc;
 
 use executor_core::Executor;
 
+use heel::Access;
+
 use super::ContainerLaunch;
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
-use super::{EnvSource, Pipe, Sandbox, SpawnError, SpawnSpec, TreeLifetime};
+use super::container_ipc::ContainerIpc;
+use super::{
+    EnvSource, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, TreeLifetime,
+};
 use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
 use crate::terminal::{
     CONTAINER_EXEC_WORKING_DIR, ContainerConfinement, inject_env_exports,
@@ -52,7 +57,7 @@ impl Sandbox {
     fn container_confinement(
         &self,
         runtime: &ContainerShellRuntime,
-        extra: &[ContainerPath],
+        extra: Vec<(ContainerPath, Access)>,
     ) -> Result<Option<ContainerConfinement>, SpawnError> {
         if !self.inner.grants.is_derived() {
             return Ok(None);
@@ -60,18 +65,18 @@ impl Sandbox {
         // The confinement is rooted at the sandbox's own directory, which a
         // child's is its space, whatever directory the process starts in.
         let working_dir = Self::container_path(runtime, &self.inner.working_dir)?;
-        let mut writable = self
+        let mut grants = self
             .inner
             .grants
             .snapshot()
             .writable
             .iter()
-            .map(|path| Self::container_path(runtime, path))
-            .collect::<Result<Vec<_>, _>>()?;
-        writable.extend(extra.iter().cloned());
+            .map(|path| Ok((Self::container_path(runtime, path)?, Access::WRITE)))
+            .collect::<Result<Vec<_>, SpawnError>>()?;
+        grants.extend(extra);
         Ok(Some(ContainerConfinement {
             working_dir,
-            writable,
+            grants,
         }))
     }
 
@@ -101,16 +106,13 @@ impl Sandbox {
     ) -> Result<SandboxedChild, SpawnError> {
         let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let SpawnSpec {
-            program,
-            script,
-            args,
+            command,
             env,
             cwd,
             stdio,
-            extra_grants: _,
-            ipc: _,
+            grants,
+            ipc,
             lifetime,
-            setup,
         } = spec;
 
         let working_dir = match &cwd {
@@ -118,17 +120,28 @@ impl Sandbox {
             None => ContainerPath::new(CONTAINER_EXEC_WORKING_DIR)
                 .expect("the container working directory is absolute"),
         };
-        let confinement = self.container_confinement(
-            runtime,
-            setup
-                .as_ref()
-                .map_or(&[][..], |setup| setup.writable.as_slice()),
-        )?;
+        let mut container_grants = Vec::new();
+        for grant in grants {
+            match grant {
+                SpawnGrant::Container { path, access } => container_grants.push((path, access)),
+                SpawnGrant::Host(_) => {
+                    return Err(SpawnError::Unsupported {
+                        backend: "container",
+                        what: "a grant on a host path",
+                    });
+                }
+            }
+        }
+        let confinement = self.container_confinement(runtime, container_grants)?;
 
         // The exec channel accepts only a script, so the environment travels
         // as exports ahead of it; the spec's lead the source's.
-        let script =
-            script.unwrap_or_else(|| shell_words::join(std::iter::once(&program).chain(&args)));
+        let script = match command {
+            SpawnCommand::Script(script) => script,
+            SpawnCommand::Program { program, args } => {
+                shell_words::join(std::iter::once(&program).chain(&args))
+            }
+        };
         let script = self.exec_script(launch, script, env)?;
         // A confined process runs in a sandbox rooted at the sandbox's own
         // directory; the directory it was asked to start in is entered inside.
@@ -138,9 +151,12 @@ impl Sandbox {
             }
             _ => script,
         };
+        let ipc = ipc
+            .map(|router| ContainerIpc::serve(&self.inner.executor, router, runtime))
+            .transpose()?;
         let script = wrap_container_script(
             &script,
-            setup.as_ref(),
+            ipc.as_ref().map(|ipc| &ipc.setup),
             self.inner.priority,
             launch.bin_dir(),
             working_dir.as_str(),
@@ -207,6 +223,9 @@ impl Sandbox {
                         exec_lifetime,
                     )
                     .await;
+                if let Some(ipc) = ipc {
+                    ipc.stop().await;
+                }
                 let (exit, descendants) = exit_of(outcome, &stderr_tx).await;
                 setter.finish(exit, descendants);
             })

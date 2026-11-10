@@ -9,7 +9,7 @@ use executor_core::{AnyExecutor, Executor};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
-use super::{EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnError, SpawnSpec};
+use super::{EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnCommand, SpawnError, SpawnSpec};
 use crate::SshServer;
 use crate::process_tree::{KillTreeError, kill_process_tree};
 use crate::ssh::SshClient;
@@ -132,21 +132,27 @@ impl Sandbox {
     ) -> Result<SandboxedChild, SpawnError> {
         let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let SpawnSpec {
-            program,
-            script,
-            args,
+            command,
             env,
             cwd,
             stdio,
-            extra_grants: _,
-            ipc: _,
+            grants,
+            ipc,
             lifetime: _,
-            setup,
         } = spec;
-        if setup.is_some() {
-            return Err(SpawnError::Setup(
-                "a container setup has nothing to run around on a server".into(),
-            ));
+        // A grant is a path on one machine and a router is served by this
+        // one: nothing of either reaches a server.
+        if !grants.is_empty() {
+            return Err(SpawnError::Unsupported {
+                backend: "ssh",
+                what: "a grant",
+            });
+        }
+        if ipc.is_some() {
+            return Err(SpawnError::Unsupported {
+                backend: "ssh",
+                what: "a way back to the host's commands",
+            });
         }
         if cwd.is_some() {
             return Err(SpawnError::Setup(
@@ -169,8 +175,12 @@ impl Sandbox {
 
         // Only what the spec names travels: the sandbox's own environment and
         // its source describe this machine.
-        let script =
-            script.unwrap_or_else(|| shell_words::join(std::iter::once(&program).chain(&args)));
+        let script = match command {
+            SpawnCommand::Script(script) => script,
+            SpawnCommand::Program { program, args } => {
+                shell_words::join(std::iter::once(&program).chain(&args))
+            }
+        };
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
         let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| failed(&e))?;
         let remote = remote_command(launch, heel, &script).map_err(|e| failed(&e))?;

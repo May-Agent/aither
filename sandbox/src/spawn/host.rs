@@ -12,7 +12,7 @@ use heel::{
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
 use super::domain::DomainGate;
 use super::stdio::{read_chunks, write_chunks};
-use super::{Backend, Pipe, Sandbox, SpawnError, SpawnSpec, Stdio};
+use super::{Backend, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio};
 #[cfg(target_os = "linux")]
 use crate::process_tree::JobProcess;
 use crate::process_tree::{JobMarker, JobTree};
@@ -234,28 +234,32 @@ impl Sandbox {
     pub(crate) async fn spawn_local(&self, spec: SpawnSpec) -> Result<LocalSpawn, SpawnError> {
         let heel = self.heel_binary()?.clone();
         let SpawnSpec {
-            program,
-            script,
-            args,
+            command,
             env,
             cwd,
             stdio,
-            extra_grants,
+            grants: extra_grants,
             ipc,
             lifetime,
-            setup,
         } = spec;
-        if script.is_some() {
-            return Err(SpawnError::Setup(
-                "a process on the host is a program: only a container or a server has a managed shell to run a script in"
-                    .into(),
-            ));
-        }
-        if setup.is_some() {
-            return Err(SpawnError::Setup(
-                "a container setup has nothing to run around on the host".into(),
-            ));
-        }
+        // A process on the host is a program: only a container or a server
+        // has a managed shell to run a script in.
+        let SpawnCommand::Program { program, args } = command else {
+            return Err(SpawnError::Unsupported {
+                backend: "host",
+                what: "a script",
+            });
+        };
+        let extra_grants = extra_grants
+            .into_iter()
+            .map(|grant| match grant {
+                SpawnGrant::Host(grant) => Ok(grant),
+                SpawnGrant::Container { .. } => Err(SpawnError::Unsupported {
+                    backend: "host",
+                    what: "a grant on a container path",
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let marker = JobMarker::new();
         let mut env = self.host_environment(env);
         env.push(marker.entry());

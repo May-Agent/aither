@@ -528,16 +528,18 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
             heel::CpuPriority::Nice(heel::NiceLevel::new(5).unwrap()),
             heel::IoPriority::Normal,
         ));
-    let spec = SpawnSpec::script("make").container_setup(super::ContainerSetup {
-        writable: vec![crate::ContainerPath::new("/tmp/aither-test.fifo").unwrap()],
-        script: "SETUP_MARK=1\n".to_string(),
-        sandbox_args: vec!["--extra".to_string(), "\"$SETUP_MARK\"".to_string()],
-    });
+    let spec = SpawnSpec::script("make")
+        .grants([super::SpawnGrant::Container {
+            path: crate::ContainerPath::new("/tmp/aither-test.fifo").unwrap(),
+            access: heel::Access::WRITE,
+        }])
+        .ipc(Some(heel::IpcRouter::new().register(Probe)));
     let process = child.spawn(spec).await.expect("the exec starts");
     assert!(process.wait().await.success());
 
     let script = started.lock().unwrap()[0].0.clone();
-    assert!(script.starts_with("SETUP_MARK=1\n"), "{script}");
+    assert!(script.starts_with("AITHER_IPC_BIN="), "{script}");
+    assert!(script.contains("for cmd in 'probe'; do"), "{script}");
     assert!(
         script.contains("run --working-dir '/workspace' "),
         "{script}"
@@ -548,9 +550,34 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
         "{script}"
     );
     assert!(
-        script.contains(" --extra \"$SETUP_MARK\" --nice 5 "),
+        script.contains(" --ipc-endpoint 'tcp://host.docker.internal:"),
         "{script}"
     );
+    assert!(
+        script.contains(" --grant \"$AITHER_IPC_DIR=rx\" --nice 5 "),
+        "{script}"
+    );
+}
+
+/// A command a spawn's router offers.
+struct Probe;
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ProbeArgs {}
+
+impl heel::IpcCommand for Probe {
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "probe".into()
+    }
+    type Args = ProbeArgs;
+    type Response = String;
+    fn handle(
+        &self,
+        _args: ProbeArgs,
+        _context: heel::IpcContext,
+    ) -> impl Future<Output = Result<String, heel::IpcError>> {
+        std::future::ready(Ok("probe_ok".into()))
+    }
 }
 
 #[tokio::test]
@@ -596,14 +623,42 @@ async fn a_confined_container_child_starts_where_it_was_asked_inside_its_own_san
 }
 
 #[tokio::test]
-async fn a_host_spawn_refuses_a_container_setup() {
+async fn each_backend_refuses_the_grant_and_command_it_cannot_honour() {
     let (_work, work) = canonical_tempdir();
     let sandbox = host_sandbox(&work).await;
     let error = sandbox
-        .spawn(SpawnSpec::new("/bin/true").container_setup(super::ContainerSetup::default()))
+        .spawn(
+            SpawnSpec::new("/bin/true").grants([super::SpawnGrant::Container {
+                path: crate::ContainerPath::new("/tmp/fifo").unwrap(),
+                access: heel::Access::WRITE,
+            }]),
+        )
         .await
-        .expect_err("the host has no setup to run");
-    assert!(matches!(error, super::SpawnError::Setup(_)), "{error}");
+        .expect_err("a host path is the only one the host honours");
+    assert!(
+        matches!(
+            error,
+            super::SpawnError::Unsupported {
+                backend: "host",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    let error = sandbox
+        .spawn(SpawnSpec::script("true"))
+        .await
+        .expect_err("the host has no managed shell");
+    assert!(
+        matches!(
+            error,
+            super::SpawnError::Unsupported {
+                backend: "host",
+                ..
+            }
+        ),
+        "{error}"
+    );
 }
 
 #[tokio::test]

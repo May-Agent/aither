@@ -1,3 +1,3 @@
-MAY_HEEL_BIN="$(command -v heel || true)";
-if [ -z "$MAY_HEEL_BIN" ]; then echo "heel command not found in container" >&2; exit 127; fi;
-"$MAY_HEEL_BIN" run{% if escaped_grants.is_none() %} --isolation permissive{% endif %} --working-dir {{ escaped_working_dir }} --env-passthrough PATH --env-passthrough HOME --executable {{ escaped_tools_dir }}{% if let Some(grants) = escaped_grants %}{% for grant in grants %} --grant {{ grant }}{% endfor %}{% endif %}{% for arg in sandbox_args %} {{ arg }}{% endfor %}{% if let Some(level) = nice %} --nice {{ level }}{% endif %}{% if let Some(io) = io_priority %} --io-priority {{ io }}{% endif %} -- sh -c {{ escaped_script }}
+AITHER_HEEL_BIN="$(command -v heel || true)";
+if [ -z "$AITHER_HEEL_BIN" ]; then echo "heel command not found in container" >&2; exit 127; fi;
+"$AITHER_HEEL_BIN" run{% if escaped_grants.is_none() %} --isolation permissive{% endif %} --working-dir {{ escaped_working_dir }} --env-passthrough PATH --env-passthrough HOME --executable {{ escaped_tools_dir }}{% if let Some(grants) = escaped_grants %}{% for grant in grants %} --grant {{ grant }}{% endfor %}{% endif %}{% for arg in sandbox_args %} {{ arg }}{% endfor %}{% if let Some(level) = nice %} --nice {{ level }}{% endif %}{% if let Some(io) = io_priority %} --io-priority {{ io }}{% endif %} -- sh -c {{ escaped_script }}

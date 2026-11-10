@@ -194,10 +194,10 @@ pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
 };
 pub use spawn::{
-    AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, ContainerLaunch, ContainerSetup,
-    DenyAllDomains, Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess,
-    GrantSnapshot, Grants, HostRoute, HostRouteError, Pipe, RemoteLaunch, Sandbox, SandboxedChild,
-    SpawnError, SpawnSpec, Stdio, TreeLifetime,
+    AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, ContainerLaunch, DenyAllDomains,
+    Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess, GrantSnapshot, Grants,
+    HostRoute, HostRouteError, Pipe, RemoteLaunch, Sandbox, SandboxedChild, SpawnCommand,
+    SpawnError, SpawnGrant, SpawnSpec, Stdio, TreeLifetime,
 };
 pub use ssh::{PreparedSsh, SshPlatform, SshProbeError, SshServer, SshServerError, probe_ssh_os};
 pub use stdin_watch::StdinWatchSignal;
