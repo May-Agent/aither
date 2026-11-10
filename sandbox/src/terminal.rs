@@ -48,7 +48,7 @@ use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
-use heel::{Access, CpuPriority, Grant, IoPriority, NetworkAuditLog, ProcessPriority};
+use heel::{CpuPriority, IoPriority, NetworkAuditLog, ProcessPriority};
 /// On platforms without `heel supervise` a wait produces no report.
 #[cfg(not(target_os = "linux"))]
 pub struct TreeReport;
@@ -66,8 +66,8 @@ use crate::jobs::Jobs;
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
-    Carry, ContainerLaunch, ContainerPath, MountRoot, RemoteLaunch, SandboxMode, ScriptDecision,
-    ScriptDir, ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptRefusal,
+    Carry, ContainerPath, MountRoot, RemoteLaunch, SandboxMode, ScriptDecision, ScriptDir,
+    ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptRefusal,
     interpreter::Interpreter,
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     limits::{LiveDuration, ShellLimits},
@@ -1649,7 +1649,12 @@ where
                     .shell()
                     .clone(),
             },
-            Backend::Container { runtime, launch } => {
+            Backend::Container {
+                runtime,
+                #[cfg(all(unix, feature = "jobserver"))]
+                launch,
+                ..
+            } => {
                 if mode == SandboxMode::Unsandboxed {
                     return Err(TerminalError::InvalidTarget(
                         "unsafe mode is only available in heel local runtime".into(),
@@ -1657,6 +1662,7 @@ where
                 }
                 ExecutionBackend::Container {
                     runtime: runtime.clone(),
+                    #[cfg(all(unix, feature = "jobserver"))]
                     launch: launch.clone(),
                 }
             }
@@ -3097,7 +3103,9 @@ enum ExecutionBackend {
     /// A container, whose programs its backend's launch names.
     Container {
         runtime: ContainerShellRuntime,
-        launch: ContainerLaunch,
+        /// Read only to open a command's jobserver fifo in the container.
+        #[cfg(all(unix, feature = "jobserver"))]
+        launch: crate::ContainerLaunch,
     },
     /// A remote host over SSH.
     Ssh {
@@ -3491,7 +3499,12 @@ where
 {
     let shell = match request.backend {
         ExecutionBackend::Local { shell } => shell.as_ref(),
-        ExecutionBackend::Container { runtime, launch } => {
+        ExecutionBackend::Container {
+            runtime,
+            #[cfg(all(unix, feature = "jobserver"))]
+            launch,
+            ..
+        } => {
             // The command's fifo lives in the container's kernel, brokered
             // by a relay run with the `python3` the launch's programs hold.
             #[cfg(all(unix, feature = "jobserver"))]
@@ -3800,12 +3813,13 @@ fn committed_git_environment(
     Ok(())
 }
 
-use crate::spawn::resolved;
-
 /// The grant a command's jobserver fifo needs: it writes tokens back to it.
 #[cfg(all(unix, feature = "jobserver"))]
-pub fn job_fifo_grant(path: &Path) -> heel::Result<Grant> {
-    Ok(Grant::new(resolved(path)?, Access::WRITE))
+pub fn job_fifo_grant(path: &Path) -> heel::Result<heel::Grant> {
+    Ok(heel::Grant::new(
+        crate::spawn::resolved(path)?,
+        heel::Access::WRITE,
+    ))
 }
 
 /// Runs a command on the host: sandboxed through the terminal's [`Sandbox`],
@@ -4388,7 +4402,7 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
         // The build tools write tokens back to the fifo.
         grants.push(crate::SpawnGrant::Container {
             path: fifo.path().clone(),
-            access: Access::WRITE,
+            access: heel::Access::WRITE,
         });
     }
     let runtime = context.container_runtime;
@@ -5045,6 +5059,7 @@ impl<E> std::fmt::Debug for Shell<E> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ContainerLaunch;
     use std::io::Write;
     use std::time::Duration;
 

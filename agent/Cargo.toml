@@ -53,7 +53,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-executor-core = "0.7"
+executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 # An in-process MCP server drives the command table through a real connection.

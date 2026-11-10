@@ -47,7 +47,9 @@ pub use domain::{
 };
 pub use env::{EnvSource, LaunchInfo};
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
-pub use host::{LocalSpawn, TreeLifetime, resolved};
+#[cfg(all(unix, feature = "jobserver"))]
+pub use host::resolved;
+pub use host::{LocalSpawn, TreeLifetime};
 #[cfg(test)]
 pub use ipc::fixture as ipc_fixture;
 pub use ipc::{AnyIpcProvider, IpcProvider};
