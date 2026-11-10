@@ -113,7 +113,7 @@ pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
 pub use compact_tool::{CompactArgs, CompactRequest, CompactSignal, CompactTool};
-pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy};
+pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy, CacheKeepAlive};
 #[cfg(feature = "skills")]
 pub use context::ActiveSkills;
 pub use context::{

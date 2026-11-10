@@ -1615,9 +1615,66 @@ pub enum Ability {
     MidConversationSystem,
 }
 
+impl Ability {
+    /// The ability's stable `snake_case` label, for listings and wire formats
+    /// that name abilities.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ToolUse => "tool_use",
+            Self::Vision => "vision",
+            Self::Audio => "audio",
+            Self::AudioOutput => "audio_output",
+            Self::Video => "video",
+            Self::WebSearch => "web_search",
+            Self::Pdf => "pdf",
+            Self::CodeExecution => "code_execution",
+            Self::Reasoning => "reasoning",
+            Self::ImageGeneration => "image_generation",
+            Self::ComputerUse => "computer_use",
+            Self::PromptCaching => "prompt_caching",
+            Self::AssistantPrefill => "assistant_prefill",
+            Self::PerMessageEffort => "per_message_effort",
+            Self::MidConversationSystem => "mid_conversation_system",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_ability_has_a_distinct_snake_case_label() {
+        let abilities = [
+            Ability::ToolUse,
+            Ability::Vision,
+            Ability::Audio,
+            Ability::AudioOutput,
+            Ability::Video,
+            Ability::WebSearch,
+            Ability::Pdf,
+            Ability::CodeExecution,
+            Ability::Reasoning,
+            Ability::ImageGeneration,
+            Ability::ComputerUse,
+            Ability::PromptCaching,
+            Ability::AssistantPrefill,
+            Ability::PerMessageEffort,
+            Ability::MidConversationSystem,
+        ];
+        let labels: alloc::collections::BTreeSet<_> =
+            abilities.iter().map(|ability| ability.label()).collect();
+        assert_eq!(labels.len(), abilities.len());
+        for label in labels {
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{label} is not snake_case"
+            );
+        }
+    }
 
     #[test]
     fn profile_creation() {

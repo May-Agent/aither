@@ -5,7 +5,8 @@
 //! 1. [`render`] renders the byte stream the way a terminal would display it,
 //!    consuming escape sequences and resolving `\r` to the last frame of each
 //!    line.
-//! 2. [`collapse`] collapses runs of blank lines to a single blank line.
+//! 2. [`collapse`] replaces each run of blank lines with one marker line
+//!    that counts them.
 //! 3. [`json_tsv`] turns a JSON array of records into TSV.
 //! 4. [`fold`] folds the bodies of blocks in output that is source code, via
 //!    [`folded_code_content`].
@@ -165,7 +166,13 @@ mod tests {
         let cleaned = compress("alpha\n\n\n\nbeta\n\ngamma\n")
             .await
             .expect("blank runs collapse");
-        assert_eq!(cleaned, "alpha\n\nbeta\n\ngamma\n");
+        let lines: Vec<&str> = cleaned.lines().collect();
+        assert_eq!(lines.len(), 5, "{cleaned}");
+        assert!(
+            lines[1].starts_with("[... 3 blank lines collapsed"),
+            "{cleaned}"
+        );
+        assert_eq!(&lines[2..], ["beta", "", "gamma"]);
     }
 
     #[tokio::test]
