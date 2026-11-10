@@ -20,7 +20,7 @@ arc-swap.workspace = true
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.9.1"
+heel = "0.9.4"
 rmp-serde = "1"
 
 # Executor for tokio integration
