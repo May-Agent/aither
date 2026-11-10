@@ -155,7 +155,7 @@ pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use interpreter::Interpreter;
 pub use job_registry::{
     Delivery, JobDelta, JobInfo, JobPlace, JobRead, JobStatus, KillCause, OwedCompletion,
-    PendingCompletion,
+    PendingCompletion, UnchangedRead,
 };
 pub use jobs::{Job, JobWaitError, Jobs, RunOutcome, ScriptResult};
 #[cfg(all(unix, feature = "jobserver"))]
@@ -226,7 +226,7 @@ pub use tool_transport::{
     probe_tool_environment,
 };
 pub use wording::{
-    AnyShellWording, CommandKilled, FoldedLines, JobInputSent, JobKillAsked, JsonAsTsv, LineRange,
-    MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines, ReservedForMain,
-    ShellWording, StoredBinaryPart,
+    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
+    JsonAsTsv, LineRange, MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines,
+    ReservedForMain, ShellWording, StoredBinaryPart,
 };

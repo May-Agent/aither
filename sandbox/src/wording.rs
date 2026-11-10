@@ -25,6 +25,33 @@ pub struct MonitorStarted<'a> {
     pub interval_secs: u64,
 }
 
+/// A call of the shell's tools refused before it ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CallRefusal {
+    /// The `description` of a `terminal` call is empty.
+    EmptyDescription,
+    /// The call names an interpreter the shell is not configured with.
+    InterpreterNotConfigured {
+        /// The interpreter asked for.
+        interpreter: crate::Interpreter,
+    },
+    /// The `timeout` is zero or above the shell's cap.
+    TimeoutOutOfRange {
+        /// The longest timeout the shell accepts.
+        cap: std::time::Duration,
+    },
+    /// A job control call names no task.
+    EmptyTaskId,
+    /// A job control call names a task the shell does not hold.
+    UnknownTask {
+        /// The task named.
+        task_id: String,
+    },
+    /// A read asks for zero bytes.
+    ZeroMaxBytes,
+}
+
 /// A command invoked by a subagent that only the main agent may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservedForMain<'a> {
@@ -164,6 +191,9 @@ pub trait ShellWording: Send + Sync + 'static {
     /// gate gave.
     fn command_blocked(&self, blocked: &CommandBlocked) -> String;
 
+    /// A call of a tool of the shell refused before it ran.
+    fn call_refused(&self, refusal: &CallRefusal) -> String;
+
     /// A `monitor` call refused before anything started.
     fn monitor_refusal(&self, refusal: &MonitorRefusal) -> String;
 
@@ -269,6 +299,13 @@ impl<R> Refused<R> {
     /// Takes the reason, dropping the text.
     pub fn into_reason(self) -> R {
         self.reason
+    }
+}
+
+impl Refused<CallRefusal> {
+    /// The error of a call refused for `refusal`, worded by `wording`.
+    pub(crate) fn call(wording: &dyn ShellWording, refusal: CallRefusal) -> anyhow::Error {
+        Self::rendered(refusal, |refusal| wording.call_refused(refusal)).into()
     }
 }
 

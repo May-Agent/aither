@@ -12,6 +12,7 @@
 //! names, subagent spaces — are leased from the terminal's
 //! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
 
+use crate::CallRefusal;
 use crate::foreground_wait::ForegroundWait;
 use crate::memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
@@ -364,118 +365,45 @@ fn carry_cwd_script(script: &str, report: &str) -> Result<String, TerminalError>
     })
 }
 
-/// Execute terminal commands in a sandboxed environment.
-///
-/// The primary interface to all system capabilities. Scripts run in a sandbox
-/// with full read access to the host filesystem but writes contained to a
-/// dedicated working directory.
-///
-/// ## Output Handling
-///
-/// By default, stdout is **compressed** before being returned. Compression
-/// is semantics-preserving: the meaning is identical to the raw output, but
-/// the representation may differ. Specifically:
-///
-/// - **JSON** outputs (arrays of objects or single objects) are automatically
-///   converted to **TSV** with dot-notation flattened column headers, but
-///   only when the TSV is smaller than the original JSON.
-/// - **Source code** outputs (detected via content analysis) are folded
-///   using syntax-aware block folding with line numbers. The full raw
-///   output is saved to a file whose URL is included in the result.
-/// - **Empty lines** and **invisible/control characters** are stripped.
-///
-/// If you need the exact verbatim output (e.g., for checksums, binary
-/// protocols, or diffing), either set `raw: true`, pipe through further
-/// processing in the script, or redirect to a file within the script.
-///
-/// Large outputs are automatically saved to file to manage context. When this
-/// happens, you receive the file path and can process it using standard Unix
-/// tools (head, tail, grep, less) or pipe through `ask` for summarization.
-///
-/// ## Built-in Commands
-///
-/// IPC-backed commands are configured by the host application and are exposed
-/// inside the terminal runtime as ordinary CLI commands. Inspect the
-/// application-provided command list and each command's `--help` output instead
-/// of assuming a fixed built-in command inventory.
-///
-/// ## Execution Modes
-///
-/// Each call selects its own runtime mode and starts a fresh shell; only a
-/// successful `cd` carries over to the next call. `timeout` is required:
-/// it is the job's maximum runtime in seconds — the job and its process
-/// tree are killed when it passes — and it may be at most 120 minutes.
-///
-/// By default the call waits in the foreground for up to 10 seconds. A
-/// command still running then **promotes to a background task**: the call
-/// returns the task id and the output captured so far, and the job keeps
-/// running under its `timeout` bound. Manage it with `terminal_read`
-/// (incremental output), `terminal_input` (stdin) and `terminal_kill`.
-/// Set `background: true` to detach immediately instead of waiting.
-///
-/// `language` is `shell` by default; `python` runs `script` as Python source,
-/// without a shell wrapper.
+// The arguments of the shell tool. They carry no rustdoc: the schema's
+// descriptions are the embedder's, supplied by the tool's `ToolIdentity`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct ShellArgs {
-    /// Short human-readable explanation of what this command is doing.
-    /// This is shown in the UI instead of echoing the shell source.
+    // A short explanation of what the command does, shown instead of its source.
     pub description: String,
 
-    /// The terminal command payload to execute.
+    // The source to run.
     pub script: String,
 
-    /// The language of `script`.
-    /// - "shell" (default): shell source
-    /// - "python": Python source, run from a file so tracebacks carry line numbers
+    // The interpreter of `script`.
     #[serde(default)]
     pub interpreter: Interpreter,
 
-    /// How the command runs.
-    /// - "sandboxed" (default): inside the sandbox
-    /// - "unsandboxed": without the sandbox, after approval
+    // Whether the command runs inside the sandbox.
     #[serde(default)]
     pub sandbox: SandboxMode,
 
-    /// Where the command runs: omitted or empty for the home environment,
-    /// otherwise the name of a configured SSH server.
+    // Where the command runs: the home environment, or a named SSH server.
     #[serde(default)]
     pub location: Option<String>,
 
-    /// Requested delivery resolution for media returned to the model.
-    /// - "auto" (default): preserve the source resolution
-    /// - "low": downscale to a 512px bounding box
-    /// - "medium": downscale to a 1024px bounding box
-    /// - "high": downscale to a 2048px bounding box
-    /// - "native": preserve original media bytes without resizing
+    // The resolution media in the output is delivered at.
     #[serde(default)]
     pub resolution: MediaResolution,
 
-    /// Maximum number of output lines to include inline.
-    /// For foreground executions, this is the inline line budget
-    /// before output offloads to file.
-    /// For executions detached with `background: true` or promoted past
-    /// the foreground window, only the first `max_lines` are returned
-    /// immediately, while full output is redirected to file.
-    /// Clamped to the ceiling of the output policy; omitted, the policy's
-    /// default.
+    // The most output lines returned inline.
     #[serde(default)]
     pub max_lines: Option<u32>,
 
-    /// When true, skip all output compression and return the verbatim
-    /// stdout bytes. Use this when you need exact byte-level fidelity
-    /// (checksums, binary protocols, diff inputs). Default: false.
+    // Whether the output is returned verbatim, without compression.
     #[serde(default)]
     pub raw: bool,
 
-    /// Maximum runtime of the command in seconds. Required. The command and
-    /// its process tree are killed when it passes; the value may be at most
-    /// 7200 (120 minutes).
+    // The command's maximum runtime in seconds.
     pub timeout: u64,
 
-    /// Start the command detached and return immediately with its task id
-    /// instead of waiting in the foreground. Default: false — the call
-    /// waits up to the foreground window and promotes a still-running
-    /// command to a background task.
+    // Whether the command is detached at once instead of waited for.
     #[serde(default)]
     pub background: bool,
 }
@@ -2261,11 +2189,10 @@ impl<E: Executor + Clone + 'static> Tool for ShellTool<E> {
             .and_then(|definitions| definitions.get_mut("Interpreter"))
             .expect("the schema of ShellArgs defines its interpreter");
         *definition = serde_json::json!({
-            "description": "The interpreter a script runs under.",
             "type": "string",
             "enum": interpreters,
         });
-        schema
+        self.identity.describe(schema)
     }
 
     type Arguments = ShellArgs;
@@ -2338,17 +2265,19 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
         mut cx: ToolContext,
     ) -> aither_core::Result<Execution> {
         if !self.interpreters.contains(&arguments.interpreter) {
-            return Err(anyhow::anyhow!(
-                "the {:?} interpreter is not configured for this shell",
-                arguments.interpreter
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::InterpreterNotConfigured {
+                    interpreter: arguments.interpreter,
+                },
             ));
         }
         let cap = self.limits.timeout_cap.get();
         let timeout = Duration::from_secs(arguments.timeout);
         if arguments.timeout == 0 || timeout > cap {
-            return Err(anyhow::anyhow!(
-                "terminal timeout must be between 1 and {} seconds",
-                cap.as_secs()
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::TimeoutOutOfRange { cap },
             ));
         }
         let prepared = self.prepare_execution(&arguments, &mut cx).await?;
@@ -2824,7 +2753,10 @@ where
         cx: &mut ToolContext,
     ) -> anyhow::Result<ExecutionPreparation> {
         if arguments.description.trim().is_empty() {
-            return Err(anyhow::anyhow!("terminal description must not be empty"));
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::EmptyDescription,
+            ));
         }
         let origin = if arguments.background {
             ScriptOrigin::Background
@@ -8856,6 +8788,33 @@ mod tests {
                 task_id: sleeping.task_id().to_owned()
             }),
             "a repeat read is a poll"
+        );
+        // The read tool refuses a poll with a typed reason the loop can
+        // tell from a read.
+        let read_tool = crate::JobReadTool::new(
+            crate::test_wording::job_tools().read,
+            jobs.clone(),
+            TestWording::any(),
+            crate::output_policy::fixture::policy(),
+        );
+        let refusal = read_tool
+            .call(
+                crate::JobReadArgs {
+                    task_id: sleeping.task_id().to_owned(),
+                    cursor,
+                    max_bytes: None,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("a repeat read is refused");
+        let refusal = refusal
+            .downcast_ref::<crate::Refused<crate::UnchangedRead>>()
+            .expect("the refusal is typed");
+        assert_eq!(refusal.reason().task_id, sleeping.task_id());
+        assert!(
+            refusal.text().contains("produced no new output"),
+            "{refusal}"
         );
         assert_eq!(jobs.kill_all().await, 1);
         let killed = sleeping.wait().await.expect("the killed job ends");

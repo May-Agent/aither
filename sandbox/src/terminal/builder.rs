@@ -242,6 +242,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_argument_is_described_by_the_identity_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let shell = shell(directory.path(), Grants::new(), &[Interpreter::Shell]).await;
+        let registry = crate::ToolRegistryBuilder::new().build(shell.output_store().clone());
+        let schema = shell
+            .with_registry(Arc::new(registry))
+            .tool()
+            .arguments_schema()
+            .to_value();
+        let described = test_wording::argument_descriptions();
+        let properties = schema["properties"].as_object().expect("an object schema");
+        assert!(!properties.is_empty());
+        for (name, property) in properties {
+            assert_eq!(
+                property["description"].as_str(),
+                Some(&*described[name.as_str()]),
+                "{name}"
+            );
+        }
+        assert!(schema.get("description").is_none(), "{schema}");
+        assert!(
+            schema["$defs"]["Interpreter"].get("description").is_none(),
+            "{schema}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_script_in_an_interpreter_the_shell_lacks_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let shell = shell(directory.path(), Grants::new(), &[Interpreter::Shell]).await;

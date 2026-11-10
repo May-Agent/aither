@@ -43,23 +43,22 @@ pub enum OutputFormat {
     Auto,
 }
 
-/// Requested delivery resolution for media returned through terminal output.
+// The resolution media returned through terminal output is delivered at.
+// Undocumented in rustdoc: the schema's descriptions are the embedder's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub enum MediaResolution {
-    /// Use the source media bytes as-is.
+    // The source media bytes as they are.
     #[default]
     Auto,
-    /// Downscale to the low bounding box of the output policy before loading
-    /// into context.
+    // Downscaled to the low bounding box of the output policy.
     Low,
-    /// Downscale to the medium bounding box of the output policy before
-    /// loading into context.
+    // Downscaled to the medium bounding box of the output policy.
     Medium,
-    /// Downscale to the high bounding box of the output policy before loading
-    /// into context.
+    // Downscaled to the high bounding box of the output policy.
     High,
-    /// Preserve the original media resolution without resizing.
+    // The original media resolution, without resizing.
     Native,
 }
 

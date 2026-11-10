@@ -4,14 +4,16 @@
 //! wording's.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::job_registry::{JobRead, UnchangedRead};
 use crate::jobs::Jobs;
-use crate::wording::{AnyShellWording, JobInputSent, JobKillAsked};
+use crate::wording::{AnyShellWording, CallRefusal, JobInputSent, JobKillAsked, Refused};
 
 /// What an embedder calls one of its tools and how it describes it to the
 /// model; neither has a default.
@@ -21,6 +23,55 @@ pub struct ToolIdentity {
     pub name: Cow<'static, str>,
     /// The tool's description, as the model reads it.
     pub description: Cow<'static, str>,
+    /// What the model reads about each argument the tool takes, by argument
+    /// name. An argument the tool takes and this lacks crashes the tool's
+    /// schema: the arguments carry no descriptions of their own.
+    pub arguments: BTreeMap<&'static str, Cow<'static, str>>,
+}
+
+impl ToolIdentity {
+    /// `schema` with every property described as this identity says.
+    ///
+    /// # Panics
+    /// Panics when a property of the schema has no description here.
+    #[must_use]
+    pub(crate) fn describe(&self, schema: schemars::Schema) -> schemars::Schema {
+        let mut value = schema.to_value();
+        self.describe_properties(&mut value);
+        schemars::Schema::try_from(value).expect("a described schema is a schema")
+    }
+
+    fn describe_properties(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(serde_json::Value::Object(properties)) = object.get_mut("properties") {
+                    for (name, property) in properties {
+                        let description = self.arguments.get(name.as_str()).unwrap_or_else(|| {
+                            panic!(
+                                "the identity of the tool `{}` describes no argument `{name}`",
+                                self.name
+                            )
+                        });
+                        if let serde_json::Value::Object(property) = property {
+                            property.insert(
+                                "description".to_owned(),
+                                serde_json::Value::String(description.to_string()),
+                            );
+                        }
+                    }
+                }
+                for child in object.values_mut() {
+                    self.describe_properties(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.describe_properties(item);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The identities of the shell tool and of the three job control tools.
@@ -36,12 +87,21 @@ pub struct ShellToolSettings {
     pub kill: ToolIdentity,
 }
 
-fn task_id(argument: &str) -> aither_core::Result<&str> {
+fn task_id<'a>(argument: &'a str, wording: &AnyShellWording) -> aither_core::Result<&'a str> {
     let task_id = argument.trim();
     if task_id.is_empty() {
-        return Err(anyhow::anyhow!("task_id must not be empty"));
+        return Err(Refused::call(&**wording, CallRefusal::EmptyTaskId));
     }
     Ok(task_id)
+}
+
+fn unknown_task(task_id: &str, wording: &AnyShellWording) -> anyhow::Error {
+    Refused::call(
+        &**wording,
+        CallRefusal::UnknownTask {
+            task_id: task_id.to_owned(),
+        },
+    )
 }
 
 /// Tool for killing a job.
@@ -65,10 +125,11 @@ impl JobKillTool {
     }
 }
 
-/// Kill a job by its task id.
+// The arguments of the kill tool, described by its `ToolIdentity`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct JobKillArgs {
-    /// Task identifier returned when the job was backgrounded.
+    // The job to kill.
     pub task_id: String,
 }
 
@@ -81,6 +142,10 @@ impl Tool for JobKillTool {
         self.identity.description.clone()
     }
 
+    fn arguments_schema(&self) -> schemars::Schema {
+        self.identity.describe(schemars::schema_for!(JobKillArgs))
+    }
+
     type Arguments = JobKillArgs;
     type Res = ToolResult;
 
@@ -89,7 +154,7 @@ impl Tool for JobKillTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let task_id = task_id(&args.task_id)?;
+        let task_id = task_id(&args.task_id, &self.wording)?;
         let killed = self.jobs.kill(task_id).await;
         Ok(ToolResult::text(
             self.wording.job_kill(&JobKillAsked { task_id, killed }),
@@ -118,14 +183,15 @@ impl JobInputTool {
     }
 }
 
-/// Send input to a job that is waiting on stdin.
+// The arguments of the input tool, described by its `ToolIdentity`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct JobInputArgs {
-    /// Task identifier returned when the job was backgrounded.
+    // The job to write to.
     pub task_id: String,
-    /// Raw bytes encoded as UTF-8 text written to the job's stdin.
+    // The text written to the job's stdin.
     pub input: String,
-    /// Append a trailing newline before writing (default true).
+    // Whether a trailing newline is appended before writing.
     #[serde(default = "default_append_newline")]
     pub append_newline: bool,
 }
@@ -143,6 +209,10 @@ impl Tool for JobInputTool {
         self.identity.description.clone()
     }
 
+    fn arguments_schema(&self) -> schemars::Schema {
+        self.identity.describe(schemars::schema_for!(JobInputArgs))
+    }
+
     type Arguments = JobInputArgs;
     type Res = ToolResult;
 
@@ -151,12 +221,12 @@ impl Tool for JobInputTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let task_id = task_id(&args.task_id)?;
+        let task_id = task_id(&args.task_id, &self.wording)?;
         let job = self
             .jobs
             .get(task_id)
             .await
-            .ok_or_else(|| anyhow::anyhow!("unknown task_id: {task_id}"))?;
+            .ok_or_else(|| unknown_task(task_id, &self.wording))?;
 
         let mut bytes = args.input.into_bytes();
         if args.append_newline {
@@ -199,15 +269,16 @@ impl JobReadTool {
     }
 }
 
-/// Read incremental output from a job.
+// The arguments of the read tool, described by its `ToolIdentity`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct JobReadArgs {
-    /// Task identifier returned when the job was backgrounded.
+    // The job to read.
     pub task_id: String,
-    /// Read only bytes after this cursor offset.
+    // The offset after which output is read.
     #[serde(default)]
     pub cursor: usize,
-    /// Maximum bytes to return in this call.
+    // The most bytes returned.
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
@@ -221,6 +292,10 @@ impl Tool for JobReadTool {
         self.identity.description.clone()
     }
 
+    fn arguments_schema(&self) -> schemars::Schema {
+        self.identity.describe(schemars::schema_for!(JobReadArgs))
+    }
+
     type Arguments = JobReadArgs;
     type Res = ToolResult;
 
@@ -229,23 +304,35 @@ impl Tool for JobReadTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let task_id = task_id(&args.task_id)?;
+        let task_id = task_id(&args.task_id, &self.wording)?;
         let max_bytes = args
             .max_bytes
             .unwrap_or_else(|| self.output.get().read_bytes);
         if max_bytes == 0 {
-            return Err(anyhow::anyhow!("max_bytes must be greater than 0"));
+            return Err(Refused::call(&*self.wording, CallRefusal::ZeroMaxBytes));
         }
         let job = self
             .jobs
             .get(task_id)
             .await
-            .ok_or_else(|| anyhow::anyhow!("unknown task_id: {task_id}"))?;
+            .ok_or_else(|| unknown_task(task_id, &self.wording))?;
         let read = job
             .read(args.cursor, max_bytes)
             .await
             .map_err(anyhow::Error::msg)?;
-        Ok(ToolResult::text(self.wording.job_read(&read)))
+        match read {
+            JobRead::Delta(_) => Ok(ToolResult::text(self.wording.job_read(&read))),
+            // A poll is a refusal the loop can tell from a read, worded as
+            // the unchanged read.
+            JobRead::Unchanged { task_id } => {
+                Err(Refused::rendered(UnchangedRead { task_id }, |unchanged| {
+                    self.wording.job_read(&JobRead::Unchanged {
+                        task_id: unchanged.task_id.clone(),
+                    })
+                })
+                .into())
+            }
+        }
     }
 }
 

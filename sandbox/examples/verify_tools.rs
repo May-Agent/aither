@@ -1,15 +1,17 @@
 #![doc = "Verify prepared baseline commands through the real terminal sandbox."]
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    Backend, CommandBlocked, CommandKilled, FoldedLines, HostProgram, Interpreter, JobInputSent,
-    JobKillAsked, JobRead, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted, OmittedLines,
-    OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain, Sandbox, Shell,
-    ShellArgs, ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution,
-    ToolIdentity, ToolRegistryBuilder, ToolTarget,
+    Backend, CallRefusal, CommandBlocked, CommandKilled, FoldedLines, HostProgram, Interpreter,
+    JobInputSent, JobKillAsked, JobRead, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted,
+    OmittedLines, OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain, Sandbox,
+    Shell, ShellArgs, ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart,
+    ToolDistribution, ToolIdentity, ToolRegistryBuilder, ToolTarget,
 };
 
 /// The wording of this example's shell: aither ships none, and the example's
@@ -30,6 +32,10 @@ impl ShellWording for ExampleWording {
 
     fn job_kill(&self, kill: &JobKillAsked<'_>) -> String {
         format!("kill of {}: {}", kill.task_id, kill.killed)
+    }
+
+    fn call_refused(&self, refusal: &CallRefusal) -> String {
+        format!("refused: {refusal:?}")
     }
 
     fn command_blocked(&self, blocked: &CommandBlocked) -> String {
@@ -91,10 +97,35 @@ impl ShellWording for ExampleWording {
     }
 }
 
+/// The descriptions of every argument the example's tools take.
+fn arguments() -> BTreeMap<&'static str, Cow<'static, str>> {
+    [
+        "description",
+        "script",
+        "interpreter",
+        "sandbox",
+        "location",
+        "resolution",
+        "max_lines",
+        "raw",
+        "timeout",
+        "background",
+        "task_id",
+        "cursor",
+        "max_bytes",
+        "input",
+        "append_newline",
+    ]
+    .into_iter()
+    .map(|name| (name, Cow::Borrowed("An argument of the example's tools.")))
+    .collect()
+}
+
 fn identity(name: &'static str, description: &'static str) -> ToolIdentity {
     ToolIdentity {
         name: name.into(),
         description: description.into(),
+        arguments: arguments(),
     }
 }
 

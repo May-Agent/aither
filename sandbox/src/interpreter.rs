@@ -8,15 +8,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::tool_python::PYTHON_COMMAND;
 
-/// The interpreter a script of the shell tool or the monitor runs under.
+// The interpreter a script of the shell tool or the monitor runs under.
+// Undocumented in rustdoc: the schema's descriptions are the embedder's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub enum Interpreter {
-    /// The script is shell source.
+    // The script is shell source.
     #[default]
     Shell,
-    /// The script is Python source, run from a file in the sandbox's
-    /// temporary directory so a traceback carries its line numbers.
+    // The script is Python source, run from a file in the sandbox's
+    // temporary directory so a traceback carries its line numbers.
     Python,
 }
 

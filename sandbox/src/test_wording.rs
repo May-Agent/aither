@@ -11,9 +11,9 @@ use crate::job_registry::{JobRead, JobStatus};
 use crate::monitor::MonitorRefusal;
 use crate::terminal::TimeoutKill;
 use crate::wording::{
-    AnyShellWording, CommandKilled, FoldedLines, JobInputSent, JobKillAsked, JsonAsTsv,
-    MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, ReservedForMain, ShellWording,
-    StoredBinaryPart,
+    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
+    JsonAsTsv, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, ReservedForMain,
+    ShellWording, StoredBinaryPart,
 };
 use aither_core::llm::CommandStream;
 
@@ -55,6 +55,12 @@ fn job_status_text(status: &JobStatus) -> String {
         JobStatus::Failed { error, .. } => format!("failed: {error}"),
         JobStatus::Killed { .. } => "was killed".to_string(),
     }
+}
+
+#[derive(Template)]
+#[template(path = "test_wording/call_refused.txt", escape = "none")]
+struct CallRefused<'a> {
+    refusal: &'a CallRefusal,
 }
 
 #[derive(Template)]
@@ -158,6 +164,42 @@ fn rendered(template: &impl Template) -> String {
         .expect("a test wording template renders typed input")
 }
 
+/// The argument descriptions the sandbox's tests give every tool: one entry
+/// for each argument any of the shell's tools takes.
+#[must_use]
+pub fn argument_descriptions()
+-> std::collections::BTreeMap<&'static str, std::borrow::Cow<'static, str>> {
+    [
+        ("description", "What the command does."),
+        ("script", "The source to run."),
+        ("interpreter", "The interpreter of the source."),
+        ("sandbox", "Whether the command runs inside the sandbox."),
+        ("location", "Where the command runs."),
+        ("resolution", "The resolution of returned media."),
+        ("max_lines", "The most output lines returned inline."),
+        ("raw", "Whether the output is returned verbatim."),
+        ("timeout", "The maximum runtime in seconds."),
+        ("background", "Whether the command is detached at once."),
+        ("task_id", "The job."),
+        ("cursor", "The offset after which output is read."),
+        ("max_bytes", "The most bytes returned."),
+        ("input", "The text written to stdin."),
+        ("append_newline", "Whether a newline is appended."),
+        ("source", "What to watch."),
+        ("command", "The source to run."),
+        ("file", "The file to follow."),
+        ("interval_secs", "Seconds between collections."),
+        ("filter", "Only matching lines are delivered."),
+        ("stop_on", "A matching line ends the monitor."),
+        ("kill_on_stop", "Whether the process is killed on a stop."),
+        ("stall_secs", "Seconds without output before a stall."),
+        ("timeout_secs", "The monitor's lifetime in seconds."),
+    ]
+    .into_iter()
+    .map(|(name, description)| (name, description.into()))
+    .collect()
+}
+
 /// The names and descriptions the sandbox's tests give the job control
 /// tools.
 #[must_use]
@@ -165,6 +207,7 @@ pub fn job_tools() -> crate::ShellToolSettings {
     let identity = |name: &'static str, description: &'static str| crate::ToolIdentity {
         name: name.into(),
         description: description.into(),
+        arguments: argument_descriptions(),
     };
     crate::ShellToolSettings {
         shell: identity("terminal", "Run a script."),
@@ -219,6 +262,10 @@ impl ShellWording for TestWording {
             task_id: kill.task_id,
             killed: kill.killed,
         })
+    }
+
+    fn call_refused(&self, refusal: &CallRefusal) -> String {
+        rendered(&CallRefused { refusal })
     }
 
     fn command_blocked(&self, blocked: &CommandBlocked) -> String {

@@ -34,63 +34,55 @@ const JOB_MARGIN: Duration = Duration::from_secs(60);
 /// the tools already running.
 #[derive(Debug, Clone)]
 pub struct MonitorSettings {
-    /// The tool's name.
-    pub name: Cow<'static, str>,
-    /// The tool's description, as the model reads it.
-    pub description: Cow<'static, str>,
+    /// The tool's name, description and argument descriptions.
+    pub identity: crate::ToolIdentity,
     /// The longest a monitor may run.
     pub max_timeout: LiveDuration,
     /// The interval between output collections of a call that states none.
     pub default_interval: LiveDuration,
 }
 
-/// `monitor` arguments.
+// The arguments of the monitor tool, described by its `ToolIdentity`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct MonitorArgs {
-    /// What to watch: `{"command": "<source>", "interpreter": "shell"|"python"}`
-    /// runs the source inside the sandbox; `{"file": "<path>"}` follows a
-    /// file's appended lines inside the sandbox, across rotation and
-    /// truncation.
+    // What to watch.
     pub source: MonitorSource,
-    /// Seconds between output collections; only non-empty increments are
-    /// delivered. Omitted, the embedder's default.
+    // Seconds between output collections.
     #[serde(default)]
     pub interval_secs: Option<u64>,
-    /// Optional regex — only matching new lines are delivered.
+    // Only lines matching it are delivered.
     #[serde(default)]
     pub filter: Option<String>,
-    /// Optional regex — the first matching new line ends the monitor.
+    // The first line matching it ends the monitor.
     #[serde(default)]
     pub stop_on: Option<String>,
-    /// With `stop_on`, also kill the watched process on the match. Default
-    /// false: the command keeps running detached.
+    // Whether the watched process is killed when `stop_on` matches.
     #[serde(default)]
     pub kill_on_stop: bool,
-    /// Report the run as stuck once if no new output arrives for this many
-    /// seconds.
+    // Seconds without new output after which the run is reported stuck.
     #[serde(default)]
     pub stall_secs: Option<u64>,
-    /// Maximum lifetime in seconds. Required, at most the embedder's cap: at
-    /// the deadline the process tree is killed and the end reported as a
-    /// timeout.
+    // The monitor's maximum lifetime in seconds.
     pub timeout_secs: u64,
 }
 
-/// The `monitor` source: a command's source text or a file path.
+// The `monitor` source: a command's source text or a file path.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub enum MonitorSource {
-    /// Source text run inside the sandbox.
+    // Source text run inside the sandbox.
     Command {
-        /// The source to run.
+        // The source to run.
         command: String,
-        /// Its interpreter: `shell` or `python`. Default `shell`.
+        // Its interpreter.
         #[serde(default)]
         interpreter: Interpreter,
     },
-    /// A file whose appended lines are followed inside the sandbox.
+    // A file whose appended lines are followed inside the sandbox.
     File {
-        /// The path, resolved against the working directory when relative.
+        // The path, resolved against the working directory when relative.
         file: String,
     },
 }
@@ -204,8 +196,11 @@ pub struct MonitorTool<E> {
 #[cfg(any(test, feature = "test-budgets"))]
 pub(crate) fn fixture_settings() -> MonitorSettings {
     MonitorSettings {
-        name: "monitor".into(),
-        description: "Watches a source.".into(),
+        identity: crate::ToolIdentity {
+            name: "monitor".into(),
+            description: "Watches a source.".into(),
+            arguments: crate::test_wording::argument_descriptions(),
+        },
         max_timeout: LiveDuration::new(Duration::from_secs(7200)),
         default_interval: LiveDuration::new(Duration::from_secs(10)),
     }
@@ -287,11 +282,17 @@ where
     E: Executor + Clone + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
-        self.settings.name.clone()
+        self.settings.identity.name.clone()
     }
 
     fn description(&self) -> Cow<'static, str> {
-        self.settings.description.clone()
+        self.settings.identity.description.clone()
+    }
+
+    fn arguments_schema(&self) -> schemars::Schema {
+        self.settings
+            .identity
+            .describe(schemars::schema_for!(MonitorArgs))
     }
 
     type Arguments = MonitorArgs;

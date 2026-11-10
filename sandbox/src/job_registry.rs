@@ -303,6 +303,14 @@ pub enum JobRead {
     },
 }
 
+/// Why a tool refused a read of a job's output: nothing changed since the
+/// job's last read. The refusal a tool returns as `Refused<UnchangedRead>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnchangedRead {
+    /// The job whose output did not change.
+    pub task_id: String,
+}
+
 /// Sender used by the registry to push bytes into a running process stdin.
 pub type TerminalInputSender = Sender<Vec<u8>>;
 

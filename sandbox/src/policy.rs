@@ -48,14 +48,16 @@ pub enum ScriptOrigin {
     Run,
 }
 
-/// Whether a script runs inside the sandbox.
+// Whether a script runs inside the sandbox. Undocumented in rustdoc: the
+// schema's descriptions are the embedder's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub enum SandboxMode {
-    /// Inside the sandbox.
+    // Inside the sandbox.
     #[default]
     Sandboxed,
-    /// Outside it, with the access of the user who runs the agent.
+    // Outside it, with the access of the user who runs the agent.
     Unsandboxed,
 }
 
