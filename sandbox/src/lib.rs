@@ -66,7 +66,6 @@ mod interpreter;
 mod limits;
 mod memory;
 pub mod monitor;
-mod notices;
 mod outage;
 mod output;
 mod output_compress;
@@ -85,6 +84,7 @@ mod tool_environment;
 mod tool_python;
 mod tool_runtime;
 mod tool_transport;
+mod wording;
 
 /// Built-in IPC commands (ask, reload).
 pub mod builtin;
@@ -112,6 +112,10 @@ pub mod test_heel;
 #[cfg(any(test, feature = "test-budgets"))]
 pub mod test_budgets;
 
+/// The wording tests read, shared through the `test-budgets` feature.
+#[cfg(any(test, feature = "test-budgets"))]
+pub mod test_wording;
+
 /// Id allocators for tests, shared with dependent crates through the
 /// `test-ids` feature.
 #[cfg(any(test, feature = "test-ids"))]
@@ -119,7 +123,8 @@ pub mod test_ids;
 
 pub use bollard_exec::BollardContainerExec;
 pub use command::{
-    AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
+    AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandCall, CommandEnvelope, CommandGate,
+    CommandObserver,
     CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
     IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
     ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
@@ -160,10 +165,6 @@ pub use monitor::{
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
     NetworkVerdict,
-};
-pub use notices::{
-    AnySandboxNotices, CommandKilled, DefaultSandboxNotices, MonitorStarted, Refused,
-    ReservedForMain, SandboxNotices,
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use output_policy::{MediaBounds, OutputLimits, OutputPolicy};
@@ -214,4 +215,9 @@ pub use tool_runtime::{
 pub use tool_transport::{
     ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,
     probe_tool_environment,
+};
+pub use wording::{
+    AnyShellWording, CommandKilled, FoldedLines, JsonAsTsv, LineRange, MonitorStarted,
+    OmittedLines, OutputSaved, Refused, RepeatedLines, ReservedForMain, ShellWording,
+    StoredBinaryPart,
 };

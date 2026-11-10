@@ -212,6 +212,7 @@ async fn terminal_with(
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
     )
     .await
     .expect("terminal tool should initialize")
@@ -452,6 +453,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
     )
     .await
     .unwrap()
@@ -479,6 +481,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
     )
     .await
     .unwrap()

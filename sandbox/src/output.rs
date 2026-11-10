@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::output_policy::{MediaBounds, OutputPolicy};
+use crate::wording::{AnyShellWording, ShellWording};
 
 /// Expected output format for terminal execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -117,10 +118,11 @@ async fn cut_text_output(
         byte_budget,
     } = cut;
 
-    let folded = crate::output_compress::folded_code_content(text)
+    let wording: &dyn ShellWording = &**store.wording();
+    let folded = crate::output_compress::folded_code_content(text, wording)
         .filter(|folded| folded.len() <= byte_budget);
     let preview = folded.unwrap_or_else(|| {
-        crate::output_compress::stored_preview(text, max_lines, byte_budget)
+        crate::output_compress::stored_preview(text, max_lines, byte_budget, wording)
             .trim_end_matches('\n')
             .to_owned()
     });
@@ -189,6 +191,8 @@ struct StoreInner {
     dir: PathBuf,
     ids: AnyIdAllocator,
     policy: OutputPolicy,
+    /// Renders the markers of the views this store cuts.
+    wording: AnyShellWording,
     /// The words of the files this store wrote.
     names: Mutex<Vec<IdLease>>,
     /// The words naming the files the directory held when this store first
@@ -198,7 +202,8 @@ struct StoreInner {
 
 impl OutputStore {
     /// Creates an output store in `dir`, naming its files with words leased
-    /// from `ids` and cutting outputs at the limits of `policy`.
+    /// from `ids`, cutting outputs at the limits of `policy` and rendering
+    /// the markers of what it cuts through `wording`.
     ///
     /// # Errors
     ///
@@ -207,18 +212,25 @@ impl OutputStore {
         dir: impl Into<PathBuf>,
         ids: AnyIdAllocator,
         policy: OutputPolicy,
+        wording: AnyShellWording,
     ) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
-        Ok(Self::at(dir, ids, policy))
+        Ok(Self::at(dir, ids, policy, wording))
     }
 
     /// An output store in `dir`, which exists.
-    pub(crate) fn at(dir: PathBuf, ids: AnyIdAllocator, policy: OutputPolicy) -> Self {
+    pub(crate) fn at(
+        dir: PathBuf,
+        ids: AnyIdAllocator,
+        policy: OutputPolicy,
+        wording: AnyShellWording,
+    ) -> Self {
         Self(Arc::new(StoreInner {
             dir,
             ids,
             policy,
+            wording,
             names: Mutex::new(Vec::new()),
             earlier: async_lock::OnceCell::new(),
         }))
@@ -228,6 +240,19 @@ impl OutputStore {
     #[must_use]
     pub fn policy(&self) -> &OutputPolicy {
         &self.0.policy
+    }
+
+    /// What renders the markers of the views this store cuts.
+    #[must_use]
+    pub fn wording(&self) -> &AnyShellWording {
+        &self.0.wording
+    }
+
+    /// An output store in `dir`, which exists, under the test budgets and
+    /// wording.
+    #[cfg(test)]
+    pub(crate) fn testing(dir: PathBuf, ids: AnyIdAllocator, policy: OutputPolicy) -> Self {
+        Self::at(dir, ids, policy, crate::test_wording::TestWording::any())
     }
 
     /// Returns the base directory path.
@@ -726,7 +751,7 @@ mod tests {
 
     /// A store in `dir` leasing from the default allocator.
     fn store(dir: &Path) -> OutputStore {
-        OutputStore::at(
+        OutputStore::testing(
             dir.to_path_buf(),
             AnyIdAllocator::default(),
             crate::output_policy::fixture::policy(),
@@ -767,7 +792,7 @@ mod tests {
     async fn a_non_default_policy_cuts_the_inline_output_and_follows_updates() {
         let dir = tempfile::tempdir().unwrap();
         let policy = OutputPolicy::new(SMALL);
-        let store = OutputStore::at(
+        let store = OutputStore::testing(
             dir.path().to_path_buf(),
             AnyIdAllocator::default(),
             policy.clone(),
@@ -801,7 +826,7 @@ mod tests {
     async fn a_stored_file_is_named_by_a_word_leased_until_the_store_drops() {
         let dir = tempfile::tempdir().unwrap();
         let ids = crate::test_ids::RecordingIds::default();
-        let store = OutputStore::at(
+        let store = OutputStore::testing(
             dir.path().to_path_buf(),
             ids.allocator(),
             crate::output_policy::fixture::policy(),
@@ -838,7 +863,7 @@ mod tests {
         // store: one by a file of another extension.
         std::fs::write(dir.path().join("alfa.png"), "earlier").unwrap();
         std::fs::write(dir.path().join("bravo.txt"), "earlier").unwrap();
-        let store = OutputStore::at(
+        let store = OutputStore::testing(
             dir.path().to_path_buf(),
             ids.allocator(),
             crate::output_policy::fixture::policy(),
@@ -861,7 +886,7 @@ mod tests {
     async fn a_name_a_file_takes_later_is_skipped_too() {
         let dir = tempfile::tempdir().unwrap();
         let ids = crate::test_ids::RecordingIds::default();
-        let store = OutputStore::at(
+        let store = OutputStore::testing(
             dir.path().to_path_buf(),
             ids.allocator(),
             crate::output_policy::fixture::policy(),

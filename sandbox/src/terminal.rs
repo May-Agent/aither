@@ -95,6 +95,7 @@ use crate::{
         LaunchHistory, Launcher, PreparedSpace, ResolvedGrant, RunSpace, Spelling, SubagentGit,
         SubagentGrant, SubagentGrantError, SubagentSpaces, canonical as canonical_path,
     },
+    wording::AnyShellWording,
 };
 
 mod subagent_git;
@@ -1671,6 +1672,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             self.output_store.dir().to_path_buf(),
             ids.clone(),
             self.output_store.policy().clone(),
+            self.output_store.wording().clone(),
         );
         self.ids = ids;
         self
@@ -1689,6 +1691,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
         executor: E,
         limits: ShellLimits,
         output: OutputPolicy,
+        wording: AnyShellWording,
     ) -> Result<Self, TerminalError> {
         let parent_dir = parent_dir.as_ref();
 
@@ -1708,8 +1711,13 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
 
         // Create outputs directory inside working dir
         let ids = AnyIdAllocator::default();
-        let output_store =
-            OutputStore::new(working_dir_path.join("outputs"), ids.clone(), output).await?;
+        let output_store = OutputStore::new(
+            working_dir_path.join("outputs"),
+            ids.clone(),
+            output,
+            wording,
+        )
+        .await?;
 
         // Start job registry service
         let (job_registry, job_registry_service) =
@@ -1769,6 +1777,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
         executor: E,
         limits: ShellLimits,
         output: OutputPolicy,
+        wording: AnyShellWording,
     ) -> Result<Self, TerminalError> {
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
@@ -1779,8 +1788,13 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
 
         // Create outputs directory inside working dir
         let ids = AnyIdAllocator::default();
-        let output_store =
-            OutputStore::new(working_dir_path.join("outputs"), ids.clone(), output).await?;
+        let output_store = OutputStore::new(
+            working_dir_path.join("outputs"),
+            ids.clone(),
+            output,
+            wording,
+        )
+        .await?;
 
         // Start job registry service
         let (job_registry, job_registry_service) =
@@ -2716,7 +2730,7 @@ where
         let commit_ledger = self.commit_ledger();
         let prepared_space = self.prepared_space();
         let role = self.registry().role();
-        let notices = self.registry().notices().clone();
+        let wording = self.output_store.wording().clone();
         let output = self.output_store.policy().clone();
         let prepared_tools = self
             .shell_sessions
@@ -2736,7 +2750,7 @@ where
             commit_ledger,
             prepared_space,
             role,
-            notices,
+            wording,
             output,
         }
     }
@@ -3372,9 +3386,9 @@ where
         }
     }
 
-    /// What renders this terminal's refusals and notices: its registry's.
-    pub(crate) fn notices(&self) -> &crate::AnySandboxNotices {
-        self.registry.registry().notices()
+    /// What renders this terminal's refusals and notices: its output store's.
+    pub(crate) fn wording(&self) -> &crate::AnyShellWording {
+        self.output_store.wording()
     }
 
     /// Why a foreground command that was killed was killed, as the model
@@ -3383,7 +3397,7 @@ where
         let killed = kill.map_or(crate::CommandKilled::BeforeTimeout, |kill| {
             crate::CommandKilled::TimedOut(kill)
         });
-        self.notices().command_killed(&killed)
+        self.wording().command_killed(&killed)
     }
 
     /// Shared front half of every `terminal` call: argument validation, then
@@ -3553,7 +3567,7 @@ where
         {
             return Err(TerminalRunError::Blocked(crate::Refused::rendered(
                 CommandBlocked { reason },
-                |blocked| self.notices().command_blocked(blocked),
+                |blocked| self.wording().command_blocked(blocked),
             )));
         }
         let mode = admission.mode;
@@ -6655,7 +6669,8 @@ mod tests {
     #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
     use crate::output::empty_stream;
-    use crate::{SandboxNotices, ToolRegistryBuilder};
+    use crate::test_wording::TestWording;
+    use crate::{ShellWording, ToolRegistryBuilder};
     #[cfg(unix)]
     use heel::DenyAll;
     use heel::NiceLevel;
@@ -6672,11 +6687,8 @@ mod tests {
     /// An output store in `dir`, which exists, leasing from the default
     /// allocator.
     fn test_outputs(dir: impl Into<PathBuf>) -> OutputStore {
-        OutputStore::at(
-            dir.into(),
-            AnyIdAllocator::default(),
-            crate::output_policy::fixture::policy(),
-        )
+        let policy = crate::output_policy::fixture::policy();
+        OutputStore::testing(dir.into(), AnyIdAllocator::default(), policy)
     }
 
     /// A stdin whose drop reports that the writer thread holding it ended.
@@ -6841,6 +6853,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7626,6 +7639,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize");
@@ -7791,6 +7805,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .unwrap();
@@ -7815,6 +7830,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7927,6 +7943,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8024,6 +8041,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8058,6 +8076,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8137,6 +8156,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8420,6 +8440,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8489,6 +8510,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8653,6 +8675,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -9091,6 +9114,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -9154,6 +9178,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -9224,6 +9249,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -9296,6 +9322,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -9997,6 +10024,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -10641,7 +10669,7 @@ mod tests {
             killed: "2026-11-04T12:01:31Z".parse().expect("valid timestamp"),
         };
         assert_eq!(
-            crate::DefaultSandboxNotices.command_killed(&crate::CommandKilled::TimedOut(&kill)),
+            TestWording.command_killed(&crate::CommandKilled::TimedOut(&kill)),
             "Its 90s timeout bound passed; it started at 2026-11-04 12:00:00 UTC \
              and was killed at 2026-11-04 12:01:31 UTC."
         );
@@ -10702,7 +10730,7 @@ mod tests {
             "{kill:?}"
         );
         assert!(
-            crate::DefaultSandboxNotices
+            TestWording
                 .command_killed(&crate::CommandKilled::TimedOut(&kill))
                 .starts_with("Its 1s timeout bound passed; it started at ")
         );
@@ -10845,6 +10873,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -11489,6 +11518,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -11548,6 +11578,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13304,6 +13335,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13400,6 +13432,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13463,6 +13496,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13599,6 +13633,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13732,6 +13767,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13877,6 +13913,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -14114,6 +14151,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -14323,6 +14361,7 @@ mod tests {
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
+            TestWording::any(),
         )
         .await
         .expect("terminal tool should initialize")

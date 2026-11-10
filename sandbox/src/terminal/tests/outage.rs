@@ -18,6 +18,7 @@ async fn terminal(
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
     )
     .await
     .expect("terminal tool should initialize")

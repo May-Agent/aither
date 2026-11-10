@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::interpreter::Interpreter;
 use crate::job_registry::{JobRegistry, JobStatus};
 use crate::limits::LiveDuration;
-use crate::notices::{MonitorStarted, Refused};
+use crate::wording::{MonitorStarted, Refused};
 use crate::output::MediaResolution;
 use crate::policy::SandboxMode;
 use crate::terminal::{Configured, JobAlert, ShellArgs, TerminalTool};
@@ -297,7 +297,7 @@ where
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let notices = self.terminal.notices();
+        let notices = self.terminal.wording();
         let interval_secs = self.interval_secs(&args);
         match self.start(args).await {
             Ok(task_id) => Ok(ToolResult::text(notices.monitor_started(&MonitorStarted {

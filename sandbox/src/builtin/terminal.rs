@@ -126,23 +126,23 @@ impl Tool for InputTerminalTool {
 #[derive(Debug, Clone)]
 pub struct ReadTerminalDeltaTool {
     registry: JobRegistry,
-    notices: crate::AnySandboxNotices,
+    wording: crate::AnyShellWording,
     output: crate::OutputPolicy,
 }
 
 impl ReadTerminalDeltaTool {
     /// Creates a terminal delta reader tool whose refused reads render
-    /// through `notices` and whose reads default to the `read_bytes` of
+    /// through `wording` and whose reads default to the `read_bytes` of
     /// `output`.
     #[must_use]
     pub const fn new(
         registry: JobRegistry,
-        notices: crate::AnySandboxNotices,
+        wording: crate::AnyShellWording,
         output: crate::OutputPolicy,
     ) -> Self {
         Self {
             registry,
-            notices,
+            wording,
             output,
         }
     }
@@ -246,7 +246,7 @@ impl Tool for ReadTerminalDeltaTool {
                 // Kept typed, so the agent loop recognises the refused poll.
                 TerminalReadError::Refused(refusal) => {
                     anyhow::Error::from(crate::Refused::rendered(refusal, |refusal| {
-                        self.notices.unchanged_task_read(refusal)
+                        self.wording.unchanged_task_read(refusal)
                     }))
                 }
                 TerminalReadError::Failed(message) => anyhow::Error::msg(message),

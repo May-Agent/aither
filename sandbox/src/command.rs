@@ -39,6 +39,7 @@ use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolConte
 use aither_core::{IdLease, WeakIdLease};
 
 use crate::command_set::{AnyCommandSet, CommandSet};
+use crate::wording::{AnyShellWording, OutputSaved, ReservedForMain, ShellWording, StoredBinaryPart};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use heel::IpcCommand;
@@ -64,25 +65,6 @@ pub enum CommandPayload {
         /// Text content.
         content: String,
     },
-}
-
-#[derive(Template)]
-#[template(path = "stored_binary_part.txt", escape = "none")]
-struct StoredBinaryPartTemplate<'a> {
-    mime: &'a str,
-    byte_count: usize,
-    url: &'a str,
-    path: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "command_output_saved.txt", escape = "none")]
-struct CommandOutputSavedTemplate<'a> {
-    preview: &'a str,
-    /// Absolute path of the file holding the full output.
-    path: &'a str,
-    line_count: usize,
-    byte_count: usize,
 }
 
 #[derive(Template)]
@@ -123,9 +105,6 @@ fn tool_usage_error(message: &str, tool_name: &str) -> String {
 /// window: a preview of `rendered` and the absolute `path` of the file that
 /// holds all of it.
 ///
-/// # Panics
-///
-/// Panics if the compiled-in template fails to render.
 #[must_use]
 pub fn output_saved_text(
     rendered: &str,
@@ -133,16 +112,16 @@ pub fn output_saved_text(
     line_count: usize,
     byte_count: usize,
     preview_bytes: usize,
+    wording: &dyn ShellWording,
 ) -> String {
-    let preview = crate::output_compress::stored_preview(rendered, usize::MAX, preview_bytes);
-    CommandOutputSavedTemplate {
+    let preview =
+        crate::output_compress::stored_preview(rendered, usize::MAX, preview_bytes, wording);
+    wording.output_saved(&OutputSaved {
         preview: preview.trim_end_matches('\n'),
         path,
         line_count,
         byte_count,
-    }
-    .render()
-    .expect("command output saved template must render")
+    })
 }
 
 fn unknown_command_text(tool_name: &str) -> String {
@@ -227,14 +206,12 @@ async fn stored_binary_text(
         .save_binary(content, mime)
         .await
         .map_err(|error| prefix_error("failed to store binary tool result: ", &error))?;
-    Ok(StoredBinaryPartTemplate {
+    Ok(outputs.wording().stored_binary_part(&StoredBinaryPart {
         mime,
         byte_count: content.len(),
         url: &url,
         path: &path.display().to_string(),
-    }
-    .render()
-    .expect("stored binary part template must render"))
+    }))
 }
 
 /// Command result envelope returned to IPC callers.
@@ -753,6 +730,7 @@ async fn handle_large_output(output: ToolResult, outputs: &OutputStore) -> Comma
             line_count,
             rendered.len(),
             outputs.policy().get().preview_bytes,
+            &**outputs.wording(),
         ),
     })
 }
@@ -851,8 +829,8 @@ pub struct DynTerminalTool {
     pub(crate) commit_ledger: Option<crate::subagent::CommitLedger>,
     pub(crate) prepared_space: Option<crate::subagent::PreparedSpace>,
     pub(crate) role: CommandRole,
-    /// The terminal registry's notices, which its controls render through.
-    pub(crate) notices: crate::AnySandboxNotices,
+    /// What renders the texts of the terminal's controls.
+    pub(crate) wording: AnyShellWording,
     /// The output budgets the terminal's controls read with.
     pub(crate) output: crate::OutputPolicy,
 }
@@ -934,7 +912,7 @@ impl DynTerminalTool {
             erase_terminal_tool(InputTerminalTool::new(self.job_registry.clone())),
             erase_terminal_tool(ReadTerminalDeltaTool::new(
                 self.job_registry.clone(),
-                self.notices.clone(),
+                self.wording.clone(),
                 self.output.clone(),
             )),
         ]
@@ -976,7 +954,6 @@ pub struct ToolRegistryBuilder {
     gate: Option<AnyCommandGate>,
     policies: Vec<crate::AnyScriptPolicy>,
     kept: HashSet<String>,
-    notices: crate::AnySandboxNotices,
 }
 
 impl ToolRegistryBuilder {
@@ -1278,14 +1255,6 @@ impl ToolRegistryBuilder {
         self.policies.push(crate::AnyScriptPolicy::new(policy));
     }
 
-    /// Renders every refusal and notice of the registry, and of the terminals
-    /// and terminal controls serving it, through `notices`; the sandbox's own
-    /// wording ([`DefaultSandboxNotices`](crate::DefaultSandboxNotices)) by
-    /// default. A subagent's registry keeps its parent's.
-    pub fn notices(&mut self, notices: crate::AnySandboxNotices) {
-        self.notices = notices;
-    }
-
     /// Builds an immutable main-agent registry storing large and binary
     /// command results in `outputs`; [`ToolRegistry::for_subagent`] derives
     /// the subagent view. Terminal-bound commands are built when a terminal
@@ -1308,7 +1277,6 @@ impl ToolRegistryBuilder {
             observer: self.observer,
             gate: self.gate,
             policies: crate::policy::ScriptPolicies::new(self.policies),
-            notices: self.notices,
             call: None,
             output: None,
             committed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1542,8 +1510,6 @@ pub struct ToolRegistry {
     /// The command policies, bound to the state of the agent this registry
     /// serves; every view of the registry for that agent shares them.
     policies: crate::policy::ScriptPolicies,
-    /// Renders the refusals and notices of the registry and its terminals.
-    notices: crate::AnySandboxNotices,
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
     /// bound it to one.
     call: Option<CallIdentity>,
@@ -1598,7 +1564,7 @@ impl ToolRegistry {
         controls.configure_tool(crate::builtin::InputTerminalTool::new(jobs.clone()));
         controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(
             jobs,
-            self.notices.clone(),
+            outputs.wording().clone(),
             outputs.policy().clone(),
         ));
         self.entries.extend(controls.entries);
@@ -1643,13 +1609,6 @@ impl ToolRegistry {
         self.role
     }
 
-    /// What renders the refusals and notices of this registry and of the
-    /// terminals serving it.
-    #[must_use]
-    pub const fn notices(&self) -> &crate::AnySandboxNotices {
-        &self.notices
-    }
-
     /// The registry a subagent's terminal serves: the same commands, each
     /// resolved to its subagent-role handler, with terminal-bound commands
     /// left for the subagent's terminal to build. Asking a subagent registry
@@ -1682,7 +1641,6 @@ impl ToolRegistry {
             observer,
             gate,
             policies: self.policies.for_agent(),
-            notices: self.notices.clone(),
             call: None,
             output: None,
             committed: self.committed.clone(),
@@ -1823,8 +1781,9 @@ impl ToolRegistry {
                 ..
             }) => self.run(tool_name, handler, args, working_dir).await,
             Some(Resolved { handler: None, .. }) => CommandEnvelope::failure(
-                self.notices
-                    .reserved_for_main(&crate::notices::ReservedForMain { command: tool_name }),
+                self.outputs
+                    .wording()
+                    .reserved_for_main(&ReservedForMain { command: tool_name }),
             ),
             None => match self.set_entry(tool_name) {
                 Some(entry) => self.run(tool_name, &entry.handler, args, working_dir).await,
@@ -3398,7 +3357,7 @@ mod tests {
 
     /// An output store in `dir` leasing from the default allocator.
     fn test_outputs(dir: &Path) -> OutputStore {
-        OutputStore::at(
+        OutputStore::testing(
             dir.to_path_buf(),
             aither_core::AnyIdAllocator::default(),
             crate::output_policy::fixture::policy(),

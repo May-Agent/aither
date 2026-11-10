@@ -5,9 +5,82 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    MediaBounds, OutputLimits, OutputPolicy, ShellArgs, ShellLimits, TerminalTool,
-    ToolDistribution, ToolRegistryBuilder, ToolTarget,
+    AnyShellWording, CommandBlocked, CommandKilled, FoldedLines, JsonAsTsv, MediaBounds,
+    MonitorRefusal, MonitorStarted, OmittedLines, OutputLimits, OutputPolicy, OutputSaved,
+    RepeatedLines, ReservedForMain, ShellArgs, ShellLimits, ShellWording, StoredBinaryPart,
+    TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolTarget, UnchangedTaskRead,
 };
+
+/// The wording of this example's shell: aither ships none, and the example's
+/// only reader is the acceptance script that checks its output.
+struct ExampleWording;
+
+impl ShellWording for ExampleWording {
+    fn unchanged_task_read(&self, read: &UnchangedTaskRead) -> String {
+        format!("task {} has no new output", read.task_id)
+    }
+
+    fn command_blocked(&self, blocked: &CommandBlocked) -> String {
+        format!("blocked: {}", blocked.reason)
+    }
+
+    fn monitor_refusal(&self, refusal: &MonitorRefusal) -> String {
+        format!("monitor refused: {refusal:?}")
+    }
+
+    fn monitor_started(&self, started: &MonitorStarted<'_>) -> String {
+        format!("monitoring {}", started.task_id)
+    }
+
+    fn reserved_for_main(&self, reserved: &ReservedForMain<'_>) -> String {
+        format!("{} is reserved for the main agent", reserved.command)
+    }
+
+    fn command_killed(&self, killed: &CommandKilled<'_>) -> String {
+        format!("killed: {killed:?}")
+    }
+
+    fn output_saved(&self, saved: &OutputSaved<'_>) -> String {
+        format!(
+            "{}\n[{} lines saved to {}]",
+            saved.preview, saved.line_count, saved.path
+        )
+    }
+
+    fn stored_binary_part(&self, part: &StoredBinaryPart<'_>) -> String {
+        format!("[{} stored at {}]", part.mime, part.path)
+    }
+
+    fn json_as_tsv(&self, json: &JsonAsTsv<'_>) -> String {
+        format!("{}\n[JSON saved to {}]", json.tsv, json.path)
+    }
+
+    fn folded_code(&self, folded: &str) -> String {
+        folded.to_owned()
+    }
+
+    fn blank_lines(&self, count: usize) -> String {
+        format!("[{count} blank lines]")
+    }
+
+    fn folded_lines(&self, folded: &FoldedLines<'_>) -> String {
+        format!(
+            "{}  [{} lines folded]",
+            folded.indent, folded.count
+        )
+    }
+
+    fn omitted_lines(&self, omitted: &OmittedLines) -> String {
+        format!(
+            "[lines {}-{} of {} omitted]",
+            omitted.range.first, omitted.range.last, omitted.total
+        )
+    }
+
+    fn repeated_lines(&self, repeated: &RepeatedLines) -> String {
+        format!("[repeated {} times]", repeated.count)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         executor_core::tokio::TokioGlobal,
         limits,
         output,
+        AnyShellWording::new(ExampleWording),
     )
     .await?
     .initialize_tools(&distribution, &PathBuf::from(cache))
