@@ -15,6 +15,7 @@ categories = ["api-bindings"]
 aither-core.workspace = true
 aither-attachments.workspace = true
 anyhow = "1.0.104"
+arc-swap.workspace = true
 askama = "0.16"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }

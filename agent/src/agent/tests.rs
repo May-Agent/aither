@@ -19,9 +19,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
-    Agent, AgentBuilder, AgentError, AgentEvent, AgentPath, Block, ContextBlock, ContextSource,
-    Hooks, InjectionKind, Moment, RunOutcome, SourceId, StopCx, StopDecision, SubagentRuns,
-    TimedEvent, ToolDecision, ToolInvocation, ToolVerdict,
+    Agent, AgentBuilder, AgentCheckpoint, AgentError, AgentEvent, AgentPath, Block, ContextBlock,
+    ContextSource, Hooks, InjectionKind, Moment, RunOutcome, SourceId, StopCx, StopDecision,
+    SubagentRuns, TimedEvent, ToolDecision, ToolInvocation, ToolVerdict,
 };
 
 #[derive(Debug)]
@@ -752,4 +752,41 @@ async fn a_panic_in_one_parallel_call_leaves_the_other_result_intact() {
         results.contains(&"Error: tool 'panicker' panicked: the disk is on fire".to_owned()),
         "{results:?}"
     );
+}
+
+#[tokio::test]
+async fn a_checkpoint_taken_mid_run_restores_the_completed_steps() {
+    let llm = Scripted::new([call("c1", "probe"), say("done")]);
+    let mut agent = AgentBuilder::new(llm).tool(Probe::default()).build();
+    let run = agent.run("go", std::iter::empty());
+    let checkpoints = run.checkpoints();
+
+    let flow = run
+        .drive(
+            (),
+            std::future::pending::<Option<AgentCheckpoint>>(),
+            |(), timed| {
+                let taken = match timed.event {
+                    AgentEvent::Checkpoint { .. } => Some(checkpoints.latest()),
+                    _ => None,
+                };
+                async move { taken.map_or(ControlFlow::Continue(()), ControlFlow::Break) }
+            },
+        )
+        .await
+        .expect("the run is stopped, not failed");
+    let ControlFlow::Break(checkpoint) = flow else {
+        panic!("the run emitted a checkpoint");
+    };
+    let checkpoint = checkpoint.expect("a checkpoint event follows a recorded checkpoint");
+
+    let mut restored = AgentBuilder::new(Scripted::new([]))
+        .tool(Probe::default())
+        .build();
+    restored
+        .restore_checkpoint(checkpoint)
+        .expect("the checkpoint restores");
+    let history = format!("{:?}", restored.history());
+    assert!(history.contains("go"), "the user message: {history}");
+    assert!(history.contains("c1"), "the completed tool call: {history}");
 }
