@@ -11,10 +11,11 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::MountRootError;
 use crate::command::CommandBlocked;
 use crate::job_registry::JobRead;
 use crate::monitor::MonitorRefusal;
-use crate::terminal::TimeoutKill;
+use crate::terminal::{TerminalError, TimeoutKill};
 
 /// A `monitor` call that started watching a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +173,33 @@ pub struct RepeatedLines {
     pub count: usize,
 }
 
+/// A call or run that did not get to an end, other than one refused before it
+/// ran: the failure as data, for the embedder to word.
+///
+/// The errors behind it ([`TerminalError`], [`MountRootError`]) carry the
+/// facts a text needs; their `Display` is for logs and is never what the
+/// model reads.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RunFailure<'a> {
+    /// The shell's container declares no workspace mount, so a run cannot
+    /// start in a host directory.
+    NoWorkspaceMount,
+    /// The run's directory lies outside the container's workspace mount.
+    OutsideWorkspace(&'a MountRootError),
+    /// Every model-facing id is leased, so the command has no task id.
+    IdsExhausted,
+    /// The shell could not run the script: a target, tool, permission or
+    /// setup failure, or one the execution reported.
+    Terminal(&'a TerminalError),
+    /// The execution failed, with the detail its backend gave
+    /// ([`TerminalError::detail`]).
+    Failed {
+        /// What the backend reported.
+        detail: &'a str,
+    },
+}
+
 /// The text the model reads for each refusal, notice and marker the shell
 /// raises, one method per family.
 ///
@@ -193,6 +221,9 @@ pub trait ShellWording: Send + Sync + 'static {
 
     /// A call of a tool of the shell refused before it ran.
     fn call_refused(&self, refusal: &CallRefusal) -> String;
+
+    /// A call or run that failed before or while it ran.
+    fn run_failure(&self, failure: &RunFailure<'_>) -> String;
 
     /// A `monitor` call refused before anything started.
     fn monitor_refusal(&self, refusal: &MonitorRefusal) -> String;

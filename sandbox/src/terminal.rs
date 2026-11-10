@@ -12,7 +12,6 @@
 //! names, subagent spaces — are leased from the terminal's
 //! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
 
-use crate::CallRefusal;
 use crate::foreground_wait::ForegroundWait;
 use crate::memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
@@ -22,6 +21,7 @@ use crate::outage::Outages;
 use crate::spawn::Backend;
 #[cfg(test)]
 use crate::{AnyShellWording, OutputPolicy};
+use crate::{CallRefusal, RunFailure, ShellWording};
 use std::{
     borrow::Cow,
     io::Read,
@@ -541,7 +541,7 @@ impl BackgroundStartup {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            let _ = self.tx.send(Err(error.to_string())).await;
+            let _ = self.tx.send(Err(error.detail().into_owned())).await;
             self.settled.close();
         }
     }
@@ -761,7 +761,13 @@ impl Script {
 }
 
 /// Why a [`Shell::run`] did not run to an end.
+///
+/// The variants carry the facts; the `Display` texts are for logs and
+/// diagnostics, and the model never reads them: the tool boundary words a
+/// failure through [`ShellWording::run_failure`] and
+/// [`ShellWording::call_refused`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ShellRunError {
     /// The timeout is zero or above the terminal's cap.
     #[error("timeout must be between 1 and {} seconds", .cap.as_secs())]
@@ -789,6 +795,25 @@ pub enum ShellRunError {
     /// Every model-facing id is leased, so the command has no task id.
     #[error(transparent)]
     Ids(#[from] IdsExhausted),
+}
+
+impl ShellRunError {
+    /// The error a tool call answers with: a refusal stays typed so the agent
+    /// loop recognises it, every other failure is worded by `wording`.
+    pub(crate) fn into_tool_error(self, wording: &dyn ShellWording) -> anyhow::Error {
+        let failure = match self {
+            Self::Refused(refusal) => return anyhow::Error::from(refusal),
+            Self::Blocked(blocked) => return anyhow::Error::from(blocked),
+            Self::Timeout { cap } => {
+                return crate::Refused::call(wording, CallRefusal::TimeoutOutOfRange { cap });
+            }
+            Self::NoWorkspaceMount => RunFailure::NoWorkspaceMount,
+            Self::OutsideWorkspace(ref error) => RunFailure::OutsideWorkspace(error),
+            Self::Terminal(ref error) => RunFailure::Terminal(error),
+            Self::Ids(_) => RunFailure::IdsExhausted,
+        };
+        anyhow::Error::msg(wording.run_failure(&failure))
+    }
 }
 
 /// The terminal tool for executing scripts in a sandbox.
@@ -2285,7 +2310,7 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
         // Registration precedes `report_ready` on every backend, so once
         // startup returns the job is killable through the registry and the
         // foreground clock only measures the command's own runtime.
-        wait_for_background_startup(&spawned.startup).await?;
+        wait_for_background_startup(&spawned.startup, &**self.wording()).await?;
         if arguments.background {
             return detach_job(
                 &self.job_registry,
@@ -2315,9 +2340,9 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
                 spawned.took_result().await;
                 Ok(Execution::Finished(command))
             }
-            Some(Err(err)) => {
+            Some(Err(detail)) => {
                 spawned.took_result().await;
-                Err(anyhow::anyhow!(err))
+                Err(failed_run(&**self.wording(), &detail))
             }
             // The command outlived its foreground window: promote it to a
             // background task.
@@ -2757,11 +2782,7 @@ where
             Some(cx),
         )
         .await
-        .map_err(|error| match error {
-            // Kept unwrapped, so the agent loop recognises the refusal.
-            ShellRunError::Refused(refusal) => anyhow::Error::from(refusal),
-            other => anyhow::Error::from(other),
-        })
+        .map_err(|error| error.into_tool_error(&**self.wording()))
     }
 
     /// The terminal's policy for a command, whoever runs it — the one entry
@@ -3044,19 +3065,15 @@ where
         match spawned.startup.recv().await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(TerminalError::Execution(error).into()),
-            Err(_) => {
-                return Err(TerminalError::Execution(
-                    "the run ended before it was registered".to_string(),
-                )
-                .into());
-            }
+            Err(_) => return Err(TerminalError::TaskLost.into()),
         }
         // The run is never announced as a background task, so its end is
         // told to the caller alone, however long it takes.
-        let result =
-            spawned.result.recv().await.map_err(|_| {
-                TerminalError::Execution("the run ended without a result".to_string())
-            });
+        let result = spawned
+            .result
+            .recv()
+            .await
+            .map_err(|_| TerminalError::TaskLost);
         let killed = self
             .job_registry
             .get_by_task_id_settled(&prepared.task_id)
@@ -3233,14 +3250,20 @@ fn run_start(target: &ExecutionTarget, dir: PathBuf) -> Result<CwdCarry, ShellRu
 
 async fn wait_for_background_startup(
     startup_rx: &Receiver<Result<(), String>>,
+    wording: &dyn ShellWording,
 ) -> anyhow::Result<()> {
     match startup_rx.recv().await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(anyhow::anyhow!(err)),
-        Err(_) => Err(anyhow::anyhow!(
-            "background startup channel dropped before registration"
+        Ok(Err(detail)) => Err(failed_run(wording, &detail)),
+        Err(_) => Err(anyhow::Error::msg(
+            wording.run_failure(&RunFailure::Terminal(&TerminalError::TaskLost)),
         )),
     }
+}
+
+/// The error of a run whose execution failed with `detail`, worded.
+fn failed_run(wording: &dyn ShellWording, detail: &str) -> anyhow::Error {
+    anyhow::Error::msg(wording.run_failure(&RunFailure::Failed { detail }))
 }
 
 /// Races the result channel against the foreground limit.
@@ -3655,7 +3678,7 @@ where
 
     let quick_result = match &result {
         Ok(ok) => Ok(ok.clone()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(err.detail().into_owned()),
     };
     let _ = result_tx.send(quick_result).await;
     // The call answers at once, taking the result or leaving it to a
@@ -3665,7 +3688,7 @@ where
     // outcome, so the registry settles the ending once no kill is in flight.
     let ending = match &result {
         Ok(command) => Ok(command.exit_code),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(error.detail().into_owned()),
     };
     let owed = status_registry.owe_completion(&task_id, ending).await;
     let kill = owed.as_ref().and_then(|owed| owed.kill);
@@ -4637,7 +4660,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         (Err(error), _) | (Ok(()), Err(error)) => {
             job_registry.close_stdout(pid).await;
             job_registry.close_stderr(pid).await;
-            job_registry.fail(pid, &error.to_string(), None).await;
+            job_registry.fail(pid, &error.detail(), None).await;
             return Err(error);
         }
     };
@@ -5641,8 +5664,18 @@ fn create_ipc_gateway_router(registry: &Arc<ToolRegistry>) -> Option<IpcRouter> 
 }
 
 /// Errors that can occur during terminal execution.
+///
+/// The variants carry the facts; the `Display` texts are for logs and
+/// diagnostics, and the model never reads them: it reads what
+/// [`ShellWording::run_failure`] makes of the error. The `String` of
+/// [`Execution`](Self::Execution) and [`SandboxSetup`](Self::SandboxSetup) is
+/// the detail the failing backend reported, not a sentence of the shell's.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TerminalError {
+    /// The task that runs the script ended before it registered or answered.
+    #[error("the task running the script ended without answering")]
+    TaskLost,
     /// Execution environment or mode is not configured.
     #[error("invalid terminal execution target: {0}")]
     InvalidTarget(String),
@@ -5686,6 +5719,24 @@ pub enum TerminalError {
     #[cfg(all(unix, feature = "jobserver"))]
     #[error(transparent)]
     Jobserver(#[from] crate::jobserver::JobserverError),
+}
+
+impl TerminalError {
+    /// What the failure reports, without the frame its `Display` puts around
+    /// it: the text a job's registry status carries, which the embedder
+    /// words inside its own.
+    #[must_use]
+    pub fn detail(&self) -> Cow<'_, str> {
+        match self {
+            Self::InvalidTarget(detail)
+            | Self::UnknownLocation(detail)
+            | Self::NoRemoteSandbox(detail)
+            | Self::Denied(detail)
+            | Self::SandboxSetup(detail)
+            | Self::Execution(detail) => Cow::Borrowed(detail),
+            other => Cow::Owned(other.to_string()),
+        }
+    }
 }
 
 impl From<crate::SpawnError> for TerminalError {

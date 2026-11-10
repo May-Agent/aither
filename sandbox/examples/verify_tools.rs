@@ -10,9 +10,9 @@ use aither_sandbox::{
     Backend, CallRefusal, CommandBlocked, CommandKilled, FoldedLines, ForegroundWait, HostProgram,
     ImportBudget, Interpreter, JobInputSent, JobKillAsked, JobRead, JsonAsTsv, LiveDuration,
     MediaBounds, MonitorRefusal, MonitorStarted, OmittedLines, OutputLimits, OutputPolicy,
-    OutputSaved, RepeatedLines, ReservedForMain, ResponseWindow, Sandbox, Shell, ShellArgs,
-    ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution, ToolIdentity,
-    ToolRegistryBuilder, ToolTarget,
+    OutputSaved, RepeatedLines, ReservedForMain, ResponseWindow, RunFailure, Sandbox, Shell,
+    ShellArgs, ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution,
+    ToolIdentity, ToolRegistryBuilder, ToolTarget,
 };
 
 /// The wording of this example's shell: aither ships none, and the example's
@@ -37,6 +37,10 @@ impl ShellWording for ExampleWording {
 
     fn call_refused(&self, refusal: &CallRefusal) -> String {
         format!("refused: {refusal:?}")
+    }
+
+    fn run_failure(&self, failure: &RunFailure<'_>) -> String {
+        format!("failed: {failure:?}")
     }
 
     fn command_blocked(&self, blocked: &CommandBlocked) -> String {

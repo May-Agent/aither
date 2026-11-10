@@ -480,10 +480,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
         )
         .await
         .expect_err("a remote script with only passes needs an approver");
-    assert!(
-        error.to_string().contains("no approver is configured"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("no approver"), "{error}");
 
     // A policy's allow settles it without the approver; the connection is
     // refused, so the call fails later, and not for want of approval.
@@ -514,7 +511,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
         result
             .as_ref()
             .err()
-            .is_none_or(|error| !error.to_string().contains("no approver is configured")),
+            .is_none_or(|error| !error.to_string().contains("no approver")),
         "{result:?}"
     );
 }
@@ -568,12 +565,7 @@ async fn default_mode_needs_the_servers_heel() {
         )
         .await
         .expect_err("no sandbox there");
-    assert!(
-        refused
-            .to_string()
-            .contains("default mode runs under `heel`, which `fixture` does not have"),
-        "{refused}"
-    );
+    assert_eq!(refused.to_string(), "no remote sandbox: fixture");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -596,12 +588,7 @@ async fn a_removed_or_unknown_location_is_refused_and_an_empty_one_is_home() {
             )
             .await
             .expect_err("no such server");
-        assert!(
-            refused
-                .to_string()
-                .contains(&format!("no SSH server named `{name}` is configured")),
-            "{refused}"
-        );
+        assert_eq!(refused.to_string(), format!("unknown location: {name}"));
     }
     let home = terminal
         .call(

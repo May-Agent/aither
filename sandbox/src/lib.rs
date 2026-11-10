@@ -228,5 +228,5 @@ pub use tool_transport::{
 pub use wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
     JsonAsTsv, LineRange, MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines,
-    ReservedForMain, ShellWording, StoredBinaryPart,
+    ReservedForMain, RunFailure, ShellWording, StoredBinaryPart,
 };

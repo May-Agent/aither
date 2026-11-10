@@ -9,11 +9,11 @@ use askama::Template;
 use crate::command::CommandBlocked;
 use crate::job_registry::{JobRead, JobStatus};
 use crate::monitor::MonitorRefusal;
-use crate::terminal::TimeoutKill;
+use crate::terminal::{TerminalError, TimeoutKill};
 use crate::wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
     JsonAsTsv, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, ReservedForMain,
-    ShellWording, StoredBinaryPart,
+    RunFailure, ShellWording, StoredBinaryPart,
 };
 use aither_core::llm::CommandStream;
 
@@ -61,6 +61,32 @@ fn job_status_text(status: &JobStatus) -> String {
 #[template(path = "test_wording/call_refused.txt", escape = "none")]
 struct CallRefused<'a> {
     refusal: &'a CallRefusal,
+}
+
+#[derive(Template)]
+#[template(path = "test_wording/run_failure.txt", escape = "none")]
+struct RunFailureText<'a> {
+    key: &'a str,
+    detail: &'a str,
+}
+
+/// The key and detail a test wording gives a terminal failure.
+fn terminal_failure(error: &TerminalError) -> (&'static str, String) {
+    match error {
+        TerminalError::TaskLost => ("task lost", String::new()),
+        TerminalError::InvalidTarget(detail) => ("invalid target", detail.clone()),
+        TerminalError::UnknownLocation(name) => ("unknown location", name.clone()),
+        TerminalError::NoRemoteSandbox(name) => ("no remote sandbox", name.clone()),
+        TerminalError::Denied(reason) => ("denied", reason.clone()),
+        TerminalError::NoApprover(kind) => ("no approver", kind.to_string()),
+        TerminalError::SandboxSetup(detail) => ("sandbox setup failed", detail.clone()),
+        TerminalError::Execution(detail) => ("execution failed", detail.clone()),
+        TerminalError::Tools(error) => ("tools", error.to_string()),
+        TerminalError::Approval(error) => ("approval", error.to_string()),
+        TerminalError::Io(error) => ("io", error.to_string()),
+        #[cfg(all(unix, feature = "jobserver"))]
+        TerminalError::Jobserver(error) => ("jobserver", error.to_string()),
+    }
 }
 
 #[derive(Template)]
@@ -266,6 +292,20 @@ impl ShellWording for TestWording {
 
     fn call_refused(&self, refusal: &CallRefusal) -> String {
         rendered(&CallRefused { refusal })
+    }
+
+    fn run_failure(&self, failure: &RunFailure<'_>) -> String {
+        let (key, detail) = match failure {
+            RunFailure::NoWorkspaceMount => ("no workspace mount", String::new()),
+            RunFailure::OutsideWorkspace(error) => ("outside workspace", error.to_string()),
+            RunFailure::IdsExhausted => ("ids exhausted", String::new()),
+            RunFailure::Terminal(error) => terminal_failure(error),
+            RunFailure::Failed { detail } => ("execution failed", (*detail).to_string()),
+        };
+        rendered(&RunFailureText {
+            key,
+            detail: &detail,
+        })
     }
 
     fn command_blocked(&self, blocked: &CommandBlocked) -> String {
