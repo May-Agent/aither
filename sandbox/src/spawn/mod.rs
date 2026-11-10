@@ -124,7 +124,10 @@ pub enum SpawnCommand {
         args: Vec<String>,
     },
     /// A script for the backend's managed shell, which only the container
-    /// and SSH backends have.
+    /// and SSH backends have: a host sandbox names no shell, so spawning a
+    /// script on it fails with [`SpawnError::Unsupported`]. A caller that
+    /// wants a script on the host spawns its shell as a program, or runs it
+    /// through a [`Shell`](crate::Shell).
     ///
     /// A script is one level of quoting for a server's login shell, which
     /// parses the command line first; a program that runs the shell would
@@ -481,7 +484,7 @@ impl Sandbox {
     /// The `heel` binary of a sandbox on the host.
     pub(crate) fn host_heel(&self) -> Option<&heel::HeelBinary> {
         match &self.inner.backend {
-            Backend::Host { heel, .. } => Some(heel),
+            Backend::Host { heel } => Some(heel),
             Backend::Container { .. } | Backend::Ssh { .. } => None,
         }
     }

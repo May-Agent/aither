@@ -104,7 +104,7 @@ struct Launch {
 impl Sandbox {
     fn heel_binary(&self) -> Result<&heel::HeelBinary, SpawnError> {
         match &self.inner.backend {
-            Backend::Host { heel, .. } => Ok(heel),
+            Backend::Host { heel } => Ok(heel),
             Backend::Container { .. } | Backend::Ssh { .. } => Err(SpawnError::Setup(
                 "a local spawn needs the host backend".into(),
             )),

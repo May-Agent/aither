@@ -18,8 +18,8 @@
 //! ```rust,ignore
 //! use aither_sandbox::{Backend, Sandbox, Shell};
 //!
-//! let sandbox = Sandbox::new(Backend::Host { heel, launch }, executor, working_dir);
-//! let shell = Shell::builder(sandbox)
+//! let sandbox = Sandbox::new(Backend::Host { heel }, executor, working_dir);
+//! let shell = Shell::builder_on_host(sandbox, host_shell)
 //!     .interpreters(interpreters)
 //!     .limits(limits)
 //!     .output(output)

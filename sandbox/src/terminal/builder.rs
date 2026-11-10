@@ -6,8 +6,8 @@ use executor_core::AnyExecutor;
 
 use super::{Interpreter, Shell, ShellToolSettings, TerminalError};
 use crate::{
-    AnyIpcProvider, AnyScriptPolicy, AnyShellWording, IpcProvider, OutputPolicy, Sandbox,
-    ScriptPolicy, ShellEvents, ShellLimits, ShellWording,
+    AnyIpcProvider, AnyScriptPolicy, AnyShellWording, HostLaunch, IpcProvider, OutputPolicy,
+    Sandbox, ScriptPolicy, ShellEvents, ShellLimits, ShellWording,
 };
 
 /// A value the builder has not been given yet.
@@ -28,6 +28,7 @@ pub struct ShellParts {
     pub(crate) events: Option<ShellEvents>,
     pub(crate) policies: Vec<AnyScriptPolicy>,
     pub(crate) ipc: Option<AnyIpcProvider>,
+    pub(crate) host_shell: Option<HostLaunch>,
 }
 
 /// Builds a [`Shell`] on the [`Sandbox`] its scripts run in.
@@ -45,12 +46,15 @@ pub struct ShellBuilder<I, L, O, W, T> {
     events: Option<ShellEvents>,
     policies: Vec<AnyScriptPolicy>,
     ipc: Option<AnyIpcProvider>,
+    host_shell: Option<HostLaunch>,
 }
 
 impl Shell<Arc<AnyExecutor>> {
-    /// Starts a shell whose scripts run in `sandbox`: its working directory,
-    /// live grants, environment source, network policy, priority and
-    /// backend are the shell's.
+    /// Starts a shell whose scripts run in `sandbox`, a sandbox on a
+    /// container: its working directory, live grants, environment source,
+    /// network policy, priority and backend are the shell's, and the shell
+    /// is the one the container's launch names. A sandbox on the host takes
+    /// [`builder_on_host`](Self::builder_on_host).
     #[must_use]
     pub const fn builder(
         sandbox: Sandbox,
@@ -65,6 +69,30 @@ impl Shell<Arc<AnyExecutor>> {
             events: None,
             policies: Vec::new(),
             ipc: None,
+            host_shell: None,
+        }
+    }
+
+    /// Starts a shell whose scripts run in `sandbox`, a sandbox on the host,
+    /// under the shell `host_shell` names. A host sandbox spawns programs and
+    /// names no shell of its own, so the shell is an input of the shell that
+    /// needs one.
+    #[must_use]
+    pub const fn builder_on_host(
+        sandbox: Sandbox,
+        host_shell: HostLaunch,
+    ) -> ShellBuilder<Missing, Missing, Missing, Missing, Missing> {
+        ShellBuilder {
+            sandbox,
+            interpreters: Missing,
+            limits: Missing,
+            output: Missing,
+            wording: Missing,
+            tools: Missing,
+            events: None,
+            policies: Vec::new(),
+            ipc: None,
+            host_shell: Some(host_shell),
         }
     }
 }
@@ -117,6 +145,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            host_shell: self.host_shell,
         }
     }
 
@@ -133,6 +162,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            host_shell: self.host_shell,
         }
     }
 
@@ -149,6 +179,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            host_shell: self.host_shell,
         }
     }
 
@@ -168,6 +199,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            host_shell: self.host_shell,
         }
     }
 
@@ -188,6 +220,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            host_shell: self.host_shell,
         }
     }
 }
@@ -206,7 +239,10 @@ impl
     /// # Errors
     /// Returns an error when the working directory or the output store cannot
     /// be created, when the sandbox runs its processes on an SSH server (a
-    /// server is a location a script names, not a shell's home).
+    /// server is a location a script names, not a shell's home), or when the
+    /// constructor does not fit the sandbox's backend: a host sandbox built
+    /// with [`Shell::builder`], or a container sandbox built with
+    /// [`Shell::builder_on_host`].
     pub async fn build(self) -> Result<Shell<Arc<AnyExecutor>>, TerminalError> {
         let Self {
             sandbox,
@@ -218,6 +254,7 @@ impl
             events,
             policies,
             ipc,
+            host_shell,
         } = self;
         let executor = sandbox.executor();
         Shell::from_parts(
@@ -232,6 +269,7 @@ impl
                 events,
                 policies,
                 ipc,
+                host_shell,
             },
         )
         .await
@@ -253,15 +291,12 @@ mod tests {
     ) -> Shell<Arc<AnyExecutor>> {
         let heel = crate::test_heel::binary().await.expect("a heel for tests");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new("/bin/bash"),
-            },
+            Backend::Host { heel },
             executor_core::tokio::TokioGlobal,
             directory,
         )
         .with_grants(grants);
-        Shell::builder(sandbox)
+        Shell::builder_on_host(sandbox, HostLaunch::new("/bin/bash"))
             .interpreters(interpreters.iter().copied())
             .limits(test_budgets::limits())
             .output(test_budgets::output_policy())
@@ -278,14 +313,11 @@ mod tests {
     ) -> Shell<Arc<AnyExecutor>> {
         let heel = crate::test_heel::binary().await.expect("a heel for tests");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new("/bin/bash"),
-            },
+            Backend::Host { heel },
             executor_core::tokio::TokioGlobal,
             directory,
         );
-        Shell::builder(sandbox)
+        Shell::builder_on_host(sandbox, HostLaunch::new("/bin/bash"))
             .interpreters([Interpreter::Shell])
             .limits(test_budgets::limits())
             .output(test_budgets::output_policy())
@@ -425,5 +457,49 @@ mod tests {
             .await
             .expect_err("python is not configured");
         assert!(error.to_string().contains("not configured"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_host_sandbox_built_without_its_host_shell_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let heel = crate::test_heel::binary().await.expect("a heel for tests");
+        let sandbox = Sandbox::new(
+            Backend::Host { heel },
+            executor_core::tokio::TokioGlobal,
+            directory.path(),
+        );
+        let error = Shell::builder(sandbox)
+            .interpreters([Interpreter::Shell])
+            .limits(test_budgets::limits())
+            .output(test_budgets::output_policy())
+            .wording(test_wording::TestWording)
+            .tools(test_wording::job_tools())
+            .build()
+            .await
+            .expect_err("a host shell needs its program");
+        assert!(error.to_string().contains("host shell"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shells_sandbox_spawns_a_program_in_the_shells_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let shell = shell(directory.path(), Grants::new(), &[Interpreter::Shell]).await;
+        let mut child = shell
+            .sandbox()
+            .spawn(crate::SpawnSpec::new("/bin/pwd"))
+            .await
+            .expect("the process starts");
+        let stdout = child.take_stdout().expect("stdout is piped");
+        let mut printed = Vec::new();
+        while let Ok(chunk) = stdout.recv().await {
+            printed.extend(chunk);
+        }
+        child.wait().await;
+        let printed = String::from_utf8(printed).unwrap();
+        assert_eq!(
+            std::path::Path::new(printed.trim()),
+            shell.sandbox().working_dir()
+        );
     }
 }

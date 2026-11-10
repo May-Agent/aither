@@ -2,22 +2,22 @@
 
 use heel::HeelBinary;
 
-use super::launch::{ContainerLaunch, HostLaunch, RemoteLaunch};
+use super::launch::{ContainerLaunch, RemoteLaunch};
 use crate::{ContainerShellRuntime, SshServer};
 
 /// Where a sandbox's processes run.
 ///
-/// The embedder supplies what each backend runs: the verified `heel` binary and the shell prepared on the host, the
-/// launch of the programs prepared in the container, the server's `heel` and
-/// launch.
+/// The embedder supplies what each backend runs: the verified `heel` binary on
+/// the host, the launch of the programs prepared in the container, the
+/// server's `heel` and launch. A host sandbox spawns programs and needs no
+/// shell; the shell a [`Shell`](crate::Shell) runs scripts under is given to
+/// [`Shell::builder_on_host`](crate::Shell::builder_on_host).
 #[derive(Debug, Clone)]
 pub enum Backend {
     /// This machine, under heel's sandbox.
     Host {
         /// The verified `heel` binary the sandbox runs under.
         heel: HeelBinary,
-        /// The shell prepared on the host.
-        launch: HostLaunch,
     },
     /// A running container, whose own limits are the boundary.
     Container {

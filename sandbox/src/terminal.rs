@@ -796,6 +796,9 @@ pub struct Shell<E> {
     /// What this shell handed its subagents, so no grant exceeds an earlier
     /// one's claim; launches resolve one at a time.
     launches: Arc<async_lock::Mutex<LaunchHistory>>,
+    /// The shell scripts run under when the sandbox runs on the host; `None`
+    /// on a container, whose launch names it.
+    host_launch: Option<crate::HostLaunch>,
 }
 
 impl<E: Clone> Clone for Shell<E> {
@@ -825,6 +828,7 @@ impl<E: Clone> Clone for Shell<E> {
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: self.launches.clone(),
+            host_launch: self.host_launch.clone(),
         }
     }
 }
@@ -888,11 +892,26 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         executor: E,
         parts: builder::ShellParts,
     ) -> Result<Self, TerminalError> {
-        if let Backend::Ssh { server, .. } = sandbox.backend() {
-            return Err(TerminalError::SandboxSetup(format!(
-                "the sandbox runs on the SSH server {}: a server is a location, not a shell's home",
-                server.name
-            )));
+        match (sandbox.backend(), &parts.host_shell) {
+            (Backend::Ssh { server, .. }, _) => {
+                return Err(TerminalError::SandboxSetup(format!(
+                    "the sandbox runs on the SSH server {}: a server is a location, not a shell's home",
+                    server.name
+                )));
+            }
+            (Backend::Host { .. }, None) => {
+                return Err(TerminalError::SandboxSetup(
+                    "a shell on the host needs its host shell: build it with `Shell::builder_on_host`"
+                        .into(),
+                ));
+            }
+            (Backend::Container { .. }, Some(_)) => {
+                return Err(TerminalError::SandboxSetup(
+                    "a host shell was given to a shell on a container, which runs the shell its launch names"
+                        .into(),
+                ));
+            }
+            (Backend::Host { .. }, Some(_)) | (Backend::Container { .. }, None) => {}
         }
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
@@ -950,6 +969,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             ipc: parts.ipc,
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
+            host_launch: parts.host_shell,
         })
     }
 
@@ -966,10 +986,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
     ) -> Result<Self, TerminalError> {
         let heel = crate::test_heel::binary().await.expect("a test heel");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
-            },
+            Backend::Host { heel },
             executor.clone(),
             working_dir.as_ref(),
         );
@@ -986,6 +1003,8 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         wording: AnyShellWording,
         tools: ShellToolSettings,
     ) -> Result<Self, TerminalError> {
+        let host_shell = matches!(sandbox.backend(), Backend::Host { .. })
+            .then(|| crate::HostLaunch::new(TEST_HOST_SHELL));
         Self::from_parts(
             sandbox,
             executor,
@@ -998,9 +1017,18 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 events: None,
                 policies: Vec::new(),
                 ipc: None,
+                host_shell,
             },
         )
         .await
+    }
+
+    /// The sandbox this shell's scripts run in, so an embedder that built the
+    /// shell spawns its own processes in the same sandbox: the same live
+    /// grants, environment source, network policy and backend.
+    #[must_use]
+    pub const fn sandbox(&self) -> &Sandbox {
+        &self.sandbox
     }
 }
 
@@ -1498,6 +1526,7 @@ where
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: Arc::default(),
+            host_launch: self.host_launch.clone(),
         })
     }
 
@@ -1612,8 +1641,13 @@ where
 
     fn resolve_home_target(&self, mode: SandboxMode) -> Result<ExecutionTarget, TerminalError> {
         let backend = match self.sandbox.backend() {
-            Backend::Host { launch, .. } => ExecutionBackend::Local {
-                shell: launch.shell().clone(),
+            Backend::Host { .. } => ExecutionBackend::Local {
+                shell: self
+                    .host_launch
+                    .as_ref()
+                    .expect("a shell on the host is built with its host shell")
+                    .shell()
+                    .clone(),
             },
             Backend::Container { runtime, launch } => {
                 if mode == SandboxMode::Unsandboxed {
@@ -8404,7 +8438,6 @@ mod tests {
         let sandbox = Sandbox::new(
             Backend::Host {
                 heel: crate::test_heel::binary().await.expect("a test heel"),
-                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
             },
             executor_core::tokio::TokioGlobal,
             dir,
@@ -8875,10 +8908,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let heel = crate::test_heel::binary().await.expect("a test heel");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
-            },
+            Backend::Host { heel },
             executor_core::tokio::TokioGlobal,
             dir.path(),
         )
