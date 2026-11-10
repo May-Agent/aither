@@ -156,7 +156,11 @@ pub fn stored_preview(text: &str, max_lines: usize, byte_budget: usize) -> Strin
         first: head_end
             .checked_sub(1)
             .map_or(1, |last_head| segments[last_head].last + 1),
-        last: segments[tail_start].first - 1,
+        // A tail that takes nothing leaves the omitted range running to the
+        // last line of the text.
+        last: segments
+            .get(tail_start)
+            .map_or(total_lines, |tail| tail.first - 1),
         total: total_lines,
     };
     let mut out = String::new();
@@ -365,6 +369,19 @@ mod tests {
         let text = "one\ntwo\nthree";
         let preview = stored_preview(text, 2, usize::MAX);
         assert!(preview.ends_with("three\n"), "{preview}");
+    }
+
+    #[test]
+    fn omitted_range_reaches_the_last_line_when_the_tail_takes_nothing() {
+        // The final line alone is over the tail's byte share, so the head
+        // takes the short lines and the tail takes no segment.
+        let mut text = numbered(5);
+        text.push_str(&"x".repeat(200));
+        text.push('\n');
+        let preview = stored_preview(&text, usize::MAX, 90);
+        assert!(preview.starts_with("line 1\n"), "{preview}");
+        assert!(preview.contains("[... lines "), "{preview}");
+        assert!(preview.contains("-6 of 6 omitted"), "{preview}");
     }
 
     #[test]
