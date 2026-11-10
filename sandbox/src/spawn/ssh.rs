@@ -91,7 +91,12 @@ impl RemoteJob {
         }
         .render()
         .map_err(|error| KillTreeError::Signal(std::io::Error::other(error)))?;
-        let output = async_process::Command::from(self.client.command(&self.server, &script))
+        let command = self
+            .client
+            .command(&self.server, &script)
+            .await
+            .map_err(|error| KillTreeError::Signal(std::io::Error::other(error)))?;
+        let output = async_process::Command::from(command)
             .stdin(ProcessStdio::null())
             .output()
             .await
@@ -123,7 +128,7 @@ const fn process_stdio(pipe: Pipe) -> fn() -> ProcessStdio {
 }
 
 impl Sandbox {
-    pub(super) fn spawn_ssh(
+    pub(super) async fn spawn_ssh(
         &self,
         server: &SshServer,
         server_heel: Option<&str>,
@@ -196,7 +201,12 @@ impl Sandbox {
         .render()
         .map_err(|e| failed(&e))?;
 
-        let command = self.inner.ssh_client.command(server, &remote);
+        let command = self
+            .inner
+            .ssh_client
+            .command(server, &remote)
+            .await
+            .map_err(|error| SpawnError::Start(error.to_string()))?;
         #[cfg(unix)]
         let command = {
             let mut command = command;
@@ -216,20 +226,7 @@ impl Sandbox {
         let executor = &self.inner.executor;
         let streams = pipe_streams(executor, &mut child);
 
-        let (setter, watch) = exit_watch();
-        executor
-            .spawn(async move {
-                // The processes on the server are out of sight, so nothing is
-                // known of the descendants the exit left.
-                setter.finish(
-                    match child.status().await {
-                        Ok(status) => ChildExit::Exited(status),
-                        Err(error) => ChildExit::Failed(error.to_string()),
-                    },
-                    Descendants::Unobserved,
-                );
-            })
-            .detach();
+        let watch = watch_exit(executor, child);
         Ok(SandboxedChild::new(
             id,
             streams,
@@ -242,6 +239,28 @@ impl Sandbox {
             watch,
         ))
     }
+}
+
+/// The watch of the local `ssh` process's exit.
+fn watch_exit(
+    executor: &AnyExecutor,
+    mut child: async_process::Child,
+) -> Arc<super::child::ExitWatch> {
+    let (setter, watch) = exit_watch();
+    executor
+        .spawn(async move {
+            // The processes on the server are out of sight, so nothing is
+            // known of the descendants the exit left.
+            setter.finish(
+                match child.status().await {
+                    Ok(status) => ChildExit::Exited(status),
+                    Err(error) => ChildExit::Failed(error.to_string()),
+                },
+                Descendants::Unobserved,
+            );
+        })
+        .detach();
+    watch
 }
 
 /// The channels of the local `ssh` process's standard streams that it has

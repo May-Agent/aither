@@ -45,7 +45,12 @@ impl SshToolTransport {
 
 impl ToolTransport for SshToolTransport {
     async fn run(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output, ToolRuntimeError> {
-        let command = async_process::Command::from(self.client.command(&self.server, script));
+        let command = self
+            .client
+            .command(&self.server, script)
+            .await
+            .map_err(|error| ToolRuntimeError::SshBootstrap(error.to_string()))?;
+        let command = async_process::Command::from(command);
         run_command(command, input).await
     }
 }
