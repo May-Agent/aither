@@ -554,6 +554,48 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
 }
 
 #[tokio::test]
+async fn a_confined_container_child_starts_where_it_was_asked_inside_its_own_sandbox() {
+    let (_work, work) = canonical_tempdir();
+    let space = work.join("space");
+    let start = space.join("sub");
+    std::fs::create_dir_all(&start).unwrap();
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let mount = crate::MountRoot::new(
+        work.clone(),
+        crate::ContainerPath::new("/workspace").unwrap(),
+    );
+    let parent = reporting_sandbox(
+        ReportingExec {
+            started: started.clone(),
+            killed: Vec::new(),
+        },
+        &work,
+        Some(mount),
+    );
+    let child = parent
+        .derived(GrantSnapshot {
+            writable: vec![space.clone()],
+            ..GrantSnapshot::default()
+        })
+        .with_working_dir(&space);
+    let process = child
+        .spawn(SpawnSpec::script("make").cwd(&start))
+        .await
+        .expect("the exec starts");
+    assert!(process.wait().await.success());
+
+    let script = started.lock().unwrap()[0].0.clone();
+    assert!(
+        script.contains("run --working-dir '/workspace/space' "),
+        "the sandbox is rooted at the child's own directory: {script}"
+    );
+    assert!(
+        script.contains("sh -c 'cd '\"'\"'/workspace/space/sub'\"'\"' || exit 1\n"),
+        "the start directory is entered inside it: {script}"
+    );
+}
+
+#[tokio::test]
 async fn a_host_spawn_refuses_a_container_setup() {
     let (_work, work) = canonical_tempdir();
     let sandbox = host_sandbox(&work).await;

@@ -9,7 +9,8 @@ use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, 
 use super::{EnvSource, Pipe, Sandbox, SpawnError, SpawnSpec, TreeLifetime};
 use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
 use crate::terminal::{
-    CONTAINER_EXEC_WORKING_DIR, ContainerConfinement, inject_env_exports, wrap_container_script,
+    CONTAINER_EXEC_WORKING_DIR, ContainerConfinement, inject_env_exports,
+    start_in_container_directory, wrap_container_script,
 };
 use crate::{ContainerPath, ContainerShellRuntime};
 
@@ -51,18 +52,14 @@ impl Sandbox {
     fn container_confinement(
         &self,
         runtime: &ContainerShellRuntime,
-        started_in: Option<&ContainerPath>,
         extra: &[ContainerPath],
     ) -> Result<Option<ContainerConfinement>, SpawnError> {
         if !self.inner.grants.is_derived() {
             return Ok(None);
         }
-        // A confined process starts in the directory it was asked to, else in
-        // the sandbox's own, which a child's is its space.
-        let working_dir = match started_in {
-            Some(dir) => dir.clone(),
-            None => Self::container_path(runtime, &self.inner.working_dir)?,
-        };
+        // The confinement is rooted at the sandbox's own directory, which a
+        // child's is its space, whatever directory the process starts in.
+        let working_dir = Self::container_path(runtime, &self.inner.working_dir)?;
         let mut writable = self
             .inner
             .grants
@@ -123,7 +120,6 @@ impl Sandbox {
         };
         let confinement = self.container_confinement(
             runtime,
-            cwd.is_some().then_some(&working_dir),
             setup
                 .as_ref()
                 .map_or(&[][..], |setup| setup.writable.as_slice()),
@@ -134,6 +130,14 @@ impl Sandbox {
         let script =
             script.unwrap_or_else(|| shell_words::join(std::iter::once(&program).chain(&args)));
         let script = self.exec_script(launch, script, env)?;
+        // A confined process runs in a sandbox rooted at the sandbox's own
+        // directory; the directory it was asked to start in is entered inside.
+        let script = match (&confinement, cwd.is_some()) {
+            (Some(_), true) => {
+                start_in_container_directory(&script, &working_dir).map_err(|e| failed(&e))?
+            }
+            _ => script,
+        };
         let script = wrap_container_script(
             &script,
             setup.as_ref(),

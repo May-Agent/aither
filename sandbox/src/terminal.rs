@@ -5464,6 +5464,32 @@ struct ContainerSetupTemplate<'a> {
     script: &'a str,
 }
 
+#[derive(Template)]
+#[template(path = "container_start_dir.sh", escape = "none")]
+struct ContainerStartDirTemplate<'a> {
+    escaped_directory: &'a str,
+    script: &'a str,
+}
+
+/// `script` entered in `directory` first: a confined command's sandbox is
+/// rooted at its own directory, and the directory the command was asked to
+/// start in is entered inside it.
+pub fn start_in_container_directory(
+    script: &str,
+    directory: &ContainerPath,
+) -> Result<String, TerminalError> {
+    ContainerStartDirTemplate {
+        escaped_directory: &shell_escape(directory.as_str()),
+        script,
+    }
+    .render()
+    .map_err(|error| {
+        TerminalError::Execution(format!(
+            "failed to render the container start directory: {error}"
+        ))
+    })
+}
+
 /// Where a container's commands reach the host's IPC bridge.
 #[derive(Clone, Copy)]
 struct ContainerIpcEndpoint<'a> {
