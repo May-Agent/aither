@@ -1004,7 +1004,7 @@ impl JobMemory {
     pub async fn kill_runaway(&self, job: &JobFootprint, snapshot: &MemorySnapshot) -> bool {
         self.jobs
             .kill_runaway(
-                job.pid,
+                &job.task_id,
                 job.footprint_bytes,
                 snapshot.capacity_bytes,
                 snapshot.domain,

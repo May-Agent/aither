@@ -266,7 +266,7 @@ impl Job {
         let (stdout, stderr) = self
             .jobs
             .registry
-            .terminal_output(ended.pid)
+            .terminal_output(&self.task_id)
             .await
             .expect("the job this handle watches is held");
         let outputs = &self.jobs.outputs;
@@ -369,14 +369,18 @@ mod tests {
             .await;
         let appender = appender(&registry, "river").await;
 
-        registry.append_stdout(1, b"one\n".to_vec()).await;
+        registry
+            .append_stdout(&lease("river"), b"one\n".to_vec())
+            .await;
         assert_eq!(
             appender.append(b"progress\n").await,
             AppendOutcome::Appended
         );
-        registry.append_stdout(1, b"two\n".to_vec()).await;
+        registry
+            .append_stdout(&lease("river"), b"two\n".to_vec())
+            .await;
 
-        let (stdout, _) = registry.terminal_output(1).await.expect("job exists");
+        let (stdout, _) = registry.terminal_output("river").await.expect("job exists");
         assert_eq!(stdout, b"one\nprogress\ntwo\n");
         let JobRead::Delta(delta) = registry
             .terminal_read("river", 0, 1024)
@@ -403,8 +407,8 @@ mod tests {
             .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         assert_eq!(append.await.unwrap(), AppendOutcome::Appended);
-        registry.append_stdout(1, b"late\n".to_vec()).await;
-        let (stdout, _) = registry.terminal_output(1).await.expect("job exists");
+        registry.append_stdout(&river, b"late\n".to_vec()).await;
+        let (stdout, _) = registry.terminal_output("river").await.expect("job exists");
         assert_eq!(stdout, b"early\nlate\n");
     }
 
@@ -441,10 +445,13 @@ mod tests {
             )
             .await;
         let appender = appender(&registry, "river").await;
-        registry.complete(1, 0, None).await;
+        registry.complete(&lease("river"), 0, None).await;
 
         assert_eq!(appender.append(b"late\n").await, AppendOutcome::JobEnded);
-        let (stdout, _) = registry.terminal_output(1).await.expect("job is held");
+        let (stdout, _) = registry
+            .terminal_output("river")
+            .await
+            .expect("job is held");
         assert_eq!(stdout, b"");
     }
 
@@ -457,7 +464,7 @@ mod tests {
             .register(1, &first, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         let appender = appender(&registry, "river").await;
-        registry.complete(1, 0, None).await;
+        registry.complete(&first, 0, None).await;
         drop(registry.owe_completion("river", Ok(0)).await.unwrap());
         drop(first);
         assert!(registry.list().await.is_empty(), "the job is forgotten");
@@ -467,7 +474,7 @@ mod tests {
             .register(2, &second, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         assert_eq!(appender.append(b"stale\n").await, AppendOutcome::JobEnded);
-        let (stdout, _) = registry.terminal_output(2).await.expect("job exists");
+        let (stdout, _) = registry.terminal_output("river").await.expect("job exists");
         assert!(stdout.is_empty(), "the stale appender reached no job");
     }
 }
