@@ -5,7 +5,7 @@ use std::sync::Arc;
 use executor_core::AnyExecutor;
 
 use super::{Interpreter, Shell, ShellToolSettings, TerminalError, Unconfigured};
-use crate::{AnyShellWording, OutputPolicy, Sandbox, ShellLimits, ShellWording};
+use crate::{AnyShellWording, OutputPolicy, Sandbox, ShellEvents, ShellLimits, ShellWording};
 
 /// A value the builder has not been given yet.
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +22,7 @@ pub(crate) struct ShellParts {
     pub(crate) output: OutputPolicy,
     pub(crate) wording: AnyShellWording,
     pub(crate) tools: ShellToolSettings,
+    pub(crate) events: Option<ShellEvents>,
 }
 
 /// Builds a [`Shell`] on the [`Sandbox`] its scripts run in.
@@ -36,6 +37,7 @@ pub struct ShellBuilder<I, L, O, W, T> {
     output: O,
     wording: W,
     tools: T,
+    events: Option<ShellEvents>,
 }
 
 impl Shell<Arc<AnyExecutor>, Unconfigured> {
@@ -51,11 +53,21 @@ impl Shell<Arc<AnyExecutor>, Unconfigured> {
             output: Missing,
             wording: Missing,
             tools: Missing,
+            events: None,
         }
     }
 }
 
 impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
+    /// Raises the shell's events, and those of the subagent shells it
+    /// launches, on `events`, which other shells may share. Without it the
+    /// shell has a handle of its own, read with [`Shell::events`].
+    #[must_use]
+    pub fn events(mut self, events: ShellEvents) -> Self {
+        self.events = Some(events);
+        self
+    }
+
     /// The interpreters a script may run under, and the ones the model's
     /// `interpreter` argument lists.
     #[must_use]
@@ -70,6 +82,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             output: self.output,
             wording: self.wording,
             tools: self.tools,
+            events: self.events,
         }
     }
 
@@ -83,6 +96,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             output: self.output,
             wording: self.wording,
             tools: self.tools,
+            events: self.events,
         }
     }
 
@@ -96,6 +110,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             output: Given(output),
             wording: self.wording,
             tools: self.tools,
+            events: self.events,
         }
     }
 
@@ -112,6 +127,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             output: self.output,
             wording: Given(AnyShellWording::new(wording)),
             tools: self.tools,
+            events: self.events,
         }
     }
 
@@ -129,6 +145,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             output: self.output,
             wording: self.wording,
             tools: Given(tools),
+            events: self.events,
         }
     }
 }
@@ -156,6 +173,7 @@ impl
             output: Given(output),
             wording: Given(wording),
             tools: Given(tools),
+            events,
         } = self;
         let executor = sandbox.executor();
         Shell::from_parts(
@@ -167,6 +185,7 @@ impl
                 output,
                 wording,
                 tools,
+                events,
             },
         )
         .await

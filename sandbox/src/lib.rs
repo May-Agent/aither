@@ -145,7 +145,8 @@ pub use container::{
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
 pub use events::{
-    JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked, StdinWatchFailed,
+    DescendantsKilled, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
+    StdinWatchFailed,
 };
 pub use foreground_wait::ForegroundWait;
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
@@ -207,10 +208,9 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, Given, Missing, Script,
-    Shell, ShellArgs, ShellBuilder, ShellRunError, ShellTool, TerminalBinding, TerminalError,
-    TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
-    open_network_audit_log,
+    CompletedCommand, Configured, DirectoryResetReason, Given, Missing, Script, Shell, ShellArgs,
+    ShellBuilder, ShellRunError, ShellTool, TerminalBinding, TerminalError, TerminalToolFactory,
+    TerminalToolFactoryError, TimeoutKill, Unconfigured, open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,

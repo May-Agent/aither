@@ -89,29 +89,68 @@ pub enum MonitorSource {
 
 /// New output a monitor collected since the last delivery.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MonitorIncrement {
+    pub(crate) task_id: String,
+    pub(crate) lines: Vec<String>,
+}
+
+impl MonitorIncrement {
     /// Task id of the watched job.
-    pub task_id: String,
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
     /// The new lines (filtered when the monitor has a `filter`).
-    pub lines: Vec<String>,
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
 }
 
 /// A monitor saw no new output for `stall_secs`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MonitorStalled {
+    pub(crate) task_id: String,
+    pub(crate) stall_secs: u64,
+}
+
+impl MonitorStalled {
     /// Task id of the watched job.
-    pub task_id: String,
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
     /// How long it has produced nothing.
-    pub stall_secs: u64,
+    #[must_use]
+    pub const fn stall_secs(&self) -> u64 {
+        self.stall_secs
+    }
 }
 
 /// A monitor ended, and why.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MonitorEnded {
+    pub(crate) task_id: String,
+    pub(crate) end: MonitorEnd,
+}
+
+impl MonitorEnded {
     /// Task id of the watched job.
-    pub task_id: String,
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
     /// What ended it.
-    pub end: MonitorEnd,
+    #[must_use]
+    pub const fn end(&self) -> &MonitorEnd {
+        &self.end
+    }
 }
 
 /// What ended a monitor.

@@ -60,8 +60,8 @@ use tracing::{debug, info, warn};
 
 use crate::builtin::ShellToolSettings;
 use crate::events::{
-    EventSender, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
-    StdinWatchFailed, event_channel,
+    DescendantsKilled, EventSender, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents,
+    StdinBlocked, StdinWatchFailed,
 };
 use crate::jobs::Jobs;
 #[cfg(all(unix, feature = "jobserver"))]
@@ -462,32 +462,6 @@ pub enum DirectoryResetReason {
     OutsideWorkspace,
     /// The directory no longer exists.
     Removed,
-}
-
-/// The most processes a [`DescendantsKilled`] alert names.
-const KILLED_PROCESSES_NAMED: usize = 8;
-
-/// Processes a foreground command left running when its shell exited, killed
-/// with it.
-///
-/// Sent once per command, at the moment they were killed.
-#[derive(Debug, Clone)]
-pub struct DescendantsKilled {
-    /// The first processes killed, at most eight.
-    pub processes: Vec<JobProcess>,
-    /// How many more were killed beyond those named.
-    pub omitted: usize,
-}
-
-impl DescendantsKilled {
-    fn new(mut killed: Vec<JobProcess>) -> Self {
-        let omitted = killed.len().saturating_sub(KILLED_PROCESSES_NAMED);
-        killed.truncate(KILLED_PROCESSES_NAMED);
-        Self {
-            processes: killed,
-            omitted,
-        }
-    }
 }
 
 /// A command that ran to completion.
@@ -1132,7 +1106,8 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
             .spawn(async move { job_registry_service.serve().await })
             .detach();
 
-        let (events_tx, events_rx) = event_channel();
+        let events_rx = parts.events.unwrap_or_default();
+        let events_tx = events_rx.sender();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let sandbox = sandbox
             .with_working_dir(working_dir_path.clone())
@@ -1202,6 +1177,7 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
                 output,
                 wording,
                 tools,
+                events: None,
             },
         )
         .await
@@ -1745,7 +1721,9 @@ where
             None => None,
         };
 
-        let (events_tx, events_rx) = event_channel();
+        // The subagent's jobs raise their facts on the parent's handle.
+        let events_rx = self.events_rx.clone();
+        let events_tx = events_rx.sender();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (job_registry, job_registry_service) =
             job_registry_channel(self.output_store.policy().clone());
@@ -2080,7 +2058,7 @@ where
                 self.job_registry.clone(),
                 &task_id,
             ));
-        let registry = Arc::new(match call {
+        let registry = Arc::new(match call.clone() {
             Some(call) => registry.for_call(call),
             None => registry,
         });
@@ -2104,6 +2082,8 @@ where
         } else {
             JobLifetime::Foreground {
                 alerts: self.events_tx.clone(),
+                task_id: task_id.to_string(),
+                call,
             }
         };
         let running_tasks = self.running_tasks.clone();
@@ -4419,10 +4399,37 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
 /// How long a command's descendants may outlive its top-level shell.
 #[derive(Clone)]
 enum JobLifetime {
-    /// None: the survivors are killed and reported on `alerts`.
-    Foreground { alerts: EventSender },
+    /// None: the survivors are killed and reported on `alerts`, as those of
+    /// the command `task_id` that the tool call `call` ran.
+    Foreground {
+        alerts: EventSender,
+        task_id: String,
+        call: Option<CallIdentity>,
+    },
     /// All of them: the job runs until its whole tree has exited.
     Background,
+}
+
+impl JobLifetime {
+    /// Reports `killed` as the descendants a foreground command left; a
+    /// background job's are never killed, so it reports nothing.
+    async fn report_descendants_killed(&self, killed: Vec<JobProcess>) {
+        let Self::Foreground {
+            alerts,
+            task_id,
+            call,
+        } = self
+        else {
+            return;
+        };
+        let _ = alerts
+            .send(ShellEvent::DescendantsKilled(DescendantsKilled {
+                task_id: task_id.clone(),
+                call: call.clone(),
+                processes: killed,
+            }))
+            .await;
+    }
 }
 
 /// Where a background job's stdin alerts go.
@@ -4622,13 +4629,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
                 killed = killed.len(),
                 "the supervisor killed the finished command's descendants"
             );
-            if let JobLifetime::Foreground { alerts } = &lifetime {
-                let _ = alerts
-                    .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
-                        killed,
-                    )))
-                    .await;
-            }
+            lifetime.report_descendants_killed(killed).await;
         }
     }
     let status = match (descendants, status) {
@@ -4765,7 +4766,7 @@ impl LocalChild {
 /// kills end by killing the tree.
 async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), TerminalError> {
     match lifetime {
-        JobLifetime::Foreground { alerts } => {
+        JobLifetime::Foreground { .. } => {
             let killed = tree
                 .kill_descendants()
                 .await
@@ -4775,11 +4776,7 @@ async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), T
                     killed = killed.len(),
                     "killed descendants of a finished foreground command"
                 );
-                let _ = alerts
-                    .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
-                        killed,
-                    )))
-                    .await;
+                lifetime.report_descendants_killed(killed).await;
             }
             Ok(())
         }
@@ -5104,7 +5101,7 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
             return Err(TerminalError::Execution(error));
         }
     };
-    if let JobLifetime::Foreground { alerts } = &job.lifetime
+    if matches!(job.lifetime, JobLifetime::Foreground { .. })
         && let Descendants::Killed(killed) = child.descendants_killed().await
         && !killed.is_empty()
     {
@@ -5112,11 +5109,7 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
             killed = killed.len(),
             "killed descendants of a finished foreground command"
         );
-        let _ = alerts
-            .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
-                killed,
-            )))
-            .await;
+        job.lifetime.report_descendants_killed(killed).await;
     }
     wait_for_terminal_stream_close(job.job_registry, pid).await;
     let (stdout, stderr) = job.job_registry.terminal_output(pid).await.ok_or_else(|| {
@@ -6576,6 +6569,15 @@ mod tests {
         );
     }
 
+    /// The lifetime of a foreground command whose facts go to `alerts`.
+    fn foreground_lifetime(alerts: EventSender) -> JobLifetime {
+        JobLifetime::Foreground {
+            alerts,
+            task_id: "probe".to_string(),
+            call: None,
+        }
+    }
+
     /// The tools bin directory a container execution passes to the wrapper.
     fn container_tools_dir() -> ContainerPath {
         crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools())
@@ -7194,7 +7196,7 @@ mod tests {
         assert_eq!(ids.leased(), ["alfa", "bravo"]);
         assert_eq!(started.task_id, "alfa");
         assert_eq!(started.output_file.url, "outputs/bravo.txt");
-        receiver.recv_completed().await.expect("the job completes");
+        receiver.recv_completed().await;
 
         let child = terminal
             .subagent_without_grant()
@@ -7312,8 +7314,7 @@ mod tests {
 
         let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv_completed())
             .await
-            .expect("the job should deliver its completion")
-            .expect("the completion channel stays open");
+            .expect("the job should deliver its completion");
         let pending = jobs
             .get_by_task_id("river")
             .await
@@ -7554,9 +7555,7 @@ mod tests {
             mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.sessions.local_tools().unwrap().clone()),
             stdin_alerts: None,
-            lifetime: JobLifetime::Foreground {
-                alerts: event_channel().0,
-            },
+            lifetime: foreground_lifetime(ShellEvents::new().sender()),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -7661,9 +7660,7 @@ mod tests {
             mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
-            lifetime: JobLifetime::Foreground {
-                alerts: event_channel().0,
-            },
+            lifetime: foreground_lifetime(ShellEvents::new().sender()),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -7789,9 +7786,7 @@ mod tests {
             mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
-            lifetime: JobLifetime::Foreground {
-                alerts: event_channel().0,
-            },
+            lifetime: foreground_lifetime(ShellEvents::new().sender()),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -8293,8 +8288,7 @@ mod tests {
         // held, not yet taken, while the host reads the registry.
         let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv_completed())
             .await
-            .expect("the job should deliver its completion")
-            .expect("the completion channel stays open");
+            .expect("the job should deliver its completion");
         assert_eq!(completed.info.task_id, task_id);
         let held = jobs.list().await;
         assert!(
@@ -8536,7 +8530,7 @@ mod tests {
             .expect("the shell holds the job");
         let result = job.wait().await.expect("the job ends");
         assert_eq!(result.outcome, crate::RunOutcome::Exited { code: 0 });
-        let ended = events.recv_completed().await.expect("the end is raised");
+        let ended = events.recv_completed().await;
         assert!(ended.pending.is_none(), "a waiter took the completion");
         drop(ended);
         // The handle holds the job, which still reads and waits.
@@ -8920,7 +8914,7 @@ mod tests {
             crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let (alert_tx, _alert_rx) = event_channel();
+        let alert_tx = ShellEvents::new().sender();
         let (_pid, output) = execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, &container_tools, dir.path()),
@@ -8938,7 +8932,7 @@ mod tests {
                 task_id: "probe".to_string(),
                 script: "cat".to_string(),
             }),
-            lifetime: JobLifetime::Foreground { alerts: alert_tx },
+            lifetime: foreground_lifetime(alert_tx),
             background_startup: &BackgroundStartup::new(startup_tx),
             carry: None,
             #[cfg(all(unix, feature = "jobserver"))]
@@ -9055,7 +9049,7 @@ mod tests {
         .expect("the relay reports ready");
         let fifo_path = job_fifo.path().clone();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let (alert_tx, _alert_rx) = event_channel();
+        let alert_tx = ShellEvents::new().sender();
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, &container_tools, dir.path()),
@@ -9069,7 +9063,7 @@ mod tests {
             prepared_tools: &container_tools,
             job_registry: &job_registry,
             stdin_alerts: None,
-            lifetime: JobLifetime::Foreground { alerts: alert_tx },
+            lifetime: foreground_lifetime(alert_tx),
             background_startup: &BackgroundStartup::new(startup_tx),
             carry: None,
             job_fifo: Some(job_fifo),
@@ -9527,7 +9521,8 @@ mod tests {
         let alerts = receiver.take_job_alerts();
         match alerts.as_slice() {
             [ShellEvent::DescendantsKilled(killed)] => {
-                assert_eq!(killed.omitted, 0);
+                assert!(!killed.task_id().is_empty());
+                assert!(killed.call().is_none(), "the call carried no identity");
                 // The name is read after the freeze, once the child exec'd.
                 assert_eq!(
                     killed
