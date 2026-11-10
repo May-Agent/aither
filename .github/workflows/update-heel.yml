@@ -65,7 +65,7 @@ jobs:
 
       - name: Validate the pin against the library
         if: steps.release.outputs.version
-        run: cargo test --locked -p aither-sandbox tool_distribution_
+        run: cargo test --locked -p aither-sandbox --lib -- --exact terminal::builder::tests::the_shell_is_built_on_the_sandboxs_directory_and_live_grants
 
       - name: Create pull request
         if: steps.release.outputs.version
