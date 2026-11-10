@@ -14,10 +14,4 @@ pub struct AgentCheckpoint {
     pub tool_surface_hash: String,
     /// Structured snapshot of the current context window.
     pub context_window: ContextWindowSnapshot,
-    /// Whether background work was still active when the checkpoint was exported.
-    pub has_background_tasks: bool,
-    /// What the conversation holds of the working document; `None` when it
-    /// holds nothing, so a restored agent shows the document whole.
-    #[serde(default)]
-    pub document: Option<crate::working_document::DocumentCheckpoint>,
 }

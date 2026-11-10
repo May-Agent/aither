@@ -40,7 +40,6 @@ pub mod prefix;
 pub mod reassembly;
 pub(crate) mod recovery;
 pub mod source;
-pub mod sources;
 pub mod state;
 pub mod system;
 pub mod window;
@@ -48,9 +47,10 @@ pub mod window;
 pub use budget::ContextBudget;
 pub use cache::{CacheLifetime, PromptCache};
 pub use compaction::{
-    AttachmentCatalogEntry, AttachmentRef, CompactionError, CompactionFork, CompletedCompaction,
-    ContextFile, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema, InvalidHandoff,
-    KeptAttachment, LineRange, PendingCompaction, Restoration, SkillCatalogEntry, build_file_index,
+    AnyFileReferences, AttachmentCatalogEntry, AttachmentRef, CompactionError, CompactionFork,
+    CompletedCompaction, ContextFile, FileReferences, Handoff, HandoffDocument, HandoffPrompt,
+    HandoffSchema, InvalidHandoff, KeptAttachment, LineRange, PendingCompaction, Restoration,
+    SkillCatalogEntry, build_file_index,
 };
 pub use event::{AnyEventSource, EventSource};
 pub use live::{LiveContent, LiveUpdate};
@@ -58,9 +58,6 @@ pub use policy::ContextPolicy;
 pub use prefix::{PrefixBlock, PrefixChain, PrefixRewrites, PromptPrefix};
 pub use reassembly::restore_context;
 pub use source::{AnyContextSource, AnyLiveSource, Block, ContextSource, LiveChange, LiveSource};
-#[cfg(feature = "skills")]
-pub use sources::ActiveSkills;
-pub use sources::BackgroundJobs;
 pub use state::{AnyStateSource, StateChange, StateSource};
 pub use system::{
     BlockKind, External, ExternalContent, ExternalSlot, Instruction, InstructionSlot, Slot,

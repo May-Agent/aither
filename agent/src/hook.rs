@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use aither_core::llm::{CallIdentity, ToolResult};
 
-use crate::external_hook::{InjectedContext, LifecyclePayload};
 use crate::{ContextCheckpoint, context_window::ContextWindowSnapshot};
 
 /// Context provided to hooks before a tool is called.
@@ -81,9 +80,6 @@ pub struct TurnBoundaryContext<'a> {
     pub turn: usize,
     /// Number of recent conversation messages after processing the tool batch.
     pub message_count: usize,
-    /// The working document as the model ends its turn; `None` after a
-    /// turn that ran tools, and for an agent that keeps no document.
-    pub document: Option<&'a crate::working_document::DocumentReview>,
 }
 
 /// What a [`StopHook`] decides as the model ends its turn.
@@ -94,7 +90,7 @@ pub enum StopDecision {
     /// The run goes on to another model request.
     Hold {
         /// What the model is told, as a system reminder; `None` when the
-        /// alerts already raised say enough, such as the working document's.
+        /// alerts already raised say enough.
         reminder: Option<String>,
     },
 }
@@ -103,10 +99,8 @@ pub enum StopDecision {
 /// embedder's stop rule.
 ///
 /// It is asked at every turn the model ends without tool calls, after the
-/// context sources raised their alerts and the working document was
-/// reviewed ([`TurnBoundaryContext::document`]). Without one, a run ends
-/// whenever the model ends its turn and no source objects, whatever the
-/// working document holds.
+/// context sources raised their alerts. Without one, a run ends whenever the
+/// model ends its turn and no source objects.
 pub trait StopHook: Send + Sync + 'static {
     /// Decides for the turn `ctx` describes.
     fn on_turn_end(
@@ -179,13 +173,8 @@ pub struct CheckpointContext<'a> {
     pub context: &'a ContextCheckpoint,
     /// Hash of the currently exposed tool surface.
     pub tool_surface_hash: &'a str,
-    /// Whether background work is still active.
-    pub has_background_tasks: bool,
     /// Structured snapshot of the currently assembled context window.
     pub window: &'a ContextWindowSnapshot,
-    /// What the conversation holds of the working document, for
-    /// [`AgentCheckpoint::document`](crate::AgentCheckpoint::document).
-    pub document: Option<&'a crate::working_document::DocumentCheckpoint>,
 }
 
 /// Reason why the agent stopped.
@@ -202,10 +191,6 @@ pub enum StopReason {
     MaxIterations,
     /// Model signaled end of turn.
     EndTurn,
-    /// Every call of the model's last turn was refused for re-reading output
-    /// that had not changed while background work runs: another request
-    /// would only poll again, so the run waits for that work to report.
-    AwaitingBackground,
 }
 
 /// Action to take before a tool is executed.
@@ -306,26 +291,6 @@ pub trait Hook: Send + Sync {
     ) -> impl std::future::Future<Output = Option<String>> + Send {
         async { None }
     }
-
-    /// Called when a lifecycle event of the session happens.
-    ///
-    /// For observation: the event cannot be blocked or changed. A hook that
-    /// has context to add keeps it and hands it over from
-    /// [`take_injected_context`](Self::take_injected_context).
-    fn on_lifecycle<P: LifecyclePayload>(
-        &self,
-        _payload: &P,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        async {}
-    }
-
-    /// Hands over the context lifecycle events injected since the last call.
-    ///
-    /// The agent calls it where it collects system alerts and delivers each
-    /// piece once, as a system alert.
-    fn take_injected_context(&self) -> Vec<InjectedContext> {
-        Vec::new()
-    }
 }
 
 /// No-op implementation for unit type (base case for `HCons`).
@@ -403,19 +368,6 @@ where
             return Some(err);
         }
         self.tail.on_checkpoint(ctx).await
-    }
-
-    async fn on_lifecycle<P: LifecyclePayload>(&self, payload: &P) {
-        futures::join!(
-            self.head.on_lifecycle(payload),
-            self.tail.on_lifecycle(payload)
-        );
-    }
-
-    fn take_injected_context(&self) -> Vec<InjectedContext> {
-        let mut context = self.head.take_injected_context();
-        context.extend(self.tail.take_injected_context());
-        context
     }
 }
 
