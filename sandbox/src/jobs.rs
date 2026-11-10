@@ -117,17 +117,19 @@ impl Jobs {
         Some(Job::new(self.clone(), task_id.to_owned(), watch))
     }
 
-    /// A way to append to the output of the job named `task_id`, which the
-    /// shell holds; `None` when it holds no such job, such as one not
-    /// registered yet.
+    /// A way to append to the output of the job named `task_id`; `None`
+    /// when the shell holds no such job. The shell holds a job from before
+    /// its process starts, so the `task_id` of a [`crate::LaunchInfo`] it
+    /// handed out always names one while the process can run; what is
+    /// appended before the job registers lands ahead of the process's own
+    /// output.
     ///
     /// The appender refers to that job alone: it keeps neither the job nor
     /// its name, and never writes into a later job given the same name.
     pub async fn output_appender(&self, task_id: &str) -> Option<JobOutputAppender> {
-        let watch = self.registry.watch(task_id).await?;
         Some(JobOutputAppender {
             registry: self.registry.clone(),
-            task_id: watch.lease(),
+            task_id: self.registry.task_lease(task_id).await?,
         })
     }
 
@@ -175,9 +177,14 @@ pub struct JobOutputAppender {
 impl JobOutputAppender {
     /// Appends `bytes` to the job's output, returning once they are in it.
     pub async fn append(&self, bytes: &[u8]) -> AppendOutcome {
+        // The lease is held until the registry answers, so its word cannot
+        // name another job meanwhile.
+        let Some(task_id) = self.task_id.upgrade() else {
+            return AppendOutcome::JobEnded;
+        };
         if self
             .registry
-            .append_running_task_stdout(&self.task_id, bytes.to_vec())
+            .append_task_stdout(&task_id, bytes.to_vec())
             .await
         {
             AppendOutcome::Appended
@@ -341,10 +348,9 @@ mod tests {
     }
 
     async fn appender(registry: &JobRegistry, task_id: &str) -> JobOutputAppender {
-        let watch = registry.watch(task_id).await.expect("the job is held");
         JobOutputAppender {
             registry: registry.clone(),
-            task_id: watch.lease(),
+            task_id: registry.task_lease(task_id).await.expect("the job is held"),
         }
     }
 
@@ -380,6 +386,45 @@ mod tests {
             panic!("a first read is a delta");
         };
         assert_eq!(delta.bytes, b"one\nprogress\ntwo\n");
+    }
+
+    #[tokio::test]
+    async fn a_launching_job_takes_appends_ahead_of_its_registration() {
+        let registry = spawn_registry();
+        let river = lease("river");
+        registry.launching(&river).await;
+        let appender = appender(&registry, "river").await;
+
+        let append = tokio::spawn(async move { appender.append(b"early\n").await });
+        tokio::task::yield_now().await;
+        assert!(!append.is_finished(), "the append waits for the job");
+
+        registry
+            .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
+            .await;
+        assert_eq!(append.await.unwrap(), AppendOutcome::Appended);
+        registry.append_stdout(1, b"late\n".to_vec()).await;
+        let (stdout, _) = registry.terminal_output(1).await.expect("job exists");
+        assert_eq!(stdout, b"early\nlate\n");
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_never_registers_releases_its_appenders() {
+        let registry = spawn_registry();
+        let river = lease("river");
+        registry.launching(&river).await;
+        let appender = appender(&registry, "river").await;
+
+        let waiting = {
+            let appender = appender.clone();
+            tokio::spawn(async move { appender.append(b"early\n").await })
+        };
+        tokio::task::yield_now().await;
+        registry.abandon_launch(&river).await;
+
+        assert_eq!(waiting.await.unwrap(), AppendOutcome::JobEnded);
+        assert_eq!(appender.append(b"more\n").await, AppendOutcome::JobEnded);
+        assert!(registry.task_lease("river").await.is_none());
     }
 
     #[tokio::test]

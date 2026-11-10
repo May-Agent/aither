@@ -3137,6 +3137,9 @@ where
     } = task;
     // Before the job registers, so the registry reports the bound it runs under.
     job_registry.bound_by_timeout(&task_id, timeout).await;
+    // Before the process starts, so a command it calls over IPC can already
+    // append to this job's output.
+    job_registry.launching(&task_id).await;
     let status_registry = job_registry.clone();
     // What the policies are told the next script starts in, spelled as this
     // script's backend names a directory.
@@ -3175,6 +3178,8 @@ where
         raw,
     })
     .await;
+    // A process that never started leaves no job to register.
+    status_registry.abandon_launch(&task_id).await;
     let interruptions = outages.end(&task_id).await;
     let (result, settled) = match result {
         Ok((command, settled)) => (Ok(command), Some(settled)),
@@ -8726,6 +8731,77 @@ mod tests {
             .expect("terminal call should succeed");
         let text = render_terminal_result(&result);
         assert!(text.contains("call_probe\nSandboxed"), "{text}");
+    }
+
+    /// A command that reports one line of progress into the job that runs it.
+    struct ProgressCommand {
+        jobs: crate::Jobs,
+        task_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NoArgs {}
+
+    impl heel::IpcCommand for ProgressCommand {
+        fn name(&self) -> Cow<'static, str> {
+            "progress".into()
+        }
+
+        type Args = NoArgs;
+        type Response = String;
+
+        fn handle(
+            &self,
+            _args: Self::Args,
+            _context: heel::IpcContext,
+        ) -> impl std::future::Future<Output = Result<Self::Response, heel::IpcError>> + Send
+        {
+            let jobs = self.jobs.clone();
+            let task_id = self.task_id.clone();
+            async move {
+                let appender = jobs
+                    .output_appender(&task_id)
+                    .await
+                    .expect("the job is held before its process can call");
+                assert_eq!(
+                    appender.append(b"working\n").await,
+                    crate::AppendOutcome::Appended
+                );
+                Ok("done".to_owned())
+            }
+        }
+    }
+
+    struct ProgressProvider(crate::Jobs);
+
+    impl crate::IpcProvider for ProgressProvider {
+        fn router(&self, launch: &crate::LaunchInfo) -> Option<heel::IpcRouter> {
+            Some(heel::IpcRouter::new().register(ProgressCommand {
+                jobs: self.0.clone(),
+                task_id: launch.task_id.clone().expect("a shell names its launches"),
+            }))
+        }
+    }
+
+    /// A script that calls an embedder's command at its first instruction
+    /// already finds its job: the appender is handed out and its line lands
+    /// in the job's output, between the script's own.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_called_at_once_appends_to_the_job_that_ran_it() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut tool = fresh_terminal(dir.path()).await;
+        tool.ipc = Some(crate::AnyIpcProvider::new(ProgressProvider(tool.jobs())));
+
+        let result = tool
+            .call(
+                terminal_args("report progress", "progress >/dev/null; echo end"),
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let text = render_terminal_result(&result);
+        assert!(text.contains("working\nend"), "{text}");
     }
 
     /// A script the sandboxed command writes into its working directory and
