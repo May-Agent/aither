@@ -535,7 +535,7 @@ impl Sandbox {
                 server,
                 heel,
                 launch,
-            } => self.spawn_ssh(server, heel.as_deref(), launch, spec),
+            } => self.spawn_ssh(server, heel.as_deref(), launch, spec).await,
         }
     }
 }
