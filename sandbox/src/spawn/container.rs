@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use executor_core::Executor;
 
+use super::ContainerLaunch;
 use super::child::{ChildExit, KillHandle, SandboxedChild, Streams, exit_watch};
 use super::{EnvSource, Pipe, Sandbox, SpawnError, SpawnSpec};
 use crate::shell_session::ContainerExecOutcome;
 use crate::terminal::{
     CONTAINER_EXEC_WORKING_DIR, ContainerConfinement, inject_env_exports, wrap_container_script,
 };
-use crate::{ContainerPath, ContainerShellRuntime, PreparedTools};
+use crate::{ContainerPath, ContainerShellRuntime};
 
 /// How many output chunks a container exec may run ahead of its reader.
 const OUTPUT_BACKLOG: usize = 64;
@@ -62,7 +63,7 @@ impl Sandbox {
     pub(super) fn spawn_container(
         &self,
         runtime: &ContainerShellRuntime,
-        tools: &PreparedTools<ContainerPath>,
+        launch: &ContainerLaunch,
         spec: SpawnSpec,
     ) -> Result<SandboxedChild, SpawnError> {
         let setup = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
@@ -90,14 +91,14 @@ impl Sandbox {
         let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| setup(&e))?;
         let script =
             inject_env_exports(script, self.inner.env_source.as_ref()).map_err(|e| setup(&e))?;
-        let script = tools.wrap_script(&script).map_err(|e| setup(&e))?;
-        let script = tools.shell_command(&script).map_err(|e| setup(&e))?;
+        let script = launch.wrap_script(&script).map_err(|e| setup(&e))?;
+        let script = launch.shell_command(&script).map_err(|e| setup(&e))?;
         let script = wrap_container_script(
             &script,
             &[],
             None,
             self.inner.priority,
-            tools.bin_dir(),
+            launch.bin_dir(),
             working_dir.as_str(),
             confinement.as_ref(),
         )

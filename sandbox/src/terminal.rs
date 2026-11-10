@@ -255,7 +255,7 @@ pub fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) 
     {
         (
             managed_shell.to_string(),
-            crate::tool_runtime::shell_arguments(script),
+            crate::spawn::shell_arguments(script),
         )
     }
 }
@@ -5538,12 +5538,17 @@ fn container_exec_script(
     } else {
         format!("{preamble}{script}")
     };
-    let script = prepared_tools.wrap_script(&script)?;
+    let launch = prepared_tools.container_launch();
+    let script = launch
+        .wrap_script(&script)
+        .map_err(ToolRuntimeError::from)?;
     let script = match carry.and_then(|carry| carry.report.as_ref()) {
         Some(report) => carry_cwd_script(&script, report.as_str())?,
         None => script,
     };
-    Ok(prepared_tools.shell_command(&script)?)
+    Ok(launch
+        .shell_command(&script)
+        .map_err(ToolRuntimeError::from)?)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5736,10 +5741,11 @@ async fn execute_ssh_background(
     // A default-mode command runs the managed shell under the server's
     // `heel`; an `unsafe` one runs it directly.
     let remote_cmd = crate::spawn::remote_command(
-        context.prepared_tools,
+        &context.prepared_tools.remote_launch()?,
         context.heel,
         &launch_script(context.language, context.script, context.task_id)?,
-    )?;
+    )
+    .map_err(ToolRuntimeError::from)?;
 
     let mut command = context.client.command(context.server, &remote_cmd);
     #[cfg(unix)]

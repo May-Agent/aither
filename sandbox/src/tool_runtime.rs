@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ContainerPath;
+use crate::spawn::{ContainerLaunch, RemoteLaunch};
 use crate::tool_python::{PYTHON_COMMAND, unlock_tree};
 pub use crate::tool_python::{PythonPin, PythonRuntime};
 
@@ -1250,21 +1251,6 @@ impl PreparedTools<PathBuf> {
     }
 }
 
-#[derive(Template)]
-#[template(path = "tool_path.sh", escape = "none")]
-struct ToolPathTemplate<'a> {
-    bin_dir: std::borrow::Cow<'a, str>,
-    uv: Option<UvEnvironmentText<'a>>,
-    script: &'a str,
-}
-
-/// The quoted values of the `uv` variables a script exports.
-struct UvEnvironmentText<'a> {
-    cache: std::borrow::Cow<'a, str>,
-    python_installs: std::borrow::Cow<'a, str>,
-    python_preference: &'static str,
-}
-
 /// `UV_PYTHON_PREFERENCE`: a project without its own Python request gets the
 /// managed `python3` from `PATH` rather than whichever interpreter `uv` last
 /// installed for another project. A `.python-version` or `.venv` that no
@@ -1295,25 +1281,6 @@ impl PreparedTools<PathBuf> {
         })
     }
 
-    pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
-        let text = |path: &Path| {
-            path.to_str()
-                .map(|text| shell_words::quote(text).into_owned())
-                .ok_or_else(|| ToolRuntimeError::InvalidCache(path.to_path_buf()))
-        };
-        let uv = self
-            .uv_environment()
-            .map(|environment| {
-                Ok::<_, ToolRuntimeError>(UvEnvironmentText {
-                    cache: text(&environment.cache)?.into(),
-                    python_installs: text(&environment.python_installs)?.into(),
-                    python_preference: UV_PYTHON_PREFERENCE,
-                })
-            })
-            .transpose()?;
-        render_tool_path(self.script_bin_dir()?, uv, script)
-    }
-
     /// The managed bash executable terminal scripts run in.
     pub(crate) fn shell(&self) -> Result<String, ToolRuntimeError> {
         self.bin_dir
@@ -1322,49 +1289,50 @@ impl PreparedTools<PathBuf> {
             .into_string()
             .map_err(|path| ToolRuntimeError::InvalidCache(path.into()))
     }
+
+    /// What the SSH backend runs these tools, prepared on a server, with: the
+    /// tools directory, the managed bash, the `uv` variables and the shared
+    /// `uv` directory as the one writable directory.
+    ///
+    /// # Errors
+    /// Fails with [`ToolRuntimeError::InvalidCache`] when a path is not text.
+    pub fn remote_launch(&self) -> Result<RemoteLaunch, ToolRuntimeError> {
+        let text = |path: &Path| {
+            path.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ToolRuntimeError::InvalidCache(path.to_path_buf()))
+        };
+        let mut launch = RemoteLaunch::new(self.script_bin_dir()?, self.shell()?);
+        if let Some(uv) = self.uv_environment() {
+            launch = launch.with_exports([
+                ("UV_CACHE_DIR".to_owned(), text(&uv.cache)?),
+                (
+                    "UV_PYTHON_INSTALL_DIR".to_owned(),
+                    text(&uv.python_installs)?,
+                ),
+                (
+                    "UV_PYTHON_PREFERENCE".to_owned(),
+                    UV_PYTHON_PREFERENCE.to_owned(),
+                ),
+            ]);
+        }
+        if let Some(dir) = self.uv_dir() {
+            launch = launch.with_writable_dir(text(dir)?);
+        }
+        Ok(launch)
+    }
 }
 
 impl PreparedTools<ContainerPath> {
-    pub(crate) fn wrap_script(&self, script: &str) -> Result<String, ToolRuntimeError> {
-        render_tool_path(self.bin_dir.as_str(), None, script)
+    /// What the container backend runs these tools, prepared in a container,
+    /// with.
+    #[must_use]
+    pub fn container_launch(&self) -> ContainerLaunch {
+        ContainerLaunch::new(
+            self.bin_dir.clone(),
+            self.bin_dir.join(ManagedTool::Bash.command()),
+        )
     }
-
-    /// A command line running `script` in the managed bash of the container.
-    pub(crate) fn shell_command(&self, script: &str) -> Result<String, ToolRuntimeError> {
-        #[derive(Template)]
-        #[template(path = "managed_shell.sh", escape = "none")]
-        struct ManagedShellTemplate<'a> {
-            shell: std::borrow::Cow<'a, str>,
-            arguments: String,
-        }
-        Ok(ManagedShellTemplate {
-            shell: shell_words::quote(self.bin_dir.join(ManagedTool::Bash.command()).as_str()),
-            arguments: shell_words::join(shell_arguments(script)),
-        }
-        .render()?)
-    }
-}
-
-/// The arguments with which the managed bash runs `script`: no startup file
-/// is read, so a script behaves the same on every host.
-pub fn shell_arguments(script: &str) -> Vec<String> {
-    ["--noprofile", "--norc", "-c", script]
-        .map(Into::into)
-        .into()
-}
-
-/// Prepends `bin_dir` to a POSIX shell script's `PATH`.
-fn render_tool_path(
-    bin_dir: &str,
-    uv: Option<UvEnvironmentText<'_>>,
-    script: &str,
-) -> Result<String, ToolRuntimeError> {
-    Ok(ToolPathTemplate {
-        bin_dir: shell_words::quote(bin_dir),
-        uv,
-        script,
-    }
-    .render()?)
 }
 
 /// Prepared command versions, in stable order independent of cache paths.
@@ -1722,7 +1690,7 @@ pub mod tests {
     #[cfg(unix)]
     fn run_in_shell(script: &str) -> std::process::Output {
         std::process::Command::new("bash")
-            .args(shell_arguments(script))
+            .args(crate::spawn::shell_arguments(script))
             .output()
             .expect("bash should run")
     }
@@ -1964,7 +1932,10 @@ printf '%s\n' 'uv @VERSION@'
             tools.container_bin_dir().unwrap().as_str(),
             format!("/opt/aither/tools/{key}/bin")
         );
-        let script = container_tools(&tools).wrap_script("rg --version").unwrap();
+        let script = container_tools(&tools)
+            .container_launch()
+            .wrap_script("rg --version")
+            .unwrap();
         assert!(
             script.starts_with(&format!("PATH=/opt/aither/tools/{key}/bin")),
             "{script}"
@@ -1978,6 +1949,8 @@ printf '%s\n' 'uv @VERSION@'
         let ready = bundle().prepare_local(cache.path()).await.unwrap();
         let uv = ready.uv_dir().unwrap().clone();
         let script = ready
+            .remote_launch()
+            .unwrap()
             .wrap_script(
                 r#"printf '%s\n' "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" "$UV_PYTHON_PREFERENCE""#,
             )
@@ -1995,7 +1968,10 @@ printf '%s\n' 'uv @VERSION@'
             )
         );
         // A container image has no such directory to export.
-        let container = container_tools(&image_tools()).wrap_script("true").unwrap();
+        let container = container_tools(&image_tools())
+            .container_launch()
+            .wrap_script("true")
+            .unwrap();
         assert!(!container.contains("UV_"), "{container}");
     }
 

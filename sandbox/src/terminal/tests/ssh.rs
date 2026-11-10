@@ -656,7 +656,7 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
 /// `heel`, and `kill` ends the remote tree.
 #[tokio::test(flavor = "multi_thread")]
 async fn spawn_on_a_server_streams_output_and_kill_ends_the_remote_tree() {
-    use crate::{PreparedSsh, SpawnSpec};
+    use crate::SpawnSpec;
 
     let sshd = Sshd::start().await;
     let (_cache, registry) = prepared_test_registry().await;
@@ -666,7 +666,8 @@ async fn spawn_on_a_server_streams_output_and_kill_ends_the_remote_tree() {
     let sandbox = Sandbox::new(
         crate::Backend::Ssh {
             server: Sshd::server(),
-            prepared: PreparedSsh::new(Some(text(&heel).to_string()), tools),
+            heel: Some(text(&heel).to_string()),
+            launch: tools.remote_launch().unwrap(),
         },
         executor_core::tokio::TokioGlobal,
         dir.path(),

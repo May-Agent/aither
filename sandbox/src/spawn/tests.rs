@@ -314,7 +314,10 @@ fn container_sandbox(scripts: &Arc<Mutex<Vec<String>>>, working_dir: &Path) -> S
     let tools =
         crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
     Sandbox::new(
-        Backend::Container { runtime, tools },
+        Backend::Container {
+            runtime,
+            launch: tools.container_launch(),
+        },
         TokioGlobal,
         working_dir,
     )
