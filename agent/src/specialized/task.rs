@@ -4862,6 +4862,7 @@ mod tests {
             mode: aither_sandbox::TerminalMode,
             script: &str,
             _language: aither_sandbox::ScriptLanguage,
+            _location: aither_sandbox::CommandLocation<'_>,
         ) -> impl std::future::Future<
             Output = Result<bool, aither_sandbox::permission::PermissionError>,
         > + Send {

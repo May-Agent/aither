@@ -639,7 +639,8 @@ async fn a_hook_that_fails_in_every_way_is_reported_and_ignored() {
 
 pub mod reviewers {
     use aither_sandbox::permission::{
-        PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
+        CommandLocation, PermissionError, PermissionHandler, PermissionRequest, Review,
+        TerminalMode,
     };
 
     use super::*;
@@ -671,6 +672,7 @@ printf '%s' "$2"
         mode: TerminalMode::Unsafe,
         script: "make install",
         language: ScriptLanguage::Shell,
+        location: CommandLocation::Local,
     };
 
     pub const DOMAIN: PermissionRequest<'static> = PermissionRequest::Domain {
@@ -684,6 +686,7 @@ printf '%s' "$2"
             mode: TerminalMode,
             script: &str,
             _language: ScriptLanguage,
+            _location: CommandLocation<'_>,
         ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
             self.asked.lock().unwrap().push((mode, script.to_string()));
             std::future::ready(Ok(self.allow))
@@ -772,7 +775,7 @@ printf '%s' "$2"
         assert!(!second.exists(), "the first decision ends the chain");
         assert_eq!(
             logged(&first)[0],
-            serde_json::json!({"role": "main", "kind": "command", "mode": "unsafe", "script": "make install", "language": "shell"})
+            serde_json::json!({"role": "main", "kind": "command", "mode": "unsafe", "script": "make install", "language": "shell", "location": {"kind": "local"}})
         );
     }
 
@@ -823,9 +826,14 @@ printf '%s' "$2"
         );
         assert_eq!(bounded(handler.review(&COMMAND)).await, Review::Passed);
         assert!(
-            bounded(handler.check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell))
-                .await
-                .unwrap()
+            bounded(handler.check(
+                TerminalMode::Unsafe,
+                "make install",
+                ScriptLanguage::Shell,
+                CommandLocation::Local
+            ))
+            .await
+            .unwrap()
         );
         assert_eq!(
             *route.asked.lock().unwrap(),
@@ -849,9 +857,14 @@ printf '%s' "$2"
             .for_subagent()
             .expect("a reviewed handler labels subagents");
         assert_eq!(bounded(subagent.review(&COMMAND)).await, Review::Passed);
-        bounded(subagent.check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell))
-            .await
-            .unwrap();
+        bounded(subagent.check(
+            TerminalMode::Unsafe,
+            "make install",
+            ScriptLanguage::Shell,
+            CommandLocation::Local,
+        ))
+        .await
+        .unwrap();
         assert_eq!(logged(&log)[0]["role"], "subagent");
         assert_eq!(route.asked.lock().unwrap().len(), 1);
     }

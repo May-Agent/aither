@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use aither_sandbox::permission::{
-    PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
+    CommandLocation, PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
 };
 use aither_sandbox::{CommandRole, ScriptLanguage, SshServer};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,8 @@ pub struct ReviewerConfig {
 /// What a reviewer reads on stdin.
 ///
 /// The role of the agent that asked, and the request, which is either a command escalation (`"kind":"command"` with
-/// `mode`, `script` and its `language`) or a network domain (`"kind":"domain"` with `domain`
+/// `mode`, `script`, its `language` and the `location` it runs at, `{"kind":"local"}` or
+/// `{"kind":"ssh","server":…}`) or a network domain (`"kind":"domain"` with `domain`
 /// and `port`).
 #[derive(Debug, Serialize)]
 pub struct ReviewRequest<'a> {
@@ -145,8 +146,9 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> Result<bool, PermissionError> {
-        self.inner.check(mode, script, language).await
+        self.inner.check(mode, script, language, location).await
     }
 
     fn will_wait_for_approval(
@@ -154,8 +156,10 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
-        self.inner.will_wait_for_approval(mode, script, language)
+        self.inner
+            .will_wait_for_approval(mode, script, language, location)
     }
 
     fn for_subagent(&self) -> Option<Self> {

@@ -17,11 +17,17 @@ struct LocationHandler {
     deny: AtomicBool,
     asked: Mutex<Vec<(String, CommandRole)>>,
     unsafe_checks: AtomicUsize,
+    /// The server each `unsafe` command was located on; `None` is the home.
+    unsafe_locations: Mutex<Vec<Option<String>>>,
 }
 
 impl LocationHandler {
     fn asked(&self) -> Vec<(String, CommandRole)> {
         self.asked.lock().unwrap().clone()
+    }
+
+    fn unsafe_locations(&self) -> Vec<Option<String>> {
+        self.unsafe_locations.lock().unwrap().clone()
     }
 }
 
@@ -31,9 +37,14 @@ impl PermissionHandler for LocationHandler {
         mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
         if mode == TerminalMode::Unsafe {
             self.unsafe_checks.fetch_add(1, AtomicOrdering::SeqCst);
+            self.unsafe_locations
+                .lock()
+                .unwrap()
+                .push(location.server().map(str::to_string));
         }
         std::future::ready(Ok(true))
     }
@@ -493,6 +504,36 @@ async fn a_subagent_asks_as_a_subagent_and_its_approval_is_shared() {
         [("fixture".to_string(), CommandRole::Subagent)]
     );
     assert_eq!(main.permission_handler.asked(), []);
+}
+
+/// An `unsafe` command reaches the handler with the server it is located
+/// on, or the home when it names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsafe_command_reaches_the_handler_with_its_location() {
+    let unreachable = tempfile::tempdir().unwrap();
+    let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
+    let tools = registry.local_tools().unwrap().clone();
+    let registry = registry.with_test_ssh(Sshd::server(), None, tools);
+    let dir = tempfile::tempdir().unwrap();
+    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
+    // The connection is refused; only the question put matters here.
+    let _ = terminal
+        .call(
+            args("true", TerminalExecutionMode::Unsafe, "fixture"),
+            ToolContext::new(),
+        )
+        .await;
+    terminal
+        .call(
+            args("true", TerminalExecutionMode::Unsafe, ""),
+            ToolContext::new(),
+        )
+        .await
+        .expect("an unsafe command runs at home");
+    assert_eq!(
+        terminal.permission_handler.unsafe_locations(),
+        [Some("fixture".to_string()), None]
+    );
 }
 
 /// A server without `heel` runs `unsafe` commands only.

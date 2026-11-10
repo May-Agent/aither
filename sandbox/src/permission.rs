@@ -54,6 +54,30 @@ impl TerminalMode {
     }
 }
 
+/// Where a command runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandLocation<'a> {
+    /// The home environment.
+    Local,
+    /// A server of the registry's SSH set.
+    Ssh {
+        /// The server's name, as the command gave it as its `location`.
+        server: &'a str,
+    },
+}
+
+impl<'a> CommandLocation<'a> {
+    /// The server's name, or `None` for the home environment.
+    #[must_use]
+    pub const fn server(self) -> Option<&'a str> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { server } => Some(server),
+        }
+    }
+}
+
 /// A request for a permission beyond the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -66,6 +90,8 @@ pub enum PermissionRequest<'a> {
         script: &'a str,
         /// The language the script is written in.
         language: ScriptLanguage,
+        /// Where the command runs.
+        location: CommandLocation<'a>,
     },
     /// A sandboxed command's connection to a network domain that is not
     /// already allowed.
@@ -109,12 +135,13 @@ pub trait PermissionHandler: Send + Sync {
     ///
     /// For `Sandboxed` mode, this should always return `Ok(true)`.
     /// For `Unsafe` mode, this should prompt for each script, which is
-    /// source in `language`.
+    /// source in `language` and runs at `location`.
     fn check(
         &self,
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
 
     /// Returns whether `check` will suspend waiting for an external approval.
@@ -126,8 +153,9 @@ pub trait PermissionHandler: Send + Sync {
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
-        let _ = (mode, script, language);
+        let _ = (mode, script, language, location);
         async { false }
     }
 
@@ -272,6 +300,7 @@ impl PermissionHandler for DenyUnsafe {
         mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true),
@@ -287,6 +316,7 @@ impl PermissionHandler for DenyUnsafe {
         _mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(false)
     }
@@ -302,6 +332,7 @@ impl PermissionHandler for NoopPermissionHandler {
         _mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(Ok(true))
     }
@@ -311,6 +342,7 @@ impl PermissionHandler for NoopPermissionHandler {
         _mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(false)
     }
@@ -339,7 +371,12 @@ mod tests {
         // Sandboxed should be allowed
         assert!(
             handler
-                .check(TerminalMode::Sandboxed, "ls", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Sandboxed,
+                    "ls",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .unwrap()
         );
@@ -347,7 +384,12 @@ mod tests {
         // Unsafe should be denied
         assert!(
             handler
-                .check(TerminalMode::Unsafe, "rm -rf /", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Unsafe,
+                    "rm -rf /",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .is_err()
         );
@@ -359,13 +401,23 @@ mod tests {
 
         assert!(
             handler
-                .check(TerminalMode::Sandboxed, "ls", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Sandboxed,
+                    "ls",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .unwrap()
         );
         assert!(
             handler
-                .check(TerminalMode::Unsafe, "rm -rf /", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Unsafe,
+                    "rm -rf /",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .unwrap()
         );
@@ -417,6 +469,24 @@ mod tests {
                 "server": { "name": "build", "target": "builder@build.internal" },
                 "role": "subagent",
             })
+        );
+    }
+
+    #[test]
+    fn a_command_request_names_where_it_runs() {
+        let request = |location| PermissionRequest::Command {
+            mode: TerminalMode::Unsafe,
+            script: "make",
+            language: ScriptLanguage::Shell,
+            location,
+        };
+        assert_eq!(
+            serde_json::to_value(request(CommandLocation::Local)).unwrap()["location"],
+            serde_json::json!({ "kind": "local" })
+        );
+        assert_eq!(
+            serde_json::to_value(request(CommandLocation::Ssh { server: "build" })).unwrap()["location"],
+            serde_json::json!({ "kind": "ssh", "server": "build" })
         );
     }
 
