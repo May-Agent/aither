@@ -64,6 +64,8 @@ mod events;
 mod foreground_wait;
 mod heel_binary;
 mod interpreter;
+mod job_registry;
+mod jobs;
 mod limits;
 mod memory;
 pub mod monitor;
@@ -89,9 +91,6 @@ mod wording;
 
 /// Built-in IPC commands (ask, reload).
 pub mod builtin;
-
-/// Background job registry for tracking tasks.
-pub mod job_registry;
 
 /// Jobserver token pool brokering across commands.
 #[cfg(all(unix, feature = "jobserver"))]
@@ -123,6 +122,10 @@ pub mod test_wording;
 pub mod test_ids;
 
 pub use bollard_exec::BollardContainerExec;
+pub use builtin::{
+    JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
+    JobToolSettings, ToolIdentity,
+};
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandCall, CommandEnvelope, CommandGate,
     CommandObserver,
@@ -147,10 +150,10 @@ pub use heel::NetworkAuditLog;
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use interpreter::Interpreter;
 pub use job_registry::{
-    Delivery, JobInfo, JobPlace, JobRegistry, JobRegistryService, JobStatus, KillCause,
-    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, UnchangedTaskRead,
-    job_registry_channel,
+    Delivery, JobDelta, JobInfo, JobPlace, JobRead, JobStatus, KillCause, OwedCompletion,
+    PendingCompletion,
 };
+pub use jobs::{Job, JobWaitError, Jobs, ScriptResult};
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
@@ -219,7 +222,7 @@ pub use tool_transport::{
     probe_tool_environment,
 };
 pub use wording::{
-    AnyShellWording, CommandKilled, FoldedLines, JsonAsTsv, LineRange, MonitorStarted,
-    OmittedLines, OutputSaved, Refused, RepeatedLines, ReservedForMain, ShellWording,
-    StoredBinaryPart,
+    AnyShellWording, CommandKilled, FoldedLines, JobInputSent, JobKillAsked, JsonAsTsv, LineRange,
+    MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines, ReservedForMain,
+    ShellWording, StoredBinaryPart,
 };

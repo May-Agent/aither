@@ -1,42 +1,85 @@
-//! Native terminal control tools for background terminal tasks.
+//! The control tools of a shell's jobs: read, input and kill.
+//!
+//! The embedder names and describes each; the texts they return are its
+//! wording's.
 
 use std::borrow::Cow;
 
 use aither_core::llm::ToolContext;
-use aither_core::llm::{CommandStream, Tool, ToolResult};
-use askama::Template;
+use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::job_registry::{JobRegistry, JobStatus, TerminalReadError};
+use crate::jobs::Jobs;
+use crate::wording::{AnyShellWording, JobInputSent, JobKillAsked};
 
-/// Tool for terminating a background terminal task.
+/// What an embedder calls one of its tools and how it describes it to the
+/// model; neither has a default.
 #[derive(Debug, Clone)]
-pub struct KillTerminalTool {
-    registry: JobRegistry,
+pub struct ToolIdentity {
+    /// The tool's name.
+    pub name: Cow<'static, str>,
+    /// The tool's description, as the model reads it.
+    pub description: Cow<'static, str>,
 }
 
-impl KillTerminalTool {
-    /// Creates a terminal kill tool.
+/// The identities of the three job control tools.
+#[derive(Debug, Clone)]
+pub struct JobToolSettings {
+    /// The tool that reads a job's output.
+    pub read: ToolIdentity,
+    /// The tool that writes to a job's stdin.
+    pub input: ToolIdentity,
+    /// The tool that kills a job.
+    pub kill: ToolIdentity,
+}
+
+fn task_id(argument: &str) -> aither_core::Result<&str> {
+    let task_id = argument.trim();
+    if task_id.is_empty() {
+        return Err(anyhow::anyhow!("task_id must not be empty"));
+    }
+    Ok(task_id)
+}
+
+/// Tool for killing a job.
+#[derive(Debug, Clone)]
+pub struct JobKillTool {
+    identity: ToolIdentity,
+    jobs: Jobs,
+    wording: AnyShellWording,
+}
+
+impl JobKillTool {
+    /// A kill tool for `jobs`, named and described by `identity`, whose
+    /// reply is `wording`'s.
     #[must_use]
-    pub const fn new(registry: JobRegistry) -> Self {
-        Self { registry }
+    pub const fn new(identity: ToolIdentity, jobs: Jobs, wording: AnyShellWording) -> Self {
+        Self {
+            identity,
+            jobs,
+            wording,
+        }
     }
 }
 
-/// Terminate a background terminal task by its task id.
+/// Kill a job by its task id.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct KillTerminalArgs {
-    /// Task identifier returned by terminal when the task is backgrounded.
+pub struct JobKillArgs {
+    /// Task identifier returned when the job was backgrounded.
     pub task_id: String,
 }
 
-impl Tool for KillTerminalTool {
+impl Tool for JobKillTool {
     fn name(&self) -> Cow<'static, str> {
-        "terminal_kill".into()
+        self.identity.name.clone()
     }
 
-    type Arguments = KillTerminalArgs;
+    fn description(&self) -> Cow<'static, str> {
+        self.identity.description.clone()
+    }
+
+    type Arguments = JobKillArgs;
     type Res = ToolResult;
 
     async fn call(
@@ -44,39 +87,41 @@ impl Tool for KillTerminalTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let task_id = args.task_id.trim();
-        if task_id.is_empty() {
-            return Err(anyhow::anyhow!("task_id must not be empty"));
-        }
-
-        let killed = self.registry.kill_by_task_id(task_id).await;
-        let text = TerminalKillTemplate { task_id, killed }
-            .render()
-            .expect("terminal kill template must render");
-        Ok(ToolResult::text(text))
+        let task_id = task_id(&args.task_id)?;
+        let killed = self.jobs.kill(task_id).await;
+        Ok(ToolResult::text(
+            self.wording.job_kill(&JobKillAsked { task_id, killed }),
+        ))
     }
 }
 
-/// Tool for sending stdin to a background terminal task.
+/// Tool for writing to a job's stdin.
 #[derive(Debug, Clone)]
-pub struct InputTerminalTool {
-    registry: JobRegistry,
+pub struct JobInputTool {
+    identity: ToolIdentity,
+    jobs: Jobs,
+    wording: AnyShellWording,
 }
 
-impl InputTerminalTool {
-    /// Creates a terminal input tool.
+impl JobInputTool {
+    /// An input tool for `jobs`, named and described by `identity`, whose
+    /// reply is `wording`'s.
     #[must_use]
-    pub const fn new(registry: JobRegistry) -> Self {
-        Self { registry }
+    pub const fn new(identity: ToolIdentity, jobs: Jobs, wording: AnyShellWording) -> Self {
+        Self {
+            identity,
+            jobs,
+            wording,
+        }
     }
 }
 
-/// Send input to a background terminal task that is waiting on stdin.
+/// Send input to a job that is waiting on stdin.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct InputTerminalArgs {
-    /// Task identifier returned by terminal when the task is backgrounded.
+pub struct JobInputArgs {
+    /// Task identifier returned when the job was backgrounded.
     pub task_id: String,
-    /// Raw bytes encoded as UTF-8 text written to terminal stdin.
+    /// Raw bytes encoded as UTF-8 text written to the job's stdin.
     pub input: String,
     /// Append a trailing newline before writing (default true).
     #[serde(default = "default_append_newline")]
@@ -87,12 +132,16 @@ const fn default_append_newline() -> bool {
     true
 }
 
-impl Tool for InputTerminalTool {
+impl Tool for JobInputTool {
     fn name(&self) -> Cow<'static, str> {
-        "terminal_input".into()
+        self.identity.name.clone()
     }
 
-    type Arguments = InputTerminalArgs;
+    fn description(&self) -> Cow<'static, str> {
+        self.identity.description.clone()
+    }
+
+    type Arguments = JobInputArgs;
     type Res = ToolResult;
 
     async fn call(
@@ -100,58 +149,58 @@ impl Tool for InputTerminalTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let task_id = args.task_id.trim();
-        if task_id.is_empty() {
-            return Err(anyhow::anyhow!("task_id must not be empty"));
-        }
+        let task_id = task_id(&args.task_id)?;
+        let job = self
+            .jobs
+            .get(task_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("unknown task_id: {task_id}"))?;
 
         let mut bytes = args.input.into_bytes();
         if args.append_newline {
             bytes.push(b'\n');
         }
+        job.input(bytes).await.map_err(anyhow::Error::msg)?;
 
-        self.registry
-            .terminal_input(task_id, bytes)
-            .await
-            .map_err(anyhow::Error::msg)?;
-
-        let text = TerminalInputTemplate { task_id }
-            .render()
-            .expect("terminal input template must render");
-        Ok(ToolResult::text(text))
+        Ok(ToolResult::text(
+            self.wording.job_input(&JobInputSent { task_id }),
+        ))
     }
 }
 
-/// Tool for reading incremental output from a background terminal task.
+/// Tool for reading a job's output as it grows.
 #[derive(Debug, Clone)]
-pub struct ReadTerminalDeltaTool {
-    registry: JobRegistry,
-    wording: crate::AnyShellWording,
+pub struct JobReadTool {
+    identity: ToolIdentity,
+    jobs: Jobs,
+    wording: AnyShellWording,
     output: crate::OutputPolicy,
 }
 
-impl ReadTerminalDeltaTool {
-    /// Creates a terminal delta reader tool whose refused reads render
-    /// through `wording` and whose reads default to the `read_bytes` of
-    /// `output`.
+impl JobReadTool {
+    /// A read tool for `jobs`, named and described by `identity`, whose
+    /// replies are `wording`'s and whose reads default to the `read_bytes`
+    /// of `output`.
     #[must_use]
     pub const fn new(
-        registry: JobRegistry,
-        wording: crate::AnyShellWording,
+        identity: ToolIdentity,
+        jobs: Jobs,
+        wording: AnyShellWording,
         output: crate::OutputPolicy,
     ) -> Self {
         Self {
-            registry,
+            identity,
+            jobs,
             wording,
             output,
         }
     }
 }
 
-/// Read incremental output from a background terminal task.
+/// Read incremental output from a job.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ReadTerminalDeltaArgs {
-    /// Task identifier returned by terminal when the task is backgrounded.
+pub struct JobReadArgs {
+    /// Task identifier returned when the job was backgrounded.
     pub task_id: String,
     /// Read only bytes after this cursor offset.
     #[serde(default)]
@@ -161,65 +210,16 @@ pub struct ReadTerminalDeltaArgs {
     pub max_bytes: Option<usize>,
 }
 
-fn job_status_text(status: &JobStatus) -> String {
-    match status {
-        JobStatus::Running => "is running".to_string(),
-        JobStatus::Completed { exit_code, .. } => format!("completed with exit code {exit_code}"),
-        JobStatus::Failed { error, .. } => format!("failed: {error}"),
-        JobStatus::Killed { .. } => "was killed".to_string(),
-    }
-}
-
-#[derive(Template)]
-#[template(path = "terminal_kill.txt", escape = "none")]
-struct TerminalKillTemplate<'a> {
-    task_id: &'a str,
-    killed: bool,
-}
-
-#[derive(Template)]
-#[template(path = "terminal_input.txt", escape = "none")]
-struct TerminalInputTemplate<'a> {
-    task_id: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "terminal_read.txt", escape = "none")]
-struct TerminalReadTemplate<'a> {
-    delta: &'a str,
-    has_more: bool,
-    cursor: usize,
-    task_id: &'a str,
-    status_text: &'a str,
-    bytes_read: usize,
-    total_bytes: usize,
-}
-
-fn render_terminal_delta(delta: &crate::job_registry::TerminalDelta) -> String {
-    let delta_text = CommandStream::Inline {
-        text: String::from_utf8_lossy(&delta.bytes).into_owned(),
-    }
-    .render_for_model();
-    let status_text = job_status_text(&delta.status);
-    TerminalReadTemplate {
-        delta: &delta_text,
-        has_more: delta.cursor < delta.total_bytes,
-        cursor: delta.cursor,
-        task_id: &delta.task_id,
-        status_text: &status_text,
-        bytes_read: delta.bytes.len(),
-        total_bytes: delta.total_bytes,
-    }
-    .render()
-    .expect("terminal read template must render")
-}
-
-impl Tool for ReadTerminalDeltaTool {
+impl Tool for JobReadTool {
     fn name(&self) -> Cow<'static, str> {
-        "terminal_read".into()
+        self.identity.name.clone()
     }
 
-    type Arguments = ReadTerminalDeltaArgs;
+    fn description(&self) -> Cow<'static, str> {
+        self.identity.description.clone()
+    }
+
+    type Arguments = JobReadArgs;
     type Res = ToolResult;
 
     async fn call(
@@ -227,72 +227,74 @@ impl Tool for ReadTerminalDeltaTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let task_id = args.task_id.trim();
-        if task_id.is_empty() {
-            return Err(anyhow::anyhow!("task_id must not be empty"));
-        }
+        let task_id = task_id(&args.task_id)?;
         let max_bytes = args
             .max_bytes
             .unwrap_or_else(|| self.output.get().read_bytes);
         if max_bytes == 0 {
             return Err(anyhow::anyhow!("max_bytes must be greater than 0"));
         }
-
-        let delta = self
-            .registry
-            .terminal_read(task_id, args.cursor, max_bytes)
+        let job = self
+            .jobs
+            .get(task_id)
             .await
-            .map_err(|error| match error {
-                // Kept typed, so the agent loop recognises the refused poll.
-                TerminalReadError::Refused(refusal) => {
-                    anyhow::Error::from(crate::Refused::rendered(refusal, |refusal| {
-                        self.wording.unchanged_task_read(refusal)
-                    }))
-                }
-                TerminalReadError::Failed(message) => anyhow::Error::msg(message),
-            })?;
-
-        let text = render_terminal_delta(&delta);
-        Ok(ToolResult::text(text))
+            .ok_or_else(|| anyhow::anyhow!("unknown task_id: {task_id}"))?;
+        let read = job
+            .read(args.cursor, max_bytes)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(ToolResult::text(self.wording.job_read(&read)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::job_registry::TerminalDelta;
+    use crate::job_registry::{Delivery, JobDelta, JobRead, JobStatus};
+    use crate::test_wording::TestWording;
+    use crate::wording::ShellWording;
 
-    fn delta(bytes: &str, cursor: usize, total_bytes: usize, status: JobStatus) -> TerminalDelta {
-        TerminalDelta {
+    fn delta(bytes: &str, cursor: usize, total_bytes: usize, status: JobStatus) -> JobRead {
+        JobRead::Delta(JobDelta {
             task_id: "amber-forest-thunder-pearl".to_string(),
             bytes: bytes.as_bytes().to_vec(),
             cursor,
             total_bytes,
             status,
-        }
+        })
     }
 
     #[test]
-    fn terminal_read_without_more_buffered_states_the_next_cursor() {
+    fn a_read_without_more_buffered_states_the_next_cursor() {
         assert_eq!(
-            render_terminal_delta(&delta("hello", 1005, 1005, JobStatus::Running)),
+            TestWording.job_read(&delta("hello", 1005, 1005, JobStatus::Running)),
             "hello\nTask 'amber-forest-thunder-pearl' is running; read 5 new bytes (1005 buffered in total); next cursor is 1005.\n"
         );
     }
 
     #[test]
-    fn terminal_read_with_more_buffered_says_how_to_continue() {
+    fn a_read_with_more_buffered_says_how_to_continue() {
         assert_eq!(
-            render_terminal_delta(&delta(
+            TestWording.job_read(&delta(
                 "hello",
                 5,
                 1005,
                 JobStatus::Completed {
                     exit_code: 0,
-                    delivery: crate::Delivery::Pending,
+                    delivery: Delivery::Pending,
                 }
             )),
             "hello\nTask 'amber-forest-thunder-pearl' completed with exit code 0; read 5 new bytes (1005 buffered in total); next cursor is 5.\nMore output is buffered: call terminal_read with cursor=5.\n"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_read_is_data_the_wording_words() {
+        let text = TestWording.job_read(&JobRead::Unchanged {
+            task_id: "amber-forest-thunder-pearl".to_string(),
+        });
+        assert!(
+            text.contains("'amber-forest-thunder-pearl' produced no new output"),
+            "{text}"
         );
     }
 }

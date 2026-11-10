@@ -1099,8 +1099,8 @@ mod tests {
         use super::*;
         use crate::{
             AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime, SandboxMode,
-            job_registry_channel,
         };
+        use crate::job_registry::job_registry_channel;
 
         const GIB: u64 = 1024 * 1024 * 1024;
 

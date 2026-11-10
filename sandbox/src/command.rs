@@ -822,7 +822,9 @@ pub struct DynTerminalTool {
     pub(crate) entries: Vec<DynTerminalToolEntry>,
     pub(crate) events: crate::ShellEvents,
     pub(crate) kept_receiver: KeptExchangeReceiver,
-    pub(crate) job_registry: crate::job_registry::JobRegistry,
+    pub(crate) jobs: crate::Jobs,
+    /// What the controls are named and described as.
+    pub(crate) job_tools: crate::builtin::JobToolSettings,
     pub(crate) working_dir: PathBuf,
     pub(crate) command_names: Vec<String>,
     pub(crate) prepared_tools: crate::ToolCatalog,
@@ -855,10 +857,10 @@ impl DynTerminalTool {
         &self.prepared_tools
     }
 
-    /// Returns the child terminal job registry.
+    /// Returns the child terminal's jobs.
     #[must_use]
-    pub fn job_registry(&self) -> crate::job_registry::JobRegistry {
-        self.job_registry.clone()
+    pub fn jobs(&self) -> crate::Jobs {
+        self.jobs.clone()
     }
 
     /// Returns the shared terminal working directory.
@@ -896,22 +898,31 @@ impl DynTerminalTool {
         self.command_names.iter().any(|n| n == name)
     }
 
-    /// The terminal controls (`terminal_kill`, `terminal_input`,
-    /// `terminal_read`) bound to this bundle's own background jobs.
+    /// The job control tools (kill, input, read) bound to this bundle's own
+    /// jobs, under the embedder's names.
     ///
     /// They are not part of [`into_entries`](Self::into_entries): an agent
-    /// that runs its own terminal controls on these gets control over this
+    /// that runs its own controls on these gets control over this
     /// terminal's jobs and no other's.
     #[must_use]
     pub fn controls(&self) -> Vec<DynTerminalToolEntry> {
-        use crate::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
+        use crate::builtin::{JobInputTool, JobKillTool, JobReadTool};
         use crate::terminal::erase_terminal_tool;
 
         vec![
-            erase_terminal_tool(KillTerminalTool::new(self.job_registry.clone())),
-            erase_terminal_tool(InputTerminalTool::new(self.job_registry.clone())),
-            erase_terminal_tool(ReadTerminalDeltaTool::new(
-                self.job_registry.clone(),
+            erase_terminal_tool(JobKillTool::new(
+                self.job_tools.kill.clone(),
+                self.jobs.clone(),
+                self.wording.clone(),
+            )),
+            erase_terminal_tool(JobInputTool::new(
+                self.job_tools.input.clone(),
+                self.jobs.clone(),
+                self.wording.clone(),
+            )),
+            erase_terminal_tool(JobReadTool::new(
+                self.job_tools.read.clone(),
+                self.jobs.clone(),
                 self.wording.clone(),
                 self.output.clone(),
             )),
@@ -1556,13 +1567,23 @@ fn detect_stdin_arg(schema: &Value) -> Option<String> {
 impl ToolRegistry {
     pub(crate) fn with_terminal_controls(
         mut self,
-        jobs: crate::JobRegistry,
+        jobs: crate::Jobs,
+        job_tools: &crate::builtin::JobToolSettings,
         outputs: OutputStore,
     ) -> Self {
         let mut controls = ToolRegistryBuilder::new();
-        controls.configure_tool(crate::builtin::KillTerminalTool::new(jobs.clone()));
-        controls.configure_tool(crate::builtin::InputTerminalTool::new(jobs.clone()));
-        controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(
+        controls.configure_tool(crate::builtin::JobKillTool::new(
+            job_tools.kill.clone(),
+            jobs.clone(),
+            outputs.wording().clone(),
+        ));
+        controls.configure_tool(crate::builtin::JobInputTool::new(
+            job_tools.input.clone(),
+            jobs.clone(),
+            outputs.wording().clone(),
+        ));
+        controls.configure_tool(crate::builtin::JobReadTool::new(
+            job_tools.read.clone(),
             jobs,
             outputs.wording().clone(),
             outputs.policy().clone(),

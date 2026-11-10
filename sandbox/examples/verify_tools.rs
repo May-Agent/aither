@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    AnyShellWording, CommandBlocked, CommandKilled, FoldedLines, JsonAsTsv, MediaBounds,
-    MonitorRefusal, MonitorStarted, OmittedLines, OutputLimits, OutputPolicy, OutputSaved,
-    RepeatedLines, ReservedForMain, ShellArgs, ShellLimits, ShellWording, StoredBinaryPart,
-    TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolTarget, UnchangedTaskRead,
+    AnyShellWording, CommandBlocked, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
+    JobRead, JobToolSettings, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted,
+    OmittedLines, OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain,
+    ShellArgs, ShellLimits, ShellWording, StoredBinaryPart, TerminalTool, ToolDistribution,
+    ToolIdentity, ToolRegistryBuilder, ToolTarget,
 };
 
 /// The wording of this example's shell: aither ships none, and the example's
@@ -16,8 +17,19 @@ use aither_sandbox::{
 struct ExampleWording;
 
 impl ShellWording for ExampleWording {
-    fn unchanged_task_read(&self, read: &UnchangedTaskRead) -> String {
-        format!("task {} has no new output", read.task_id)
+    fn job_read(&self, read: &JobRead) -> String {
+        match read {
+            JobRead::Unchanged { task_id } => format!("task {task_id} has no new output"),
+            JobRead::Delta(delta) => String::from_utf8_lossy(&delta.bytes).into_owned(),
+        }
+    }
+
+    fn job_input(&self, sent: &JobInputSent<'_>) -> String {
+        format!("input written to {}", sent.task_id)
+    }
+
+    fn job_kill(&self, kill: &JobKillAsked<'_>) -> String {
+        format!("kill of {}: {}", kill.task_id, kill.killed)
     }
 
     fn command_blocked(&self, blocked: &CommandBlocked) -> String {
@@ -82,6 +94,13 @@ impl ShellWording for ExampleWording {
     }
 }
 
+fn identity(name: &'static str, description: &'static str) -> ToolIdentity {
+    ToolIdentity {
+        name: name.into(),
+        description: description.into(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -126,6 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits,
         output,
         AnyShellWording::new(ExampleWording),
+        JobToolSettings {
+            read: identity("job_read", "Read a job's output."),
+            input: identity("job_input", "Write to a job's stdin."),
+            kill: identity("job_kill", "Kill a job."),
+        },
     )
     .await?
     .initialize_tools(&distribution, &PathBuf::from(cache))

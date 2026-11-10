@@ -7,18 +7,54 @@
 use askama::Template;
 
 use crate::command::CommandBlocked;
-use crate::job_registry::UnchangedTaskRead;
+use crate::job_registry::{JobRead, JobStatus};
 use crate::monitor::MonitorRefusal;
 use crate::terminal::TimeoutKill;
 use crate::wording::{
-    AnyShellWording, CommandKilled, FoldedLines, JsonAsTsv, MonitorStarted, OmittedLines,
-    OutputSaved, RepeatedLines, ReservedForMain, ShellWording, StoredBinaryPart,
+    AnyShellWording, CommandKilled, FoldedLines, JobInputSent, JobKillAsked, JsonAsTsv,
+    MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, ReservedForMain, ShellWording,
+    StoredBinaryPart,
 };
+use aither_core::llm::CommandStream;
 
 #[derive(Template)]
 #[template(path = "test_wording/unchanged_task_read.txt")]
 struct UnchangedTaskReadText<'a> {
     task_id: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "test_wording/job_read.txt", escape = "none")]
+struct JobReadText<'a> {
+    delta: &'a str,
+    has_more: bool,
+    cursor: usize,
+    task_id: &'a str,
+    status_text: &'a str,
+    bytes_read: usize,
+    total_bytes: usize,
+}
+
+#[derive(Template)]
+#[template(path = "test_wording/job_input.txt", escape = "none")]
+struct JobInputText<'a> {
+    task_id: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "test_wording/job_kill.txt", escape = "none")]
+struct JobKillText<'a> {
+    task_id: &'a str,
+    killed: bool,
+}
+
+fn job_status_text(status: &JobStatus) -> String {
+    match status {
+        JobStatus::Running => "is running".to_string(),
+        JobStatus::Completed { exit_code, .. } => format!("completed with exit code {exit_code}"),
+        JobStatus::Failed { error, .. } => format!("failed: {error}"),
+        JobStatus::Killed { .. } => "was killed".to_string(),
+    }
 }
 
 #[derive(Template)]
@@ -122,6 +158,21 @@ fn rendered(template: &impl Template) -> String {
         .expect("a test wording template renders typed input")
 }
 
+/// The names and descriptions the sandbox's tests give the job control
+/// tools.
+#[must_use]
+pub fn job_tools() -> crate::JobToolSettings {
+    let identity = |name: &'static str, description: &'static str| crate::ToolIdentity {
+        name: name.into(),
+        description: description.into(),
+    };
+    crate::JobToolSettings {
+        read: identity("terminal_read", "Read a job's output."),
+        input: identity("terminal_input", "Write to a job's stdin."),
+        kill: identity("terminal_kill", "Kill a job."),
+    }
+}
+
 /// The wording the sandbox's tests read.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TestWording;
@@ -135,9 +186,37 @@ impl TestWording {
 }
 
 impl ShellWording for TestWording {
-    fn unchanged_task_read(&self, read: &UnchangedTaskRead) -> String {
-        rendered(&UnchangedTaskReadText {
-            task_id: &read.task_id,
+    fn job_read(&self, read: &JobRead) -> String {
+        match read {
+            JobRead::Unchanged { task_id } => rendered(&UnchangedTaskReadText { task_id }),
+            JobRead::Delta(delta) => {
+                let output = CommandStream::Inline {
+                    text: String::from_utf8_lossy(&delta.bytes).into_owned(),
+                }
+                .render_for_model();
+                rendered(&JobReadText {
+                    delta: &output,
+                    has_more: delta.cursor < delta.total_bytes,
+                    cursor: delta.cursor,
+                    task_id: &delta.task_id,
+                    status_text: &job_status_text(&delta.status),
+                    bytes_read: delta.bytes.len(),
+                    total_bytes: delta.total_bytes,
+                })
+            }
+        }
+    }
+
+    fn job_input(&self, sent: &JobInputSent<'_>) -> String {
+        rendered(&JobInputText {
+            task_id: sent.task_id,
+        })
+    }
+
+    fn job_kill(&self, kill: &JobKillAsked<'_>) -> String {
+        rendered(&JobKillText {
+            task_id: kill.task_id,
+            killed: kill.killed,
         })
     }
 

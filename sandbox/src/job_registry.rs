@@ -226,7 +226,7 @@ impl Drop for PendingCompletion {
 /// Keeps a job in its registry, finished or not, while something reads it
 /// by its task id; the registry forgets a finished job only once every
 /// watch of it dropped. [`JobRegistry::watch`] hands them out.
-pub(crate) struct JobWatch {
+pub struct JobWatch {
     tx: Sender<JobCommand>,
     /// Keeps the word naming this job; the unwatch it sends keeps a clone
     /// until the registry hears of it.
@@ -257,9 +257,20 @@ pub struct OwedCompletion {
     pub pending: PendingCompletion,
 }
 
+impl JobRead {
+    /// The delta, or `None` for an unchanged read.
+    #[must_use]
+    pub fn into_delta(self) -> Option<JobDelta> {
+        match self {
+            Self::Delta(delta) => Some(delta),
+            Self::Unchanged { .. } => None,
+        }
+    }
+}
+
 /// Incremental read result for a background terminal buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalDelta {
+pub struct JobDelta {
     /// Stable task identifier exposed to the model.
     pub task_id: String,
     /// Cursor the caller should pass on the next read.
@@ -272,29 +283,20 @@ pub struct TerminalDelta {
     pub status: JobStatus,
 }
 
-/// A `terminal_read` refused because it would return what the task's last
-/// read returned: only more output, or the task's end, can tell the model
-/// something new.
+/// What a read of a job's output returned.
 ///
-/// [`SandboxNotices::unchanged_task_read`](crate::SandboxNotices::unchanged_task_read)
-/// renders its text.
+/// A read that would return what the job's last read returned is a poll:
+/// only more output, or the job's end, can tell the reader something new, so
+/// it comes back as [`Self::Unchanged`] for the reader's wording to say so.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnchangedTaskRead {
-    /// The background task whose output did not change.
-    pub task_id: String,
-}
-
-/// Why [`JobRegistry::terminal_read`] returned no delta.
-#[derive(Debug, thiserror::Error)]
-pub enum TerminalReadError {
-    /// The read would return what the task's last read returned; the
-    /// caller renders it through its
-    /// [`SandboxNotices`](crate::SandboxNotices).
-    #[error("refused as a poll: {0:?}")]
-    Refused(UnchangedTaskRead),
-    /// The read could not be served, such as an unknown task id.
-    #[error("{0}")]
-    Failed(String),
+pub enum JobRead {
+    /// Output past the cursor, or the same cursor with a changed status.
+    Delta(JobDelta),
+    /// Nothing changed since this job's last read.
+    Unchanged {
+        /// The job whose output did not change.
+        task_id: String,
+    },
 }
 
 /// Sender used by the registry to push bytes into a running process stdin.
@@ -332,6 +334,8 @@ struct JobState {
     deferred_end: Option<Ending>,
     /// Callers parked until the last kill in flight records its outcome.
     settled_waiters: Vec<SettledWaiter>,
+    /// Callers parked until the job ends.
+    ended_waiters: Vec<Sender<Option<JobInfo>>>,
     output_redirect: Option<async_fs::File>,
     finished_at: Option<Instant>,
     /// Whether the job's [`PendingCompletion`] was handed out.
@@ -469,7 +473,7 @@ enum JobRequest {
         pid: u32,
         reply: Sender<Option<(Vec<u8>, Vec<u8>)>>,
     },
-    ReadTerminalDelta {
+    ReadJobDelta {
         task_id: String,
         cursor: usize,
         max_bytes: usize,
@@ -477,7 +481,11 @@ enum JobRequest {
         /// tracked by the unchanged-read refusal; a monitor pump's reads are
         /// not, and read the complete-line buffer instead.
         tracked: bool,
-        reply: Sender<Result<TerminalDelta, TerminalReadError>>,
+        reply: Sender<Result<JobRead, String>>,
+    },
+    WaitEnded {
+        task_id: String,
+        reply: Sender<Option<JobInfo>>,
     },
     TerminalStreamsClosed {
         pid: u32,
@@ -835,17 +843,15 @@ impl JobRegistry {
     /// Returns terminal output added since the provided cursor.
     ///
     /// # Errors
-    /// [`TerminalReadError::Refused`] when the read would return what the
-    /// task's last read returned; [`TerminalReadError::Failed`] when the
-    /// task id is unknown.
+    /// An error when the task id is unknown.
     pub async fn terminal_read(
         &self,
         task_id: &str,
         cursor: usize,
         max_bytes: usize,
-    ) -> Result<TerminalDelta, TerminalReadError> {
+    ) -> Result<JobRead, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::ReadTerminalDelta {
+        self.send_command(JobRequest::ReadJobDelta {
             task_id: task_id.to_string(),
             cursor,
             max_bytes,
@@ -867,9 +873,9 @@ impl JobRegistry {
         task_id: &str,
         cursor: usize,
         max_bytes: usize,
-    ) -> Result<TerminalDelta, String> {
+    ) -> Result<JobDelta, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::ReadTerminalDelta {
+        self.send_command(JobRequest::ReadJobDelta {
             task_id: task_id.to_string(),
             cursor,
             max_bytes,
@@ -877,13 +883,25 @@ impl JobRegistry {
             reply: reply_tx,
         })
         .await;
-        match Self::recv_reply(reply_rx).await {
-            Ok(delta) => Ok(delta),
-            Err(TerminalReadError::Failed(error)) => Err(error),
-            Err(TerminalReadError::Refused(refusal)) => {
-                unreachable!("an untracked read is never refused: {refusal:?}")
+        match Self::recv_reply(reply_rx).await? {
+            JobRead::Delta(delta) => Ok(delta),
+            JobRead::Unchanged { task_id } => {
+                unreachable!("an untracked read of {task_id} is never unchanged")
             }
         }
+    }
+
+    /// Waits until the job ends and returns how: its status, and the real
+    /// ending of a job whose kill was in flight. `None` for a task the
+    /// registry does not hold.
+    pub async fn wait_ended(&self, task_id: &str) -> Option<JobInfo> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::WaitEnded {
+            task_id: task_id.to_string(),
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
     }
 
     /// Marks a job as completed.
@@ -1485,7 +1503,7 @@ async fn handle_job_request(
         JobRequest::TerminalOutput { pid, reply } => {
             send_terminal_output(jobs, pid, reply).await;
         }
-        JobRequest::ReadTerminalDelta {
+        JobRequest::ReadJobDelta {
             task_id,
             cursor,
             max_bytes,
@@ -1493,9 +1511,11 @@ async fn handle_job_request(
             reply,
         } => {
             let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
-                .map_err(TerminalReadError::Failed)
-                .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
+                .map(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
+        }
+        JobRequest::WaitEnded { task_id, reply } => {
+            wait_for_end(jobs, &task_id, reply).await;
         }
         JobRequest::TerminalStreamsClosed { pid, reply } => {
             let closed = jobs
@@ -1597,6 +1617,7 @@ impl JobState {
             kills_in_flight: 0,
             deferred_end: None,
             settled_waiters: Vec::new(),
+            ended_waiters: Vec::new(),
             output_redirect: None,
             finished_at: None,
             completion_owed: false,
@@ -1633,6 +1654,10 @@ fn finish(job: &mut JobState, end: JobEnd) {
         JobEnd::Killed(cause) => JobStatus::Killed { cause, delivery },
     };
     job.finished_at = Some(Instant::now());
+    for waiter in std::mem::take(&mut job.ended_waiters) {
+        // A waiter that stopped waiting dropped its receiver.
+        let _ = waiter.try_send(Some(job.info.clone()));
+    }
     job.kill_switch = None;
     // Dropping the last sender ends the stdin writer thread blocked on it.
     job.input_tx = None;
@@ -1921,20 +1946,40 @@ async fn redirect_task_output(
 fn tracked_delta(
     reads: &mut ReadTracker,
     task_id: &str,
-    delta: TerminalDelta,
+    delta: JobDelta,
     tracked: bool,
-) -> Result<TerminalDelta, TerminalReadError> {
+) -> JobRead {
     let returned = (delta.cursor, delta.total_bytes, delta.status.clone());
     if !tracked {
-        return Ok(delta);
+        return JobRead::Delta(delta);
     }
     if reads.delta_reads.get(task_id) == Some(&returned) {
-        Err(TerminalReadError::Refused(UnchangedTaskRead {
+        JobRead::Unchanged {
             task_id: task_id.to_string(),
-        }))
+        }
     } else {
         reads.delta_reads.insert(task_id.to_string(), returned);
-        Ok(delta)
+        JobRead::Delta(delta)
+    }
+}
+
+/// Answers a wait for a job's end at once when it ended, or parks it until
+/// [`finish`] records the ending.
+async fn wait_for_end(
+    jobs: &mut HashMap<u32, JobState>,
+    task_id: &str,
+    reply: Sender<Option<JobInfo>>,
+) {
+    match find_pid_by_task_id(jobs, task_id).and_then(|pid| jobs.get_mut(&pid)) {
+        Some(job) if matches!(job.info.status, JobStatus::Running) => {
+            job.ended_waiters.push(reply);
+        }
+        Some(job) => {
+            let _ = reply.send(Some(job.info.clone())).await;
+        }
+        None => {
+            let _ = reply.send(None).await;
+        }
     }
 }
 
@@ -1944,7 +1989,7 @@ fn read_terminal_delta(
     cursor: usize,
     max_bytes: usize,
     lines: bool,
-) -> Result<TerminalDelta, String> {
+) -> Result<JobDelta, String> {
     find_pid_by_task_id(jobs, task_id).map_or_else(
         || Err(format!("unknown task_id: {task_id}")),
         |pid| {
@@ -2203,7 +2248,7 @@ fn terminal_read(
     cursor: usize,
     max_bytes: usize,
     lines: bool,
-) -> Result<TerminalDelta, String> {
+) -> Result<JobDelta, String> {
     let buffer = if lines {
         &job.line_buffer
     } else {
@@ -2217,7 +2262,7 @@ fn terminal_read(
         ));
     }
     let end = total_bytes.min(cursor.saturating_add(max_bytes));
-    Ok(TerminalDelta {
+    Ok(JobDelta {
         task_id: job.info.task_id.clone(),
         cursor: end,
         total_bytes,
@@ -2348,10 +2393,7 @@ mod tests {
         drop(watch);
         assert!(registry.list().await.is_empty(), "the job is forgotten");
         assert!(registry.get_by_task_id("river").await.is_none());
-        assert!(matches!(
-            registry.terminal_read("river", 0, 1024).await,
-            Err(TerminalReadError::Failed(_))
-        ));
+        assert!(registry.terminal_read("river", 0, 1024).await.is_err());
         assert!(!registry.kill_by_task_id("river").await);
         assert!(
             registry
@@ -2489,22 +2531,25 @@ mod tests {
         let first = registry
             .terminal_read("alpha", 0, 1024)
             .await
-            .expect("first read succeeds");
+            .expect("first read succeeds")
+            .into_delta()
+            .expect("the first read is a delta");
         let second = registry.terminal_read("alpha", first.cursor, 1024).await;
         assert!(
             matches!(
                 &second,
-                Err(TerminalReadError::Refused(UnchangedTaskRead { task_id }))
-                    if task_id == "alpha"
+                Ok(JobRead::Unchanged { task_id }) if task_id == "alpha"
             ),
-            "an unchanged repeat read must be refused as a poll: {second:?}"
+            "an unchanged repeat read is reported as a poll: {second:?}"
         );
 
         registry.append_stdout(7, b"two".to_vec()).await;
         let third = registry
             .terminal_read("alpha", first.cursor, 1024)
             .await
-            .expect("read succeeds once output changed");
+            .expect("read succeeds once output changed")
+            .into_delta()
+            .expect("changed output reads as a delta");
         assert_eq!(third.bytes, b"two");
     }
 
@@ -2643,7 +2688,12 @@ mod tests {
         registry.append_stdout(202, b"hello ".to_vec()).await;
         registry.append_stderr(202, b"world".to_vec()).await;
 
-        let first = registry.terminal_read("delta", 0, 6).await.unwrap();
+        let first = registry
+            .terminal_read("delta", 0, 6)
+            .await
+            .unwrap()
+            .into_delta()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&first.bytes), "hello ");
         assert_eq!(first.cursor, 6);
         assert_eq!(first.total_bytes, 11);
@@ -2652,6 +2702,8 @@ mod tests {
         let second = registry
             .terminal_read("delta", first.cursor, 32)
             .await
+            .unwrap()
+            .into_delta()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&second.bytes), "world");
         assert_eq!(second.cursor, 11);
@@ -2693,6 +2745,8 @@ mod tests {
         let merged = registry
             .terminal_read("lines", 0, usize::MAX)
             .await
+            .unwrap()
+            .into_delta()
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&merged.bytes),

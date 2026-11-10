@@ -213,6 +213,7 @@ async fn terminal_with(
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
         crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
     )
     .await
     .expect("terminal tool should initialize")
@@ -454,6 +455,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
         crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
     )
     .await
     .unwrap()
@@ -482,6 +484,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
         crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
     )
     .await
     .unwrap()

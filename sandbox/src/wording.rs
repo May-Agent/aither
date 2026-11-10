@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::command::CommandBlocked;
-use crate::job_registry::UnchangedTaskRead;
+use crate::job_registry::JobRead;
 use crate::monitor::MonitorRefusal;
 use crate::terminal::TimeoutKill;
 
@@ -39,6 +39,23 @@ pub enum CommandKilled<'a> {
     TimedOut(&'a TimeoutKill),
     /// It was killed before its bound passed, by a kill or a watchdog.
     BeforeTimeout,
+}
+
+/// Bytes written to a job's stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobInputSent<'a> {
+    /// The job written to.
+    pub task_id: &'a str,
+}
+
+/// A kill of a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobKillAsked<'a> {
+    /// The job asked to die.
+    pub task_id: &'a str,
+    /// Whether a running job was found and killed; `false` for an unknown
+    /// one or one that already stopped.
+    pub killed: bool,
 }
 
 /// An output too large for the window, replaced by a preview and the file
@@ -122,9 +139,15 @@ pub struct RepeatedLines {
 ///
 /// There is no default for any method and aither ships no implementation.
 pub trait ShellWording: Send + Sync + 'static {
-    /// A background read refused because the task's output has not changed
-    /// since its last read.
-    fn unchanged_task_read(&self, read: &UnchangedTaskRead) -> String;
+    /// What a read of a job's output returned: new output, or the fact that
+    /// nothing changed since the job's last read.
+    fn job_read(&self, read: &JobRead) -> String;
+
+    /// A job's stdin was written.
+    fn job_input(&self, sent: &JobInputSent<'_>) -> String;
+
+    /// A kill of a job was asked for.
+    fn job_kill(&self, kill: &JobKillAsked<'_>) -> String;
 
     /// A command the shell's command gate blocked, wrapping the reason the
     /// gate gave.

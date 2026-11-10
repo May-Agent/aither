@@ -97,6 +97,8 @@ use crate::{
     },
     wording::AnyShellWording,
 };
+use crate::builtin::JobToolSettings;
+use crate::jobs::Jobs;
 use crate::events::{
     EventSender, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
     StdinWatchFailed, event_channel,
@@ -1173,6 +1175,8 @@ pub struct TerminalTool<E, State = Unconfigured> {
     events_tx: EventSender,
     /// Where they are read.
     events_rx: ShellEvents,
+    /// What the job control tools are named and described as.
+    job_tools: JobToolSettings,
     /// Time bounds applied to spawned executions.
     limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
@@ -1219,6 +1223,7 @@ impl<E: Clone, State: Clone> Clone for TerminalTool<E, State> {
             job_registry: self.job_registry.clone(),
             events_tx: self.events_tx.clone(),
             events_rx: self.events_rx.clone(),
+            job_tools: self.job_tools.clone(),
             limits: self.limits.clone(),
             running_tasks: self.running_tasks.clone(),
             grants: self.grants.clone(),
@@ -1348,6 +1353,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
         limits: ShellLimits,
         output: OutputPolicy,
         wording: AnyShellWording,
+        job_tools: JobToolSettings,
     ) -> Result<Self, TerminalError> {
         let parent_dir = parent_dir.as_ref();
 
@@ -1396,6 +1402,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             job_registry,
             events_tx,
             events_rx,
+            job_tools,
             limits: TerminalLimits::new(limits),
             running_tasks,
             grants: Grants::new(),
@@ -1428,6 +1435,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
         limits: ShellLimits,
         output: OutputPolicy,
         wording: AnyShellWording,
+        job_tools: JobToolSettings,
     ) -> Result<Self, TerminalError> {
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
@@ -1467,6 +1475,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             job_registry,
             events_tx,
             events_rx,
+            job_tools,
             limits: TerminalLimits::new(limits),
             running_tasks,
             grants: Grants::new(),
@@ -1498,6 +1507,7 @@ impl<E, State> TerminalTool<E, State> {
             job_registry: self.job_registry,
             events_tx: self.events_tx,
             events_rx: self.events_rx,
+            job_tools: self.job_tools,
             limits: self.limits,
             running_tasks: self.running_tasks,
             grants: self.grants,
@@ -1529,7 +1539,11 @@ where
     pub fn with_registry(self, registry: Arc<ToolRegistry>) -> TerminalTool<E, Configured> {
         let registry = Arc::new(
             Arc::unwrap_or_clone(registry)
-                .with_terminal_controls(self.job_registry(), self.output_store.clone()),
+                .with_terminal_controls(
+                    self.jobs(),
+                    &self.job_tools,
+                    self.output_store.clone(),
+                ),
         );
         self.map_state(|Unconfigured| Launching { registry })
             .into_served()
@@ -1952,9 +1966,19 @@ where
         &self.ids
     }
 
-    /// Returns the job registry handle.
-    pub fn job_registry(&self) -> JobRegistry {
+    /// The job registry handle.
+    pub(crate) fn job_registry(&self) -> JobRegistry {
         self.job_registry.clone()
+    }
+
+    /// This terminal's jobs.
+    #[must_use]
+    pub fn jobs(&self) -> Jobs {
+        Jobs::new(
+            self.job_registry(),
+            self.events(),
+            self.output_store.clone(),
+        )
     }
 
     /// What a watch task reports through; `monitor` clones it for every pump
@@ -2188,7 +2212,15 @@ where
             self.registry
                 .registry()
                 .for_subagent(observer, gate)
-                .with_terminal_controls(job_registry.clone(), self.output_store.clone()),
+                .with_terminal_controls(
+                    Jobs::new(
+                        job_registry.clone(),
+                        events_rx.clone(),
+                        self.output_store.clone(),
+                    ),
+                    &self.job_tools,
+                    self.output_store.clone(),
+                ),
         );
         let launching = TerminalTool {
             working_dir: space,
@@ -2200,6 +2232,7 @@ where
             job_registry,
             events_tx,
             events_rx,
+            job_tools: self.job_tools.clone(),
             limits: self.limits.clone(),
             running_tasks,
             grants,
@@ -2340,7 +2373,8 @@ where
 
         let events = self.events();
         let kept_receiver = self.kept_receiver();
-        let job_registry = self.job_registry();
+        let jobs = self.jobs();
+        let job_tools = self.job_tools.clone();
         let working_dir = self.working_dir().clone();
         let command_names = self.registry().available_tool_names();
         let commit_ledger = self.commit_ledger();
@@ -2359,7 +2393,8 @@ where
             entries,
             events,
             kept_receiver,
-            job_registry,
+            jobs,
+            job_tools,
             working_dir,
             command_names,
             prepared_tools,
@@ -6289,7 +6324,7 @@ mod tests {
     use super::*;
     use crate::GitDirAccess;
     #[cfg(unix)]
-    use crate::builtin::{InputTerminalArgs, InputTerminalTool};
+    use crate::builtin::{JobInputArgs, JobInputTool};
     use crate::output::empty_stream;
     use crate::test_wording::TestWording;
     use crate::{ShellWording, ToolRegistryBuilder};
@@ -6305,6 +6340,15 @@ mod tests {
 
     #[cfg(unix)]
     mod ssh;
+
+    /// The tool that writes to the stdin of `jobs`' jobs.
+    fn input_tool(jobs: Jobs) -> JobInputTool {
+        JobInputTool::new(
+            crate::test_wording::job_tools().input,
+            jobs,
+            TestWording::any(),
+        )
+    }
 
     /// An output store in `dir`, which exists, leasing from the default
     /// allocator.
@@ -6476,6 +6520,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7262,6 +7307,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize");
@@ -7428,6 +7474,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .unwrap();
@@ -7453,6 +7500,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7566,6 +7614,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7664,6 +7713,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7699,6 +7749,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7779,6 +7830,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -7857,10 +7909,7 @@ mod tests {
 
         drop(completed);
         assert!(jobs.list().await.is_empty(), "a delivered job is forgotten");
-        assert!(matches!(
-            jobs.terminal_read("river", 0, 1024).await,
-            Err(crate::TerminalReadError::Failed(_))
-        ));
+        assert!(jobs.terminal_read("river", 0, 1024).await.is_err());
         assert!(!jobs.kill_by_task_id("river").await);
         // The job's flow lets go of the word as it ends.
         for _ in 0..500 {
@@ -8063,6 +8112,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8133,6 +8183,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8298,6 +8349,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8737,6 +8789,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8801,6 +8854,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8872,6 +8926,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -8885,7 +8940,7 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let background_receiver = tool.background_receiver();
-        let input_tool = InputTerminalTool::new(tool.job_registry());
+        let input_tool = input_tool(tool.jobs());
 
         let result = tool
             .run_background(ShellArgs {
@@ -8912,7 +8967,7 @@ mod tests {
 
         input_tool
             .call(
-                InputTerminalArgs {
+                JobInputArgs {
                     task_id: task_id.clone(),
                     input: "lexo".to_string(),
                     append_newline: true,
@@ -8934,6 +8989,78 @@ mod tests {
         );
     }
 
+    /// A job is read, waited for and killed through its handle, and an
+    /// unchanged read is data.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_job_handle_reads_waits_and_kills() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, shell_sessions) = prepared_test_registry().await;
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+            TestWording::any(),
+            crate::test_wording::job_tools(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
+        let tool = tool.with_registry(registry);
+        let events = tool.background_receiver();
+        let jobs = tool.jobs();
+
+        let args = |script: &str| ShellArgs {
+            background: true,
+            timeout: 60,
+            ..terminal_args("a job", script)
+        };
+        tool.run_background(args("printf done; exit 3"))
+            .await
+            .expect("the job starts");
+        let finished = jobs
+            .get(&started_task_id(&events))
+            .await
+            .expect("the shell holds the job");
+        let result = finished.wait().await.expect("the job ends");
+        assert_eq!(result.outcome, CommandOutcome::Exited { code: 3 });
+        assert_eq!(output_text(&result.stdout), Some("done"));
+
+        tool.run_background(args("sleep 60"))
+            .await
+            .expect("the job starts");
+        let sleeping = jobs
+            .get(&started_task_id(&events))
+            .await
+            .expect("the shell holds the job");
+        let first = sleeping.read(0, 1024).await.expect("the job reads");
+        let cursor = first.into_delta().expect("a first read is a delta").cursor;
+        assert_eq!(
+            sleeping.read(cursor, 1024).await,
+            Ok(crate::JobRead::Unchanged {
+                task_id: sleeping.task_id().to_owned()
+            }),
+            "a repeat read is a poll"
+        );
+        assert_eq!(jobs.kill_all().await, 1);
+        let killed = sleeping.wait().await.expect("the killed job ends");
+        assert!(matches!(killed.outcome, CommandOutcome::Killed { .. }));
+        assert!(
+            jobs.list()
+                .await
+                .iter()
+                .all(|job| !matches!(job.status, JobStatus::Running))
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn killing_background_terminal_kills_descendant_processes() {
@@ -8945,6 +9072,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -9538,9 +9666,9 @@ mod tests {
             "a blocked reader must yield exactly one stdin alert: {alerts:?}"
         );
 
-        InputTerminalTool::new(tool.job_registry())
+        input_tool(tool.jobs())
             .call(
-                InputTerminalArgs {
+                JobInputArgs {
                     task_id: task_id.clone(),
                     input: "lexo".to_string(),
                     append_newline: true,
@@ -9647,6 +9775,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -10496,6 +10625,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -10589,7 +10719,7 @@ mod tests {
         let (_tools_cache, tool) =
             prioritized_terminal_tool(dir.path(), test_nice_priority()).await;
         let background_receiver = tool.background_receiver();
-        let input_tool = InputTerminalTool::new(tool.job_registry());
+        let input_tool = input_tool(tool.jobs());
 
         // `exec` keeps `$$` — the pid the probe wrote — on the interactive
         // shell the session then drives.
@@ -10624,7 +10754,7 @@ mod tests {
 
         input_tool
             .call(
-                InputTerminalArgs {
+                JobInputArgs {
                     task_id: task_id.clone(),
                     input: "exit".to_string(),
                     append_newline: true,
@@ -11141,6 +11271,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -11201,6 +11332,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -12958,6 +13090,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13055,6 +13188,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13119,6 +13253,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13256,6 +13391,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13390,6 +13526,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13536,6 +13673,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13774,6 +13912,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")
@@ -13984,6 +14123,7 @@ mod tests {
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
             TestWording::any(),
+            crate::test_wording::job_tools(),
         )
         .await
         .expect("terminal tool should initialize")

@@ -5,8 +5,8 @@ mod terminal;
 
 pub use ask::{AskCommand, AskModelTier};
 pub use terminal::{
-    InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool,
-    ReadTerminalDeltaArgs, ReadTerminalDeltaTool,
+    JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
+    JobToolSettings, ToolIdentity,
 };
 
 use heel::IpcRouter;

@@ -19,6 +19,7 @@ async fn terminal(
         crate::limits::fixture::limits(),
         crate::output_policy::fixture::policy(),
         crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
     )
     .await
     .expect("terminal tool should initialize")
