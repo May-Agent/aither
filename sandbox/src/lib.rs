@@ -162,7 +162,9 @@ pub use notices::{
     ReservedForMain, SandboxNotices,
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
-pub use permission::{CommandLocation, PermissionHandler, PermissionRequest, Review, TerminalMode};
+pub use permission::{
+    CommandLocation, LocationApproval, PermissionHandler, PermissionRequest, Review, TerminalMode,
+};
 pub use policy::{
     AnyCommandPolicy, CommandPolicy, PolicyDecision, PolicyRefusal, ScriptCheck, ScriptEnd,
     ScriptOrigin, ScriptOutcome,

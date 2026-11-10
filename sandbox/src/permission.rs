@@ -67,6 +67,19 @@ pub enum CommandLocation<'a> {
     },
 }
 
+/// How far an answer of [`PermissionHandler::check_location`] reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationApproval {
+    /// Commands may not run on the server.
+    Refused,
+    /// The command that asked runs; the next command on the server asks
+    /// again.
+    Once,
+    /// Commands run on the server for as long as it stays in the registry,
+    /// a subagent's included.
+    Session,
+}
+
 impl<'a> CommandLocation<'a> {
     /// The server's name, or `None` for the home environment.
     #[must_use]
@@ -105,9 +118,9 @@ pub enum PermissionRequest<'a> {
     /// all. Approving it lets the terminal connect and prepare the server:
     /// the managed tools in its cache directory and, when it has no `heel`,
     /// the distribution's pinned `heel` for its platform in
-    /// `~/.local/bin`. Once approved, the server's later commands, a
-    /// subagent's included, are not asked about again while it stays in the
-    /// registry; each still passes the admission its mode needs.
+    /// `~/.local/bin`. Once approved for the session, the server's later
+    /// commands, a subagent's included, are not asked about again while it
+    /// stays in the registry; each still passes the admission its mode needs.
     Location {
         /// The server the command names.
         server: &'a SshServer,
@@ -186,19 +199,21 @@ pub trait PermissionHandler: Send + Sync {
         None
     }
 
-    /// Whether commands may run on `server`, asked once by the first command
-    /// that names it, after [`review`](Self::review) passed the
-    /// [`PermissionRequest::Location`]. `role` says whether a subagent asks,
-    /// so the handler can put a subagent's request to its main agent.
+    /// Whether commands may run on `server` and how far the answer reaches,
+    /// asked by the first command that names it and again by every command
+    /// after a [`LocationApproval::Once`], after [`review`](Self::review)
+    /// passed the [`PermissionRequest::Location`]. `role` says whether a
+    /// subagent asks, so the handler can put a subagent's request to its
+    /// main agent.
     ///
-    /// Default implementation denies every server (fail-safe).
+    /// Default implementation refuses every server (fail-safe).
     fn check_location(
         &self,
         server: &SshServer,
         role: CommandRole,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+    ) -> impl Future<Output = Result<LocationApproval, PermissionError>> + Send {
         let _ = (server, role);
-        async { Ok(false) }
+        async { Ok(LocationApproval::Refused) }
     }
 
     /// Whether [`check_location`](Self::check_location) will suspend waiting
@@ -355,8 +370,8 @@ impl PermissionHandler for NoopPermissionHandler {
         &self,
         _server: &SshServer,
         _role: CommandRole,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-        std::future::ready(Ok(true))
+    ) -> impl Future<Output = Result<LocationApproval, PermissionError>> + Send {
+        std::future::ready(Ok(LocationApproval::Session))
     }
 }
 
@@ -438,17 +453,19 @@ mod tests {
             name: "build".to_string(),
             target: "builder@build.internal".to_string(),
         };
-        assert!(
-            !DenyUnsafe
+        assert_eq!(
+            DenyUnsafe
                 .check_location(&server, CommandRole::Main)
                 .await
-                .unwrap()
+                .unwrap(),
+            LocationApproval::Refused
         );
-        assert!(
+        assert_eq!(
             NoopPermissionHandler
                 .check_location(&server, CommandRole::Subagent)
                 .await
-                .unwrap()
+                .unwrap(),
+            LocationApproval::Session
         );
     }
 

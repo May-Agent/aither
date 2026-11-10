@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use async_lock::OnceCell;
+use async_lock::{Mutex, OnceCell};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -155,8 +155,19 @@ pub struct PreparedSsh {
 #[derive(Debug)]
 pub struct SshEnvironment {
     server: SshServer,
-    approved: OnceCell<()>,
+    /// Whether a session approval was given. Held while a request is
+    /// asked, so concurrent commands wait for it.
+    approved: Mutex<bool>,
     prepared: OnceCell<PreparedSsh>,
+}
+
+/// How far an approval that let a command run on a server reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalReach {
+    /// The command that asked.
+    Once,
+    /// Every command on the server while it stays in the registry.
+    Session,
 }
 
 impl SshEnvironment {
@@ -164,14 +175,23 @@ impl SshEnvironment {
         &self.server
     }
 
-    /// Settles approval once: concurrent first commands wait for one
-    /// request, and a refused request leaves the next command to ask again.
+    /// Settles approval: a session approval is asked once and kept, with
+    /// concurrent commands waiting for the one request; a once-only or a
+    /// refused request leaves the next command to ask again.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the guard is held across the request so concurrent commands wait for it"
+    )]
     pub(crate) async fn approve<F, Fut, E>(&self, ask: F) -> Result<(), E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(), E>>,
+        Fut: Future<Output = Result<ApprovalReach, E>>,
     {
-        self.approved.get_or_try_init(ask).await?;
+        let mut approved = self.approved.lock().await;
+        if !*approved {
+            let reach = ask().await?;
+            *approved = reach == ApprovalReach::Session;
+        }
         Ok(())
     }
 
@@ -194,7 +214,7 @@ impl SshEnvironment {
 
     #[cfg(test)]
     pub(crate) fn is_approved(&self) -> bool {
-        self.approved.is_initialized()
+        *self.approved.lock_blocking()
     }
 
     #[cfg(test)]
@@ -233,7 +253,7 @@ impl SshEnvironments {
         }
         let environment = Arc::new(SshEnvironment {
             server,
-            approved: OnceCell::new(),
+            approved: Mutex::new(false),
             prepared: OnceCell::new(),
         });
         let mut duplicate = false;
@@ -326,7 +346,10 @@ mod tests {
         let set = SshEnvironments::default();
         set.add(server("build", "builder@build.internal")).unwrap();
         let first = set.get("build").unwrap();
-        first.approve(|| async { Ok::<_, ()>(()) }).await.unwrap();
+        first
+            .approve(|| async { Ok::<_, ()>(ApprovalReach::Session) })
+            .await
+            .unwrap();
         assert!(first.is_approved());
         set.remove("build");
         set.add(server("build", "builder@build.internal")).unwrap();
@@ -341,7 +364,7 @@ mod tests {
         assert_eq!(environment.approve(|| async { Err("no") }).await, Err("no"));
         assert!(!environment.is_approved());
         environment
-            .approve(|| async { Ok::<_, &str>(()) })
+            .approve(|| async { Ok::<_, &str>(ApprovalReach::Session) })
             .await
             .unwrap();
         // Settled: a later ask is never made.
@@ -349,5 +372,21 @@ mod tests {
             .approve(|| async { Err("asked again") })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_once_only_approval_is_not_kept() {
+        let set = SshEnvironments::default();
+        set.add(server("build", "builder@build.internal")).unwrap();
+        let environment = set.get("build").unwrap();
+        environment
+            .approve(|| async { Ok::<_, &str>(ApprovalReach::Once) })
+            .await
+            .unwrap();
+        assert!(!environment.is_approved());
+        assert_eq!(
+            environment.approve(|| async { Err("asked again") }).await,
+            Err("asked again")
+        );
     }
 }

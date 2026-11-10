@@ -73,8 +73,8 @@ use crate::{
     job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
     output::{INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, stored_path},
     permission::{
-        CommandLocation, PermissionError, PermissionHandler, PermissionRequest, Review,
-        TerminalMode,
+        CommandLocation, LocationApproval, PermissionError, PermissionHandler, PermissionRequest,
+        Review, TerminalMode,
     },
     process_tree::{JobMarker, JobProcess, JobTree},
     script_language::ScriptLanguage,
@@ -82,7 +82,7 @@ use crate::{
         BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry,
     },
-    ssh::{SshClient, SshEnvironment, SshServer},
+    ssh::{ApprovalReach, SshClient, SshEnvironment, SshServer},
     stdin_watch::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
@@ -2986,7 +2986,7 @@ where
                     .review(&PermissionRequest::Location { server, role })
                     .await
                 {
-                    Review::Approved => return Ok(()),
+                    Review::Approved => return Ok(ApprovalReach::Session),
                     Review::Denied(reason) => {
                         return Err(TerminalError::from(PermissionError::Denied(reason)));
                     }
@@ -3019,10 +3019,12 @@ where
                     )
                     .await;
                 }
-                if allowed? {
-                    Ok(())
-                } else {
-                    Err(TerminalError::LocationDenied(server.name.clone()))
+                match allowed? {
+                    LocationApproval::Session => Ok(ApprovalReach::Session),
+                    LocationApproval::Once => Ok(ApprovalReach::Once),
+                    LocationApproval::Refused => {
+                        Err(TerminalError::LocationDenied(server.name.clone()))
+                    }
                 }
             })
             .await

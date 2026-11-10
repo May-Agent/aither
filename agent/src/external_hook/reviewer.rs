@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use aither_sandbox::permission::{
-    CommandLocation, PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode,
+    CommandLocation, LocationApproval, PermissionError, PermissionHandler, PermissionRequest,
+    Review, TerminalMode,
 };
 use aither_sandbox::{CommandRole, ScriptLanguage, SshServer};
 use serde::{Deserialize, Serialize};
@@ -185,7 +186,7 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         &self,
         server: &SshServer,
         role: CommandRole,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+    ) -> impl Future<Output = Result<LocationApproval, PermissionError>> + Send {
         self.inner.check_location(server, role)
     }
 
