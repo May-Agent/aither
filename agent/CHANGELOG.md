@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0](https://github.com/May-Agent/aither/compare/agent-v0.28.0...agent-v0.29.0) - 2026-11-10
+
+### Added
+
+- *(sandbox)* [**breaking**] an SSH approval covers one command or the session
+- *(sandbox)* [**breaking**] a permission check carries where the command runs
+- *(agent)* refresh an idle agent's cache entry and keep-alive only past a command's deadline
+
+### Other
+
+- Merge pull request #687 from May-Agent/feat/684-685-ssh-permission
+
 ## [0.28.0](https://github.com/May-Agent/aither/compare/agent-v0.27.0...agent-v0.28.0) - 2026-11-09
 
 ### Added
