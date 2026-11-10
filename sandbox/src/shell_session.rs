@@ -4,9 +4,9 @@ use async_channel::{Receiver, Sender};
 
 use askama::Template as _;
 
-use crate::ContainerPath;
 use crate::ssh::{SshEnvironments, SshServer, SshServerError};
 use crate::stdin_watch::StdinWatchSignal;
+use crate::{ContainerPath, HostRoute};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -199,102 +199,12 @@ impl ContainerExec for AnyContainerExec {
     }
 }
 
-/// An address the container IPC bridge may listen on.
-///
-/// The bridge executes host IPC commands for whoever connects, so it is bound
-/// only to an address the container network alone reaches — never the
-/// unspecified (`0.0.0.0`, `::`) address, which would expose it on every
-/// interface including the LAN, nor a multicast address, which cannot serve a
-/// listener. Docker Desktop and `OrbStack` forward `host.docker.internal` to the
-/// host's loopback, so the bridge binds `127.0.0.1`; native Linux Docker
-/// routes the name to the container network's gateway the host owns (`docker0`
-/// or the docker `bridge` network gateway, e.g. `172.17.0.1`), so the bridge
-/// binds that address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BridgeAddress(std::net::IpAddr);
-
-/// Why an address cannot bind the container IPC bridge.
-#[derive(Debug, thiserror::Error)]
-pub enum BridgeAddressError {
-    /// The unspecified wildcard address would listen on every interface.
-    #[error("the unspecified address {0} would expose the container IPC bridge on every interface")]
-    Unspecified(std::net::IpAddr),
-    /// A multicast address cannot serve a listener.
-    #[error("the multicast address {0} cannot bind the container IPC bridge")]
-    Multicast(std::net::IpAddr),
-}
-
-impl TryFrom<std::net::IpAddr> for BridgeAddress {
-    type Error = BridgeAddressError;
-
-    fn try_from(address: std::net::IpAddr) -> Result<Self, Self::Error> {
-        if address.is_unspecified() {
-            return Err(BridgeAddressError::Unspecified(address));
-        }
-        if address.is_multicast() {
-            return Err(BridgeAddressError::Multicast(address));
-        }
-        Ok(Self(address))
-    }
-}
-
-impl BridgeAddress {
-    /// The address the bridge listens on.
-    #[must_use]
-    pub const fn ip(&self) -> std::net::IpAddr {
-        self.0
-    }
-}
-
-/// How a container reaches the host's IPC bridge.
-///
-/// `host` is the name the container dials (`host.docker.internal` on Docker —
-/// made resolvable through `--add-host=host.docker.internal:host-gateway` —
-/// `host.containers.internal` on Podman), and `bind` is the host address the
-/// bridge listens on: `127.0.0.1` on Docker Desktop and `OrbStack`, which
-/// forward the name to host loopback, or the container network's gateway
-/// address on native Linux Docker. The two belong to the same route, and only
-/// the caller — which knows the container runtime — can pair them correctly.
-#[derive(Clone, Debug)]
-pub struct ContainerIpcRoute {
-    host: String,
-    bind: BridgeAddress,
-}
-
-impl ContainerIpcRoute {
-    /// Creates the route a container uses to reach the host's IPC bridge.
-    ///
-    /// # Panics
-    /// Panics if `host` is empty after trimming.
-    #[must_use]
-    pub fn new(host: impl Into<String>, bind: BridgeAddress) -> Self {
-        let host = host.into();
-        assert!(
-            !host.trim().is_empty(),
-            "container IPC route requires a non-empty host"
-        );
-        Self { host, bind }
-    }
-
-    /// The name the container dials to reach the bridge.
-    #[must_use]
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    /// The host address the bridge listens on.
-    #[must_use]
-    pub const fn bind(&self) -> BridgeAddress {
-        self.bind
-    }
-}
-
 /// Container runtime session metadata.
 #[derive(Clone)]
 pub struct ContainerShellRuntime {
     exec: Arc<dyn ContainerExecImpl>,
     container_id: String,
-    ipc_route: ContainerIpcRoute,
+    host_route: HostRoute,
     /// The host directory the container mounts as its workspace, declared by
     /// whoever mounts it.
     workspace_mount: Option<crate::MountRoot>,
@@ -304,7 +214,7 @@ impl std::fmt::Debug for ContainerShellRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContainerShellRuntime")
             .field("container_id", &self.container_id)
-            .field("ipc_route", &self.ipc_route)
+            .field("host_route", &self.host_route)
             .field("workspace_mount", &self.workspace_mount)
             .finish_non_exhaustive()
     }
@@ -318,7 +228,7 @@ impl ContainerShellRuntime {
     #[must_use]
     pub fn new(
         container_id: impl Into<String>,
-        ipc_route: ContainerIpcRoute,
+        host_route: HostRoute,
         exec: AnyContainerExec,
     ) -> Self {
         let container_id = container_id.into();
@@ -329,7 +239,7 @@ impl ContainerShellRuntime {
         Self {
             exec: exec.inner,
             container_id,
-            ipc_route,
+            host_route,
             workspace_mount: None,
         }
     }
@@ -356,10 +266,10 @@ impl ContainerShellRuntime {
         &self.container_id
     }
 
-    /// Returns the route the container uses to reach the host's IPC bridge.
+    /// Returns where the host is reachable from inside the container.
     #[must_use]
-    pub const fn ipc_route(&self) -> &ContainerIpcRoute {
-        &self.ipc_route
+    pub const fn host_route(&self) -> &HostRoute {
+        &self.host_route
     }
 
     pub(crate) fn exec(&self) -> Arc<dyn ContainerExecImpl> {
@@ -819,47 +729,5 @@ mod tests {
         assert_eq!(subagent.ssh_servers(), std::slice::from_ref(&prod));
         assert_eq!(subagent.remove_ssh_server("prod"), Some(prod));
         assert_eq!(registry.ssh_servers(), []);
-    }
-
-    #[test]
-    fn bridge_address_rejects_the_unspecified_and_multicast_addresses() {
-        use super::{BridgeAddress, BridgeAddressError};
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-        for address in [
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        ] {
-            assert!(
-                matches!(
-                    BridgeAddress::try_from(address),
-                    Err(BridgeAddressError::Unspecified(_))
-                ),
-                "{address} must be rejected as unspecified"
-            );
-        }
-        for address in [
-            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
-            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
-        ] {
-            assert!(
-                matches!(
-                    BridgeAddress::try_from(address),
-                    Err(BridgeAddressError::Multicast(_))
-                ),
-                "{address} must be rejected as multicast"
-            );
-        }
-        for address in [
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)),
-        ] {
-            assert_eq!(
-                BridgeAddress::try_from(address)
-                    .expect("a concrete host address should be accepted")
-                    .ip(),
-                address
-            );
-        }
     }
 }

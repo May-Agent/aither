@@ -89,8 +89,7 @@ const KILL_ROUND_PAUSE: Duration = Duration::from_millis(10);
 /// Why a process tree could not be killed.
 #[derive(Debug, thiserror::Error)]
 pub enum KillTreeError {
-    /// The signal to the process group failed.
-    #[cfg(unix)]
+    /// The signal to the process group failed, locally or on a server.
     #[error("failed to signal the process group: {0}")]
     Signal(#[source] std::io::Error),
     /// The descendants of the job could not be found or killed.

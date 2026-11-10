@@ -701,3 +701,84 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
     let local = render_terminal_result(&local);
     assert!(local.contains("--jobserver-auth=fifo:"), "{local}");
 }
+
+/// A process spawned on a server streams its output under the server's
+/// `heel`, and `kill` ends the remote tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_on_a_server_streams_output_and_kill_ends_the_remote_tree() {
+    use crate::{PreparedSsh, SpawnSpec};
+
+    let sshd = Sshd::start().await;
+    let (_cache, registry) = prepared_test_registry().await;
+    let tools = registry.local_tools().unwrap().clone();
+    let dir = tempfile::tempdir().unwrap();
+    let heel = sshd.home().join(".local/bin/heel");
+    let sandbox = Sandbox::new(
+        crate::Backend::Ssh {
+            server: Sshd::server(),
+            prepared: PreparedSsh::new(Some(text(&heel).to_string()), tools),
+        },
+        executor_core::tokio::TokioGlobal,
+        dir.path(),
+    )
+    .with_ssh_client(sshd.client.clone());
+
+    let mut child = sandbox
+        .spawn(SpawnSpec::new("/bin/echo").args(["from-the-server"]))
+        .await
+        .expect("the process starts under the server's heel");
+    let stdout = child.take_stdout().unwrap();
+    let stderr = child.take_stderr().unwrap();
+    let mut printed = Vec::new();
+    while let Ok(chunk) = stdout.recv().await {
+        printed.extend(chunk);
+    }
+    let mut failed = Vec::new();
+    while let Ok(chunk) = stderr.recv().await {
+        failed.extend(chunk);
+    }
+    let exit = child.wait().await;
+    assert_eq!(
+        String::from_utf8_lossy(&printed),
+        "from-the-server\n",
+        "{exit:?}: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert!(exit.success());
+
+    // The server's login shell parses the command line first, so the job is
+    // a file rather than a quoted argument.
+    let job = sshd.home().join("job.sh");
+    std::fs::write(&job, "sleep 300 &\necho $!\nwait\n").unwrap();
+    let unconfined = sandbox.unconfined();
+    let mut child = unconfined
+        .spawn(SpawnSpec::new("/bin/sh").args([text(&job)]))
+        .await
+        .expect("the process starts");
+    let stdout = child.take_stdout().unwrap();
+    let remote = tokio::time::timeout(Duration::from_secs(60), stdout.recv())
+        .await
+        .expect("the descendant reports its id")
+        .expect("stdout is open");
+    let remote = String::from_utf8(remote).unwrap().trim().to_string();
+    let alive = |pid: &str| {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(&remote), "the remote descendant runs");
+    child.kill().await.expect("the tree is killed");
+    tokio::time::timeout(Duration::from_secs(60), child.wait())
+        .await
+        .expect("the killed process is waited for");
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while alive(&remote) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the remote descendant ends with the client");
+}

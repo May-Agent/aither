@@ -140,13 +140,22 @@ impl SshClient {
     }
 }
 
-/// A server prepared on its first command.
+/// A server prepared on its first command: what the embedder prepared on it.
 #[derive(Debug, Clone)]
 pub struct PreparedSsh {
     /// The `heel` binary on the server, when it has one; a default-mode
     /// command needs it, an `unsafe` one does not.
     pub(crate) heel: Option<String>,
     pub(crate) tools: PreparedTools<PathBuf>,
+}
+
+impl PreparedSsh {
+    /// The preparation of a server whose `heel` is at the path `heel` on the
+    /// server, if it has one, and whose managed tools are `tools`.
+    #[must_use]
+    pub const fn new(heel: Option<String>, tools: PreparedTools<PathBuf>) -> Self {
+        Self { heel, tools }
+    }
 }
 
 /// One server of a registry's set and what its first use settled: whether

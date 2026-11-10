@@ -2,8 +2,8 @@
 //!
 //! Different terminal modes have different permission requirements:
 //! - `Sandboxed`: No approval needed; outbound network is available by
-//!   default, filtered per-domain via [`PermissionHandler::check_domain`]
-//!   and audited by higher layers
+//!   default, filtered per-domain by the sandbox's network lists and its
+//!   [`DomainApprover`](crate::DomainApprover) and audited by higher layers
 //! - `Unsafe`: Per-script approval required
 
 use std::future::Future;
@@ -106,14 +106,6 @@ pub enum PermissionRequest<'a> {
         /// Where the command runs.
         location: CommandLocation<'a>,
     },
-    /// A sandboxed command's connection to a network domain that is not
-    /// already allowed.
-    Domain {
-        /// The host being connected to.
-        domain: &'a str,
-        /// The port being connected to.
-        port: u16,
-    },
     /// The first command on an SSH server: whether commands may run there at
     /// all. Approving it lets the terminal connect and prepare the server:
     /// the managed tools in its cache directory and, when it has no `heel`,
@@ -175,11 +167,10 @@ pub trait PermissionHandler: Send + Sync {
     /// Decides `request` before the handler's own route is asked.
     ///
     /// The terminal calls this first for every command that needs a mode
-    /// beyond the sandbox and for every domain for which
-    /// [`domain_needs_approval`](Self::domain_needs_approval) holds. Only a
+    /// beyond the sandbox and for every first command on a server. Only a
     /// request this passes reaches [`will_wait_for_approval`](Self::will_wait_for_approval)
-    /// and [`check`](Self::check) or [`check_domain`](Self::check_domain), so
-    /// a request decided here never reports waiting on anyone.
+    /// and [`check`](Self::check), so a request decided here never reports
+    /// waiting on anyone.
     ///
     /// The default passes every request.
     fn review(&self, request: &PermissionRequest<'_>) -> impl Future<Output = Review> + Send {
@@ -226,65 +217,6 @@ pub trait PermissionHandler: Send + Sync {
     ) -> impl Future<Output = bool> + Send {
         let _ = (server, role);
         async { false }
-    }
-
-    /// Checks if a network domain is allowed.
-    ///
-    /// Called for each network connection attempt in `Sandboxed` mode.
-    /// The implementation may prompt the user, check against a whitelist, etc.
-    ///
-    /// Default implementation denies all domains (fail-safe).
-    fn check_domain(&self, domain: &str, port: u16) -> impl Future<Output = bool> + Send {
-        let _ = (domain, port);
-        async { false }
-    }
-
-    /// Whether [`check_domain`](Self::check_domain) would have to ask
-    /// someone about this domain, as opposed to deciding it silently (a
-    /// default allow-list, a domain already approved, a fixed policy).
-    ///
-    /// Only such a domain is put to [`review`](Self::review). The default
-    /// is `false`.
-    fn domain_needs_approval(&self, domain: &str, port: u16) -> impl Future<Output = bool> + Send {
-        let _ = (domain, port);
-        async { false }
-    }
-
-    /// Records that `domain` was approved by a reviewer, the way the handler
-    /// records a domain its user approved, so that
-    /// [`domain_needs_approval`](Self::domain_needs_approval) no longer holds
-    /// for it. A handler whose `domain_needs_approval` can hold implements
-    /// this; the default does nothing.
-    fn remember_domain(&self, domain: &str, port: u16) -> impl Future<Output = ()> + Send {
-        let _ = (domain, port);
-        async {}
-    }
-
-    /// The decision for a connection to `domain`: the review step first, for
-    /// a domain that needs approval, then [`check_domain`](Self::check_domain).
-    ///
-    /// The terminal's network policy calls this. A handler wrapping another
-    /// forwards the individual methods and leaves this one provided.
-    fn authorize_domain(&self, domain: &str, port: u16) -> impl Future<Output = bool> + Send {
-        async move {
-            if self.domain_needs_approval(domain, port).await {
-                match self
-                    .review(&PermissionRequest::Domain { domain, port })
-                    .await
-                {
-                    Review::Approved => {
-                        self.remember_domain(domain, port).await;
-                        return true;
-                    }
-                    Review::Denied(reason) => {
-                        tracing::info!(domain, port, %reason, "network domain denied by review");
-                        return false;
-                    }
-                    Review::Passed => {}
-                }
-            }
-            self.check_domain(domain, port).await
-        }
     }
 }
 
@@ -337,7 +269,7 @@ impl PermissionHandler for DenyUnsafe {
     }
 }
 
-/// A no-op permission handler that allows every execution mode and domain.
+/// A no-op permission handler that allows every execution mode and location.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopPermissionHandler;
 
@@ -360,10 +292,6 @@ impl PermissionHandler for NoopPermissionHandler {
         _location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(false)
-    }
-
-    fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
-        std::future::ready(true)
     }
 
     fn check_location(
@@ -439,15 +367,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deny_unsafe_check_domain() {
-        let handler = DenyUnsafe;
-
-        // Default implementation denies all domains
-        assert!(!handler.check_domain("example.com", 443).await);
-        assert!(!handler.check_domain("api.github.com", 80).await);
-    }
-
-    #[tokio::test]
     async fn only_the_noop_handler_allows_a_location_by_default() {
         let server = SshServer {
             name: "build".to_string(),
@@ -505,14 +424,5 @@ mod tests {
             serde_json::to_value(request(CommandLocation::Ssh { server: "build" })).unwrap()["location"],
             serde_json::json!({ "kind": "ssh", "server": "build" })
         );
-    }
-
-    #[tokio::test]
-    async fn test_noop_permission_handler_check_domain() {
-        let handler = NoopPermissionHandler;
-
-        // NoopPermissionHandler allows all domains
-        assert!(handler.check_domain("example.com", 443).await);
-        assert!(handler.check_domain("malicious.com", 80).await);
     }
 }

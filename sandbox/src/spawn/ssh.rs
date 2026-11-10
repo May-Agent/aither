@@ -1,0 +1,258 @@
+//! The SSH backend: a process on a server, under the server's own `heel`.
+
+use std::borrow::Cow;
+use std::path::PathBuf;
+use std::process::Stdio as ProcessStdio;
+use std::sync::Arc;
+
+use askama::Template;
+use executor_core::Executor;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::child::{ChildExit, KillHandle, SandboxedChild, Streams, exit_watch};
+use super::{EnvSource, Pipe, Sandbox, SpawnError, SpawnSpec};
+use crate::process_tree::{KillTreeError, kill_process_tree};
+use crate::ssh::{PreparedSsh, SshClient};
+use crate::terminal::{TerminalError, inject_env_exports, shell_launch};
+use crate::{PreparedTools, SshServer, ToolRuntimeError};
+
+#[derive(Template)]
+#[template(path = "ssh_tool_execution.sh", escape = "none")]
+struct SshToolExecutionTemplate<'a> {
+    binary: Cow<'a, str>,
+    tools_dir: Cow<'a, str>,
+    /// Read, write and execute access to the shared `uv` directory, quoted.
+    uv_grant: Option<String>,
+    program: Cow<'a, str>,
+    arguments: String,
+}
+
+/// The command line that runs `script` on a server: the managed shell under
+/// the server's `heel` when `heel` is given, directly otherwise.
+pub fn remote_command(
+    tools: &PreparedTools<PathBuf>,
+    heel: Option<&str>,
+    script: &str,
+) -> Result<String, TerminalError> {
+    let script = tools.wrap_script(script)?;
+    let (program, args) = shell_launch(&tools.shell()?, &script);
+    let Some(binary) = heel else {
+        return Ok(shell_words::join(
+            std::iter::once(program.as_str()).chain(args.iter().map(String::as_str)),
+        ));
+    };
+    let directory = tools.script_bin_dir()?;
+    let uv_grant = tools
+        .uv_dir()
+        .map(|dir| {
+            let dir = dir
+                .to_str()
+                .ok_or_else(|| ToolRuntimeError::InvalidCache(dir.clone()))?;
+            Ok::<_, ToolRuntimeError>(shell_words::quote(&format!("{dir}=rwx")).into_owned())
+        })
+        .transpose()?;
+    Ok(SshToolExecutionTemplate {
+        binary: shell_words::quote(binary),
+        tools_dir: shell_words::quote(directory),
+        uv_grant,
+        program: shell_words::quote(&program),
+        arguments: shell_words::join(&args),
+    }
+    .render()
+    .map_err(ToolRuntimeError::from)?)
+}
+
+#[derive(Template)]
+#[template(path = "ssh_job_start.sh", escape = "none")]
+struct SshJobStartTemplate<'a> {
+    /// The file the job's process group id is written to, quoted.
+    pidfile: &'a str,
+    command: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "ssh_job_kill.sh", escape = "none")]
+struct SshJobKillTemplate<'a> {
+    pidfile: &'a str,
+}
+
+/// A job running on a server. Ending the local `ssh` client does not end the
+/// remote command, so the job records its process group on the server and
+/// [`kill`](Self::kill) signals the group there.
+#[derive(Debug)]
+pub struct RemoteJob {
+    client: SshClient,
+    server: SshServer,
+    /// The pid file on the server, quoted.
+    pidfile: String,
+    /// The local `ssh` process.
+    local: u32,
+}
+
+impl RemoteJob {
+    /// Ends the remote process group, then the local client.
+    pub(crate) async fn kill(&self) -> Result<(), KillTreeError> {
+        let script = SshJobKillTemplate {
+            pidfile: &self.pidfile,
+        }
+        .render()
+        .map_err(|error| KillTreeError::Signal(std::io::Error::other(error)))?;
+        let output = async_process::Command::from(self.client.command(&self.server, &script))
+            .stdin(ProcessStdio::null())
+            .output()
+            .await
+            .map_err(KillTreeError::Signal)?;
+        if !output.status.success() {
+            return Err(KillTreeError::Signal(std::io::Error::other(format!(
+                "ending the job on {} failed ({}): {}",
+                self.server.name,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))));
+        }
+        let local = kill_process_tree(self.local).await;
+        // The client ends once its remote command did.
+        #[cfg(unix)]
+        if matches!(&local, Err(KillTreeError::Signal(error)) if error.raw_os_error() == Some(libc::ESRCH))
+        {
+            return Ok(());
+        }
+        local
+    }
+}
+
+const fn process_stdio(pipe: Pipe) -> fn() -> ProcessStdio {
+    match pipe {
+        Pipe::Null => ProcessStdio::null,
+        Pipe::Piped => ProcessStdio::piped,
+    }
+}
+
+impl Sandbox {
+    pub(super) fn spawn_ssh(
+        &self,
+        server: &SshServer,
+        prepared: &PreparedSsh,
+        spec: SpawnSpec,
+    ) -> Result<SandboxedChild, SpawnError> {
+        let setup = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
+        let SpawnSpec {
+            program,
+            args,
+            env,
+            cwd,
+            stdio,
+            extra_grants: _,
+            ipc: _,
+        } = spec;
+        if cwd.is_some() {
+            return Err(SpawnError::Setup(
+                "an SSH process starts in the server's login directory: a host path names nothing there"
+                    .into(),
+            ));
+        }
+        // A confined process runs under the server's `heel`; one that is not
+        // confined runs directly.
+        let heel = if self.inner.unconfined {
+            None
+        } else {
+            Some(prepared.heel.as_deref().ok_or_else(|| {
+                SpawnError::Setup(format!(
+                    "the server {} has no heel, so a process on it cannot be sandboxed",
+                    server.name
+                ))
+            })?)
+        };
+
+        // Only what the spec names travels: the sandbox's own environment and
+        // its source describe this machine.
+        let script = shell_words::join(std::iter::once(&program).chain(&args));
+        let spec_env: Arc<dyn EnvSource> = Arc::new(env);
+        let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| setup(&e))?;
+        let remote = remote_command(&prepared.tools, heel, &script).map_err(|e| setup(&e))?;
+        let pidfile = shell_words::quote(&format!(
+            "/tmp/aither-spawn-{}.pgid",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .into_owned();
+        let remote = SshJobStartTemplate {
+            pidfile: &pidfile,
+            command: &remote,
+        }
+        .render()
+        .map_err(|e| setup(&e))?;
+
+        let mut command = self.inner.ssh_client.command(server, &remote);
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        // The pipes are set on the async command: converting a std command
+        // resets them, and spawning would then inherit this process's stdio.
+        let mut child = async_process::Command::from(command)
+            .stdin(process_stdio(stdio.stdin)())
+            .stdout(process_stdio(stdio.stdout)())
+            .stderr(process_stdio(stdio.stderr)())
+            .spawn()
+            .map_err(|error| SpawnError::Start(error.to_string()))?;
+        let id = child.id();
+
+        let executor = &self.inner.executor;
+        let mut streams = Streams::default();
+        if let Some(mut stdin) = child.stdin.take() {
+            let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
+            streams.stdin = Some(tx);
+            executor
+                .spawn(async move {
+                    while let Ok(bytes) = rx.recv().await {
+                        if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+        }
+        if let Some(stdout) = child.stdout.take() {
+            let (tx, rx) = async_channel::unbounded();
+            streams.stdout = Some(rx);
+            executor.spawn(pump(stdout, tx)).detach();
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let (tx, rx) = async_channel::unbounded();
+            streams.stderr = Some(rx);
+            executor.spawn(pump(stderr, tx)).detach();
+        }
+
+        let (setter, watch) = exit_watch();
+        executor
+            .spawn(async move {
+                setter.finish(match child.status().await {
+                    Ok(status) => ChildExit::Exited(status),
+                    Err(error) => ChildExit::Failed(error.to_string()),
+                });
+            })
+            .detach();
+        Ok(SandboxedChild::new(
+            id,
+            streams,
+            KillHandle::Remote(RemoteJob {
+                client: self.inner.ssh_client.clone(),
+                server: server.clone(),
+                pidfile,
+                local: id,
+            }),
+            watch,
+        ))
+    }
+}
+
+/// Moves a pipe to a channel of chunks that closes at its end.
+async fn pump(
+    mut reader: impl futures_lite::AsyncRead + Unpin,
+    tx: async_channel::Sender<Vec<u8>>,
+) {
+    let mut buffer = vec![0_u8; 8192];
+    while let Ok(count) = reader.read(&mut buffer).await {
+        if count == 0 || tx.send(buffer[..count].to_vec()).await.is_err() {
+            break;
+        }
+    }
+}
