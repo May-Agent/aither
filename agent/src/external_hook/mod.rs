@@ -28,7 +28,10 @@ pub use lifecycle::{
     SessionStart, Stop, SubagentEnd, SubagentStart, SubagentStop, UserMessage,
 };
 pub use live::{HookKind, HookWarning, HooksConfig, HooksConfigError, LiveHooks, LiveHooksError};
-pub use reviewer::{ReviewAnswer, ReviewRequest, ReviewedPermission, ReviewerConfig};
+pub use reviewer::{
+    DomainSubject, ReviewAnswer, ReviewRequest, ReviewSubject, ReviewedDomains, ReviewedPermission,
+    ReviewerConfig,
+};
 pub use runner::{HookCommand, HookRole, HookRunError, HookRunner};
 pub use script::HookCheckError;
 

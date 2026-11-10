@@ -6,7 +6,7 @@ use aither_sandbox::permission::{
     CommandLocation, LocationApproval, PermissionError, PermissionHandler, PermissionRequest,
     Review, TerminalMode,
 };
-use aither_sandbox::{CommandRole, ScriptLanguage, SshServer};
+use aither_sandbox::{CommandRole, DomainApprover, DomainRequest, ScriptLanguage, SshServer};
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::ExternalHooks;
@@ -23,6 +23,30 @@ pub struct ReviewerConfig {
     pub command: HookCommand,
 }
 
+/// A network domain a sandbox's lists leave open, as a reviewer reads it.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DomainSubject<'a> {
+    /// A connection to `domain` on `port`.
+    Domain {
+        /// The host being connected to.
+        domain: &'a str,
+        /// The port being connected to.
+        port: u16,
+    },
+}
+
+/// What a reviewer is asked about: a permission beyond the sandbox, or a
+/// network domain the sandbox's lists leave open.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(untagged)]
+pub enum ReviewSubject<'a> {
+    /// A command escalation or an SSH location.
+    Permission(PermissionRequest<'a>),
+    /// A network domain.
+    Domain(DomainSubject<'a>),
+}
+
 /// What a reviewer reads on stdin.
 ///
 /// The role of the agent that asked, and the request, which is either a command escalation (`"kind":"command"` with
@@ -35,7 +59,7 @@ pub struct ReviewRequest<'a> {
     pub role: HookRole,
     /// What is being asked for.
     #[serde(flatten)]
-    pub request: PermissionRequest<'a>,
+    pub request: ReviewSubject<'a>,
 }
 
 /// What a reviewer prints on stdout. Printing nothing is a pass. Any field
@@ -63,7 +87,7 @@ impl ExternalHooks {
     /// when no working version is left the user is asked to fix it. Where the
     /// user cannot be asked the failure is reported through `tracing` and
     /// counts as a pass, so a failure never grants anything.
-    async fn review(&self, request: PermissionRequest<'_>) -> Review {
+    async fn review(&self, request: ReviewSubject<'_>) -> Review {
         let request = ReviewRequest {
             role: self.role(),
             request,
@@ -109,9 +133,8 @@ impl ExternalHooks {
 /// reviewer to approve grants the request without reaching `inner`, the first
 /// to deny refuses it, and a request every reviewer passes goes to `inner`
 /// unchanged, including its wait query. A command that needs a mode beyond
-/// the sandbox and a network domain that `inner` would have to ask about are
-/// both reviewed; a domain `inner` allows silently is not, and a domain a
-/// reviewer approves is remembered by `inner` as if its user had approved it.
+/// the sandbox is reviewed; network domains are reviewed by
+/// [`ReviewedDomains`].
 /// A subagent's terminal gets [`for_subagent`](PermissionHandler::for_subagent),
 /// the same reviewers labelled with the subagent role, over the same `inner`
 /// route.
@@ -139,7 +162,7 @@ impl<P> ReviewedPermission<P> {
 impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P> {
     /// Runs the chain; the first reviewer to decide ends it.
     async fn review(&self, request: &PermissionRequest<'_>) -> Review {
-        self.hooks.review(*request).await
+        self.hooks.review(ReviewSubject::Permission(*request)).await
     }
 
     async fn check(
@@ -170,18 +193,6 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         })
     }
 
-    fn check_domain(&self, domain: &str, port: u16) -> impl Future<Output = bool> + Send {
-        self.inner.check_domain(domain, port)
-    }
-
-    fn domain_needs_approval(&self, domain: &str, port: u16) -> impl Future<Output = bool> + Send {
-        self.inner.domain_needs_approval(domain, port)
-    }
-
-    fn remember_domain(&self, domain: &str, port: u16) -> impl Future<Output = ()> + Send {
-        self.inner.remember_domain(domain, port)
-    }
-
     fn check_location(
         &self,
         server: &SshServer,
@@ -196,5 +207,53 @@ impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P>
         role: CommandRole,
     ) -> impl Future<Output = bool> + Send {
         self.inner.will_wait_for_location(server, role)
+    }
+}
+
+/// A [`DomainApprover`] with the host's reviewers in front of `inner`.
+///
+/// The first reviewer to approve a domain grants it without reaching
+/// `inner`, the first to deny refuses it, and a domain every reviewer passes
+/// goes to `inner`. Only domains the sandbox's network lists leave open reach
+/// it, so a listed host is never reviewed. Whether an approval is remembered
+/// is `inner`'s policy; a reviewer's approval is not passed to it.
+#[derive(Debug, Clone)]
+pub struct ReviewedDomains<A> {
+    inner: A,
+    hooks: ExternalHooks,
+}
+
+impl<A> ReviewedDomains<A> {
+    /// The main agent's approver: the reviewers of `hooks` in front of
+    /// `inner`.
+    #[must_use]
+    pub const fn new(inner: A, hooks: ExternalHooks) -> Self {
+        Self { inner, hooks }
+    }
+}
+
+impl<A: Clone> ReviewedDomains<A> {
+    /// The same approver for a subagent, its reviewers labelled with the
+    /// subagent role.
+    #[must_use]
+    pub fn for_subagent(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            hooks: self.hooks.for_subagent(),
+        }
+    }
+}
+
+impl<A: DomainApprover> DomainApprover for ReviewedDomains<A> {
+    async fn approve(&self, request: &DomainRequest) -> bool {
+        let subject = ReviewSubject::Domain(DomainSubject::Domain {
+            domain: &request.host,
+            port: request.port,
+        });
+        match self.hooks.review(subject).await {
+            Review::Approved => true,
+            Review::Denied(_) => false,
+            Review::Passed => self.inner.approve(request).await,
+        }
     }
 }

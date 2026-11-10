@@ -135,7 +135,7 @@ pub use error::AgentError;
 pub use event::{AgentEvent, CompactionOutcome, TimedEvent};
 pub use external_hook::{
     ExternalHooks, HookTestTool, HooksConfig, InjectedContext, LifecycleHookConfig, LiveHooks,
-    ReviewedPermission, ReviewerConfig,
+    ReviewedDomains, ReviewedPermission, ReviewerConfig,
 };
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{

@@ -19,7 +19,7 @@ use super::lifecycle::{
     SessionStart, Stop, SubagentStart, SubagentStop, UserMessage,
 };
 use super::live::{Entry, HookConfig, HookKind, HookSet, LiveHooks};
-use super::reviewer::{ReviewAnswer, ReviewRequest};
+use super::reviewer::{DomainSubject, ReviewAnswer, ReviewRequest, ReviewSubject};
 use super::runner::{HookCommand, HookRole, HookRunError, HookRunner};
 
 /// How many samples run at once.
@@ -368,12 +368,12 @@ async fn run_sample(
                 runner,
                 command,
                 role,
-                PermissionRequest::Command {
+                ReviewSubject::Permission(PermissionRequest::Command {
                     mode: TerminalMode::Unsafe,
                     script,
                     language: ScriptLanguage::Shell,
                     location: CommandLocation::Local,
-                },
+                }),
             )
             .await
         }
@@ -382,10 +382,10 @@ async fn run_sample(
                 runner,
                 command,
                 role,
-                PermissionRequest::Domain {
+                ReviewSubject::Domain(DomainSubject::Domain {
                     domain,
                     port: *port,
-                },
+                }),
             )
             .await
         }
@@ -415,7 +415,7 @@ async fn review(
     runner: &HookRunner,
     command: &HookCommand,
     role: HookRole,
-    request: PermissionRequest<'_>,
+    request: ReviewSubject<'_>,
 ) -> Observation {
     observe(
         runner

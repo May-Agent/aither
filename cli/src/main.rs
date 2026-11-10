@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
-    ScriptLanguage, ToolRegistryBuilder, cli_to_json,
+    DomainApprover, DomainRequest, ScriptLanguage, ToolRegistryBuilder, cli_to_json,
     permission::{CommandLocation, PermissionError, PermissionHandler, TerminalMode},
     schema_to_help,
 };
@@ -96,19 +96,13 @@ const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
 /// Interactive permission handler that prompts the user.
 ///
 /// - Sandboxed: always allow (no prompt)
-/// - Network: ask once, then auto-approve all domains
 /// - Unsafe: always ask for each script
 #[derive(Debug, Default)]
-struct InteractivePermissionHandler {
-    /// Cache of approved domains outside the default whitelist.
-    approved_domains: ArcSwap<HashSet<String>>,
-}
+struct InteractivePermissionHandler;
 
 impl InteractivePermissionHandler {
-    fn new() -> Self {
-        Self {
-            approved_domains: ArcSwap::from_pointee(HashSet::new()),
-        }
+    const fn new() -> Self {
+        Self
     }
 }
 
@@ -147,14 +141,6 @@ impl PermissionHandler for InteractivePermissionHandler {
         })
     }
 
-    fn check_domain(
-        &self,
-        domain: &str,
-        _port: u16,
-    ) -> impl std::future::Future<Output = bool> + Send {
-        std::future::ready(self.prompt_for_domain(domain))
-    }
-
     fn will_wait_for_approval(
         &self,
         _mode: TerminalMode,
@@ -164,26 +150,23 @@ impl PermissionHandler for InteractivePermissionHandler {
     ) -> impl std::future::Future<Output = bool> + Send {
         std::future::ready(true)
     }
+}
 
-    fn domain_needs_approval(
-        &self,
-        domain: &str,
-        _port: u16,
-    ) -> impl std::future::Future<Output = bool> + Send {
-        std::future::ready(!self.domain_is_allowed(domain))
-    }
+/// Approves the domains the network lists leave open by asking the user once
+/// per domain outside the default whitelist.
+#[derive(Debug, Clone, Default)]
+struct InteractiveDomains {
+    /// Cache of approved domains outside the default whitelist.
+    approved_domains: Arc<ArcSwap<HashSet<String>>>,
+}
 
-    fn remember_domain(
-        &self,
-        domain: &str,
-        _port: u16,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        self.approve_domain(domain);
-        std::future::ready(())
+impl DomainApprover for InteractiveDomains {
+    fn approve(&self, request: &DomainRequest) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(self.prompt_for_domain(&request.host))
     }
 }
 
-impl InteractivePermissionHandler {
+impl InteractiveDomains {
     /// Prompts once per new domain, remembering the answer.
     fn prompt_for_domain(&self, domain: &str) -> bool {
         if self.domain_is_allowed(domain) {
@@ -473,7 +456,8 @@ async fn acp_session_agent(
     let terminal_tool =
         aither_agent::sandbox::TerminalTool::new_in(&setup.cwd, permission_handler, TokioGlobal)
             .await
-            .map_err(|err| to_acp(err.into()))?;
+            .map_err(|err| to_acp(err.into()))?
+            .with_domain_approver(InteractiveDomains::default());
 
     let agent = setup
         .mcp
@@ -500,7 +484,7 @@ async fn build_agent(
     // four random words; the ids the model reads are leased words)
     // Uses interactive permission handler:
     // - Sandboxed: always allow (no prompt)
-    // - Network: ask once, then remember
+    // - Network (InteractiveDomains): ask once per domain, then remember
     // - Unsafe: always ask for each script
     let workdir_parent = std::env::temp_dir().join("aither");
     let permission_handler = InteractivePermissionHandler::new();
@@ -509,7 +493,8 @@ async fn build_agent(
         permission_handler,
         TokioGlobal,
     )
-    .await?;
+    .await?
+    .with_domain_approver(InteractiveDomains::default());
 
     // Create terminal-first agent builder
     // All tools become IPC commands accessible via terminal

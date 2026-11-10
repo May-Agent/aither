@@ -642,6 +642,7 @@ pub mod reviewers {
         CommandLocation, PermissionError, PermissionHandler, PermissionRequest, Review,
         TerminalMode,
     };
+    use aither_sandbox::{DomainApprover, DomainRequest};
 
     use super::*;
 
@@ -659,13 +660,21 @@ printf '%s' "$2"
     pub struct Route {
         pub asked: Arc<Mutex<Vec<(TerminalMode, String)>>>,
         pub allow: bool,
-        /// The domains `check_domain` was asked about.
-        pub domains_asked: Arc<Mutex<Vec<String>>>,
-        /// Whether `check_domain` approves the domains it is asked about.
-        pub allow_domain: bool,
-        /// Domains that need no approval: the default allow-list and the
-        /// domains already approved, like a user-facing handler keeps.
-        pub allowed_domains: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// The existing domain route: records the domains that reach it and
+    /// answers `allow`.
+    #[derive(Clone, Default)]
+    pub struct Domains {
+        pub asked: Arc<Mutex<Vec<String>>>,
+        pub allow: bool,
+    }
+
+    impl DomainApprover for Domains {
+        fn approve(&self, request: &DomainRequest) -> impl Future<Output = bool> + Send {
+            self.asked.lock().unwrap().push(request.host.clone());
+            std::future::ready(self.allow)
+        }
     }
 
     pub const COMMAND: PermissionRequest<'static> = PermissionRequest::Command {
@@ -673,11 +682,6 @@ printf '%s' "$2"
         script: "make install",
         language: ScriptLanguage::Shell,
         location: CommandLocation::Local,
-    };
-
-    pub const DOMAIN: PermissionRequest<'static> = PermissionRequest::Domain {
-        domain: "registry.example",
-        port: 443,
     };
 
     impl PermissionHandler for Route {
@@ -690,42 +694,6 @@ printf '%s' "$2"
         ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
             self.asked.lock().unwrap().push((mode, script.to_string()));
             std::future::ready(Ok(self.allow))
-        }
-
-        fn check_domain(&self, domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
-            self.domains_asked.lock().unwrap().push(domain.to_string());
-            let approved = {
-                let mut allowed = self.allowed_domains.lock().unwrap();
-                let approved = allowed.iter().any(|d| d == domain);
-                if self.allow_domain && !approved {
-                    allowed.push(domain.to_string());
-                }
-                approved
-            };
-            std::future::ready(self.allow_domain || approved)
-        }
-
-        fn domain_needs_approval(
-            &self,
-            domain: &str,
-            _port: u16,
-        ) -> impl Future<Output = bool> + Send {
-            std::future::ready(
-                !self
-                    .allowed_domains
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|d| d == domain),
-            )
-        }
-
-        fn remember_domain(&self, domain: &str, _port: u16) -> impl Future<Output = ()> + Send {
-            self.allowed_domains
-                .lock()
-                .unwrap()
-                .push(domain.to_string());
-            std::future::ready(())
         }
     }
 
@@ -914,20 +882,46 @@ printf '%s' "$2"
         assert!(!log.exists());
     }
 
+    fn request(host: &str) -> DomainRequest {
+        DomainRequest {
+            host: host.into(),
+            port: 443,
+            agent: None,
+        }
+    }
+
+    async fn domains(
+        chain: Vec<ReviewerConfig>,
+        allow: bool,
+    ) -> (ReviewedDomains<Domains>, Domains) {
+        let tools = crate::test_support::prepared_fixture().await;
+        let route = Domains {
+            allow,
+            ..Domains::default()
+        };
+        (
+            ReviewedDomains::new(route.clone(), reviewer_hooks(chain, &tools).await),
+            route,
+        )
+    }
+
     #[tokio::test]
-    async fn a_reviewer_approves_a_domain_and_it_is_not_reviewed_again() {
+    async fn a_reviewer_approves_a_domain_without_reaching_the_route() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let (handler, route) = handler(vec![reviewer(
-            dir.path(),
-            "net",
-            &log,
-            r#"{"decision":"approve"}"#,
-        )])
+        let (approver, route) = domains(
+            vec![reviewer(
+                dir.path(),
+                "net",
+                &log,
+                r#"{"decision":"approve"}"#,
+            )],
+            false,
+        )
         .await;
-        assert!(bounded(handler.authorize_domain("registry.example", 443)).await);
+        assert!(bounded(approver.approve(&request("registry.example"))).await);
         assert!(
-            route.domains_asked.lock().unwrap().is_empty(),
+            route.asked.lock().unwrap().is_empty(),
             "the user's route was not asked"
         );
         assert_eq!(
@@ -936,64 +930,44 @@ printf '%s' "$2"
                 "role": "main", "kind": "domain", "domain": "registry.example", "port": 443
             })]
         );
-        // The next connection to it is remembered: no reviewer runs.
-        assert!(bounded(handler.authorize_domain("registry.example", 443)).await);
-        assert_eq!(logged(&log).len(), 1);
-        // Another domain is reviewed.
-        assert!(bounded(handler.authorize_domain("other.example", 443)).await);
-        assert_eq!(logged(&log).len(), 2);
     }
 
     #[tokio::test]
     async fn a_reviewer_denies_a_domain_and_it_is_reviewed_again() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let (handler, route) = handler(vec![reviewer(
-            dir.path(),
-            "net",
-            &log,
-            r#"{"decision":"deny","reason":"unknown host"}"#,
-        )])
+        let (approver, route) = domains(
+            vec![reviewer(
+                dir.path(),
+                "net",
+                &log,
+                r#"{"decision":"deny","reason":"unknown host"}"#,
+            )],
+            true,
+        )
         .await;
-        let Review::Denied(reason) = bounded(handler.review(&DOMAIN)).await else {
-            panic!("the reviewer denies");
-        };
-        assert!(reason.contains("unknown host"));
-        assert!(!bounded(handler.authorize_domain("registry.example", 443)).await);
-        assert!(!bounded(handler.authorize_domain("registry.example", 443)).await);
-        assert!(route.domains_asked.lock().unwrap().is_empty());
-        assert_eq!(logged(&log).len(), 3, "a denial is not remembered");
+        assert!(!bounded(approver.approve(&request("registry.example"))).await);
+        assert!(!bounded(approver.approve(&request("registry.example"))).await);
+        assert!(route.asked.lock().unwrap().is_empty());
+        assert_eq!(logged(&log).len(), 2, "a denial is not remembered");
     }
 
     #[tokio::test]
-    async fn an_allowed_domain_and_a_passed_domain_follow_the_existing_route() {
+    async fn a_passed_domain_follows_the_existing_route() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let route = Route {
-            allow_domain: true,
-            allowed_domains: Arc::new(Mutex::new(vec!["allowed.example".into()])),
-            ..Route::default()
-        };
-        let tools = crate::test_support::prepared_fixture().await;
-        let handler = ReviewedPermission::new(
-            route.clone(),
-            reviewer_hooks(
+        for allow in [true, false] {
+            let (approver, route) = domains(
                 vec![reviewer(dir.path(), "net", &log, r#"{"decision":"pass"}"#)],
-                &tools,
+                allow,
             )
-            .await,
-        );
-        // Allowed without asking anyone: no reviewer, and the route decides.
-        assert!(bounded(handler.authorize_domain("allowed.example", 443)).await);
-        assert!(!log.exists());
-        // Passed by every reviewer: the existing route is asked, once.
-        assert!(bounded(handler.authorize_domain("registry.example", 443)).await);
-        assert_eq!(logged(&log).len(), 1);
-        assert_eq!(
-            *route.domains_asked.lock().unwrap(),
-            ["allowed.example", "registry.example"]
-        );
-        assert!(bounded(handler.authorize_domain("registry.example", 443)).await);
-        assert_eq!(logged(&log).len(), 1, "the user's approval is remembered");
+            .await;
+            assert_eq!(
+                bounded(approver.approve(&request("registry.example"))).await,
+                allow
+            );
+            assert_eq!(*route.asked.lock().unwrap(), ["registry.example"]);
+        }
+        assert_eq!(logged(&log).len(), 2);
     }
 }
