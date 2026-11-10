@@ -12,11 +12,8 @@ keywords = ["ai", "agent", "llm", "planning"]
 categories = ["api-bindings"]
 
 [dependencies]
-dunce = { version = "1.0.5", default-features = false }
 aither-core.workspace = true
 aither-attachments.workspace = true
-aither-sandbox.workspace = true
-executor-core = "0.7"
 anyhow = "1.0.104"
 askama = "0.16"
 schemars = "1.2.3"
@@ -24,19 +21,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2"
 sync_wrapper = "1"
 serde_json = "1.0"
-basic-toml = { version = "0.1.10", default-features = false }
 indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
 async-fs = "2"
 async-channel = "2"
 async-io = "2"
-async-process = "2"
-arc-swap = "1"
-aho-corasick = { version = "1.1.5", default-features = false, features = ["std", "perf-literal"] }
-regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }
-blocking = { version = "1.7.0", default-features = false }
-notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
-event-listener = "5"
 aither-websearch = { workspace = true, optional = true }
 aither-webfetch = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
@@ -53,43 +42,35 @@ similar = "3"
 uuid = { version = "1", features = ["v4"] }
 num-traits = "0.2"
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
-whatlang = { version = "0.18", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["std", "time"] }
-# `statvfs` for the free space of a volume; macOS also reads its memory
-# pressure and load average through it.
-libc = { version = "0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", default-features = false, features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Memory",
-    "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
 
 [dev-dependencies]
-hex = "0.4"
-aither-sandbox = { workspace = true, features = ["test-git", "test-heel", "test-ids"] }
+executor-core = "0.7"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
-url = "2.5.8"
-aither-openai.workspace = true
 # An in-process MCP server drives the command table through a real connection.
 aither-mcp = { workspace = true, default-features = false, features = ["client"] }
 
 [features]
 default = []
+# Serialize and deserialize the event types (`AgentEvent`, `TimedEvent` and
+# everything they carry), for an embedder that sends them across a process
+# boundary. `serde` itself is always a dependency: checkpoints need it.
+serde = ["aither-core/serde"]
 websearch = ["dep:aither-websearch"]
 webfetch = ["dep:aither-webfetch"]
 filesystem = ["dep:aither-fs"]
 command = ["dep:aither-command"]
 mcp = ["dep:aither-mcp"]
 skills = ["dep:aither-skills"]
-languages = ["dep:whatlang"]
-connectivity = ["dep:aither-connectivity", "aither-sandbox/connectivity"]
-full = ["websearch", "webfetch", "filesystem", "command", "mcp", "skills", "languages", "connectivity"]
+connectivity = ["dep:aither-connectivity"]
+full = ["websearch", "webfetch", "filesystem", "command", "mcp", "skills", "connectivity"]
 [lints]
 workspace = true

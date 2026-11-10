@@ -35,7 +35,7 @@ use crate::session::{AcpSession, Cancellation};
 ///
 /// let mut server = AcpServer::stdio("my-agent", "1.0.0", executor, |setup| async move {
 ///     // Create the agent for this session, with the MCP servers it was opened with
-///     let mut builder = Agent::builder(llm).system_prompt("You are helpful");
+///     let mut builder = Agent::builder(llm).instruction("You are helpful");
 ///     for connection in setup.mcp {
 ///         builder = builder.mcp(connection);
 ///     }
@@ -75,10 +75,8 @@ pub struct SessionSetup {
 }
 
 /// Builds the agent backing a new session.
-pub type AgentFactory<LLM> = Box<
-    dyn Fn(SessionSetup) -> Pin<Box<dyn Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send>>
-        + Send,
->;
+pub type AgentFactory<LLM> =
+    Box<dyn Fn(SessionSetup) -> Pin<Box<dyn Future<Output = Result<Agent<LLM>>> + Send>> + Send>;
 
 impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> std::fmt::Debug
     for AcpServer<T, LLM>
@@ -114,7 +112,7 @@ impl<LLM: LanguageModel + 'static> AcpServer<StdioTransport, LLM> {
     ) -> Self
     where
         F: Fn(SessionSetup) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send + 'static,
+        Fut: Future<Output = Result<Agent<LLM>>> + Send + 'static,
     {
         Self::new(StdioTransport::new(), name, version, executor, make_agent)
     }
@@ -134,7 +132,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel + 'static> AcpServer<T, LLM> 
     ) -> Self
     where
         F: Fn(SessionSetup) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send + 'static,
+        Fut: Future<Output = Result<Agent<LLM>>> + Send + 'static,
     {
         Self {
             transport,

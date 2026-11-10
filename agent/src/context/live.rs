@@ -1,7 +1,7 @@
 //! Prefix content that changes while a session runs.
 //!
 //! Some system blocks describe things that change mid-session: a repository's
-//! `AGENTS.md`, memory, the table of commands `terminal` runs. Rewriting such
+//! `AGENTS.md`, memory, a table of the embedder's commands. Rewriting such
 //! a block at once would invalidate the provider's cached prefix, and leaving
 //! it would leave the model believing the old version. Live content takes the
 //! third way, the same for every such block:
@@ -34,9 +34,6 @@ pub struct LiveContent {
 }
 
 impl LiveContent {
-    /// The table of the CLI commands `terminal` runs.
-    pub const COMMANDS: Self = Self::new("The table of terminal commands", "commands_diff");
-
     /// Live content the alert calls `subject`, which opens its first
     /// sentence ("The launch directory's AGENTS.md files"), and whose diff it
     /// wraps in the tag `tag` (`agents_md_diff`).

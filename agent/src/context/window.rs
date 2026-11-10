@@ -48,7 +48,6 @@ use aither_core::llm::{Message, Role, ToolCall};
 use super::compaction::{AttachmentCatalogEntry, AttachmentRef, Handoff};
 use super::live::{LiveContent, LiveUpdate};
 use super::source::{Block, LiveChange};
-use super::state::SeenStates;
 use super::system::{
     External, Instruction, Sourced, SourcedSlot, SystemLayout, SystemRegion, TaggedBlockTemplate,
     render_prefix,
@@ -175,11 +174,6 @@ pub struct Context {
     /// change is staged and announced instead of written into it.
     #[serde(default)]
     prefix_sent: bool,
-
-    /// What the model has seen of each state source's states. Reassembling
-    /// removes the state alerts that told it, and this with them.
-    #[serde(default, skip_serializing_if = "SeenStates::is_empty")]
-    seen_states: SeenStates,
 }
 
 impl Default for Context {
@@ -219,18 +213,7 @@ impl Context {
             items: Vec::new(),
             next_seq: 0,
             prefix_sent: false,
-            seen_states: SeenStates::default(),
         }
-    }
-
-    /// What the model has seen of each state source's states.
-    pub(crate) const fn seen_states(&self) -> &SeenStates {
-        &self.seen_states
-    }
-
-    /// Records what the model has seen of a state source's states.
-    pub(crate) fn set_seen_states(&mut self, id: &str, seen: serde_json::Value) {
-        self.seen_states.set(id, seen);
     }
 
     // ── System blocks (stable, cacheable prefix) ──────────────────────
@@ -366,13 +349,6 @@ impl Context {
         let alert = announce(&LiveChange::new(&change.before, &change.after));
         self.push_item(Message::system(alert.content()), ItemKind::Restated);
         Some(alert.len())
-    }
-
-    /// Appends a state alert: removed by the next reassembly whatever its
-    /// position, since the state source restates the current value after
-    /// it when that is not the normal one.
-    pub(crate) fn push_state_alert(&mut self, block: &Block) -> u64 {
-        self.push_item(Message::system(block.content()), ItemKind::Restated)
     }
 
     /// Returns the number of persistent system blocks, live source blocks
@@ -701,14 +677,12 @@ impl Context {
     /// Clears only the conversation, keeping system blocks and the handoff.
     pub fn clear_recent(&mut self) {
         self.items.clear();
-        self.seen_states.clear();
     }
 
     /// Clears all non-persistent context: the handoff and the conversation.
     pub fn clear_history(&mut self) {
         self.handoff = None;
         self.items.clear();
-        self.seen_states.clear();
     }
 
     /// Clears everything, including persistent system blocks.
@@ -733,7 +707,6 @@ impl Context {
             handoff: self.handoff.clone(),
             items: self.items.clone(),
             next_seq: self.next_seq,
-            seen_states: self.seen_states.clone(),
         }
     }
 
@@ -744,7 +717,6 @@ impl Context {
             .next_seq
             .max(checkpoint.items.last().map_or(0, |item| item.seq + 1));
         self.items = checkpoint.items;
-        self.seen_states = checkpoint.seen_states;
     }
 
     /// Restores runtime-managed state from another serialized context while
@@ -928,8 +900,6 @@ impl Context {
     /// only once it was delivered.
     pub fn reassemble_below(&mut self, fork_point: u64) -> ReassemblyReport {
         let mut report = ReassemblyReport::default();
-        // Every state alert goes below, and what the model saw with them.
-        self.seen_states.clear();
 
         for (applied, freed) in [
             self.instructions.apply_staged(),
@@ -1142,8 +1112,6 @@ pub struct ContextCheckpoint {
     items: Vec<ContextItem>,
     #[serde(default)]
     next_seq: u64,
-    #[serde(default, skip_serializing_if = "SeenStates::is_empty")]
-    seen_states: SeenStates,
 }
 
 impl ContextCheckpoint {
@@ -1155,7 +1123,6 @@ impl ContextCheckpoint {
             handoff,
             items,
             next_seq,
-            seen_states: SeenStates::default(),
         }
     }
 
@@ -1252,6 +1219,18 @@ mod tests {
     use super::*;
     use crate::context::system::{ExternalContent, ExternalSlot, InstructionSlot};
     use aither_core::llm::{Attachment, ToolCall};
+
+    /// A context whose layout holds the instruction slots the tests fill.
+    fn laid_out() -> Context {
+        Context::with_layout(SystemLayout::new(
+            [
+                InstructionSlot::BASE_SYSTEM,
+                InstructionSlot::PERSONA,
+                InstructionSlot::PERMISSIONS,
+            ],
+            [],
+        ))
+    }
 
     #[derive(Template)]
     #[template(path = "tagged_block.txt", escape = "none")]
@@ -1501,7 +1480,7 @@ mod tests {
 
     #[test]
     fn request_layout_puts_the_live_tail_last() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1523,7 +1502,7 @@ mod tests {
     /// message byte-identical, or the provider re-reads the entire prompt.
     #[test]
     fn appending_never_perturbs_the_cacheable_prefix() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1539,8 +1518,8 @@ mod tests {
         // change is appended, the block the prefix holds stays.
         assert_eq!(set_issues(&mut context, "#23 open"), None);
         assert!(set_issues(&mut context, "#23 closed").is_some());
-        // A state alert and an event are appended like any alert.
-        context.push_state_alert(&Block::new("memory", "memory is critically tight"));
+        // A block and an event are appended like any alert.
+        context.push_block_alert(&Block::new("memory", "memory is critically tight"));
         context.push_block_alert(&Block::new("job", "job 7 was killed"));
         context.push(Message::user("second"));
         let after = context.build_request(&[Block::new("tasks", "<tasks>v2</tasks>")]);
@@ -1575,7 +1554,7 @@ mod tests {
     /// before the handoff and the conversation.
     #[test]
     fn a_live_block_sits_between_the_system_prompt_and_the_handoff() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1859,7 +1838,7 @@ mod tests {
 
     #[test]
     fn checkpoint_round_trip_keeps_every_commit_time_and_the_request() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1877,7 +1856,7 @@ mod tests {
         let checkpoint: ContextCheckpoint =
             serde_json::from_str(&json).expect("deserialize checkpoint");
 
-        let mut restored = Context::new();
+        let mut restored = laid_out();
         restored
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -2330,23 +2309,6 @@ mod tests {
         assert_eq!(context.recent()[1].content(), answer);
     }
 
-    /// A state alert goes with any reassembly, before or after the fork,
-    /// since its source restates the current value after it.
-    #[test]
-    fn every_reassembly_removes_the_state_alerts() {
-        let mut context = Context::new();
-        context.push_state_alert(&Block::new("memory", "critical"));
-        context.mark_prefix_sent();
-        let fork_point = context.fork_point();
-        context.push_state_alert(&Block::new("memory", "warning"));
-        context.mark_prefix_sent();
-
-        let report = context.reassemble_below(fork_point);
-
-        assert_eq!(report.system_messages_pruned, 2);
-        assert_eq!(context.len_recent(), 0);
-    }
-
     /// An event no request has carried survives a reassembly and a
     /// compaction's apply, wherever it sits; once delivered it goes.
     #[test]
@@ -2413,7 +2375,7 @@ mod tests {
 
     #[test]
     fn checkpoint_round_trip_preserves_sequence_numbers() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "stable");
@@ -2422,7 +2384,7 @@ mod tests {
         context.push(Message::user("two"));
 
         let checkpoint = context.checkpoint();
-        let mut restored = Context::new();
+        let mut restored = laid_out();
         restored
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "stable");
@@ -2449,7 +2411,7 @@ mod tests {
 
     #[test]
     fn restore_runtime_state_preserves_system_blocks() {
-        let mut current = Context::new();
+        let mut current = laid_out();
         current
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "keep me");

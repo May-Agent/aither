@@ -1,35 +1,28 @@
 //! Composable providers of per-request context.
 //!
-//! Working documents, running background jobs and active skills all follow
-//! the same shape: read some live state, render it into the tail of the next
-//! request, and occasionally insist on something durable — a nag that a
-//! checklist has gone stale, or a refusal to let the run end with unchecked
-//! items. Hard-coding each of them into the agent loop made that loop the
-//! place every new kind of ambient context had to be threaded through.
-//! A [`ContextSource`] is that contract, so the loop knows only the trait and
-//! hosts register whatever else they need with
-//! [`AgentOptions::context_source`](crate::AgentOptions::context_source).
+//! A running job, an open checklist, a machine's load: each reads some live
+//! state, renders it into the next request, and occasionally insists on
+//! something durable. A [`ContextSource`] is that contract, so the loop knows
+//! only the trait and the embedder registers whatever it needs with
+//! [`AgentBuilder::context_source`](crate::AgentBuilder::context_source).
 //!
-//! A source declares how its content reaches the model by the trait it
-//! implements:
+//! A source returns [`ContextBlock`]s, each with a [`Placement`]:
 //!
-//! - a [`ContextSource`] renders into the *tail* of the request, never into
+//! - [`Placement::Tail`] renders into the *tail* of one request, never into
 //!   the middle of it, so content that changes on every single request is
 //!   the last thing the model reads and the cached prefix never moves;
-//! - a [`LiveSource`] is *live content*: it renders into the cacheable
-//!   prefix, after the system prompt and before the handoff, for large
-//!   content that rarely changes and would cost full input price on every
-//!   request in the tail. The agent keeps the version the model has seen. A
-//!   change to it never rewrites a prefix the provider may hold: it is
-//!   staged, announced once as the diff alert the source writes for it, and
-//!   folded in at the next reassembly or compaction, which drops the diffs,
-//!   exactly like a staged system block (see
-//!   [`Context::update_live`](crate::Context::update_live));
-//! - a [`StateSource`](super::StateSource) is *state*: keyed conditions with
-//!   a latest value, told to the model only when the value differs from the
-//!   one it last saw;
-//! - an [`EventSource`](super::EventSource) is *events*: each delivered
-//!   once, and never restated.
+//! - [`Placement::Stable`] appends to the conversation once and stays there,
+//!   part of the cached prefix from then on. State changes, events and
+//!   one-shot corrections are stable blocks, consumed when injected.
+//!
+//! A [`LiveSource`] is *live content*: it renders into the cacheable prefix,
+//! after the system prompt and before the handoff, for large content that
+//! rarely changes and would cost full input price on every request in the
+//! tail. The agent keeps the version the model has seen. A change to it never
+//! rewrites a prefix the provider may hold: it is staged, announced once as
+//! the diff alert the source writes for it, and folded in at the next
+//! reassembly or compaction, which drops the diffs, exactly like a staged
+//! system block (see [`Context::update_live`](crate::Context::update_live)).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -95,124 +88,190 @@ impl Block {
     }
 }
 
-/// Supplies live context to every request the agent sends.
+/// Where a [`ContextBlock`] goes in the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Placement {
+    /// Appended to the conversation once, where it stays: from the next
+    /// request on it is part of the cached prefix, which nothing rewrites
+    /// while the provider's cache is warm. This is the placement for a
+    /// one-shot alert, consumed when it is injected.
+    Stable,
+    /// Rendered into the tail of this request only, after everything cached,
+    /// so content that changes on every request never moves the prefix.
+    Tail,
+}
+
+/// A piece of context and where it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBlock {
+    block: Block,
+    placement: Placement,
+}
+
+impl ContextBlock {
+    /// A block appended to the conversation for good; see
+    /// [`Placement::Stable`].
+    #[must_use]
+    pub fn stable(tag: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::new(Block::new(tag, content), Placement::Stable)
+    }
+
+    /// A block rendered into this request's tail only; see
+    /// [`Placement::Tail`].
+    #[must_use]
+    pub fn tail(tag: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::new(Block::new(tag, content), Placement::Tail)
+    }
+
+    /// Places an existing block.
+    #[must_use]
+    pub const fn new(block: Block, placement: Placement) -> Self {
+        Self { block, placement }
+    }
+
+    /// The block.
+    #[must_use]
+    pub const fn block(&self) -> &Block {
+        &self.block
+    }
+
+    /// Where the block goes.
+    #[must_use]
+    pub const fn placement(&self) -> Placement {
+        self.placement
+    }
+}
+
+/// The point in the loop at which a [`ContextSource`] is asked for blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Moment {
+    /// A request is being assembled.
+    ///
+    /// `reassembled` is `true` when the window was rewritten since the
+    /// previous request (a cold-cache reassembly or an applied compaction):
+    /// every [`Placement::Stable`] block from before it is gone, and a source
+    /// that needs the model to still know something must say it again. The
+    /// first call of an agent is the start of the session.
+    Request {
+        /// Whether the window was rewritten since the previous request.
+        reassembled: bool,
+    },
+    /// A turn that executed tools ended.
+    ToolTurnEnd,
+    /// The model is about to end the run. Any [`Placement::Stable`] block
+    /// returned here is an objection: it forces another turn, such as to
+    /// refuse an early finish while a checklist has unchecked items.
+    FinalTurn,
+}
+
+/// Supplies context to the requests the agent sends.
 ///
-/// Implementations are polled at a request boundary, so they may read files
+/// Implementations are asked at a request boundary, so they may read files
 /// or query registries; they must not block.
 ///
 /// # Example
 ///
 /// ```
-/// use aither_agent::{Block, ContextSource};
+/// use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 ///
 /// struct Clock;
 ///
 /// impl ContextSource for Clock {
-///     async fn render(&self) -> Option<Block> {
-///         Some(Block::new("now", "2025-01-01T00:00:00Z"))
+///     fn id(&self) -> SourceId {
+///         SourceId::new("clock")
+///     }
+///
+///     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+///         self.peek(moment).await
+///     }
+///
+///     async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
+///         match moment {
+///             Moment::Request { .. } => vec![ContextBlock::tail("now", "2025-01-01T00:00:00Z")],
+///             _ => Vec::new(),
+///         }
 ///     }
 /// }
 /// ```
 pub trait ContextSource: Send + Sync + 'static {
-    /// Renders this source's contribution to the next request's tail.
-    ///
-    /// Returning `None` omits the source entirely — the right answer when
-    /// there is nothing to say, since an empty block still costs tokens and
-    /// still invites the model to reason about it.
-    ///
-    /// The default renders nothing, for a source that only raises durable
-    /// alerts.
-    fn render(&self) -> impl Future<Output = Option<Block>> + Send {
-        async { None }
-    }
+    /// Names the source in [`AgentEvent::ContextInjected`](crate::AgentEvent::ContextInjected).
+    fn id(&self) -> super::SourceId;
 
-    /// Reports the block that was actually sent.
+    /// The blocks this source contributes at `moment`.
     ///
-    /// Called once per request, after the tail has been assembled, which is
-    /// the only point at which a source can know what the model has seen and
-    /// therefore what counts as a change next time.
-    fn commit(&mut self, block: &Block) -> impl Future<Output = ()> + Send {
-        let _ = block;
+    /// An empty list is the right answer when there is nothing to say, since
+    /// an empty block still costs tokens and still invites the model to
+    /// reason about it. A [`Placement::Stable`] block is consumed by being
+    /// injected: the source does not return it again unless the window was
+    /// rewritten.
+    fn blocks(&mut self, moment: Moment) -> impl Future<Output = Vec<ContextBlock>> + Send;
+
+    /// The blocks [`blocks`](Self::blocks) would return now at `moment`,
+    /// without consuming any of them.
+    ///
+    /// A preview of the next request asks this instead of `blocks`, so that
+    /// it shows exactly what the request would carry while a one-shot block
+    /// is still waiting to be delivered by the request itself. It takes
+    /// `&self` because nothing may change.
+    fn peek(&self, moment: Moment) -> impl Future<Output = Vec<ContextBlock>> + Send;
+
+    /// Reports the [`Placement::Tail`] blocks that were actually sent.
+    ///
+    /// Called once per request, after the request has been assembled, which
+    /// is the only point at which a source can know what the model has seen
+    /// and therefore what counts as a change next time.
+    fn committed(&mut self, tail: &[Block]) -> impl Future<Output = ()> + Send {
+        let _ = tail;
         async {}
-    }
-
-    /// Produces a durable alert as a request is being assembled.
-    ///
-    /// Unlike [`render`](Self::render), the returned block is appended to the
-    /// conversation once and stays there, so a source can insert content at
-    /// the moment it changes instead of re-rendering it into every request.
-    /// `reassembled` is `true` when the window was rewritten since the
-    /// previous request (a cold-cache reassembly or an applied compaction):
-    /// every durable alert from before it is gone, and a source that needs
-    /// the model to still know something must say it again. The first call
-    /// of an agent is the start of the session.
-    fn on_request(&mut self, reassembled: bool) -> impl Future<Output = Option<Block>> + Send {
-        let _ = reassembled;
-        async { None }
-    }
-
-    /// Produces a durable alert after a turn that executed tools.
-    ///
-    /// Unlike [`render`](Self::render), the returned block is appended to the
-    /// conversation and stays there: it survives into later requests instead
-    /// of being regenerated, which is what makes it usable for one-shot
-    /// corrections.
-    fn on_tool_turn_end(&mut self) -> impl Future<Output = Option<Block>> + Send {
-        async { None }
-    }
-
-    /// Produces a durable alert when the model is about to end the run.
-    ///
-    /// Returning `Some` forces another turn, so a source may use this to
-    /// refuse an early finish — for instance while a checklist still has
-    /// unchecked items.
-    fn on_final_turn(&mut self) -> impl Future<Output = Option<Block>> + Send {
-        async { None }
     }
 }
 
 /// Object-safe twin of [`ContextSource`].
 trait ContextSourceImpl: Send + Sync {
-    fn render<'a>(&'a self) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>>;
+    fn id(&self) -> super::SourceId;
 
-    fn commit<'a>(&'a mut self, block: &'a Block) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-
-    fn on_request<'a>(
+    fn blocks<'a>(
         &'a mut self,
-        reassembled: bool,
-    ) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>>;
+        moment: Moment,
+    ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>>;
 
-    fn on_tool_turn_end<'a>(
+    fn peek<'a>(
+        &'a self,
+        moment: Moment,
+    ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>>;
+
+    fn committed<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>>;
-
-    fn on_final_turn<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>>;
+        tail: &'a [Block],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 impl<T: ContextSource> ContextSourceImpl for T {
-    fn render<'a>(&'a self) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>> {
-        Box::pin(ContextSource::render(self))
+    fn id(&self) -> super::SourceId {
+        ContextSource::id(self)
     }
 
-    fn commit<'a>(&'a mut self, block: &'a Block) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(ContextSource::commit(self, block))
-    }
-
-    fn on_request<'a>(
+    fn blocks<'a>(
         &'a mut self,
-        reassembled: bool,
-    ) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>> {
-        Box::pin(ContextSource::on_request(self, reassembled))
+        moment: Moment,
+    ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>> {
+        Box::pin(ContextSource::blocks(self, moment))
     }
 
-    fn on_tool_turn_end<'a>(
+    fn peek<'a>(
+        &'a self,
+        moment: Moment,
+    ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>> {
+        Box::pin(ContextSource::peek(self, moment))
+    }
+
+    fn committed<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>> {
-        Box::pin(ContextSource::on_tool_turn_end(self))
-    }
-
-    fn on_final_turn<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Block>> + Send + 'a>> {
-        Box::pin(ContextSource::on_final_turn(self))
+        tail: &'a [Block],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(ContextSource::committed(self, tail))
     }
 }
 
@@ -226,7 +285,10 @@ pub struct AnyContextSource {
 
 impl std::fmt::Debug for AnyContextSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("AnyContextSource").finish()
+        formatter
+            .debug_struct("AnyContextSource")
+            .field("id", &self.inner.id())
+            .finish()
     }
 }
 
@@ -239,32 +301,28 @@ impl AnyContextSource {
         }
     }
 
-    /// See [`ContextSource::render`].
-    pub fn render(&self) -> impl Future<Output = Option<Block>> + Send + '_ {
-        self.inner.render()
+    /// See [`ContextSource::id`].
+    #[must_use]
+    pub fn id(&self) -> super::SourceId {
+        self.inner.id()
     }
 
-    /// See [`ContextSource::commit`].
-    pub fn commit<'a>(&'a mut self, block: &'a Block) -> impl Future<Output = ()> + Send + 'a {
-        self.inner.commit(block)
-    }
-
-    /// See [`ContextSource::on_request`].
-    pub fn on_request(
+    /// See [`ContextSource::blocks`].
+    pub fn blocks(
         &mut self,
-        reassembled: bool,
-    ) -> impl Future<Output = Option<Block>> + Send + '_ {
-        self.inner.on_request(reassembled)
+        moment: Moment,
+    ) -> impl Future<Output = Vec<ContextBlock>> + Send + '_ {
+        self.inner.blocks(moment)
     }
 
-    /// See [`ContextSource::on_tool_turn_end`].
-    pub fn on_tool_turn_end(&mut self) -> impl Future<Output = Option<Block>> + Send + '_ {
-        self.inner.on_tool_turn_end()
+    /// See [`ContextSource::peek`].
+    pub fn peek(&self, moment: Moment) -> impl Future<Output = Vec<ContextBlock>> + Send + '_ {
+        self.inner.peek(moment)
     }
 
-    /// See [`ContextSource::on_final_turn`].
-    pub fn on_final_turn(&mut self) -> impl Future<Output = Option<Block>> + Send + '_ {
-        self.inner.on_final_turn()
+    /// See [`ContextSource::committed`].
+    pub fn committed<'a>(&'a mut self, tail: &'a [Block]) -> impl Future<Output = ()> + Send + 'a {
+        self.inner.committed(tail)
     }
 }
 
@@ -424,6 +482,7 @@ impl AnyLiveSource {
 }
 
 #[cfg(test)]
+#[allow(clippy::unused_async_trait_impl, clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -489,34 +548,47 @@ mod tests {
     }
 
     impl ContextSource for Counter {
-        fn render(&self) -> impl Future<Output = Option<Block>> + Send {
-            std::future::ready(Some(Block::new(
-                "counter",
-                self.committed.len().to_string(),
-            )))
+        fn id(&self) -> crate::SourceId {
+            crate::SourceId::new("counter")
         }
 
-        async fn commit(&mut self, block: &Block) {
-            self.committed.push(block.content().to_string());
+        async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+            ContextSource::peek(&*self, moment).await
         }
 
-        fn on_tool_turn_end(&mut self) -> impl Future<Output = Option<Block>> + Send {
-            std::future::ready(Some(Block::new("counter_alert", "tool turn observed")))
+        async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
+            match moment {
+                Moment::Request { .. } => vec![ContextBlock::tail(
+                    "counter",
+                    self.committed.len().to_string(),
+                )],
+                Moment::ToolTurnEnd => {
+                    vec![ContextBlock::stable("counter_alert", "tool turn observed")]
+                }
+                Moment::FinalTurn => Vec::new(),
+            }
+        }
+
+        async fn committed(&mut self, tail: &[Block]) {
+            self.committed
+                .extend(tail.iter().map(|block| block.content().to_string()));
         }
     }
 
     #[tokio::test]
     async fn erased_source_forwards_every_method() {
         let mut source = AnyContextSource::new(Counter::default());
-        let block = source.render().await.expect("counter renders");
-        assert_eq!(block.content(), "0");
-        source.commit(&block).await;
-        let next = source.render().await.expect("counter renders");
-        assert_eq!(next.content(), "1");
-        assert_eq!(
-            source.on_tool_turn_end().await.map(|b| b.tag().to_string()),
-            Some("counter_alert".to_string())
-        );
-        assert!(source.on_final_turn().await.is_none());
+        assert_eq!(source.id().as_str(), "counter");
+        let blocks = source.blocks(Moment::Request { reassembled: false }).await;
+        assert_eq!(blocks[0].block().content(), "0");
+        assert_eq!(blocks[0].placement(), Placement::Tail);
+        let sent: Vec<Block> = blocks.iter().map(|b| b.block().clone()).collect();
+        source.committed(&sent).await;
+        let next = source.blocks(Moment::Request { reassembled: false }).await;
+        assert_eq!(next[0].block().content(), "1");
+        let alerts = source.blocks(Moment::ToolTurnEnd).await;
+        assert_eq!(alerts[0].block().tag(), "counter_alert");
+        assert_eq!(alerts[0].placement(), Placement::Stable);
+        assert!(source.blocks(Moment::FinalTurn).await.is_empty());
     }
 }

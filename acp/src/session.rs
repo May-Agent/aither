@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aither_agent::{Agent, AgentEvent};
+use aither_agent::{Agent, AgentEvent, OutputKind};
 use aither_core::LanguageModel;
 use uuid::Uuid;
 
@@ -68,13 +68,13 @@ pub struct AcpSession<LLM: LanguageModel + 'static> {
     cwd: PathBuf,
     mcp_servers: Vec<McpServer>,
     cancelled: Cancellation,
-    agent: Agent<LLM, LLM, LLM>,
+    agent: Agent<LLM>,
 }
 
 impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
     /// Create a new session that drives the given agent.
     #[must_use]
-    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>, agent: Agent<LLM, LLM, LLM>) -> Self {
+    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>, agent: Agent<LLM>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             cwd,
@@ -166,30 +166,36 @@ impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
 /// Reports one agent event to the client as the matching ACP session update.
 fn report_event(event: AgentEvent, on_update: &mut impl FnMut(SessionUpdate)) {
     match event {
-        AgentEvent::Text(text) => {
-            on_update(SessionUpdate::AgentMessageChunk(text_chunk(text)));
-        }
-        AgentEvent::Reasoning(text) => {
+        AgentEvent::BlockDelta {
+            kind: OutputKind::Reasoning,
+            text,
+            ..
+        } => {
             on_update(SessionUpdate::AgentThoughtChunk(text_chunk(text)));
         }
-        AgentEvent::ToolCallStart {
-            id,
+        AgentEvent::BlockDelta { text, .. } => {
+            on_update(SessionUpdate::AgentMessageChunk(text_chunk(text)));
+        }
+        AgentEvent::ToolCallStarted {
+            call,
             name,
             arguments,
+            ..
         } => {
             on_update(SessionUpdate::ToolCall(ToolCall {
-                tool_call_id: id,
+                tool_call_id: call.as_str().to_string(),
                 title: name,
                 kind: None,
                 status: Some(ToolCallStatus::InProgress),
                 content: Vec::new(),
                 locations: Vec::new(),
-                raw_input: serde_json::from_str(&arguments).ok(),
+                raw_input: Some(arguments),
                 raw_output: None,
                 meta: None,
             }));
         }
-        AgentEvent::ToolCallEnd { id, result, .. } => {
+        AgentEvent::ToolCallEnded { call, result, .. } => {
+            let id = call.as_str().to_string();
             // The agent reports a typed ToolResult; ACP wants a status
             // and the text a reader should see.
             let status = if result.is_error() {
