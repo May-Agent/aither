@@ -1318,6 +1318,18 @@ fn tool_schema<A: JsonSchema>() -> Value {
     )
 }
 
+/// The JSON schema `tool` supplies for its arguments, which may depend on its
+/// own state.
+///
+/// # Panics
+/// Panics if the schema cannot be serialized or lays out its positional
+/// fields invalidly.
+fn live_tool_schema<T: Tool>(tool: &T) -> Value {
+    checked_schema(
+        serde_json::to_value(tool.arguments_schema()).expect("failed to serialize tool schema"),
+    )
+}
+
 /// Returns `schema` after checking its positional layout, so a bad command
 /// fails when it is built rather than when it is called.
 fn checked_schema(schema: Value) -> Value {
@@ -1404,7 +1416,7 @@ where
     T: Tool + Send + Sync + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
-    let schema = tool_schema::<T::Arguments>();
+    let schema = live_tool_schema(&tool);
     // Auto-detect stdin_arg from schema: optional "input" field
     let stdin_arg = detect_stdin_arg(&schema);
     let help = schema_to_help(&schema);
@@ -2265,7 +2277,7 @@ where
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
     pub fn new(tool: T, outputs: OutputStore) -> Self {
-        let schema = tool_schema::<T::Arguments>();
+        let schema = live_tool_schema(&tool);
         Self {
             tool,
             schema,
@@ -2347,7 +2359,7 @@ where
     /// # Panics
     /// Panics if the tool argument schema cannot be serialized.
     pub fn new(tool: T, outputs: OutputStore) -> Self {
-        let schema = tool_schema::<T::Arguments>();
+        let schema = live_tool_schema(&tool);
         let name = tool.name().to_string();
         let stdin_arg = detect_stdin_arg(&schema);
         let help = schema_to_help(&schema);

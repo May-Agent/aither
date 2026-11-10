@@ -732,6 +732,20 @@ pub trait Tool: Send + Sync {
         description_from_schema::<Self::Arguments>().unwrap_or_default()
     }
 
+    /// The JSON schema of the tool's arguments, as sent to the provider.
+    ///
+    /// The default derives it from [`Self::Arguments`]. Override it to build
+    /// the schema from the tool's own state, for an argument whose allowed
+    /// values are configured at runtime. Every reader of a tool's schema —
+    /// [`ToolDefinition::new`], and through it the provider request and
+    /// [`Tools::definitions`] — reads it here, so the override must keep the
+    /// shape `Self::Arguments` deserializes from. The root must be an object
+    /// schema, as providers require; the default wraps a non-object
+    /// `Arguments` type in one.
+    fn arguments_schema(&self) -> Schema {
+        derived_arguments_schema::<Self::Arguments>()
+    }
+
     /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
     /// Its rustdoc becomes the default tool description.
     type Arguments: Send + JsonSchema + DeserializeOwned;
@@ -832,7 +846,7 @@ fn is_object<T: JsonSchema>() -> bool {
 
 /// Builds the argument schema for a tool, wrapping scalars so the root is
 /// always an object as providers require.
-fn arguments_schema<T: JsonSchema>() -> Schema {
+fn derived_arguments_schema<T: JsonSchema>() -> Schema {
     if is_object::<T>() {
         schema_for!(T)
     } else {
@@ -1038,7 +1052,7 @@ impl ToolDefinition {
         Self {
             name: tool.name(),
             description: tool.description(),
-            arguments: arguments_schema::<T::Arguments>(),
+            arguments: tool.arguments_schema(),
         }
     }
 
@@ -1923,6 +1937,77 @@ mod tests {
         assert!(debug_str.contains("ToolDefinition"));
         assert!(debug_str.contains("calculator"));
         assert!(debug_str.contains("Performs basic mathematical operations"));
+    }
+
+    #[derive(JsonSchema, Deserialize)]
+    #[expect(dead_code, reason = "only the schema is read")]
+    struct PickArgs {
+        /// The interpreter to run with.
+        interpreter: String,
+    }
+
+    /// A tool whose `interpreter` argument lists the values it was built with.
+    struct Pick {
+        interpreters: Vec<String>,
+    }
+
+    impl Tool for Pick {
+        fn name(&self) -> Cow<'static, str> {
+            "pick".into()
+        }
+        fn description(&self) -> Cow<'static, str> {
+            "Picks an interpreter.".into()
+        }
+        fn arguments_schema(&self) -> Schema {
+            let mut schema = derived_arguments_schema::<PickArgs>();
+            schema.ensure_object();
+            let property = schema
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .and_then(|properties| properties.get_mut("interpreter"))
+                .and_then(Value::as_object_mut)
+                .expect("interpreter property");
+            property.insert("enum".into(), self.interpreters.clone().into());
+            schema
+        }
+        type Arguments = PickArgs;
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+            _cx: ToolContext,
+        ) -> impl Future<Output = Result<Self::Res>> + Send {
+            core::future::ready(Ok(ToolResult::text("ok")))
+        }
+    }
+
+    #[test]
+    fn runtime_schema_reaches_the_definition_and_the_registry() {
+        let tool = Pick {
+            interpreters: vec!["bash".to_string(), "python".to_string()],
+        };
+        let expected = serde_json::json!(["bash", "python"]);
+
+        let schema = ToolDefinition::new(&tool).arguments_openai_schema();
+        assert_eq!(schema["properties"]["interpreter"]["enum"], expected);
+
+        let mut tools = Tools::new();
+        tools.register(tool).expect("registers");
+        let listed = tools.definitions();
+        assert_eq!(
+            listed[0].arguments_openai_schema()["properties"]["interpreter"]["enum"],
+            expected
+        );
+    }
+
+    #[test]
+    fn tool_without_override_sends_the_derived_schema() {
+        let schema = ToolDefinition::new(&Calculator).arguments_openai_schema();
+        let mut derived = schema_for!(<Calculator as Tool>::Arguments).to_value();
+        clean_schema(&mut derived);
+        assert_eq!(schema, derived);
+        assert!(schema["properties"]["interpreter"].is_null());
     }
 
     #[test]
