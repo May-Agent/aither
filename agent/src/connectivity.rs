@@ -190,7 +190,7 @@ mod tests {
                 Some(change),
                 std::future::pending(),
                 |mut change, timed| async move {
-                    if matches!(timed.event, crate::AgentEvent::Text(_))
+                    if matches!(timed.event, crate::AgentEvent::BlockDelta { .. })
                         && let Some(change) = change.take()
                     {
                         change(controller);
@@ -232,11 +232,14 @@ mod tests {
             .run("hello", std::iter::empty())
             .drive(false, std::future::pending(), |woke, timed| async move {
                 match timed.event {
-                    crate::AgentEvent::Text(_) if !woke => {
+                    crate::AgentEvent::BlockDelta { .. } if !woke => {
                         controller.wake();
                         ControlFlow::Continue(true)
                     }
-                    crate::AgentEvent::ResponseRetry { error, .. } => ControlFlow::Break(error),
+                    crate::AgentEvent::RequestEnded {
+                        outcome: crate::RequestOutcome::Retrying { error, .. },
+                        ..
+                    } => ControlFlow::Break(error),
                     _ => ControlFlow::Continue(woke),
                 }
             })

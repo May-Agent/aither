@@ -123,6 +123,7 @@ pub struct PrefixRewrites {
 
 /// The prompt prefix of a request about to be sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PromptPrefix {
     /// The hash chain of the request's prefix.
     pub chain: PrefixChain,

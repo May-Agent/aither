@@ -1,1 +1,0 @@
-Shell runtime: {{ runtime }}. Local backend: {% if local %}available{% else %}unavailable{% endif %}. SSH backend: {% if ssh %}available{% else %}unavailable{% endif %}.
