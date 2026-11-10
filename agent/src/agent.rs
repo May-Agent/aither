@@ -27,7 +27,7 @@ use crate::{
         restore_context,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
-    error::AgentError,
+    error::{AgentError, ToolPanic},
     event::{
         AgentEvent, AgentPath, BlockId, CheckpointReason, CompactionOutcome, CompactionTrigger,
         InjectionKind, OutputKind, PauseId, RequestId, RequestOutcome, RunId, RunOutcome, RunPause,
@@ -490,10 +490,21 @@ impl<H: Hooks> ToolRun<'_, H> {
             )
         } else {
             let start = Instant::now();
-            let result = self
-                .tools
-                .call(&call.name, &arguments.to_string(), self.context())
-                .await;
+            // A panic from the tool ends only this call: it becomes the
+            // call's failed result, so the other calls of the turn finish and
+            // the run goes on. The panic hook has already run by the time the
+            // unwind is caught.
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+                self.tools
+                    .call(&call.name, &arguments.to_string(), self.context())
+                    .await
+            }))
+            .await
+            .unwrap_or_else(|payload| {
+                let panic = ToolPanic::caught(&call.name, payload.as_ref());
+                tracing::error!(tool = %panic.name, message = %panic.message, "tool panicked");
+                Err(panic.into())
+            });
             (result, start.elapsed())
         };
         let mut outcome = ToolOutcome {

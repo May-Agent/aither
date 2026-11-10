@@ -85,7 +85,7 @@ pub use context::{
     SourcedSlot, SystemLayout,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
-pub use error::AgentError;
+pub use error::{AgentError, ToolPanic};
 pub use event::{
     AgentEvent, AgentPath, BlockId, CheckpointReason, CompactionOutcome, CompactionTrigger,
     InjectionKind, OutputKind, PauseId, RequestId, RequestOutcome, RunId, RunOutcome, RunPause,

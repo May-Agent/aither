@@ -135,6 +135,41 @@ impl Tool for Probe {
     }
 }
 
+/// Panics on every call.
+struct Panicker;
+
+impl Tool for Panicker {
+    fn name(&self) -> Cow<'static, str> {
+        "panicker".into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        "Panics on every call.".into()
+    }
+
+    type Arguments = NoArguments;
+    type Res = ToolResult;
+
+    async fn call(
+        &self,
+        _arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
+        panic!("the disk is on fire");
+    }
+}
+
+fn tool_results(llm: &Scripted) -> Vec<String> {
+    llm.requests()
+        .last()
+        .expect("the model was asked at least once")
+        .messages()
+        .iter()
+        .filter(|message| message.role() == aither_core::llm::Role::Tool)
+        .map(|message| message.content().to_string())
+        .collect()
+}
+
 async fn run_to_end<M, H, C, S>(
     agent: &mut Agent<M, H, C, S>,
     prompt: &str,
@@ -665,5 +700,56 @@ async fn a_preview_carries_what_the_run_then_sends_and_consumes_nothing() {
     assert!(
         sent_text.contains("one-shot-correction"),
         "the one-shot block reaches the run after a preview: {sent_text}"
+    );
+}
+
+#[tokio::test]
+async fn a_panicking_tool_fails_its_call_and_the_next_call_runs() {
+    let llm = Scripted::new([call("c1", "panicker"), call("c2", "probe"), say("done")]);
+    let probe = Probe::default();
+    let mut agent = AgentBuilder::new(llm.clone())
+        .tool(Panicker)
+        .tool(probe.clone())
+        .build();
+
+    let (result, _) = run_to_end(&mut agent, "go").await;
+
+    result.expect("the run survives the panic");
+    assert_eq!(*probe.0.lock().unwrap(), 1, "the next call ran normally");
+    let results = tool_results(&llm);
+    assert_eq!(
+        results,
+        [
+            "Error: tool 'panicker' panicked: the disk is on fire",
+            "probed"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_panic_in_one_parallel_call_leaves_the_other_result_intact() {
+    let llm = Scripted::new([
+        vec![
+            Event::ToolCall(ToolCall::new("c1", "panicker", serde_json::json!({}))),
+            Event::ToolCall(ToolCall::new("c2", "probe", serde_json::json!({}))),
+        ],
+        say("done"),
+    ]);
+    let probe = Probe::default();
+    let mut agent = AgentBuilder::new(llm.clone())
+        .tool(Panicker)
+        .tool(probe.clone())
+        .build();
+
+    let (result, _) = run_to_end(&mut agent, "go").await;
+
+    result.expect("the run survives the panic");
+    assert_eq!(*probe.0.lock().unwrap(), 1);
+    let results = tool_results(&llm);
+    assert_eq!(results.len(), 2);
+    assert!(results.contains(&"probed".to_owned()), "{results:?}");
+    assert!(
+        results.contains(&"Error: tool 'panicker' panicked: the disk is on fire".to_owned()),
+        "{results:?}"
     );
 }
