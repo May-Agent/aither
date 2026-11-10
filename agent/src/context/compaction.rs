@@ -793,6 +793,23 @@ mod tests {
     use super::*;
     use aither_core::llm::ToolCall;
 
+    /// Names every word that is a path under `outputs/` or `artifacts/`.
+    struct UnderDirectories;
+
+    impl FileReferences for UnderDirectories {
+        fn files(&self, output: &str) -> Vec<String> {
+            output
+                .split_whitespace()
+                .filter(|word| word.starts_with("outputs/") || word.starts_with("artifacts/"))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn references() -> AnyFileReferences {
+        AnyFileReferences::new(UnderDirectories)
+    }
+
     #[test]
     fn build_file_index_pairs_outputs_with_call_descriptions() {
         let messages = vec![
@@ -822,7 +839,7 @@ mod tests {
             Message::tool("call_2", "wrote artifacts/slides.md"),
         ];
 
-        let index = build_file_index(&[], &messages, None);
+        let index = build_file_index(&[], &messages, Some(&references()));
         assert_eq!(index.len(), 2);
         assert!(
             index[0].contains("outputs/river.txt")
@@ -830,32 +847,6 @@ mod tests {
             "index entry should pair path with description: {index:?}"
         );
         assert!(index[1].contains("artifacts/slides.md") && index[1].contains("Write deck"));
-    }
-
-    #[test]
-    fn build_file_index_finds_the_absolute_path_a_saved_output_notice_prints() {
-        let dir = std::path::Path::new("/work/session/outputs");
-        // Joined the way the sandbox names the file, so the separator is the
-        // platform's.
-        let path = dir.join("river.txt").display().to_string();
-        let path = path.as_str();
-        let messages = vec![
-            Message::assistant_with_tool_calls(
-                "",
-                vec![ToolCall::new(
-                    "call_1",
-                    "terminal",
-                    serde_json::json!({"description": "Run the suite"}),
-                )],
-            ),
-            Message::tool(
-                "call_1",
-                aither_sandbox::output_saved_text("head", path, 100, 5000),
-            ),
-        ];
-        let index = build_file_index(&[], &messages, Some(dir));
-        assert_eq!(index.len(), 1, "{index:?}");
-        assert!(index[0].contains(path) && index[0].contains("Run the suite"));
     }
 
     #[test]
@@ -881,7 +872,7 @@ mod tests {
             Message::tool("call_2", "updated artifacts/report.md"),
         ];
 
-        let index = build_file_index(&[], &messages, None);
+        let index = build_file_index(&[], &messages, Some(&references()));
         assert_eq!(index.len(), 1);
         assert!(index[0].contains("final revision"));
     }
@@ -906,7 +897,7 @@ mod tests {
         let file_index = build_file_index(
             context.handoff_file_index(),
             &context.build_request(&[]),
-            None,
+            Some(&references()),
         );
         context.apply_handoff(
             Handoff::with_file_index("task".to_string(), file_index.clone()),

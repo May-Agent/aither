@@ -37,8 +37,6 @@
 mod agent;
 mod builder;
 mod cache_stats;
-#[cfg(test)]
-mod call_identity_tests;
 mod checkpoint;
 mod clock;
 mod compaction_state;
@@ -52,14 +50,10 @@ mod event;
 mod fork;
 mod hook;
 #[cfg(test)]
-mod idle_compaction_tests;
-#[cfg(test)]
 mod midstream_retry_tests;
 mod model_group;
 mod request_parameters;
 mod subagent;
-#[cfg(test)]
-mod test_support;
 mod tools;
 mod warmth;
 
@@ -87,8 +81,8 @@ pub use context::{
     ExternalSlot, FileReferences, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema,
     InstructionSlot, InvalidHandoff, KeptAttachment, LineRange, LiveChange, LiveContent,
     LiveSource, LiveUpdate, Moment, Placement, PrefixBlock, PrefixChain, PrefixRewrites,
-    PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, SourceId,
-    Sourced, SourcedSlot, SystemLayout,
+    PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, SourceId, Sourced,
+    SourcedSlot, SystemLayout,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;

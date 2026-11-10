@@ -1220,6 +1220,18 @@ mod tests {
     use crate::context::system::{ExternalContent, ExternalSlot, InstructionSlot};
     use aither_core::llm::{Attachment, ToolCall};
 
+    /// A context whose layout holds the instruction slots the tests fill.
+    fn laid_out() -> Context {
+        Context::with_layout(SystemLayout::new(
+            [
+                InstructionSlot::BASE_SYSTEM,
+                InstructionSlot::PERSONA,
+                InstructionSlot::PERMISSIONS,
+            ],
+            [],
+        ))
+    }
+
     #[derive(Template)]
     #[template(path = "tagged_block.txt", escape = "none")]
     struct Memory<'a> {
@@ -1468,7 +1480,7 @@ mod tests {
 
     #[test]
     fn request_layout_puts_the_live_tail_last() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1490,7 +1502,7 @@ mod tests {
     /// message byte-identical, or the provider re-reads the entire prompt.
     #[test]
     fn appending_never_perturbs_the_cacheable_prefix() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1506,8 +1518,8 @@ mod tests {
         // change is appended, the block the prefix holds stays.
         assert_eq!(set_issues(&mut context, "#23 open"), None);
         assert!(set_issues(&mut context, "#23 closed").is_some());
-        // A state alert and an event are appended like any alert.
-        context.push_state_alert(&Block::new("memory", "memory is critically tight"));
+        // A block and an event are appended like any alert.
+        context.push_block_alert(&Block::new("memory", "memory is critically tight"));
         context.push_block_alert(&Block::new("job", "job 7 was killed"));
         context.push(Message::user("second"));
         let after = context.build_request(&[Block::new("tasks", "<tasks>v2</tasks>")]);
@@ -1542,7 +1554,7 @@ mod tests {
     /// before the handoff and the conversation.
     #[test]
     fn a_live_block_sits_between_the_system_prompt_and_the_handoff() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1826,7 +1838,7 @@ mod tests {
 
     #[test]
     fn checkpoint_round_trip_keeps_every_commit_time_and_the_request() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -1844,7 +1856,7 @@ mod tests {
         let checkpoint: ContextCheckpoint =
             serde_json::from_str(&json).expect("deserialize checkpoint");
 
-        let mut restored = Context::new();
+        let mut restored = laid_out();
         restored
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "be useful");
@@ -2297,23 +2309,6 @@ mod tests {
         assert_eq!(context.recent()[1].content(), answer);
     }
 
-    /// A state alert goes with any reassembly, before or after the fork,
-    /// since its source restates the current value after it.
-    #[test]
-    fn every_reassembly_removes_the_state_alerts() {
-        let mut context = Context::new();
-        context.push_state_alert(&Block::new("memory", "critical"));
-        context.mark_prefix_sent();
-        let fork_point = context.fork_point();
-        context.push_state_alert(&Block::new("memory", "warning"));
-        context.mark_prefix_sent();
-
-        let report = context.reassemble_below(fork_point);
-
-        assert_eq!(report.system_messages_pruned, 2);
-        assert_eq!(context.len_recent(), 0);
-    }
-
     /// An event no request has carried survives a reassembly and a
     /// compaction's apply, wherever it sits; once delivered it goes.
     #[test]
@@ -2380,7 +2375,7 @@ mod tests {
 
     #[test]
     fn checkpoint_round_trip_preserves_sequence_numbers() {
-        let mut context = Context::new();
+        let mut context = laid_out();
         context
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "stable");
@@ -2389,7 +2384,7 @@ mod tests {
         context.push(Message::user("two"));
 
         let checkpoint = context.checkpoint();
-        let mut restored = Context::new();
+        let mut restored = laid_out();
         restored
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "stable");
@@ -2416,7 +2411,7 @@ mod tests {
 
     #[test]
     fn restore_runtime_state_preserves_system_blocks() {
-        let mut current = Context::new();
+        let mut current = laid_out();
         current
             .instructions_mut()
             .insert_tagged(&InstructionSlot::BASE_SYSTEM, "keep me");

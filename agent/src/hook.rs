@@ -202,10 +202,7 @@ pub trait Hooks: Send + Sync + 'static {
 
     /// Whether the run ends when the model ends its turn without a tool
     /// call.
-    fn on_stop(
-        &self,
-        cx: &StopCx<'_>,
-    ) -> impl std::future::Future<Output = StopDecision> + Send {
+    fn on_stop(&self, cx: &StopCx<'_>) -> impl std::future::Future<Output = StopDecision> + Send {
         let _ = cx;
         async { StopDecision::End }
     }

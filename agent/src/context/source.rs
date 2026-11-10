@@ -283,7 +283,10 @@ impl AnyContextSource {
     }
 
     /// See [`ContextSource::blocks`].
-    pub fn blocks(&mut self, moment: Moment) -> impl Future<Output = Vec<ContextBlock>> + Send + '_ {
+    pub fn blocks(
+        &mut self,
+        moment: Moment,
+    ) -> impl Future<Output = Vec<ContextBlock>> + Send + '_ {
         self.inner.blocks(moment)
     }
 
@@ -449,6 +452,7 @@ impl AnyLiveSource {
 }
 
 #[cfg(test)]
+#[allow(clippy::unused_async_trait_impl, clippy::assert_is_empty)]
 mod tests {
     use super::*;
 
@@ -524,7 +528,9 @@ mod tests {
                     "counter",
                     self.committed.len().to_string(),
                 )],
-                Moment::ToolTurnEnd => vec![ContextBlock::stable("counter_alert", "tool turn observed")],
+                Moment::ToolTurnEnd => {
+                    vec![ContextBlock::stable("counter_alert", "tool turn observed")]
+                }
                 Moment::FinalTurn => Vec::new(),
             }
         }

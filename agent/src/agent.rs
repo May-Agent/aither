@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "skills")]
+use crate::context::SkillCatalogEntry;
 use crate::{
     checkpoint::AgentCheckpoint,
     compaction_state::CompactionState,
@@ -28,8 +30,8 @@ use crate::{
     error::AgentError,
     event::{
         AgentEvent, AgentPath, BlockId, CheckpointReason, CompactionOutcome, CompactionTrigger,
-        InjectionKind, OutputKind, PauseId, RequestId, RequestOutcome, RunId, RunOutcome,
-        RunPause, TimedEvent, ToolOrigin, ToolVerdict,
+        InjectionKind, OutputKind, PauseId, RequestId, RequestOutcome, RunId, RunOutcome, RunPause,
+        TimedEvent, ToolOrigin, ToolVerdict,
     },
     hook::{
         AfterTool, Hooks, RequestCx, StopCx, StopDecision, ToolDecision, ToolInvocation,
@@ -38,14 +40,12 @@ use crate::{
     request_parameters::WithParameters,
     tools::AgentTools,
 };
-#[cfg(feature = "skills")]
-use crate::context::SkillCatalogEntry;
 use aither_core::{
     LanguageModel,
     llm::{
-        AnyApprover, Approval, ApprovalRequest, Approver, ApproverFailure, Attachment, CancelSignal,
-        Canceller, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role, TokenCounting,
-        ToolCall, ToolCallId,
+        AnyApprover, Approval, ApprovalRequest, Approver, ApproverFailure, Attachment,
+        CancelSignal, Canceller, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role,
+        TokenCounting, ToolCall, ToolCallId,
         model::{Ability, Parameters, Profile as ModelProfile},
         tool::{Progress, ProgressSink},
     },
@@ -176,7 +176,7 @@ impl CancelHandle {
 pub struct Run<F> {
     /// The run's state machine spans every turn and is tens of kilobytes;
     /// boxed so a `Run` moves into the caller's future without copying it.
-    run: Pin<Box<F>>,
+    body: Pin<Box<F>>,
     events: async_channel::Receiver<TimedEvent>,
     cancel: CancelHandle,
 }
@@ -199,7 +199,7 @@ where
         let cancel = CancelHandle::default();
         // The run owns the sink and drops it as it finishes.
         Self {
-            run: Box::pin(start(EventSink { sender, agent }, cancel.signal())),
+            body: Box::pin(start(EventSink { sender, agent }, cancel.signal())),
             events,
             cancel,
         }
@@ -212,6 +212,7 @@ where
     }
 
     /// A handle that cancels this run after [`drive`](Self::drive) took it.
+    #[must_use]
     pub fn cancel_handle(&self) -> CancelHandle {
         self.cancel.clone()
     }
@@ -255,7 +256,7 @@ where
         H: Future<Output = ControlFlow<B, S>>,
     {
         let Self {
-            mut run,
+            body: mut run,
             events,
             cancel,
         } = self;
@@ -264,10 +265,11 @@ where
         let mut outcome = None;
         let mut stopped = None;
         loop {
+            // Read before the closure: borrowing `stopped` across the await
+            // would make the future need `B: Sync`.
+            let stopping = stopped.is_none();
             let next = std::future::poll_fn(|cx| {
-                if stopped.is_none()
-                    && let Poll::Ready(value) = stop.as_mut().poll(cx)
-                {
+                if stopping && let Poll::Ready(value) = stop.as_mut().poll(cx) {
                     return Poll::Ready(RunStep::Stopped(value));
                 }
                 poll_run(run.as_mut(), &mut outcome, cx);
@@ -293,10 +295,9 @@ where
                 RunStep::Event(event) => event,
                 RunStep::Finished(result) => {
                     result?;
-                    return Ok(match stopped {
-                        Some(value) => ControlFlow::Break(value),
-                        None => ControlFlow::Continue(state),
-                    });
+                    return Ok(
+                        stopped.map_or_else(|| ControlFlow::Continue(state), ControlFlow::Break)
+                    );
                 }
                 RunStep::Stopped(value) => {
                     stopped = Some(value);
@@ -376,14 +377,14 @@ struct BrokenStream {
 
 /// A finished tool call, waiting to be paired with its call in the context.
 #[derive(Debug)]
-pub(crate) struct FinishedToolCall {
+pub struct FinishedToolCall {
     id: String,
     outcome: ToolOutcome,
     /// Context an `after_tool` hook appended, to follow the turn's results.
     appended: Option<String>,
 }
 
-pub(crate) type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
+pub type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
 
 /// One tool call on its way through the hooks and the tool.
 struct ToolRun<'a, H> {
@@ -483,7 +484,10 @@ impl<H: Hooks> ToolRun<'_, H> {
         }
 
         let (result, duration) = if let Some(reason) = denied {
-            (Ok(aither_core::llm::ToolResult::error(reason)), Duration::ZERO)
+            (
+                Ok(aither_core::llm::ToolResult::error(reason)),
+                Duration::ZERO,
+            )
         } else {
             let start = Instant::now();
             let result = self
@@ -838,6 +842,7 @@ struct CancelledToolCallTemplate<'a> {
 /// let response = agent.query("What is 2+2?").await?;
 /// ```
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Agent<M, H = (), C = M, Schema = HandoffDocument> {
     /// The conversation model, behind an Arc so a forked compaction can own
     /// it while the run continues.
@@ -1164,7 +1169,7 @@ where
         request: LLMRequest,
         id: RequestId,
         events: &EventSink,
-    ) -> Result<ModelTurn, BrokenStream> {
+    ) -> Result<ModelTurn, Box<BrokenStream>> {
         let mut response = Response::new(events, id);
         let mut malformed_function_call = false;
         let mut opened = false;
@@ -1173,16 +1178,20 @@ where
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
             let received = event.is_ok();
-            let action =
-                handle_model_event(&mut self.cache_stats, &mut self.budget, event, &mut response)
-                    .map_err(|error| {
-                        response.end_block();
-                        BrokenStream {
-                            error,
-                            opened,
-                            usage: response.usage.take(),
-                        }
-                    })?;
+            let action = handle_model_event(
+                &mut self.cache_stats,
+                &mut self.budget,
+                event,
+                &mut response,
+            )
+            .map_err(|error| {
+                response.end_block();
+                Box::new(BrokenStream {
+                    error,
+                    opened,
+                    usage: response.usage.take(),
+                })
+            })?;
             if received && let Some(carried) = self.delivering.take() {
                 self.context.mark_delivered_below(carried);
             }
@@ -1211,8 +1220,12 @@ where
         events: &EventSink,
         cancel: &CancelSignal,
     ) -> Result<(), AgentError> {
-        self.run_to_end(events, cancel, Some(Message::user(prompt).with_attachments(attachments)))
-            .await
+        self.run_to_end(
+            events,
+            cancel,
+            Some(Message::user(prompt).with_attachments(attachments)),
+        )
+        .await
     }
 
     /// A run without a new user message: the model acts on what the host
@@ -1249,12 +1262,14 @@ where
             cancel,
             run: &run,
         };
+        // Cancellation is polled first: a run cancelled before it started
+        // must not get a turn in.
         let finished = futures_lite::future::or(
-            async { Some(self.run_body(&cx, message).await) },
             async {
                 cancel.cancelled().await;
                 None
             },
+            async { Some(self.run_body(&cx, message).await) },
         )
         .await;
         match finished {
@@ -1613,7 +1628,7 @@ where
     }
 
     async fn push_turn_boundary_events(
-        &mut self,
+        &self,
         cx: &RunCx<'_>,
         turn: usize,
         response_text: &str,
@@ -1690,28 +1705,6 @@ where
         self.warmth.clone()
     }
 
-    /// Pretends the cache entry was started `age` ago.
-    ///
-    /// The system clock counts from boot, so a freshly booted machine cannot
-    /// stand `age` back; the entry moves to a manual clock standing `age`
-    /// past its origin, with the entry at the origin.
-    #[cfg(test)]
-    pub(crate) fn backdate_cache_entry(&mut self, age: Duration) {
-        let clock = crate::ManualClock::new();
-        clock.advance(age);
-        self.warmth =
-            crate::CacheWarmth::new(self.prompt_cache.lifetime(), crate::AnyClock::new(clock));
-        self.warmth
-            .start_entry(crate::clock::Instant::from_nanos(0));
-    }
-
-    /// Swaps the cache lifetime, forgetting any started entry.
-    #[cfg(test)]
-    pub(crate) fn use_cache_lifetime(&mut self, lifetime: CacheLifetime) {
-        self.prompt_cache = self.prompt_cache.clone().with_lifetime(lifetime);
-        self.warmth = self.warmth.with_lifetime(lifetime);
-    }
-
     /// How long the provider's prompt-cache entry for this agent's context
     /// stays warm without a hit.
     #[must_use]
@@ -1782,18 +1775,23 @@ where
     ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         let prompt = prompt.to_string();
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
-        Run::new(AgentPath::of(&self.identity), move |sink, cancel| async move {
-            self.run_streaming(prompt, attachments, &sink, &cancel).await
-        })
+        Run::new(
+            AgentPath::of(&self.identity),
+            move |sink, cancel| async move {
+                self.run_streaming(prompt, attachments, &sink, &cancel)
+                    .await
+            },
+        )
     }
 
     /// Continues the conversation without a new user message, so the model
     /// acts on the messages the host added with
     /// [`push_message`](Self::push_message). Driven like [`run`](Self::run).
     pub fn resume(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
-        Run::new(AgentPath::of(&self.identity), move |sink, cancel| async move {
-            self.resume_streaming(&sink, &cancel).await
-        })
+        Run::new(
+            AgentPath::of(&self.identity),
+            move |sink, cancel| async move { self.resume_streaming(&sink, &cancel).await },
+        )
     }
 
     /// Registers a tool for the agent to use.
@@ -1874,12 +1872,19 @@ where
         focus: Option<&str>,
     ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         let focus = focus.map(str::to_string);
-        Run::new(AgentPath::of(&self.identity), move |sink, _cancel| async move {
-            self.finish_lost_compaction(&sink);
-            Box::pin(self.compact_streaming(focus.as_deref(), CompactionTrigger::Requested, &sink))
+        Run::new(
+            AgentPath::of(&self.identity),
+            move |sink, _cancel| async move {
+                self.finish_lost_compaction(&sink);
+                Box::pin(self.compact_streaming(
+                    focus.as_deref(),
+                    CompactionTrigger::Requested,
+                    &sink,
+                ))
                 .await
                 .map(drop)
-        })
+            },
+        )
     }
 
     /// Runs one compaction to its end, announcing it on `events`.
@@ -2211,22 +2216,25 @@ where
     /// [`drive`](Run::drive) returns the compaction failure; the window is
     /// left as it was.
     pub fn compact_when_idle(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
-        Run::new(AgentPath::of(&self.identity), move |sink, _cancel| async move {
-            self.finish_lost_compaction(&sink);
-            if self.idle_compaction_due_in() != Some(Duration::ZERO) {
-                return Ok(());
-            }
-            let result =
-                Box::pin(self.compact_streaming(None, CompactionTrigger::Idle, &sink)).await?;
-            self.idle_compacted = true;
-            if let Some(result) = &result {
-                tracing::info!(
-                    compacted = result.messages_compacted,
-                    "compacted the idle context shortly before its cache expires"
-                );
-            }
-            Ok(())
-        })
+        Run::new(
+            AgentPath::of(&self.identity),
+            move |sink, _cancel| async move {
+                self.finish_lost_compaction(&sink);
+                if self.idle_compaction_due_in() != Some(Duration::ZERO) {
+                    return Ok(());
+                }
+                let result =
+                    Box::pin(self.compact_streaming(None, CompactionTrigger::Idle, &sink)).await?;
+                self.idle_compacted = true;
+                if let Some(result) = &result {
+                    tracing::info!(
+                        compacted = result.messages_compacted,
+                        "compacted the idle context shortly before its cache expires"
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Forks a compaction off `request` to run alongside the turns that follow.
@@ -2434,19 +2442,17 @@ where
         }
         let failure = match failure {
             Some(failure) => failure,
-            None => match Box::pin(self.compact_streaming(
-                None,
-                CompactionTrigger::PausePoint,
-                events,
-            ))
-            .await
-            {
-                Ok(result) => return Ok(result.is_some()),
-                Err(error) => {
-                    tracing::warn!(%error, "compaction failed with the window exhausted");
-                    error
+            None => {
+                match Box::pin(self.compact_streaming(None, CompactionTrigger::PausePoint, events))
+                    .await
+                {
+                    Ok(result) => return Ok(result.is_some()),
+                    Err(error) => {
+                        tracing::warn!(%error, "compaction failed with the window exhausted");
+                        error
+                    }
                 }
-            },
+            }
         };
 
         let policy = self.config.context_policy;
@@ -2479,12 +2485,8 @@ where
         });
         self.reassembled = true;
         self.prefix_rewrites.reassembled = true;
-        let result = Box::pin(self.compact_streaming(
-            None,
-            CompactionTrigger::PausePoint,
-            events,
-        ))
-        .await?;
+        let result =
+            Box::pin(self.compact_streaming(None, CompactionTrigger::PausePoint, events)).await?;
         Ok(result.is_some())
     }
 
@@ -2505,19 +2507,6 @@ where
                 source.committed(&sent).await;
             }
         }
-    }
-
-    /// Pushes a durable system alert into the conversation.
-    ///
-    /// Unlike a context source's block, which is re-rendered for every
-    /// request, an alert pushed here is an item in the conversation: it
-    /// survives until reassembly or a handoff prunes it, which is what makes
-    /// it the right channel for a one-off correction the model must see.
-    #[cfg(test)]
-    fn push_system_alert(&mut self, content: impl Into<String>) {
-        let block = Block::new("system-reminder", content);
-        self.budget.append(block.len());
-        self.context.push_block_alert(&block);
     }
 
     /// Brings every live source's block to what it renders now.
@@ -3056,12 +3045,8 @@ where
         }
         // Boxed: the compaction future is large and sits on every run's path
         // (see `run_futures_stay_small_with_a_real_provider_type`).
-        if let Some(result) = Box::pin(self.compact_streaming(
-            None,
-            CompactionTrigger::ColdCache,
-            events,
-        ))
-        .await?
+        if let Some(result) =
+            Box::pin(self.compact_streaming(None, CompactionTrigger::ColdCache, events)).await?
         {
             tracing::info!(
                 compacted = result.messages_compacted,
@@ -3227,7 +3212,5 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
-#[cfg(test)]
-mod keep_warm_tests;
 #[cfg(test)]
 mod tests;

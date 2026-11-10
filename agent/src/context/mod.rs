@@ -38,6 +38,7 @@ pub mod source;
 pub mod system;
 pub mod window;
 
+pub use crate::event::SourceId;
 pub use budget::ContextBudget;
 pub use cache::{CacheLifetime, PromptCache};
 pub use compaction::{
@@ -46,7 +47,6 @@ pub use compaction::{
     HandoffSchema, InvalidHandoff, KeptAttachment, LineRange, PendingCompaction, Restoration,
     SkillCatalogEntry, build_file_index,
 };
-pub use crate::event::SourceId;
 pub use live::{LiveContent, LiveUpdate};
 pub use policy::ContextPolicy;
 pub use prefix::{PrefixBlock, PrefixChain, PrefixRewrites, PromptPrefix};

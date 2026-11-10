@@ -68,12 +68,6 @@ impl CacheWarmth {
             .store(at.as_nanos(), Ordering::Relaxed);
     }
 
-    /// A handle on a never-started entry with another lifetime, same clock.
-    #[cfg(test)]
-    pub(crate) fn with_lifetime(&self, lifetime: CacheLifetime) -> Self {
-        Self::new(lifetime, self.inner.clock.clone())
-    }
-
     /// Records that a request or keep-alive started the entry just now.
     pub(crate) fn start_entry_now(&self) {
         self.start_entry(self.inner.clock.now());

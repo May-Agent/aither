@@ -151,6 +151,13 @@ impl<K> Slot<K> {
     }
 }
 
+#[cfg(test)]
+impl InstructionSlot {
+    pub(crate) const BASE_SYSTEM: Self = Self::new("base_system");
+    pub(crate) const PERSONA: Self = Self::new("persona");
+    pub(crate) const PERMISSIONS: Self = Self::new("permissions");
+}
+
 /// The order the host gives the system prompt's blocks.
 ///
 /// Every block the prompt holds has a slot here; inserting a block whose slot

@@ -78,7 +78,7 @@ where
         cancel: CancelSignal,
     ) -> RunOutcome {
         let own = AgentPath::of(self.identity());
-        let driven = Agent::run(self, prompt, std::iter::empty())
+        let driven = Self::run(self, prompt, std::iter::empty())
             .drive(None, cancel.cancelled(), |ended, timed| {
                 let outcome = match (&timed.event, timed.agent == own) {
                     (AgentEvent::RunEnded { outcome, .. }, true) => Some(outcome.clone()),
@@ -173,25 +173,27 @@ impl SubagentRuns {
     /// Panics if the registry lock is poisoned.
     pub fn start(&self, started_by: &CallIdentity, name: &str, prompt: &str) -> SubagentRun {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let identity = AgentIdentity::Subagent(SubagentIdentity::new(
-            name,
-            Some(started_by.clone()),
-        ));
+        let identity =
+            AgentIdentity::Subagent(SubagentIdentity::new(name, Some(started_by.clone())));
         let parent = AgentPath::of(started_by.agent());
         let path = AgentPath::of(&identity);
         let cancel = CancelHandle::default();
-        self.shared.runs.lock().expect("subagent runs lock poisoned").insert(
-            id,
-            Slot {
-                info: SubagentRunInfo {
-                    id,
-                    name: name.to_string(),
-                    prompt: prompt.to_string(),
-                    started: Instant::now(),
+        self.shared
+            .runs
+            .lock()
+            .expect("subagent runs lock poisoned")
+            .insert(
+                id,
+                Slot {
+                    info: SubagentRunInfo {
+                        id,
+                        name: name.to_string(),
+                        prompt: prompt.to_string(),
+                        started: Instant::now(),
+                    },
+                    cancel: cancel.clone(),
                 },
-                cancel: cancel.clone(),
-            },
-        );
+            );
         let run = SubagentRun {
             id,
             runs: self.clone(),
@@ -254,7 +256,11 @@ impl SubagentRuns {
     /// Panics if the registry lock is poisoned.
     #[must_use]
     pub fn cancel_all(&self) -> usize {
-        let runs = self.shared.runs.lock().expect("subagent runs lock poisoned");
+        let runs = self
+            .shared
+            .runs
+            .lock()
+            .expect("subagent runs lock poisoned");
         for slot in runs.values() {
             slot.cancel.cancel();
         }

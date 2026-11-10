@@ -63,7 +63,7 @@ impl AgentPath {
 
     /// Whether this is the main agent.
     #[must_use]
-    pub fn is_main(&self) -> bool {
+    pub const fn is_main(&self) -> bool {
         self.0.is_empty()
     }
 }

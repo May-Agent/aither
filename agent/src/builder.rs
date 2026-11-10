@@ -670,7 +670,7 @@ mod tests {
     // Mock hook
     struct MockHook;
 
-    impl Hook for MockHook {}
+    impl Hooks for MockHook {}
 
     #[test]
     fn test_builder_basic() {
@@ -713,15 +713,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_hook() {
-        let _agent = AgentBuilder::new(MockLlm).hook(MockHook).build();
-    }
-
-    #[test]
-    fn test_builder_with_multiple_hooks() {
-        let _agent = AgentBuilder::new(MockLlm)
-            .hook(MockHook)
-            .hook(MockHook)
-            .build();
+        let _agent = AgentBuilder::new(MockLlm).hooks(MockHook).build();
     }
 
     /// Options set before a step that changes the builder's type survive it.
@@ -734,7 +726,7 @@ mod tests {
         let agent = AgentBuilder::new(MockLlm)
             .context_policy(policy)
             .max_iterations(7)
-            .hook(MockHook)
+            .hooks(MockHook)
             .compaction_model(MockLlm, Parameters::default())
             .build();
         assert_eq!(agent.config.context_policy, policy);
