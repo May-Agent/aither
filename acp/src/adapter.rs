@@ -141,6 +141,7 @@ impl SessionUpdateMapper {
                     .remove(&(agent.clone(), call.as_str().to_string()));
                 Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
                     status: Some(tool_result_status(result)),
+                    content: Some(vec![text_content(result.render_for_model())]),
                     raw_output: Some(tool_result_raw_output(result)),
                     ..update(call_id(agent, call.as_str()))
                 }))

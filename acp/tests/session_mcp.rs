@@ -127,7 +127,11 @@ async fn a_session_agent_can_call_the_tools_of_the_mcp_servers_it_was_opened_wit
     let finished = updates
         .iter()
         .find_map(|n| match &n.update {
-            SessionUpdate::ToolCallUpdate(update) => Some(update),
+            SessionUpdate::ToolCallUpdate(update)
+                if update.status == Some(ToolCallStatus::Completed) =>
+            {
+                Some(update)
+            }
             _ => None,
         })
         .expect("the agent called a tool");
