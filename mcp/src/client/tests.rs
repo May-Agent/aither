@@ -137,48 +137,51 @@ async fn child_process_tool_list_changed_refreshes_the_connection_tools() {
 }
 
 #[tokio::test]
-async fn a_tool_added_by_list_changed_is_a_terminal_command_at_once() {
+async fn the_servers_tools_are_ordinary_tools_that_follow_its_list() {
+    use aither_core::llm::{Tool, ToolContext, ToolResult};
+
     let transport = ChildProcessTransport::from_command(&mut script("changing_tools_server.sh"))
         .expect("spawn sh");
-    let conn = McpConnection::connect(&TokioGlobal, transport, ())
-        .await
-        .unwrap();
-    let mut builder = aither_sandbox::ToolRegistryBuilder::new();
-    builder.command_set(conn);
-    // The fixture's results are empty, so nothing is saved to the directory.
-    let outputs = aither_sandbox::OutputStore::new(
-        std::env::temp_dir(),
-        aither_core::AnyIdAllocator::default(),
-        aither_sandbox::test_budgets::output_policy(),
-        aither_sandbox::test_wording::TestWording::any(),
-    )
-    .await
-    .unwrap();
-    let registry = builder.build(outputs);
-    let mut names = registry.registered_tool_names();
-    names.sort();
-    assert_eq!(names, ["alpha", "beta"]);
+    let conn = std::sync::Arc::new(
+        McpConnection::connect(&TokioGlobal, transport, ())
+            .await
+            .unwrap(),
+    );
+    let names = |tools: &[crate::McpTool]| {
+        let mut names: Vec<_> = tools.iter().map(|tool| tool.name().into_owned()).collect();
+        names.sort();
+        names
+    };
+    let tools = conn.tools();
+    assert_eq!(names(&tools), ["alpha", "beta"]);
+    assert_eq!(
+        tools[0].arguments_schema().to_value()["type"],
+        "object",
+        "the schema is the server's"
+    );
 
     // The server answers this call, then announces a different tool list.
-    assert!(registry.query_tool_handler("alpha", &[]).await.ok);
+    let alpha = tools.iter().find(|tool| tool.name() == "alpha").unwrap();
+    assert_eq!(
+        alpha.call(json!({}), ToolContext::new()).await.unwrap(),
+        ToolResult::parts(Vec::new())
+    );
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !registry.is_tool_configured("gamma") {
+        while !conn.has_tool("gamma") {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("the tool list was not refreshed within 10s");
 
-    // The same registry, never rebuilt, follows the server's list.
-    let mut names = registry.registered_tool_names();
-    names.sort();
-    assert_eq!(names, ["beta", "gamma"]);
-    assert!(registry.tool_help("gamma").is_some());
-    let gone = registry.query_tool_handler("alpha", &[]).await;
-    assert_eq!(
-        gone.error.as_deref(),
-        Some("unknown command 'alpha'. Run 'help' to see available commands.")
-    );
+    // Taking the tools again follows the server's list, and a tool the
+    // server dropped is no longer callable.
+    assert_eq!(names(&conn.tools()), ["beta", "gamma"]);
+    let gone = alpha
+        .call(json!({}), ToolContext::new())
+        .await
+        .expect_err("the server no longer has alpha");
+    assert!(gone.to_string().contains("alpha"), "{gone}");
 }
 
 #[tokio::test]

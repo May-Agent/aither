@@ -7,9 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aither_core::llm::CallIdentity;
-use aither_core::llm::tool::{ToolDefinition, ToolResult, ToolResultPart};
-use aither_sandbox::CommandSet;
+use aither_core::llm::tool::{Tool, ToolContext, ToolDefinition, ToolResult, ToolResultPart};
 use askama::Template;
 use async_process::Command;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -411,29 +409,75 @@ fn error_message_text(content: &[Content]) -> String {
     }
 }
 
-/// The server's tools as terminal commands that follow its tool list.
+/// One tool of an MCP server as an ordinary [`Tool`].
 ///
-/// Register a connection with
-/// [`ToolRegistryBuilder::command_set`](aither_sandbox::ToolRegistryBuilder::command_set):
-/// each tool becomes a command whose help text, positional arguments and
-/// validation derive from its JSON schema, and a tool the server adds or
-/// removes with `notifications/tools/list_changed` becomes runnable, or stops
-/// being runnable, as soon as the connection has re-listed.
-impl CommandSet for McpConnection {
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        Self::definitions(self)
+/// Its name, description and argument schema are the server's, taken when the
+/// tool was made; its arguments are the JSON the schema describes, passed to
+/// the server as they are. The tool holds the connection, so a call after the
+/// server removed the tool from its list fails with
+/// [`McpError::UnknownTool`]. A server that announces a new tool list is
+/// followed by taking [`McpConnection::tools`] again.
+#[derive(Debug, Clone)]
+pub struct McpTool {
+    connection: Arc<McpConnection>,
+    name: String,
+    description: String,
+    schema: schemars::Schema,
+}
+
+impl Tool for McpTool {
+    type Arguments = serde_json::Value;
+    type Res = ToolResult;
+
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Owned(self.name.clone())
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        Cow::Owned(self.description.clone())
+    }
+
+    fn arguments_schema(&self) -> schemars::Schema {
+        self.schema.clone()
     }
 
     async fn call(
         &self,
-        name: &str,
-        _call: Option<CallIdentity>,
-        arguments: serde_json::Value,
-    ) -> Result<ToolResult, String> {
-        let result = Self::call(self, name, arguments)
-            .await
-            .map_err(|error| error.to_string())?;
-        call_result_to_tool_result(result).map_err(|error| error.to_string())
+        arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> aither_core::Result<Self::Res> {
+        let result = self.connection.call(&self.name, arguments).await?;
+        Ok(call_result_to_tool_result(result)?)
+    }
+}
+
+impl McpConnection {
+    /// The server's tools as of now, each an ordinary [`Tool`] an embedder
+    /// registers wherever it exposes tools.
+    ///
+    /// The list is a snapshot, as [`definitions`](Self::definitions) is, and
+    /// a tool whose schema JSON Schema does not allow is left out with a
+    /// warning.
+    #[must_use]
+    pub fn tools(self: &Arc<Self>) -> Vec<McpTool> {
+        self.mcp_definitions()
+            .iter()
+            .filter_map(|definition| {
+                let Ok(schema) = schemars::Schema::try_from(definition.input_schema.clone()) else {
+                    tracing::warn!(
+                        tool = %definition.name,
+                        "skipping MCP tool with an unusable schema"
+                    );
+                    return None;
+                };
+                Some(McpTool {
+                    connection: Arc::clone(self),
+                    name: definition.name.clone(),
+                    description: definition.description.clone().unwrap_or_default(),
+                    schema,
+                })
+            })
+            .collect()
     }
 }
 
