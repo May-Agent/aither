@@ -1761,6 +1761,11 @@ where
         self.job_registry.clone()
     }
 
+    /// The largest `timeout` a script of this shell accepts now.
+    pub(crate) fn timeout_cap(&self) -> Duration {
+        self.limits.timeout_cap.get()
+    }
+
     /// This terminal's jobs.
     #[must_use]
     pub fn jobs(&self) -> Jobs {
@@ -2476,8 +2481,21 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
     pub async fn call(
         &self,
         arguments: ShellArgs,
-        mut cx: ToolContext,
+        cx: ToolContext,
     ) -> aither_core::Result<ToolResult> {
+        match self.execute(arguments, cx).await? {
+            Execution::Finished(result) => result.into_tool_result(),
+            Execution::Detached(detached) => detached.into_command_result().into_tool_result(),
+        }
+    }
+
+    /// Runs one call to the point it answers: its result, or the job it
+    /// detached.
+    async fn execute(
+        &self,
+        arguments: ShellArgs,
+        mut cx: ToolContext,
+    ) -> aither_core::Result<Execution> {
         if !self.interpreters.contains(&arguments.interpreter) {
             return Err(anyhow::anyhow!(
                 "the {:?} interpreter is not configured for this shell",
@@ -2520,14 +2538,15 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
         // foreground clock only measures the command's own runtime.
         wait_for_background_startup(&spawned.startup).await?;
         if arguments.background {
-            return background_terminal_result(
+            return detach_job(
                 &self.job_registry,
                 &prepared.outputs,
                 &prepared.task_id,
                 prepared.max_lines,
                 &self.events_tx,
             )
-            .await;
+            .await
+            .map(Execution::Detached);
         }
         let outcome =
             wait_for_foreground_result(&spawned.result, self.limits.foreground_wait.get()).await;
@@ -2545,7 +2564,7 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
                     .into_script_result(killed)
                     .into_command_result(&prepared.task_id, &self.output_store);
                 spawned.took_result().await;
-                command.into_tool_result()
+                Ok(Execution::Finished(command))
             }
             Some(Err(err)) => {
                 spawned.took_result().await;
@@ -2553,16 +2572,60 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
             }
             // The command outlived its foreground window: promote it to a
             // background task.
-            None => {
-                background_terminal_result(
-                    &self.job_registry,
-                    &prepared.outputs,
-                    &prepared.task_id,
-                    prepared.max_lines,
-                    &self.events_tx,
-                )
-                .await
+            None => detach_job(
+                &self.job_registry,
+                &prepared.outputs,
+                &prepared.task_id,
+                prepared.max_lines,
+                &self.events_tx,
+            )
+            .await
+            .map(Execution::Detached),
+        }
+    }
+}
+
+/// What a call answered.
+enum Execution {
+    /// The script ended inside the foreground window.
+    Finished(CommandResult),
+    /// The script became a job.
+    Detached(Detached),
+}
+
+/// A job a call detached, with the output file it was redirected to.
+struct Detached {
+    task_id: String,
+    redirect: BackgroundRedirect,
+    /// Holds the job until the caller took it over.
+    watch: crate::job_registry::JobWatch,
+}
+
+impl Detached {
+    /// The result the model reads for the job's start.
+    fn into_command_result(self) -> CommandResult {
+        let Self {
+            task_id, redirect, ..
+        } = self;
+        let stdout = if redirect.truncated {
+            CommandStream::Stored {
+                file: redirect.file.clone(),
+                preview: redirect.preview,
+                truncated: true,
             }
+        } else {
+            CommandStream::Inline {
+                text: redirect.preview,
+            }
+        };
+        CommandResult {
+            stdout,
+            stderr: None,
+            interruptions: Vec::new(),
+            outcome: CommandOutcome::Running {
+                task_id,
+                output: redirect.file,
+            },
         }
     }
 }
@@ -2854,22 +2917,31 @@ async fn left_in_start(carry: &CwdCarry, reported: &str, working_dir: &Path) -> 
 impl<E: Executor + Clone + 'static> Shell<E, Configured> {
     /// Runs `script` as a detached background job bounded by `timeout`, for
     /// embedders that drive the terminal directly rather than through the
-    /// `terminal` tool schema. Shares [`Self::call`]'s `background: true`
-    /// path.
+    /// `terminal` tool schema, and returns the job. Shares [`Self::call`]'s
+    /// `background: true` path, so the job is announced as one.
     ///
     /// # Errors
     ///
     /// Fails the way a `terminal` call does: an invalid `timeout`, a
     /// refused permission, a blocked command or a spawn failure.
-    pub async fn run_background(&self, arguments: ShellArgs) -> aither_core::Result<ToolResult> {
-        self.call(
-            ShellArgs {
-                background: true,
-                ..arguments
-            },
-            ToolContext::new(),
-        )
-        .await
+    pub async fn run_background(&self, arguments: ShellArgs) -> aither_core::Result<crate::Job> {
+        let execution = self
+            .execute(
+                ShellArgs {
+                    background: true,
+                    ..arguments
+                },
+                ToolContext::new(),
+            )
+            .await?;
+        match execution {
+            Execution::Detached(detached) => Ok(crate::Job::new(
+                self.jobs(),
+                detached.task_id,
+                detached.watch,
+            )),
+            Execution::Finished(_) => unreachable!("a background call detaches its job"),
+        }
     }
 }
 
@@ -3436,13 +3508,21 @@ async fn wait_for_foreground_result(
     .await
 }
 
-async fn background_terminal_result(
+/// Detaches the running task `task_id` as a job: its output goes to a file
+/// and the shell raises [`ShellEvent::JobStarted`].
+async fn detach_job(
     job_registry: &JobRegistry,
     outputs: &OutputStore,
     task_id: &str,
     max_lines: usize,
     started_tx: &EventSender,
-) -> aither_core::Result<ToolResult> {
+) -> aither_core::Result<Detached> {
+    // The call still owns the job's completion, so the job is registered; the
+    // hold keeps it past a consumer that takes the completion at once.
+    let watch = job_registry
+        .watch(task_id)
+        .await
+        .expect("a job whose call has not returned is registered");
     let redirect =
         start_background_output_redirect(job_registry, outputs, task_id, max_lines).await?;
     let _ = started_tx
@@ -3452,27 +3532,11 @@ async fn background_terminal_result(
             output_file: redirect.file.clone(),
         }))
         .await;
-    let stdout = if redirect.truncated {
-        CommandStream::Stored {
-            file: redirect.file.clone(),
-            preview: redirect.preview,
-            truncated: true,
-        }
-    } else {
-        CommandStream::Inline {
-            text: redirect.preview,
-        }
-    };
-    CommandResult {
-        stdout,
-        stderr: None,
-        interruptions: Vec::new(),
-        outcome: CommandOutcome::Running {
-            task_id: task_id.to_string(),
-            output: redirect.file,
-        },
-    }
-    .into_tool_result()
+    Ok(Detached {
+        task_id: task_id.to_string(),
+        redirect,
+        watch,
+    })
 }
 
 /// Output file a background job was redirected to, with what it holds so far.
@@ -6741,6 +6805,24 @@ mod tests {
         ));
     }
 
+    /// A detached call answered as the model reads it.
+    trait CallDetached {
+        async fn call_detached(&self, arguments: ShellArgs) -> aither_core::Result<ToolResult>;
+    }
+
+    impl<E: Executor + Clone + 'static> CallDetached for Shell<E, Configured> {
+        async fn call_detached(&self, arguments: ShellArgs) -> aither_core::Result<ToolResult> {
+            self.call(
+                ShellArgs {
+                    background: true,
+                    ..arguments
+                },
+                ToolContext::new(),
+            )
+            .await
+        }
+    }
+
     fn render_terminal_result(result: &ToolResult) -> String {
         result.render_for_model()
     }
@@ -7870,7 +7952,7 @@ mod tests {
         // first read of that task and cannot be refused as unchanged.
         let receiver = child.background_receiver();
         let result = child
-            .run_background(background_args(
+            .call_detached(background_args(
                 "echo one stdin line",
                 "read line; printf 'got %s\\n' \"$line\"",
             ))
@@ -7906,7 +7988,7 @@ mod tests {
     async fn configured_child_terminal_kill_addresses_child_jobs() {
         let (_dirs, parent, child) = parent_and_child_terminals().await;
         let result = child
-            .run_background(background_args("sleep", "sleep 30"))
+            .call_detached(background_args("sleep", "sleep 30"))
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -8879,7 +8961,7 @@ mod tests {
         let input_tool = input_tool(tool.jobs());
 
         let result = tool
-            .run_background(ShellArgs {
+            .call_detached(ShellArgs {
                 description: "wait for terminal input and echo it back".to_string(),
                 script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
                 interpreter: Interpreter::Shell,
@@ -9087,7 +9169,7 @@ mod tests {
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
-            .run_background(ShellArgs {
+            .call_detached(ShellArgs {
                 description: "start a descendant process".to_string(),
                 script: "sleep 30 & echo $! > child.pid; wait".to_string(),
                 interpreter: Interpreter::Shell,
@@ -9198,17 +9280,14 @@ mod tests {
         tool: &Shell<executor_core::tokio::TokioGlobal, Configured>,
         script: &str,
     ) -> String {
-        let result = tool
+        let job = tool
             .run_background(ShellArgs {
                 background: true,
                 ..terminal_args("background job", script)
             })
             .await
             .expect("terminal should start the job");
-        match result.command().map(|command| &command.outcome) {
-            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
-            other => panic!("background job needs a task id, got {other:?}"),
-        }
+        job.task_id().to_owned()
     }
 
     /// Python terminal arguments for `code`.
@@ -9273,16 +9352,13 @@ mod tests {
         )
         .await;
         let receiver = tool.background_receiver();
-        let result = tool
+        let job = tool
             .run_background(python_args(
                 "import time\nprint('ready', flush=True)\ntime.sleep(60)",
             ))
             .await
             .expect("python should start detached");
-        let task_id = match result.command().map(|command| &command.outcome) {
-            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
-            other => panic!("a background job needs a task id, got {other:?}"),
-        };
+        let task_id = job.task_id().to_owned();
         assert_eq!(started_task_id(&receiver), task_id);
 
         let jobs = tool.job_registry().list().await;
@@ -10140,7 +10216,7 @@ mod tests {
         script: &str,
         timeout: u64,
     ) -> (String, i32) {
-        let result = tool
+        let job = tool
             .run_background(ShellArgs {
                 background: true,
                 timeout,
@@ -10148,10 +10224,7 @@ mod tests {
             })
             .await
             .expect("terminal should start the background job");
-        let task_id = match result.command().map(|command| &command.outcome) {
-            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
-            other => panic!("background job needs a task id, got {other:?}"),
-        };
+        let task_id = job.task_id().to_owned();
         let child = recorded_child_pid(tool.working_dir()).await;
         // Past the shell's exit and several of the tree's checks.
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -10715,18 +10788,21 @@ mod tests {
         // `exec` keeps `$$` — the pid the probe wrote — on the interactive
         // shell the session then drives.
         let result = tool
-            .run_background(ShellArgs {
-                description: "start a persistent shell".to_string(),
-                script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
-                interpreter: Interpreter::Shell,
-                sandbox: SandboxMode::Sandboxed,
-                location: None,
-                resolution: MediaResolution::Auto,
-                max_lines: Some(50),
-                raw: false,
-                timeout: 30,
-                background: true,
-            })
+            .call(
+                ShellArgs {
+                    description: "start a persistent shell".to_string(),
+                    script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
+                    location: None,
+                    resolution: MediaResolution::Auto,
+                    max_lines: Some(50),
+                    raw: false,
+                    timeout: 30,
+                    background: true,
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -10771,10 +10847,13 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let result = tool
-            .run_background(ShellArgs {
-                background: true,
-                ..pid_probe_args()
-            })
+            .call(
+                ShellArgs {
+                    background: true,
+                    ..pid_probe_args()
+                },
+                ToolContext::new(),
+            )
             .await
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
@@ -14611,6 +14690,32 @@ mod tests {
             )),
             "the deadline kills the run and reports a timeout: {alerts:?}"
         );
+    }
+
+    /// The watched job's bound stays a margin past the monitor's deadline, so
+    /// the largest monitor is the shell's cap less that margin, and one past
+    /// it is refused up front instead of failing to start the job.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_largest_monitor_leaves_the_jobs_margin_inside_the_shells_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
+        monitor
+            .call(monitor_command("sleep 60", 7140), ToolContext::new())
+            .await
+            .expect("a monitor whose job bound fits the cap starts");
+        let refused = monitor
+            .call(monitor_command("sleep 60", 7141), ToolContext::new())
+            .await;
+        assert!(refused.is_err(), "its job's bound would pass the cap");
+        tool.jobs().kill_all().await;
     }
 
     #[cfg(unix)]

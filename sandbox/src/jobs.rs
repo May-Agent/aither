@@ -113,11 +113,7 @@ impl Jobs {
     /// the same name.
     pub async fn get(&self, task_id: &str) -> Option<Job> {
         let watch = self.registry.watch(task_id).await?;
-        Some(Job {
-            task_id: task_id.to_owned(),
-            jobs: self.clone(),
-            _watch: Arc::new(watch),
-        })
+        Some(Job::new(self.clone(), task_id.to_owned(), watch))
     }
 
     /// Kills the job named `task_id` with its whole process tree; `false`
@@ -150,6 +146,14 @@ pub struct Job {
 }
 
 impl Job {
+    pub(crate) fn new(jobs: Jobs, task_id: String, watch: JobWatch) -> Self {
+        Self {
+            task_id,
+            jobs,
+            _watch: Arc::new(watch),
+        }
+    }
+
     /// The word the job is named by.
     #[must_use]
     pub fn task_id(&self) -> &str {

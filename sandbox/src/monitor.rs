@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use aither_core::llm::{CommandOutcome, Tool, ToolContext, ToolResult};
+use aither_core::llm::{Tool, ToolContext, ToolResult};
 use executor_core::{Executor, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,10 @@ use crate::output::MediaResolution;
 use crate::policy::SandboxMode;
 use crate::terminal::{Configured, Shell, ShellArgs};
 use crate::wording::{MonitorStarted, Refused};
+
+/// How long the watched job's own `timeout` bound outlasts the monitor's
+/// deadline.
+const JOB_MARGIN: Duration = Duration::from_secs(60);
 
 /// What an embedder decides about monitoring: the tool's name and description
 /// and the bounds of a watch. The bounds are live, so changing one reaches
@@ -178,7 +182,7 @@ struct Watch {
     task_id: String,
     /// Keeps the job, and its word, until the pump reports its end, so a
     /// completion the agent took first still leaves the pump its status.
-    held: Option<crate::job_registry::JobWatch>,
+    _job: crate::Job,
     registry: JobRegistry,
     alerts: EventSender,
     interval: Duration,
@@ -315,7 +319,14 @@ where
 impl<E: Executor + Clone + 'static> MonitorTool<E> {
     /// Starts the watched job and its pump; returns the job's task id.
     async fn start(&self, args: MonitorArgs) -> Result<String, MonitorRefusal> {
-        let max_timeout = self.settings.max_timeout.get();
+        // The pump owns the deadline and the job's own bound stays a margin
+        // past it, so a monitor is accepted only when the shell accepts that
+        // bound too.
+        let max_timeout = self
+            .settings
+            .max_timeout
+            .get()
+            .min(self.terminal.timeout_cap().saturating_sub(JOB_MARGIN));
         if args.timeout_secs == 0 || args.timeout_secs > max_timeout.as_secs() {
             return Err(MonitorRefusal::TimeoutOutOfRange { max: max_timeout });
         }
@@ -341,7 +352,7 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
             MonitorSource::Command { .. } => "monitored command".to_string(),
             MonitorSource::File { file } => format!("monitor file {file}"),
         };
-        let result = self
+        let job = self
             .terminal
             .run_background(ShellArgs {
                 description,
@@ -352,29 +363,21 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
                 resolution: MediaResolution::Auto,
                 max_lines: Some(1),
                 raw: true,
-                // The job's own watchdog stays a minute past the monitor's
+                // The job's own watchdog stays a margin past the monitor's
                 // deadline, so the pump's kill — not the watchdog's — ends a
                 // timed-out run and the end reports `TimedOut`.
-                timeout: (args.timeout_secs + 60).min(max_timeout.as_secs()),
+                timeout: args.timeout_secs + JOB_MARGIN.as_secs(),
                 background: true,
             })
             .await
             .map_err(|error| MonitorRefusal::StartFailed {
                 reason: error.to_string(),
             })?;
-        let task_id = match result.command().map(|command| &command.outcome) {
-            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
-            _ => {
-                return Err(MonitorRefusal::StartFailed {
-                    reason: "the monitored job did not start detached".to_string(),
-                });
-            }
-        };
-        let registry = self.terminal.job_registry();
+        let task_id = job.task_id().to_owned();
         let watch = Watch {
-            held: registry.watch(&task_id).await,
+            _job: job,
             task_id: task_id.clone(),
-            registry,
+            registry: self.terminal.job_registry(),
             alerts: self.terminal.event_sender(),
             interval: Duration::from_secs(interval_secs),
             deadline: Instant::now() + Duration::from_secs(args.timeout_secs),
@@ -410,7 +413,7 @@ async fn send(alerts: &EventSender, alert: ShellEvent) {
 async fn watch_task(watch: Watch) {
     let Watch {
         task_id,
-        held: _held,
+        _job,
         registry,
         alerts,
         interval,
