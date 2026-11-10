@@ -30,25 +30,10 @@ mod json_tsv;
 mod preview;
 mod render;
 
-use askama::Template;
-
 use crate::output::OutputStore;
+use crate::wording::{JsonAsTsv, ShellWording};
 
 pub use preview::stored_preview;
-
-#[derive(Template)]
-#[template(path = "json_tsv_output.txt", escape = "none")]
-struct JsonTsvOutput<'a> {
-    tsv: &'a str,
-    url: &'a str,
-    path: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "folded_code_output.txt", escape = "none")]
-struct FoldedCodeOutput<'a> {
-    folded: &'a str,
-}
 
 /// Renders the folded view of cut source code for the model, or `None` when
 /// `text` is not recognisable source code or folding does not shrink it.
@@ -56,15 +41,9 @@ struct FoldedCodeOutput<'a> {
 /// The folded view carries the line numbers of the unfolded `text`, which the
 /// caller stores.
 #[must_use]
-pub fn folded_code_content(text: &str) -> Option<String> {
-    let folded = fold::fold_source_code(text)?;
-    Some(
-        FoldedCodeOutput {
-            folded: folded.trim_end_matches('\n'),
-        }
-        .render()
-        .expect("folded code output template must render"),
-    )
+pub fn folded_code_content(text: &str, wording: &dyn ShellWording) -> Option<String> {
+    let folded = fold::fold_source_code(text, wording)?;
+    Some(wording.folded_code(folded.trim_end_matches('\n')))
 }
 
 /// Cleans foreground terminal text for the model.
@@ -87,18 +66,16 @@ pub async fn compress_text(store: &OutputStore, text: &str) -> std::io::Result<O
         return Ok(None);
     }
 
-    let cleaned = collapse::collapse_blank_runs(&render::render_terminal(text));
+    let cleaned = collapse::collapse_blank_runs(&render::render_terminal(text), &**store.wording());
 
     if let Some(tsv) = json_tsv::to_tsv(&cleaned) {
         let (url, path) = store.save_raw(cleaned.as_bytes()).await?;
         let path = path.display().to_string();
-        let rendered = JsonTsvOutput {
+        let rendered = store.wording().json_as_tsv(&JsonAsTsv {
             tsv: tsv.trim_end_matches('\n'),
             url: &url,
             path: &path,
-        }
-        .render()
-        .expect("json tsv output template must render");
+        });
         return Ok(Some(rendered));
     }
 
@@ -113,7 +90,11 @@ mod tests {
 
     /// A store in `dir` leasing from the default allocator.
     fn store(dir: &Path) -> OutputStore {
-        OutputStore::at(dir.to_path_buf(), aither_core::AnyIdAllocator::default())
+        OutputStore::testing(
+            dir.to_path_buf(),
+            aither_core::AnyIdAllocator::default(),
+            crate::output_policy::fixture::policy(),
+        )
     }
 
     async fn compress(text: &str) -> Option<String> {

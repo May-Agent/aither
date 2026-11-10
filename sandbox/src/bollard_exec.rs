@@ -472,6 +472,7 @@ impl ContainerExec for BollardContainerExec {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         exec_inner(
             self.client.clone(),
@@ -480,7 +481,7 @@ impl ContainerExec for BollardContainerExec {
             working_dir.to_string(),
             kill_rx,
             stdin_rx,
-            ExecLifetime::Foreground,
+            lifetime,
             Some(stdout),
         )
     }

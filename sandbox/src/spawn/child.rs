@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use async_channel::{Receiver, Sender};
 
 use super::ssh::RemoteJob;
-use crate::process_tree::{JobTree, KillTreeError};
+use crate::process_tree::{JobProcess, JobTree, KillTreeError};
+use crate::stdin_watch::StdinWatchSignal;
 
 /// How a spawned process ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,18 @@ impl ChildExit {
     }
 }
 
+/// The processes a child left running that the backend ended with it, which
+/// only a [`Foreground`](crate::TreeLifetime::Foreground) child has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Descendants {
+    /// These were running when the process exited, and were killed; empty
+    /// when it left none, or when its lifetime lets them run on.
+    Killed(Vec<JobProcess>),
+    /// The backend cannot see the processes of its tree: an SSH child's run
+    /// on another machine, behind a login shell.
+    Unobserved,
+}
+
 /// How a child's whole process tree is ended.
 pub enum KillHandle {
     /// A local job's tree: its supervisor or its watched process table.
@@ -41,7 +54,7 @@ pub enum KillHandle {
 
 /// The exit of one child, set once by the task that waits for it.
 pub struct ExitWatch {
-    result: Mutex<Option<ChildExit>>,
+    result: Mutex<Option<(ChildExit, Descendants)>>,
     done: Receiver<()>,
 }
 
@@ -69,12 +82,13 @@ pub fn exit_watch() -> (ExitSetter, Arc<ExitWatch>) {
 }
 
 impl ExitSetter {
-    pub(crate) fn finish(self, exit: ChildExit) {
+    pub(crate) fn finish(self, exit: ChildExit, descendants: Descendants) {
         *self
             .watch
             .result
             .lock()
-            .expect("the exit result lock is never held across a panic") = Some(exit);
+            .expect("the exit result lock is never held across a panic") =
+            Some((exit, descendants));
     }
 }
 
@@ -89,6 +103,7 @@ pub struct SandboxedChild {
     stdin: Option<Sender<Vec<u8>>>,
     stdout: Option<Receiver<Vec<u8>>>,
     stderr: Option<Receiver<Vec<u8>>>,
+    stdin_blocked: Option<Receiver<StdinWatchSignal>>,
     kill: KillHandle,
     exit: Arc<ExitWatch>,
 }
@@ -107,12 +122,14 @@ impl SandboxedChild {
             stdin,
             stdout,
             stderr,
+            stdin_blocked,
         } = streams;
         Self {
             id,
             stdin,
             stdout,
             stderr,
+            stdin_blocked,
             kill,
             exit,
         }
@@ -142,6 +159,20 @@ impl SandboxedChild {
     /// did not pipe it or it was taken.
     pub const fn take_stderr(&mut self) -> Option<Receiver<Vec<u8>>> {
         self.stderr.take()
+    }
+
+    /// The signals that a process of the child's tree is waiting to read its
+    /// piped standard input with nothing buffered, once; `None` when the
+    /// spawn did not pipe stdin, it was taken, or the backend cannot watch
+    /// it.
+    ///
+    /// The host and container backends watch the stdin pipe: one
+    /// [`StdinWatchSignal::Blocked`] per blocking episode, or a single
+    /// [`StdinWatchSignal::Failed`] when the watch cannot run at all. An SSH
+    /// child has no watch: its stdin is a pipe to a local `ssh` client,
+    /// which cannot tell whether a process on the server reads it.
+    pub const fn take_stdin_blocked(&mut self) -> Option<Receiver<StdinWatchSignal>> {
+        self.stdin_blocked.take()
     }
 
     /// Kills the whole process tree: the process and every descendant,
@@ -176,6 +207,23 @@ impl SandboxedChild {
     /// Panics when another thread panicked holding the exit result's lock,
     /// which nothing does across a panic.
     pub async fn wait(&self) -> ChildExit {
+        self.outcome().await.0
+    }
+
+    /// Waits like [`wait`](Self::wait) and answers the processes the child
+    /// left running that the backend ended: those of a
+    /// [`Foreground`](crate::TreeLifetime::Foreground) spawn, found and
+    /// killed when its top-level process exited. A
+    /// [`Background`](crate::TreeLifetime::Background) child's descendants
+    /// are waited for instead, so nothing is killed.
+    ///
+    /// An SSH child answers [`Descendants::Unobserved`]; a failed wait
+    /// answers it too.
+    pub async fn descendants_killed(&self) -> Descendants {
+        self.outcome().await.1
+    }
+
+    async fn outcome(&self) -> (ChildExit, Descendants) {
         // Nothing is ever sent: the channel closes when the exit is recorded.
         let _ = self.exit.done.recv().await;
         self.exit
@@ -183,7 +231,12 @@ impl SandboxedChild {
             .lock()
             .expect("the exit result lock is never held across a panic")
             .clone()
-            .unwrap_or_else(|| ChildExit::Failed("the task waiting for the process ended".into()))
+            .unwrap_or_else(|| {
+                (
+                    ChildExit::Failed("the task waiting for the process ended".into()),
+                    Descendants::Unobserved,
+                )
+            })
     }
 }
 
@@ -193,4 +246,5 @@ pub struct Streams {
     pub(crate) stdin: Option<Sender<Vec<u8>>>,
     pub(crate) stdout: Option<Receiver<Vec<u8>>>,
     pub(crate) stderr: Option<Receiver<Vec<u8>>>,
+    pub(crate) stdin_blocked: Option<Receiver<StdinWatchSignal>>,
 }

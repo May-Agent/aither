@@ -283,9 +283,11 @@ pub(crate) mod testing {
     }
 
     /// Allows exactly one address, which stands in for a public one.
+    #[cfg(feature = "headless")]
     #[derive(Clone)]
     pub(crate) struct Only(pub(crate) SocketAddr);
 
+    #[cfg(feature = "headless")]
     impl AddressPolicy for Only {
         fn check(&self, host: &str, addr: SocketAddr) -> Result<(), UrlPolicyError> {
             if addr == self.0 {

@@ -76,6 +76,8 @@ pub trait ContainerExec: Send + Sync {
     /// empty. `stdout` is bounded, so a consumer that stops reading holds the
     /// command back. The command is killed, as when `kill_rx` fires, once
     /// `kill_rx` fires or closes, or once `stdout` has no receiver left.
+    /// `lifetime` is [`Self::exec`]'s.
+    #[allow(clippy::too_many_arguments)]
     fn exec_streamed(
         &self,
         container_id: &str,
@@ -84,6 +86,7 @@ pub trait ContainerExec: Send + Sync {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
@@ -103,6 +106,7 @@ pub trait ContainerExecImpl: Send + Sync {
 
     /// Execute a command inside a container, streaming its stdout, through a
     /// boxed future.
+    #[allow(clippy::too_many_arguments)]
     fn exec_streamed_boxed<'a>(
         &'a self,
         container_id: &'a str,
@@ -111,6 +115,7 @@ pub trait ContainerExecImpl: Send + Sync {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
 
@@ -178,6 +183,7 @@ impl ContainerExec for AnyContainerExec {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let inner = Arc::clone(&self.inner);
         let container_id = container_id.to_string();
@@ -193,6 +199,7 @@ impl ContainerExec for AnyContainerExec {
                     kill_rx,
                     stdin_rx,
                     stdout,
+                    lifetime,
                 )
                 .await
         }
@@ -468,8 +475,17 @@ impl<T: ContainerExec> ContainerExecImpl for T {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
-        Box::pin(self.exec_streamed(container_id, script, working_dir, kill_rx, stdin_rx, stdout))
+        Box::pin(self.exec_streamed(
+            container_id,
+            script,
+            working_dir,
+            kill_rx,
+            stdin_rx,
+            stdout,
+            lifetime,
+        ))
     }
 }
 
@@ -484,37 +500,18 @@ pub enum ShellBackend {
     Container,
 }
 
-/// Which home backends are usable in the current deployment.
+/// Tracks the tools prepared for the home environment, the SSH servers
+/// commands may run on and how to reach them.
 ///
-/// SSH servers are never a home environment; they are the registry's server
-/// set, which changes while it lives.
-#[derive(Debug, Clone, Serialize)]
-pub struct ShellRuntimeAvailability {
-    /// Whether local execution is available. Always true in practice.
-    pub local: bool,
-    /// Whether a container runtime has been wired up.
-    pub container: bool,
-}
-
-impl Default for ShellRuntimeAvailability {
-    fn default() -> Self {
-        Self {
-            local: true,
-            container: false,
-        }
-    }
-}
-
-/// Tracks the home backend, the SSH servers commands may run on and how to
-/// reach them.
+/// The home environment is the shell's [`Sandbox`](crate::Sandbox): its
+/// backend says where commands with no `location` run, and the tools are
+/// prepared for exactly that backend.
 ///
 /// Cloning shares the SSH server set: a server added or removed through one
 /// holder is seen by every other, the terminals of subagents included.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ShellSessionRegistry {
-    availability: ShellRuntimeAvailability,
     ssh: SshEnvironments,
-    container_runtime: Option<ContainerShellRuntime>,
     pub(crate) prepared_tools: Option<crate::tool_environment::PreparedToolEnvironments>,
 }
 
@@ -526,37 +523,6 @@ impl std::fmt::Debug for ShellSessionRegistry {
 }
 
 impl ShellSessionRegistry {
-    /// Creates a registry advertising the given backends, with no SSH server.
-    #[must_use]
-    pub fn new(availability: ShellRuntimeAvailability) -> Self {
-        Self {
-            availability,
-            ssh: SshEnvironments::default(),
-            container_runtime: None,
-            prepared_tools: None,
-        }
-    }
-
-    /// Replaces runtime availability.
-    #[must_use]
-    pub const fn with_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
-        self.availability = availability;
-        self
-    }
-
-    /// Sets the container runtime.
-    #[must_use]
-    pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
-        self.container_runtime = Some(runtime);
-        self
-    }
-
-    #[must_use]
-    /// Returns runtime availability.
-    pub fn availability(&self) -> ShellRuntimeAvailability {
-        self.availability.clone()
-    }
-
     /// Adds `server` to the set commands may run on, for every holder of this
     /// registry. Its name and target are trimmed. It is prepared on its first
     /// command, which asks the terminal's permission handler first.
@@ -591,29 +557,6 @@ impl ShellSessionRegistry {
     pub(crate) fn with_ssh_client(mut self, client: crate::ssh::SshClient) -> Self {
         self.ssh = self.ssh.with_client(client);
         self
-    }
-
-    pub(crate) const fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
-        self.container_runtime.as_ref()
-    }
-
-    /// Picks the backend to use for a command that did not name one.
-    ///
-    /// Prefers a container when one is configured, since it isolates better
-    /// than running on the host.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if neither a container nor local execution is available.
-    pub fn resolve_local_backend(&self) -> Result<ShellBackend, String> {
-        let availability = self.availability();
-        if availability.container {
-            return Ok(ShellBackend::Container);
-        }
-        if availability.local {
-            return Ok(ShellBackend::Local);
-        }
-        Err("no local backend available".to_string())
     }
 }
 
@@ -665,6 +608,7 @@ mod disk_probe_tests {
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
             _stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
         ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
             std::future::ready(Err("a probe is never streamed".to_string()))
         }
@@ -715,11 +659,11 @@ mod disk_probe_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellRuntimeAvailability, ShellSessionRegistry, SshServer};
+    use super::{ShellSessionRegistry, SshServer};
 
     #[test]
     fn every_clone_of_a_registry_shares_its_live_server_set() {
-        let registry = ShellSessionRegistry::new(ShellRuntimeAvailability::default());
+        let registry = ShellSessionRegistry::default();
         let subagent = registry.clone();
         let prod = SshServer {
             name: "prod".to_string(),

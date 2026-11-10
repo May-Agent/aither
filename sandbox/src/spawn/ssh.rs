@@ -5,11 +5,11 @@ use std::process::Stdio as ProcessStdio;
 use std::sync::Arc;
 
 use askama::Template;
-use executor_core::Executor;
+use executor_core::{AnyExecutor, Executor};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::child::{ChildExit, KillHandle, SandboxedChild, Streams, exit_watch};
-use super::{EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnError, SpawnSpec};
+use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
+use super::{EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnCommand, SpawnError, SpawnSpec};
 use crate::SshServer;
 use crate::process_tree::{KillTreeError, kill_process_tree};
 use crate::ssh::SshClient;
@@ -130,16 +130,30 @@ impl Sandbox {
         launch: &RemoteLaunch,
         spec: SpawnSpec,
     ) -> Result<SandboxedChild, SpawnError> {
-        let setup = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
+        let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let SpawnSpec {
-            program,
-            args,
+            command,
             env,
             cwd,
             stdio,
-            extra_grants: _,
-            ipc: _,
+            grants,
+            ipc,
+            lifetime: _,
         } = spec;
+        // A grant is a path on one machine and a router is served by this
+        // one: nothing of either reaches a server.
+        if !grants.is_empty() {
+            return Err(SpawnError::Unsupported {
+                backend: "ssh",
+                what: "a grant",
+            });
+        }
+        if ipc.is_some() {
+            return Err(SpawnError::Unsupported {
+                backend: "ssh",
+                what: "a way back to the host's commands",
+            });
+        }
         if cwd.is_some() {
             return Err(SpawnError::Setup(
                 "an SSH process starts in the server's login directory: a host path names nothing there"
@@ -161,10 +175,15 @@ impl Sandbox {
 
         // Only what the spec names travels: the sandbox's own environment and
         // its source describe this machine.
-        let script = shell_words::join(std::iter::once(&program).chain(&args));
+        let script = match command {
+            SpawnCommand::Script(script) => script,
+            SpawnCommand::Program { program, args } => {
+                shell_words::join(std::iter::once(&program).chain(&args))
+            }
+        };
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
-        let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| setup(&e))?;
-        let remote = remote_command(launch, heel, &script).map_err(|e| setup(&e))?;
+        let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| failed(&e))?;
+        let remote = remote_command(launch, heel, &script).map_err(|e| failed(&e))?;
         let pidfile = shell_words::quote(&format!(
             "/tmp/aither-spawn-{}.pgid",
             uuid::Uuid::new_v4().simple()
@@ -175,11 +194,15 @@ impl Sandbox {
             command: &remote,
         }
         .render()
-        .map_err(|e| setup(&e))?;
+        .map_err(|e| failed(&e))?;
 
-        let mut command = self.inner.ssh_client.command(server, &remote);
+        let command = self.inner.ssh_client.command(server, &remote);
         #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let command = {
+            let mut command = command;
+            std::os::unix::process::CommandExt::process_group(&mut command, 0);
+            command
+        };
         // The pipes are set on the async command: converting a std command
         // resets them, and spawning would then inherit this process's stdio.
         let mut child = async_process::Command::from(command)
@@ -191,38 +214,20 @@ impl Sandbox {
         let id = child.id();
 
         let executor = &self.inner.executor;
-        let mut streams = Streams::default();
-        if let Some(mut stdin) = child.stdin.take() {
-            let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
-            streams.stdin = Some(tx);
-            executor
-                .spawn(async move {
-                    while let Ok(bytes) = rx.recv().await {
-                        if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                })
-                .detach();
-        }
-        if let Some(stdout) = child.stdout.take() {
-            let (tx, rx) = async_channel::unbounded();
-            streams.stdout = Some(rx);
-            executor.spawn(pump(stdout, tx)).detach();
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let (tx, rx) = async_channel::unbounded();
-            streams.stderr = Some(rx);
-            executor.spawn(pump(stderr, tx)).detach();
-        }
+        let streams = pipe_streams(executor, &mut child);
 
         let (setter, watch) = exit_watch();
         executor
             .spawn(async move {
-                setter.finish(match child.status().await {
-                    Ok(status) => ChildExit::Exited(status),
-                    Err(error) => ChildExit::Failed(error.to_string()),
-                });
+                // The processes on the server are out of sight, so nothing is
+                // known of the descendants the exit left.
+                setter.finish(
+                    match child.status().await {
+                        Ok(status) => ChildExit::Exited(status),
+                        Err(error) => ChildExit::Failed(error.to_string()),
+                    },
+                    Descendants::Unobserved,
+                );
             })
             .detach();
         Ok(SandboxedChild::new(
@@ -237,6 +242,36 @@ impl Sandbox {
             watch,
         ))
     }
+}
+
+/// The channels of the local `ssh` process's standard streams that it has
+/// pipes for.
+fn pipe_streams(executor: &AnyExecutor, child: &mut async_process::Child) -> Streams {
+    let mut streams = Streams::default();
+    if let Some(mut stdin) = child.stdin.take() {
+        let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
+        streams.stdin = Some(tx);
+        executor
+            .spawn(async move {
+                while let Ok(bytes) = rx.recv().await {
+                    if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+    if let Some(stdout) = child.stdout.take() {
+        let (tx, rx) = async_channel::unbounded();
+        streams.stdout = Some(rx);
+        executor.spawn(pump(stdout, tx)).detach();
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let (tx, rx) = async_channel::unbounded();
+        streams.stderr = Some(rx);
+        executor.spawn(pump(stderr, tx)).detach();
+    }
+    streams
 }
 
 /// Moves a pipe to a channel of chunks that closes at its end.

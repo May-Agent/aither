@@ -22,6 +22,7 @@
 mod backend;
 mod child;
 mod container;
+pub mod container_ipc;
 mod domain;
 mod env;
 mod grants;
@@ -39,16 +40,17 @@ use std::sync::Arc;
 use executor_core::{AnyExecutor, Executor};
 
 pub use backend::Backend;
-pub use child::{ChildExit, SandboxedChild};
+pub use child::{ChildExit, Descendants, SandboxedChild};
 pub use domain::{
     AnyDomainApprover, ApproveAllDomains, DenyAllDomains, DomainApprover, DomainRequest,
 };
 pub use env::EnvSource;
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
 pub use host::{LocalSpawn, TreeLifetime, resolved};
-pub use launch::{ContainerLaunch, RemoteLaunch, shell_arguments};
+#[cfg(not(windows))]
+pub use launch::shell_arguments;
+pub use launch::{ContainerLaunch, RemoteLaunch};
 pub use route::{HostRoute, HostRouteError};
-pub use ssh::remote_command;
 
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::process_tree::ProcessScanner;
@@ -64,6 +66,15 @@ pub enum SpawnError {
     /// The process could not be started.
     #[error("failed to start the process: {0}")]
     Start(String),
+    /// The spec asks for something the backend cannot honour, and the
+    /// process is not started without it.
+    #[error("the {backend} backend cannot honour {what}")]
+    Unsupported {
+        /// The backend that refused.
+        backend: &'static str,
+        /// What the spec asked for.
+        what: &'static str,
+    },
 }
 
 /// Whether a standard stream of a spawned process is piped to its handle.
@@ -98,25 +109,61 @@ impl Default for Stdio {
     }
 }
 
+/// What a spawned process runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnCommand {
+    /// A program with its arguments.
+    Program {
+        /// The program to run.
+        program: String,
+        /// Its arguments.
+        args: Vec<String>,
+    },
+    /// A script for the backend's managed shell, which only the container
+    /// and SSH backends have.
+    ///
+    /// A script is one level of quoting for a server's login shell, which
+    /// parses the command line first; a program that runs the shell would
+    /// need two.
+    Script(String),
+}
+
+/// An access a process is granted beyond the sandbox's own grants, named
+/// where the backend that honours it sees the path.
+#[derive(Debug, Clone)]
+pub enum SpawnGrant {
+    /// A resolved path on the host; only the host backend honours it.
+    Host(heel::Grant),
+    /// A path inside the container; only the container backend honours it.
+    /// It widens only a [derived](Sandbox::derived) sandbox's confinement:
+    /// any other process already has the whole container.
+    Container {
+        /// The path, as the container spells it.
+        path: crate::ContainerPath,
+        /// What the process may do with it.
+        access: heel::Access,
+    },
+}
+
 /// A process to start under a [`Sandbox`].
 pub struct SpawnSpec {
-    pub(crate) program: String,
-    pub(crate) args: Vec<String>,
+    pub(crate) command: SpawnCommand,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) stdio: Stdio,
     /// Grants this one process needs beyond the sandbox's (a command's
     /// jobserver fifo).
-    pub(crate) extra_grants: Vec<heel::Grant>,
+    pub(crate) grants: Vec<SpawnGrant>,
     /// The commands the process may call back into the host with.
     pub(crate) ipc: Option<heel::IpcRouter>,
+    /// Whether the backend ends the processes the top-level one leaves.
+    pub(crate) lifetime: TreeLifetime,
 }
 
 impl std::fmt::Debug for SpawnSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpawnSpec")
-            .field("program", &self.program)
-            .field("args", &self.args)
+            .field("command", &self.command)
             .field("cwd", &self.cwd)
             .field("stdio", &self.stdio)
             .finish_non_exhaustive()
@@ -128,21 +175,43 @@ impl SpawnSpec {
     /// working directory, with the default [`Stdio`].
     #[must_use]
     pub fn new(program: impl Into<String>) -> Self {
-        Self {
+        Self::of(SpawnCommand::Program {
             program: program.into(),
             args: Vec::new(),
+        })
+    }
+
+    /// A process running `source` in the managed shell the backend was given
+    /// the programs of, with the default [`Stdio`]. Only the container and
+    /// SSH backends have a managed shell to run it in: a spawn on the host
+    /// names a program.
+    #[must_use]
+    pub fn script(source: impl Into<String>) -> Self {
+        Self::of(SpawnCommand::Script(source.into()))
+    }
+
+    fn of(command: SpawnCommand) -> Self {
+        Self {
+            command,
             env: Vec::new(),
             cwd: None,
             stdio: Stdio::default(),
-            extra_grants: Vec::new(),
+            grants: Vec::new(),
             ipc: None,
+            lifetime: TreeLifetime::Background,
         }
     }
 
     /// Appends arguments.
+    ///
+    /// # Panics
+    /// Panics on a script, which takes none.
     #[must_use]
-    pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.args.extend(args.into_iter().map(Into::into));
+    pub fn args(mut self, more: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let SpawnCommand::Program { args, .. } = &mut self.command else {
+            panic!("a script takes no arguments");
+        };
+        args.extend(more.into_iter().map(Into::into));
         self
     }
 
@@ -151,6 +220,38 @@ impl SpawnSpec {
     #[must_use]
     pub fn env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
         self.env.extend(env);
+        self
+    }
+
+    /// Grants this process alone beyond the sandbox's. A grant is named
+    /// where the backend that honours it sees the path: a backend refuses
+    /// the [`SpawnGrant`] it cannot honour, and a server honours none.
+    #[must_use]
+    pub fn grants(mut self, grants: impl IntoIterator<Item = SpawnGrant>) -> Self {
+        self.grants.extend(grants);
+        self
+    }
+
+    /// Lets the process call the commands of `router` back on the host. The
+    /// host serves it in process; a container is reached over a listener at
+    /// its [host route](crate::ContainerShellRuntime::host_route); a server
+    /// has no way back, so its backend refuses it.
+    #[must_use]
+    pub fn ipc(mut self, router: Option<heel::IpcRouter>) -> Self {
+        self.ipc = router;
+        self
+    }
+
+    /// Sets how long the process's descendants may outlive it. The default
+    /// is [`TreeLifetime::Background`]: the child lasts until its whole tree
+    /// has exited, and its piped stdin is watched
+    /// ([`SandboxedChild::take_stdin_blocked`]); a container child's watch
+    /// runs, and costs a probe in the container, even when stdin is not
+    /// piped. SSH keeps the default for either value, as it cannot see the
+    /// tree.
+    #[must_use]
+    pub const fn lifetime(mut self, lifetime: TreeLifetime) -> Self {
+        self.lifetime = lifetime;
         self
     }
 
@@ -349,6 +450,59 @@ impl Sandbox {
         &self.inner.working_dir
     }
 
+    /// The same sandbox starting its processes in `working_dir`.
+    #[must_use]
+    pub fn with_working_dir(self, working_dir: impl Into<PathBuf>) -> Self {
+        self.edit(|inner| inner.working_dir = working_dir.into())
+    }
+
+    /// The same sandbox on `backend`: the grants, environment and network
+    /// policy are kept.
+    #[must_use]
+    pub fn with_backend(self, backend: Backend) -> Self {
+        self.edit(|inner| inner.backend = backend)
+    }
+
+    /// The sandbox with what a tool session adds for the programs it
+    /// prepared: grants that lead the embedder's fixed ones, environment the
+    /// embedder's own and its source's override, and the write denylist unless
+    /// the embedder gave one.
+    pub(crate) fn with_session(
+        self,
+        grants: Vec<heel::Grant>,
+        environment: Vec<(String, String)>,
+        write_denylist: heel::WriteDenylist,
+    ) -> Self {
+        self.edit(|inner| {
+            inner.fixed_grants.splice(0..0, grants);
+            inner.environment.splice(0..0, environment);
+            inner.write_denylist.get_or_insert(write_denylist);
+        })
+    }
+
+    /// The `heel` binary of a sandbox on the host.
+    pub(crate) fn host_heel(&self) -> Option<&heel::HeelBinary> {
+        match &self.inner.backend {
+            Backend::Host { heel } => Some(heel),
+            Backend::Container { .. } | Backend::Ssh { .. } => None,
+        }
+    }
+
+    /// The executor the sandbox's tasks run on.
+    pub(crate) fn executor(&self) -> Arc<AnyExecutor> {
+        Arc::clone(&self.inner.executor)
+    }
+
+    /// Where the sandbox's processes run.
+    pub(crate) fn backend(&self) -> &Backend {
+        &self.inner.backend
+    }
+
+    /// The scheduling priority of the sandbox's processes.
+    pub(crate) fn priority(&self) -> heel::ProcessPriority {
+        self.inner.priority
+    }
+
     /// The same sandbox without confinement: a host spawn takes host access,
     /// ignoring the grants and denylists and the network lists.
     pub(crate) fn unconfined(&self) -> Self {
@@ -362,7 +516,6 @@ impl Sandbox {
     }
 
     /// Reaches SSH servers through `client` instead of the default one.
-    #[cfg(test)]
     pub(crate) fn with_ssh_client(self, client: crate::ssh::SshClient) -> Self {
         self.edit(|inner| inner.ssh_client = client)
     }

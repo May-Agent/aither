@@ -149,6 +149,8 @@ async fn a_tool_added_by_list_changed_is_a_terminal_command_at_once() {
     let outputs = aither_sandbox::OutputStore::new(
         std::env::temp_dir(),
         aither_core::AnyIdAllocator::default(),
+        aither_sandbox::test_budgets::output_policy(),
+        aither_sandbox::test_wording::TestWording::any(),
     )
     .await
     .unwrap();

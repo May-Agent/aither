@@ -121,6 +121,8 @@ test-git = []
 test-heel = []
 # Expose `test_ids`, id allocators for tests, to dependents' tests.
 test-ids = []
+# Expose `test_budgets`, time and output budgets for tests, to dependents' tests.
+test-budgets = []
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
 code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]

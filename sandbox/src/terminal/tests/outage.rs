@@ -5,7 +5,7 @@ use aither_core::llm::InterruptionCause;
 
 use super::*;
 
-type Terminal = TerminalTool<executor_core::tokio::TokioGlobal, Configured>;
+type Terminal = Shell<executor_core::tokio::TokioGlobal, Configured>;
 
 /// A terminal recording `connectivity`; the cache directory must outlive it.
 async fn terminal(
@@ -13,17 +13,20 @@ async fn terminal(
     connectivity: &Connectivity,
 ) -> (crate::tool_runtime::tests::UnlockingTempDir, Terminal) {
     let (cache, shell_sessions) = prepared_test_registry().await;
-    let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        })
-        .with_connectivity(connectivity);
+    let tool = Shell::new_exact(
+        dir,
+        executor_core::tokio::TokioGlobal,
+        crate::limits::fixture::limits(),
+        crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
+    )
+    .await
+    .expect("terminal tool should initialize")
+    .adopt_prepared_tools(shell_sessions)
+    .await
+    .expect("prepared tools should be adopted")
+    .with_connectivity(connectivity);
     let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
     (cache, tool.with_registry(registry))
 }
@@ -59,7 +62,7 @@ async fn run_held(
         during();
         std::fs::write(release, "").expect("release file");
     });
-    let args = TerminalArgs {
+    let args = ShellArgs {
         background,
         ..background_args("hold", &held_script(tool))
     };

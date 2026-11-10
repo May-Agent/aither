@@ -1097,9 +1097,9 @@ mod tests {
         use async_channel::{Receiver, Sender};
 
         use super::*;
+        use crate::job_registry::job_registry_channel;
         use crate::{
-            AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime, TerminalMode,
-            job_registry_channel,
+            AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime, SandboxMode,
         };
 
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -1147,6 +1147,7 @@ mod tests {
                 _kill_rx: Receiver<()>,
                 _stdin_rx: Receiver<Vec<u8>>,
                 _stdout: Sender<Vec<u8>>,
+                _lifetime: crate::ExecLifetime,
             ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
                 std::future::ready(Err("a probe is never streamed".to_string()))
             }
@@ -1183,7 +1184,7 @@ mod tests {
         }
 
         async fn memory_with_jobs() -> JobMemory {
-            let (jobs, service) = job_registry_channel();
+            let (jobs, service) = job_registry_channel(crate::output_policy::fixture::policy());
             tokio::spawn(async move { service.serve().await });
             for (place, pid, task) in [
                 (JobPlace::Host, 1, "host"),
@@ -1196,8 +1197,8 @@ mod tests {
                     &crate::test_ids::lease(task),
                     "exec",
                     task,
-                    crate::ScriptLanguage::Shell,
-                    TerminalMode::Sandboxed,
+                    crate::Interpreter::Shell,
+                    SandboxMode::Sandboxed,
                 )
                 .await;
             }

@@ -9,7 +9,7 @@
 //! identical consecutive lines are replaced by one copy plus a marker naming
 //! the range they covered.
 
-use askama::Template;
+use crate::wording::{LineRange, OmittedLines, RepeatedLines, ShellWording};
 
 /// The head of a preview gets this fraction of the line and byte budget --
 /// one third -- and the tail gets the rest.
@@ -18,22 +18,6 @@ use askama::Template;
 /// a command's output, while the head is usually a banner, so the tail is
 /// worth twice the head.
 const HEAD_BUDGET_DIVISOR: usize = 3;
-
-#[derive(Template)]
-#[template(path = "omitted_lines_marker.txt", escape = "none")]
-struct OmittedLinesMarker {
-    first: usize,
-    last: usize,
-    total: usize,
-}
-
-#[derive(Template)]
-#[template(path = "repeated_lines_marker.txt", escape = "none")]
-struct RepeatedLinesMarker {
-    first: usize,
-    last: usize,
-    count: usize,
-}
 
 /// One preview item: a line of the stored text, plus a marker when it stands
 /// for a run of identical lines.
@@ -76,19 +60,21 @@ impl Segment<'_> {
 ///
 /// Describing a run only helps when the description is smaller than the
 /// repeats it stands in for, so a pair of short lines stays verbatim.
-fn collapsed_run_marker(first: usize, last: usize, count: usize, line: &str) -> Option<String> {
-    if count < 2 {
+fn collapsed_run_marker(
+    run: &RepeatedLines,
+    line: &str,
+    wording: &dyn ShellWording,
+) -> Option<String> {
+    if run.count < 2 {
         return None;
     }
-    let marker = RepeatedLinesMarker { first, last, count }
-        .render()
-        .expect("repeated lines marker template must render");
-    (marker.len() + 1 < line.len() * (count - 1)).then_some(marker)
+    let marker = wording.repeated_lines(run);
+    (marker.len() + 1 < line.len() * (run.count - 1)).then_some(marker)
 }
 
 /// Splits `text` into preview items, collapsing runs of identical consecutive
 /// lines whenever the marker is shorter than the lines it replaces.
-fn segments(text: &str) -> Vec<Segment<'_>> {
+fn segments<'a>(text: &'a str, wording: &dyn ShellWording) -> Vec<Segment<'a>> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut segments = Vec::with_capacity(lines.len());
     let mut index = 0;
@@ -99,7 +85,14 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
             end += 1;
         }
         let count = end - index;
-        match collapsed_run_marker(index + 1, end, count, line) {
+        let run = RepeatedLines {
+            range: LineRange {
+                first: index + 1,
+                last: end,
+            },
+            count,
+        };
+        match collapsed_run_marker(&run, line, wording) {
             Some(marker) => segments.push(Segment {
                 first: index + 1,
                 last: end,
@@ -127,13 +120,18 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
 /// and the omitted middle is announced by a marker, both carrying line
 /// numbers of `text` itself.
 #[must_use]
-pub fn stored_preview(text: &str, max_lines: usize, byte_budget: usize) -> String {
+pub fn stored_preview(
+    text: &str,
+    max_lines: usize,
+    byte_budget: usize,
+    wording: &dyn ShellWording,
+) -> String {
     let total_lines = text.split_inclusive('\n').count();
     if total_lines <= max_lines && text.len() <= byte_budget {
         return text.to_owned();
     }
 
-    let segments = segments(text);
+    let segments = segments(text, wording);
     let head_line_cap = max_lines / HEAD_BUDGET_DIVISOR;
     let head_byte_cap = byte_budget / HEAD_BUDGET_DIVISOR;
     let tail_line_cap = max_lines - head_line_cap;
@@ -143,7 +141,7 @@ pub fn stored_preview(text: &str, max_lines: usize, byte_budget: usize) -> Strin
     let tail_start = take_tail(&segments[head_end..], tail_line_cap, tail_byte_cap) + head_end;
 
     if head_end == 0 && tail_start == segments.len() {
-        return cut_single_line(text, total_lines, byte_budget);
+        return cut_single_line(text, total_lines, byte_budget, wording);
     }
     if head_end == tail_start {
         // Every segment fits: the only reduction is the collapsed runs.
@@ -152,24 +150,22 @@ pub fn stored_preview(text: &str, max_lines: usize, byte_budget: usize) -> Strin
         return out;
     }
 
-    let omitted = OmittedLinesMarker {
-        first: head_end
-            .checked_sub(1)
-            .map_or(1, |last_head| segments[last_head].last + 1),
-        // A tail that takes nothing leaves the omitted range running to the
-        // last line of the text.
-        last: segments
-            .get(tail_start)
-            .map_or(total_lines, |tail| tail.first - 1),
+    let omitted = OmittedLines {
+        range: LineRange {
+            first: head_end
+                .checked_sub(1)
+                .map_or(1, |last_head| segments[last_head].last + 1),
+            // A tail that takes nothing leaves the omitted range running to
+            // the last line of the text.
+            last: segments
+                .get(tail_start)
+                .map_or(total_lines, |tail| tail.first - 1),
+        },
         total: total_lines,
     };
     let mut out = String::new();
     render_range(&segments[..head_end], &mut out);
-    out.push_str(
-        &omitted
-            .render()
-            .expect("omitted lines marker template must render"),
-    );
+    out.push_str(&wording.omitted_lines(&omitted));
     out.push('\n');
     render_range(&segments[tail_start..], &mut out);
     out
@@ -215,7 +211,12 @@ fn render_range(segments: &[Segment<'_>], out: &mut String) {
 
 /// Handles the degenerate case where not even one line fits the budget: cut
 /// inside the first line at a character boundary and announce the rest.
-fn cut_single_line(text: &str, total_lines: usize, byte_budget: usize) -> String {
+fn cut_single_line(
+    text: &str,
+    total_lines: usize,
+    byte_budget: usize,
+    wording: &dyn ShellWording,
+) -> String {
     let mut cut = byte_budget.min(text.len());
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
@@ -228,23 +229,24 @@ fn cut_single_line(text: &str, total_lines: usize, byte_budget: usize) -> String
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    let omitted = OmittedLinesMarker {
-        first: head.split_inclusive('\n').count().max(1),
-        last: total_lines,
+    out.push_str(&wording.omitted_lines(&OmittedLines {
+        range: LineRange {
+            first: head.split_inclusive('\n').count().max(1),
+            last: total_lines,
+        },
         total: total_lines,
-    };
-    out.push_str(
-        &omitted
-            .render()
-            .expect("omitted lines marker template must render"),
-    );
+    }));
     out.push('\n');
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::test_wording::TestWording;
+
+    fn stored_preview(text: &str, max_lines: usize, byte_budget: usize) -> String {
+        super::stored_preview(text, max_lines, byte_budget, &TestWording)
+    }
 
     fn numbered(count: usize) -> String {
         use std::fmt::Write;

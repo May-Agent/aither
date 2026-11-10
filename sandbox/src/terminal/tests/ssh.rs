@@ -2,6 +2,8 @@
 //! on a server is asked for, lazy preparation, both modes, the live server
 //! set and the OS probe, against a private `sshd` on loopback.
 
+use std::process::Stdio;
+
 use crate::ssh::SshClient;
 use crate::{SshPlatform, SshProbeError, SshServer};
 
@@ -36,7 +38,7 @@ impl crate::ScriptPolicy for RecordStarts {
     }
 }
 
-type Terminal = TerminalTool<executor_core::tokio::TokioGlobal, Configured>;
+type Terminal = Shell<executor_core::tokio::TokioGlobal, Configured>;
 
 #[derive(Template)]
 #[template(path = "test_sshd_config.txt", escape = "none")]
@@ -195,6 +197,13 @@ impl Drop for Sshd {
     }
 }
 
+/// The host backend a shell's home is, under the pinned `heel`.
+async fn host_home() -> crate::Backend {
+    crate::Backend::Host {
+        heel: crate::test_heel::pinned().await.expect("the pinned heel"),
+    }
+}
+
 /// A terminal in `dir` over `registry` that asks `approver` for what needs
 /// approval.
 async fn terminal(dir: &Path, registry: ShellSessionRegistry, approver: &Approvals) -> Terminal {
@@ -207,29 +216,35 @@ async fn terminal_with(
     approver: &Approvals,
     policy: RecordStarts,
 ) -> Terminal {
-    let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-        .await
-        .expect("terminal tool should initialize")
-        .with_approver(approver.clone())
-        .adopt_prepared_tools(registry)
-        .await
-        .expect("prepared tools should be adopted");
+    let tool = Shell::new_exact(
+        dir,
+        executor_core::tokio::TokioGlobal,
+        crate::limits::fixture::limits(),
+        crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
+    )
+    .await
+    .expect("terminal tool should initialize")
+    .with_approver(approver.clone())
+    .adopt_prepared_tools(registry)
+    .await
+    .expect("prepared tools should be adopted");
     let mut commands = ToolRegistryBuilder::new();
     commands.script_policy(policy);
     let commands = Arc::new(commands.build(tool.output_store().clone()));
     tool.with_registry(commands)
 }
 
-fn args(script: &str, mode: TerminalExecutionMode, location: &str) -> TerminalArgs {
-    TerminalArgs {
+fn args(script: &str, mode: SandboxMode, location: &str) -> ShellArgs {
+    ShellArgs {
         description: "run on the server".to_string(),
         script: script.to_string(),
-        language: ScriptLanguage::Shell,
-        mode,
+        interpreter: Interpreter::Shell,
+        sandbox: mode,
         location: Some(location.to_string()),
-        expect: OutputFormat::Text,
         resolution: MediaResolution::Auto,
-        max_lines: 50,
+        max_lines: Some(50),
         raw: true,
         timeout: 60,
         background: false,
@@ -283,7 +298,7 @@ async fn a_server_added_live_is_asked_prepared_lazily_and_runs_both_modes() {
     let cache = crate::tool_runtime::tests::unlocking_tempdir();
     let registry = local_registry()
         .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
+        .initialize_tools(&host_home().await, &distribution, cache.path())
         .await
         .expect("the home prepares without touching any server");
     let dir = tempfile::tempdir().unwrap();
@@ -302,7 +317,7 @@ async fn a_server_added_live_is_asked_prepared_lazily_and_runs_both_modes() {
     let script = "echo \"remote=$AITHER_FIXTURE_BASH\"";
     let sandboxed = terminal
         .call(
-            args(script, TerminalExecutionMode::Default, "fixture"),
+            args(script, SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
@@ -334,7 +349,7 @@ async fn a_server_added_live_is_asked_prepared_lazily_and_runs_both_modes() {
         .call(
             args(
                 "echo \"direct=$AITHER_FIXTURE_BASH home=$HOME\"",
-                TerminalExecutionMode::Unsafe,
+                SandboxMode::Unsandboxed,
                 " fixture ",
             ),
             ToolContext::new(),
@@ -353,11 +368,7 @@ async fn a_server_added_live_is_asked_prepared_lazily_and_runs_both_modes() {
     // A server's command is a remote job: its local `ssh` process stands for
     // work whose memory is never judged here.
     terminal
-        .run_background(args(
-            "echo remote-job",
-            TerminalExecutionMode::Default,
-            "fixture",
-        ))
+        .run_background(args("echo remote-job", SandboxMode::Sandboxed, "fixture"))
         .await
         .expect("a background command starts on the server");
     let places = terminal
@@ -384,7 +395,7 @@ async fn a_server_without_heel_gets_the_pinned_one_installed() {
     let cache = crate::tool_runtime::tests::unlocking_tempdir();
     let registry = local_registry()
         .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
+        .initialize_tools(&host_home().await, &distribution, cache.path())
         .await
         .expect("the home prepares without touching any server");
     let dir = tempfile::tempdir().unwrap();
@@ -398,7 +409,7 @@ async fn a_server_without_heel_gets_the_pinned_one_installed() {
 
     let output = terminal
         .call(
-            args("echo installed", TerminalExecutionMode::Default, "fixture"),
+            args("echo installed", SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
@@ -422,7 +433,7 @@ async fn a_denied_script_on_a_server_never_prepares_it_and_carries_the_reason() 
     for _ in 0..2 {
         let denied = terminal
             .call(
-                args("true", TerminalExecutionMode::Default, "fixture"),
+                args("true", SandboxMode::Sandboxed, "fixture"),
                 ToolContext::new(),
             )
             .await
@@ -447,41 +458,52 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
     let dir = tempfile::tempdir().unwrap();
 
     // No policy decided, and no approver exists: the script is not run.
-    let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-        .await
-        .unwrap()
-        .adopt_prepared_tools(registry.clone())
-        .await
-        .unwrap();
+    let tool = Shell::new_exact(
+        dir.path(),
+        executor_core::tokio::TokioGlobal,
+        crate::limits::fixture::limits(),
+        crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
+    )
+    .await
+    .unwrap()
+    .adopt_prepared_tools(registry.clone())
+    .await
+    .unwrap();
     let commands = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
     let tool = tool.with_registry(commands);
     let error = tool
         .call(
-            args("true", TerminalExecutionMode::Default, "fixture"),
+            args("true", SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
         .expect_err("a remote script with only passes needs an approver");
-    assert!(
-        error.to_string().contains("no approver is configured"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("no approver"), "{error}");
 
     // A policy's allow settles it without the approver; the connection is
     // refused, so the call fails later, and not for want of approval.
-    let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-        .await
-        .unwrap()
-        .adopt_prepared_tools(registry)
-        .await
-        .unwrap();
+    let tool = Shell::new_exact(
+        dir.path(),
+        executor_core::tokio::TokioGlobal,
+        crate::limits::fixture::limits(),
+        crate::output_policy::fixture::policy(),
+        crate::test_wording::TestWording::any(),
+        crate::test_wording::job_tools(),
+    )
+    .await
+    .unwrap()
+    .adopt_prepared_tools(registry)
+    .await
+    .unwrap();
     let mut policies = ToolRegistryBuilder::new();
     policies.script_policy(Decide(ScriptDecision::Allow));
     let commands = Arc::new(policies.build(tool.output_store().clone()));
     let tool = tool.with_registry(commands);
     let result = tool
         .call(
-            args("true", TerminalExecutionMode::Default, "fixture"),
+            args("true", SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await;
@@ -489,7 +511,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
         result
             .as_ref()
             .err()
-            .is_none_or(|error| !error.to_string().contains("no approver is configured")),
+            .is_none_or(|error| !error.to_string().contains("no approver")),
         "{result:?}"
     );
 }
@@ -508,13 +530,13 @@ async fn a_policy_sees_the_location_of_an_unsafe_command() {
     // The connection is refused; only the policy's view matters here.
     let _ = terminal
         .call(
-            args("true", TerminalExecutionMode::Unsafe, "fixture"),
+            args("true", SandboxMode::Unsandboxed, "fixture"),
             ToolContext::new(),
         )
         .await;
     terminal
         .call(
-            args("true", TerminalExecutionMode::Unsafe, ""),
+            args("true", SandboxMode::Unsandboxed, ""),
             ToolContext::new(),
         )
         .await
@@ -538,17 +560,12 @@ async fn default_mode_needs_the_servers_heel() {
     let terminal = terminal(dir.path(), registry, &Approvals::default()).await;
     let refused = terminal
         .call(
-            args("true", TerminalExecutionMode::Default, "fixture"),
+            args("true", SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
         .expect_err("no sandbox there");
-    assert!(
-        refused
-            .to_string()
-            .contains("default mode runs under `heel`, which `fixture` does not have"),
-        "{refused}"
-    );
+    assert_eq!(refused.to_string(), "no remote sandbox: fixture");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -566,21 +583,16 @@ async fn a_removed_or_unknown_location_is_refused_and_an_empty_one_is_home() {
     for name in ["fixture", "staging"] {
         let refused = terminal
             .call(
-                args("true", TerminalExecutionMode::Default, name),
+                args("true", SandboxMode::Sandboxed, name),
                 ToolContext::new(),
             )
             .await
             .expect_err("no such server");
-        assert!(
-            refused
-                .to_string()
-                .contains(&format!("no SSH server named `{name}` is configured")),
-            "{refused}"
-        );
+        assert_eq!(refused.to_string(), format!("unknown location: {name}"));
     }
     let home = terminal
         .call(
-            args("echo home", TerminalExecutionMode::Default, ""),
+            args("echo home", SandboxMode::Sandboxed, ""),
             ToolContext::new(),
         )
         .await
@@ -615,7 +627,7 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
     let cache = crate::tool_runtime::tests::unlocking_tempdir();
     let registry = local_registry()
         .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
+        .initialize_tools(&host_home().await, &distribution, cache.path())
         .await
         .expect("the home prepares");
     let dir = tempfile::tempdir().unwrap();
@@ -634,7 +646,7 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
 
     let remote = terminal
         .call(
-            args(script, TerminalExecutionMode::Default, "fixture"),
+            args(script, SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
@@ -642,7 +654,7 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
     let remote = render_terminal_result(&remote);
     assert!(remote.contains("jobs=none"), "{remote}");
 
-    let mut local = args(script, TerminalExecutionMode::Default, "fixture");
+    let mut local = args(script, SandboxMode::Sandboxed, "fixture");
     local.location = None;
     let local = terminal
         .call(local, ToolContext::new())
@@ -732,4 +744,57 @@ async fn spawn_on_a_server_streams_output_and_kill_ends_the_remote_tree() {
     })
     .await
     .expect("the remote descendant ends with the client");
+}
+
+/// A script spawned on a server is quoted once for its login shell, which
+/// parses the command line first: a double-quoted script survives a login
+/// shell that does not read single quotes the way POSIX does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_spawned_on_a_server_runs_in_the_managed_shell() {
+    use crate::SpawnSpec;
+
+    let sshd = Sshd::start().await;
+    let (_cache, registry) = prepared_test_registry().await;
+    let tools = registry.local_tools().unwrap().clone();
+    let dir = tempfile::tempdir().unwrap();
+    let heel = sshd.home().join(".local/bin/heel");
+    let sandbox = Sandbox::new(
+        crate::Backend::Ssh {
+            server: Sshd::server(),
+            heel: Some(text(&heel).to_string()),
+            launch: tools.remote_launch().unwrap(),
+        },
+        executor_core::tokio::TokioGlobal,
+        dir.path(),
+    )
+    .with_ssh_client(sshd.client.clone());
+
+    let mut child = sandbox
+        .spawn(SpawnSpec::script("echo \"from-the-script\""))
+        .await
+        .expect("the script starts under the server's heel");
+    let stdout = child.take_stdout().unwrap();
+    let stderr = child.take_stderr().unwrap();
+    let mut printed = Vec::new();
+    while let Ok(chunk) = stdout.recv().await {
+        printed.extend(chunk);
+    }
+    let mut failed = Vec::new();
+    while let Ok(chunk) = stderr.recv().await {
+        failed.extend(chunk);
+    }
+    let exit = child.wait().await;
+    assert_eq!(
+        String::from_utf8_lossy(&printed),
+        "from-the-script\n",
+        "{exit:?}: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert!(exit.success());
+    // The processes on the server are out of sight, and its stdin has no watch.
+    assert_eq!(
+        child.descendants_killed().await,
+        crate::Descendants::Unobserved
+    );
+    assert!(child.take_stdin_blocked().is_none());
 }

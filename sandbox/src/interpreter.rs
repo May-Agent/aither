@@ -1,4 +1,4 @@
-//! The language of a script a command runs.
+//! The interpreter a script runs under.
 
 use std::borrow::Cow;
 
@@ -8,15 +8,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::tool_python::PYTHON_COMMAND;
 
-/// The language of a script `terminal` or `monitor` runs.
+// The interpreter a script of the shell tool or the monitor runs under.
+// Undocumented in rustdoc: the schema's descriptions are the embedder's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
-pub enum ScriptLanguage {
-    /// The script is shell source.
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
+pub enum Interpreter {
+    // The script is shell source.
     #[default]
     Shell,
-    /// The script is Python source, run from a file in the sandbox's
-    /// temporary directory so a traceback carries its line numbers.
+    // The script is Python source, run from a file in the sandbox's
+    // temporary directory so a traceback carries its line numbers.
     Python,
 }
 
@@ -28,7 +30,7 @@ struct PythonScriptTemplate<'a> {
     code: &'a str,
 }
 
-impl ScriptLanguage {
+impl Interpreter {
     /// The shell script that runs `script` for the job `task_id`.
     ///
     /// Shell source runs as it is. Python source is written to a file under
@@ -63,27 +65,23 @@ mod tests {
 
     #[test]
     fn shell_runs_as_written() {
-        let script = ScriptLanguage::Shell
-            .launch_script("echo hi", "t1")
-            .unwrap();
+        let script = Interpreter::Shell.launch_script("echo hi", "t1").unwrap();
         assert_eq!(script, "echo hi");
     }
 
     #[test]
     fn python_is_written_to_a_file_of_its_task() {
-        let script = ScriptLanguage::Python
-            .launch_script("print(1)", "t1")
-            .unwrap();
+        let script = Interpreter::Python.launch_script("print(1)", "t1").unwrap();
         assert!(script.contains("aither-t1.py"));
         assert!(script.contains("print(1)"));
     }
 
     #[test]
-    fn language_is_lowercase_on_the_wire() {
+    fn interpreter_is_lowercase_on_the_wire() {
         assert_eq!(
-            serde_json::to_string(&ScriptLanguage::Python).unwrap(),
+            serde_json::to_string(&Interpreter::Python).unwrap(),
             "\"python\""
         );
-        assert_eq!(ScriptLanguage::default(), ScriptLanguage::Shell);
+        assert_eq!(Interpreter::default(), Interpreter::Shell);
     }
 }

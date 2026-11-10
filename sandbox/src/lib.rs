@@ -9,16 +9,22 @@
 //! # Setting Up the Terminal Tool
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
+//! use aither_sandbox::{Shell, ToolRegistryBuilder};
 //! use std::sync::Arc;
 //!
 //! // Creates a working directory heel names with four random words (e.g.,
 //! // amber-forest-thunder-pearl/), not a leased id, with an outputs/
 //! // subdirectory and IPC command wrapper scripts; the ids the model reads are
 //! // leased from `with_id_allocator`'s allocator
-//! let tool = TerminalTool::new_in(std::env::temp_dir(), executor).await?;
-//! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
-//! let tool = tool.with_registry(registry);
+//! let shell = Shell::builder(sandbox)
+//!     .limits(limits)
+//!     .output(output)
+//!     .wording(wording)
+//!     .tools(tools)
+//!     .build()
+//!     .await?;
+//! let registry = Arc::new(ToolRegistryBuilder::new().build(shell.output_store().clone()));
+//! let tool = shell.with_registry(registry);
 //!
 //! // Access the working directory path
 //! tracing::info!("Working dir: {}", tool.working_dir().display());
@@ -60,17 +66,20 @@ mod command_set;
 mod container;
 #[cfg(all(unix, feature = "jobserver"))]
 mod container_jobserver;
+mod events;
 mod foreground_wait;
-mod heel_binary;
+mod interpreter;
+mod job_registry;
+mod jobs;
+mod limits;
 mod memory;
 pub mod monitor;
-mod notices;
 mod outage;
 mod output;
 mod output_compress;
+mod output_policy;
 mod policy;
 mod process_tree;
-mod script_language;
 mod shell_session;
 mod shell_syntax;
 mod spawn;
@@ -83,12 +92,10 @@ mod tool_environment;
 mod tool_python;
 mod tool_runtime;
 mod tool_transport;
+mod wording;
 
 /// Built-in IPC commands (ask, reload).
 pub mod builtin;
-
-/// Background job registry for tracking tasks.
-pub mod job_registry;
 
 /// Jobserver token pool brokering across commands.
 #[cfg(all(unix, feature = "jobserver"))]
@@ -96,9 +103,6 @@ pub mod jobserver;
 
 /// Declarative host-based network policy.
 pub mod network_policy;
-
-/// Permission handling for terminal modes.
-pub mod permission;
 
 /// Isolated git for tests, shared with dependent crates through the `test-git` feature.
 #[cfg(any(test, feature = "test-git"))]
@@ -109,16 +113,28 @@ pub mod test_git;
 #[cfg(any(test, feature = "test-heel"))]
 pub mod test_heel;
 
+/// Budgets for tests, shared through the `test-budgets` feature.
+#[cfg(any(test, feature = "test-budgets"))]
+pub mod test_budgets;
+
+/// The wording tests read, shared through the `test-budgets` feature.
+#[cfg(any(test, feature = "test-budgets"))]
+pub mod test_wording;
+
 /// Id allocators for tests, shared with dependent crates through the
 /// `test-ids` feature.
 #[cfg(any(test, feature = "test-ids"))]
 pub mod test_ids;
 
 pub use bollard_exec::BollardContainerExec;
+pub use builtin::{
+    JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
+    ShellToolSettings, ToolIdentity,
+};
 pub use command::{
-    AnyCommandGate, AnyCommandObserver, CommandCall, CommandEnvelope, CommandGate, CommandObserver,
-    CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
-    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
+    AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandCall, CommandEnvelope, CommandGate,
+    CommandObserver, CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler,
+    GateDecision, IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
     ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
     output_saved_text, register_ipc_gateway_command, register_tool_command, register_tool_direct,
     schema_to_help, tool_output_to_payload, validate_positional_layout,
@@ -128,20 +144,26 @@ pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
+pub use events::{
+    DescendantsKilled, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
+    StdinWatchFailed,
+};
 pub use foreground_wait::ForegroundWait;
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
 pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
+pub use interpreter::Interpreter;
 pub use job_registry::{
-    Delivery, JobInfo, JobPlace, JobRegistry, JobRegistryService, JobStatus, KillCause,
-    OwedCompletion, PendingCompletion, TerminalDelta, TerminalReadError, UnchangedTaskRead,
-    job_registry_channel,
+    Delivery, JobDelta, JobInfo, JobPlace, JobRead, JobStatus, KillCause, OwedCompletion,
+    PendingCompletion, UnchangedRead,
 };
+pub use jobs::{Job, JobWaitError, Jobs, RunOutcome, ScriptResult};
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
 };
+pub use limits::{LiveDuration, ShellLimits};
 pub use memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
     ContainerSnapshot, FileFootprintRegistry, FootprintError, FootprintReader, FootprintRegistry,
@@ -149,19 +171,15 @@ pub use memory::{
     ProbedContainerMemory, ResponseWindow, SystemFootprints,
 };
 pub use monitor::{
-    MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorRefusal, MonitorSource,
-    MonitorStalled, MonitorTool,
+    MonitorArgs, MonitorEnd, MonitorEnded, MonitorIncrement, MonitorRefusal, MonitorSettings,
+    MonitorSource, MonitorStalled, MonitorTool,
 };
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
     NetworkVerdict,
 };
-pub use notices::{
-    AnySandboxNotices, CommandKilled, DefaultSandboxNotices, MonitorStarted, Refused,
-    ReservedForMain, SandboxNotices,
-};
 pub use output::{MediaResolution, OutputFormat, OutputStore};
-pub use permission::TerminalMode;
+pub use output_policy::{MediaBounds, OutputLimits, OutputPolicy};
 pub use policy::{
     AnyScriptPolicy, Carry, SandboxMode, ScriptCheck, ScriptDecision, ScriptDir, ScriptEnd,
     ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptPolicy, ScriptRefusal,
@@ -169,19 +187,18 @@ pub use policy::{
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
-pub use script_language::ScriptLanguage;
 pub use shell_session::{
     AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerProbe, ContainerProbeError,
-    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
-    ShellSessionRegistry,
+    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellSessionRegistry,
 };
 pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
 };
 pub use spawn::{
     AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, ContainerLaunch, DenyAllDomains,
-    DomainApprover, DomainRequest, EnvSource, GitDirAccess, GrantSnapshot, Grants, HostRoute,
-    HostRouteError, Pipe, RemoteLaunch, Sandbox, SandboxedChild, SpawnError, SpawnSpec, Stdio,
+    Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess, GrantSnapshot, Grants,
+    HostRoute, HostRouteError, Pipe, RemoteLaunch, Sandbox, SandboxedChild, SpawnCommand,
+    SpawnError, SpawnGrant, SpawnSpec, Stdio, TreeLifetime,
 };
 pub use ssh::{PreparedSsh, SshPlatform, SshProbeError, SshServer, SshServerError, probe_ssh_os};
 pub use stdin_watch::StdinWatchSignal;
@@ -191,14 +208,9 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
-    CompletedTask, Configured, DEFAULT_FOREGROUND_WAIT, DEFAULT_LONG_JOB_ALERT_AFTER,
-    DEFAULT_RESPONSE_WINDOW, DEFAULT_SUBAGENT_IMPORT_LIMIT, DEFAULT_TIMEOUT_CAP, DescendantsKilled,
-    DirectoryResetReason, JobAlert, LongRunningJob, StartedBackgroundTask, StdinBlockedJob,
-    StdinProbeFailedJob, TerminalArgs, TerminalBinding, TerminalError, TerminalExecutionMode,
-    TerminalRunError, TerminalRunner, TerminalScript, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryError, TimeoutKill, Unconfigured, background_task_channel,
-    open_network_audit_log,
+    CompletedCommand, Configured, DirectoryResetReason, Given, Missing, Script, Shell, ShellArgs,
+    ShellBuilder, ShellRunError, ShellTool, TerminalBinding, TerminalError, TerminalToolFactory,
+    TerminalToolFactoryError, TimeoutKill, Unconfigured, open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
@@ -212,4 +224,9 @@ pub use tool_runtime::{
 pub use tool_transport::{
     ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,
     probe_tool_environment,
+};
+pub use wording::{
+    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
+    JsonAsTsv, LineRange, MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines,
+    ReservedForMain, RunFailure, ShellWording, StoredBinaryPart,
 };

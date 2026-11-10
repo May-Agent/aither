@@ -11,10 +11,14 @@ use aither_core::{IdLease, WeakIdLease};
 use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
+use crate::interpreter::Interpreter;
 use crate::memory::MemoryDomain;
-use crate::permission::TerminalMode;
-use crate::process_tree::{JobTree, KillTreeError, ProcessScanner};
-use crate::script_language::ScriptLanguage;
+use crate::output_policy::OutputPolicy;
+use crate::policy::SandboxMode;
+#[cfg(unix)]
+use crate::process_tree::KillTreeError;
+use crate::process_tree::{JobTree, ProcessScanner};
+use crate::terminal::TimeoutKill;
 
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
@@ -27,10 +31,10 @@ pub struct JobInfo {
     pub execution_key: String,
     /// The script that was executed.
     pub script: String,
-    /// The language of `script`.
-    pub language: ScriptLanguage,
+    /// The interpreter of `script`.
+    pub interpreter: Interpreter,
     /// The permission mode used.
-    pub mode: TerminalMode,
+    pub mode: SandboxMode,
     /// When the job was started.
     pub started_at: Instant,
     /// Current status of the job.
@@ -90,9 +94,10 @@ pub enum JobStatus {
 /// Why a job was killed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillCause {
-    /// A request ended it: `terminal_kill`, its `timeout` bound, or the
-    /// shutdown of its terminal.
+    /// A request ended it: `terminal_kill`, or the shutdown of its terminal.
     User,
+    /// Its `timeout` bound passed.
+    Timeout(TimeoutKill),
     /// Its home environment's memory ran out of room for the agent's jobs
     /// (see [`MemoryDomain`]), and the agent left it running past the
     /// response window that followed the final warning.
@@ -225,7 +230,7 @@ impl Drop for PendingCompletion {
 /// Keeps a job in its registry, finished or not, while something reads it
 /// by its task id; the registry forgets a finished job only once every
 /// watch of it dropped. [`JobRegistry::watch`] hands them out.
-pub(crate) struct JobWatch {
+pub struct JobWatch {
     tx: Sender<JobCommand>,
     /// Keeps the word naming this job; the unwatch it sends keeps a clone
     /// until the registry hears of it.
@@ -252,13 +257,26 @@ impl Drop for JobWatch {
 pub struct OwedCompletion {
     /// Why the job was killed; `None` when it ended on its own.
     pub kill: Option<KillCause>,
-    /// Keeps the completion pending until the agent takes it.
-    pub pending: PendingCompletion,
+    /// Keeps the completion pending until the agent takes it; `None` when a
+    /// waiter ([`JobRegistry::wait_taking`]) already took it, so nothing is
+    /// owed.
+    pub pending: Option<PendingCompletion>,
+}
+
+impl JobRead {
+    /// The delta, or `None` for an unchanged read.
+    #[must_use]
+    pub fn into_delta(self) -> Option<JobDelta> {
+        match self {
+            Self::Delta(delta) => Some(delta),
+            Self::Unchanged { .. } => None,
+        }
+    }
 }
 
 /// Incremental read result for a background terminal buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalDelta {
+pub struct JobDelta {
     /// Stable task identifier exposed to the model.
     pub task_id: String,
     /// Cursor the caller should pass on the next read.
@@ -271,29 +289,28 @@ pub struct TerminalDelta {
     pub status: JobStatus,
 }
 
-/// A `terminal_read` refused because it would return what the task's last
-/// read returned: only more output, or the task's end, can tell the model
-/// something new.
+/// What a read of a job's output returned.
 ///
-/// [`SandboxNotices::unchanged_task_read`](crate::SandboxNotices::unchanged_task_read)
-/// renders its text.
+/// A read that would return what the job's last read returned is a poll:
+/// only more output, or the job's end, can tell the reader something new, so
+/// it comes back as [`Self::Unchanged`] for the reader's wording to say so.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnchangedTaskRead {
-    /// The background task whose output did not change.
-    pub task_id: String,
+pub enum JobRead {
+    /// Output past the cursor, or the same cursor with a changed status.
+    Delta(JobDelta),
+    /// Nothing changed since this job's last read.
+    Unchanged {
+        /// The job whose output did not change.
+        task_id: String,
+    },
 }
 
-/// Why [`JobRegistry::terminal_read`] returned no delta.
-#[derive(Debug, thiserror::Error)]
-pub enum TerminalReadError {
-    /// The read would return what the task's last read returned; the
-    /// caller renders it through its
-    /// [`SandboxNotices`](crate::SandboxNotices).
-    #[error("refused as a poll: {0:?}")]
-    Refused(UnchangedTaskRead),
-    /// The read could not be served, such as an unknown task id.
-    #[error("{0}")]
-    Failed(String),
+/// Why a tool refused a read of a job's output: nothing changed since the
+/// job's last read. The refusal a tool returns as `Refused<UnchangedRead>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnchangedRead {
+    /// The job whose output did not change.
+    pub task_id: String,
 }
 
 /// Sender used by the registry to push bytes into a running process stdin.
@@ -306,6 +323,7 @@ enum TerminalStream {
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct JobState {
     info: JobInfo,
     /// Keeps the job's task id leased while the registry keeps the job.
@@ -331,10 +349,16 @@ struct JobState {
     deferred_end: Option<Ending>,
     /// Callers parked until the last kill in flight records its outcome.
     settled_waiters: Vec<SettledWaiter>,
+    /// Callers parked until the job ends.
+    ended_waiters: Vec<Sender<Option<JobInfo>>>,
     output_redirect: Option<async_fs::File>,
     finished_at: Option<Instant>,
     /// Whether the job's [`PendingCompletion`] was handed out.
     completion_owed: bool,
+    /// Whether a waiter took the completion before it was handed out: the
+    /// job then reads [`Delivery::Taken`] the moment it ends and owes
+    /// nothing.
+    claimed: bool,
     /// How many [`JobWatch`]es of the job live.
     watchers: usize,
 }
@@ -358,8 +382,8 @@ enum StateCommand {
         task_id: IdLease,
         execution_key: String,
         script: String,
-        language: ScriptLanguage,
-        mode: TerminalMode,
+        interpreter: Interpreter,
+        mode: SandboxMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
         place: JobPlace,
@@ -468,7 +492,7 @@ enum JobRequest {
         pid: u32,
         reply: Sender<Option<(Vec<u8>, Vec<u8>)>>,
     },
-    ReadTerminalDelta {
+    ReadJobDelta {
         task_id: String,
         cursor: usize,
         max_bytes: usize,
@@ -476,7 +500,13 @@ enum JobRequest {
         /// tracked by the unchanged-read refusal; a monitor pump's reads are
         /// not, and read the complete-line buffer instead.
         tracked: bool,
-        reply: Sender<Result<TerminalDelta, TerminalReadError>>,
+        reply: Sender<Result<JobRead, String>>,
+    },
+    WaitEnded {
+        task_id: String,
+        /// Whether the waiter takes the job's completion.
+        claim: bool,
+        reply: Sender<Option<JobInfo>>,
     },
     TerminalStreamsClosed {
         pid: u32,
@@ -561,11 +591,14 @@ pub struct JobRegistryService {
     /// What each [`PendingCompletion`] reports back on; weak, so the service
     /// still ends with the last handle.
     tx: WeakSender<JobCommand>,
+    /// How much of a script a job listing shows.
+    policy: OutputPolicy,
 }
 
-/// Creates a registry handle and its background service.
+/// Creates a registry handle and its background service; job listings are
+/// cut at the `job_preview_bytes` of `policy`.
 #[must_use]
-pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
+pub fn job_registry_channel(policy: OutputPolicy) -> (JobRegistry, JobRegistryService) {
     let (tx, rx) = async_channel::unbounded();
     let weak = tx.downgrade();
     (
@@ -573,7 +606,11 @@ pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
             tx,
             scanner: ProcessScanner::default(),
         },
-        JobRegistryService { rx, tx: weak },
+        JobRegistryService {
+            rx,
+            tx: weak,
+            policy,
+        },
     )
 }
 
@@ -605,7 +642,7 @@ impl JobRegistry {
         task_id: &IdLease,
         execution_key: &str,
         script: &str,
-        mode: TerminalMode,
+        mode: SandboxMode,
         output_path: Option<PathBuf>,
     ) {
         self.register_with_tree(
@@ -613,7 +650,7 @@ impl JobRegistry {
             task_id,
             execution_key,
             script,
-            ScriptLanguage::Shell,
+            Interpreter::Shell,
             mode,
             output_path,
             None,
@@ -624,7 +661,7 @@ impl JobRegistry {
 
     /// Registers a new running job like [`Self::register`], for a job that
     /// runs at `place` instead of on this machine, with `script` in
-    /// `language`.
+    /// `interpreter`.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_at(
         &self,
@@ -633,15 +670,15 @@ impl JobRegistry {
         task_id: &IdLease,
         execution_key: &str,
         script: &str,
-        language: ScriptLanguage,
-        mode: TerminalMode,
+        interpreter: Interpreter,
+        mode: SandboxMode,
     ) {
         self.register_with_tree(
             pid,
             task_id,
             execution_key,
             script,
-            language,
+            interpreter,
             mode,
             None,
             None,
@@ -660,8 +697,8 @@ impl JobRegistry {
         task_id: &IdLease,
         execution_key: &str,
         script: &str,
-        language: ScriptLanguage,
-        mode: TerminalMode,
+        interpreter: Interpreter,
+        mode: SandboxMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
         place: JobPlace,
@@ -672,7 +709,7 @@ impl JobRegistry {
             task_id: task_id.clone(),
             execution_key: execution_key.to_string(),
             script: script.to_string(),
-            language,
+            interpreter,
             mode,
             output_path,
             process_tree,
@@ -827,17 +864,15 @@ impl JobRegistry {
     /// Returns terminal output added since the provided cursor.
     ///
     /// # Errors
-    /// [`TerminalReadError::Refused`] when the read would return what the
-    /// task's last read returned; [`TerminalReadError::Failed`] when the
-    /// task id is unknown.
+    /// An error when the task id is unknown.
     pub async fn terminal_read(
         &self,
         task_id: &str,
         cursor: usize,
         max_bytes: usize,
-    ) -> Result<TerminalDelta, TerminalReadError> {
+    ) -> Result<JobRead, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::ReadTerminalDelta {
+        self.send_command(JobRequest::ReadJobDelta {
             task_id: task_id.to_string(),
             cursor,
             max_bytes,
@@ -859,9 +894,9 @@ impl JobRegistry {
         task_id: &str,
         cursor: usize,
         max_bytes: usize,
-    ) -> Result<TerminalDelta, String> {
+    ) -> Result<JobDelta, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::ReadTerminalDelta {
+        self.send_command(JobRequest::ReadJobDelta {
             task_id: task_id.to_string(),
             cursor,
             max_bytes,
@@ -869,13 +904,38 @@ impl JobRegistry {
             reply: reply_tx,
         })
         .await;
-        match Self::recv_reply(reply_rx).await {
-            Ok(delta) => Ok(delta),
-            Err(TerminalReadError::Failed(error)) => Err(error),
-            Err(TerminalReadError::Refused(refusal)) => {
-                unreachable!("an untracked read is never refused: {refusal:?}")
+        match Self::recv_reply(reply_rx).await? {
+            JobRead::Delta(delta) => Ok(delta),
+            JobRead::Unchanged { task_id } => {
+                unreachable!("an untracked read of {task_id} is never unchanged")
             }
         }
+    }
+
+    /// Waits until the job ends and returns how: its status, and the real
+    /// ending of a job whose kill was in flight. `None` for a task the
+    /// registry does not hold.
+    pub async fn wait_ended(&self, task_id: &str) -> Option<JobInfo> {
+        self.wait(task_id, false).await
+    }
+
+    /// Waits until the job ends, as [`Self::wait_ended`] does, and takes its
+    /// completion: nothing is owed to the agent for a job its waiter read, so
+    /// the job's [`OwedCompletion`] carries no [`PendingCompletion`]. A
+    /// completion already handed out stays with its holder.
+    pub async fn wait_taking(&self, task_id: &str) -> Option<JobInfo> {
+        self.wait(task_id, true).await
+    }
+
+    async fn wait(&self, task_id: &str, claim: bool) -> Option<JobInfo> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::WaitEnded {
+            task_id: task_id.to_string(),
+            claim,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
     }
 
     /// Marks a job as completed.
@@ -973,6 +1033,12 @@ impl JobRegistry {
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
         self.kill_for(pid, KillCause::User).await
+    }
+
+    /// Kills a running job whose `timeout` bound passed; the job reads
+    /// [`KillCause::Timeout`].
+    pub async fn kill_timed_out(&self, pid: u32, kill: TimeoutKill) -> bool {
+        self.kill_for(pid, KillCause::Timeout(kill)).await
     }
 
     /// Kills a running job whose process tree holds `footprint_bytes` of a
@@ -1255,7 +1321,16 @@ impl JobRegistryService {
                     handle_state_command(&mut jobs, &mut reads, &mut parked, command).await;
                 }
                 JobCommand::Request(request) => {
-                    handle_job_request(&mut jobs, &mut reads, &mut parked, &self.tx, request).await;
+                    let preview = self.policy.get().job_preview_bytes;
+                    handle_job_request(
+                        &mut jobs,
+                        &mut reads,
+                        &mut parked,
+                        &self.tx,
+                        preview,
+                        request,
+                    )
+                    .await;
                 }
             }
         }
@@ -1274,7 +1349,7 @@ async fn handle_state_command(
             task_id,
             execution_key,
             script,
-            language,
+            interpreter,
             mode,
             output_path,
             process_tree,
@@ -1292,7 +1367,7 @@ async fn handle_state_command(
                 task_id,
                 execution_key,
                 script,
-                language,
+                interpreter,
                 mode,
                 output_path,
                 place,
@@ -1379,6 +1454,7 @@ async fn handle_job_request(
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
     tx: &WeakSender<JobCommand>,
+    script_preview_bytes: usize,
     request: JobRequest,
 ) {
     match request {
@@ -1467,7 +1543,7 @@ async fn handle_job_request(
         JobRequest::TerminalOutput { pid, reply } => {
             send_terminal_output(jobs, pid, reply).await;
         }
-        JobRequest::ReadTerminalDelta {
+        JobRequest::ReadJobDelta {
             task_id,
             cursor,
             max_bytes,
@@ -1475,9 +1551,15 @@ async fn handle_job_request(
             reply,
         } => {
             let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
-                .map_err(TerminalReadError::Failed)
-                .and_then(|delta| tracked_delta(reads, &task_id, delta, tracked));
+                .map(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
+        }
+        JobRequest::WaitEnded {
+            task_id,
+            claim,
+            reply,
+        } => {
+            wait_for_end(jobs, &task_id, claim, reply).await;
         }
         JobRequest::TerminalStreamsClosed { pid, reply } => {
             let closed = jobs
@@ -1486,7 +1568,9 @@ async fn handle_job_request(
             let _ = reply.send(closed).await;
         }
         JobRequest::FormatRunning { reply } => {
-            let _ = reply.send(format_running_jobs(jobs)).await;
+            let _ = reply
+                .send(format_running_jobs(jobs, script_preview_bytes))
+                .await;
         }
         JobRequest::HasRunning { reply } => {
             let _ = reply.send(has_running_job(jobs)).await;
@@ -1534,8 +1618,8 @@ fn register_job(
     task_id: IdLease,
     execution_key: String,
     script: String,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     output_path: Option<PathBuf>,
     place: JobPlace,
     timeout: Option<Duration>,
@@ -1547,7 +1631,7 @@ fn register_job(
         task_id: task_id.to_string(),
         execution_key,
         script,
-        language,
+        interpreter,
         mode,
         started_at: Instant::now(),
         status: JobStatus::Running,
@@ -1577,9 +1661,11 @@ impl JobState {
             kills_in_flight: 0,
             deferred_end: None,
             settled_waiters: Vec::new(),
+            ended_waiters: Vec::new(),
             output_redirect: None,
             finished_at: None,
             completion_owed: false,
+            claimed: false,
             watchers: 0,
         }
     }
@@ -1613,6 +1699,10 @@ fn finish(job: &mut JobState, end: JobEnd) {
         JobEnd::Killed(cause) => JobStatus::Killed { cause, delivery },
     };
     job.finished_at = Some(Instant::now());
+    for waiter in std::mem::take(&mut job.ended_waiters) {
+        // A waiter that stopped waiting dropped its receiver.
+        let _ = waiter.try_send(Some(job.info.clone()));
+    }
     job.kill_switch = None;
     // Dropping the last sender ends the stdin writer thread blocked on it.
     job.input_tx = None;
@@ -1696,14 +1786,23 @@ async fn owe_completion(
         job.info.status
     );
     job.completion_owed = true;
+    let kill = job.info.status.kill_cause();
+    if job.claimed {
+        // A waiter read the job: nothing is owed to the agent.
+        mark_taken(job);
+        return OwedCompletion {
+            kill,
+            pending: None,
+        };
+    }
     OwedCompletion {
-        kill: job.info.status.kill_cause(),
-        pending: PendingCompletion {
+        kill,
+        pending: Some(PendingCompletion {
             tx: tx
                 .upgrade()
                 .expect("a request arrives through a live registry handle"),
             task_id: Some(job.task_id.clone()),
-        },
+        }),
     }
 }
 
@@ -1901,20 +2000,43 @@ async fn redirect_task_output(
 fn tracked_delta(
     reads: &mut ReadTracker,
     task_id: &str,
-    delta: TerminalDelta,
+    delta: JobDelta,
     tracked: bool,
-) -> Result<TerminalDelta, TerminalReadError> {
+) -> JobRead {
     let returned = (delta.cursor, delta.total_bytes, delta.status.clone());
     if !tracked {
-        return Ok(delta);
+        return JobRead::Delta(delta);
     }
     if reads.delta_reads.get(task_id) == Some(&returned) {
-        Err(TerminalReadError::Refused(UnchangedTaskRead {
+        JobRead::Unchanged {
             task_id: task_id.to_string(),
-        }))
+        }
     } else {
         reads.delta_reads.insert(task_id.to_string(), returned);
-        Ok(delta)
+        JobRead::Delta(delta)
+    }
+}
+
+/// Answers a wait for a job's end at once when it ended, or parks it until
+/// [`finish`] records the ending.
+async fn wait_for_end(
+    jobs: &mut HashMap<u32, JobState>,
+    task_id: &str,
+    claim: bool,
+    reply: Sender<Option<JobInfo>>,
+) {
+    match find_pid_by_task_id(jobs, task_id).and_then(|pid| jobs.get_mut(&pid)) {
+        Some(job) if matches!(job.info.status, JobStatus::Running) => {
+            job.claimed |= claim && !job.completion_owed;
+            job.ended_waiters.push(reply);
+        }
+        Some(job) => {
+            job.claimed |= claim && !job.completion_owed;
+            let _ = reply.send(Some(job.info.clone())).await;
+        }
+        None => {
+            let _ = reply.send(None).await;
+        }
     }
 }
 
@@ -1924,7 +2046,7 @@ fn read_terminal_delta(
     cursor: usize,
     max_bytes: usize,
     lines: bool,
-) -> Result<TerminalDelta, String> {
+) -> Result<JobDelta, String> {
     find_pid_by_task_id(jobs, task_id).map_or_else(
         || Err(format!("unknown task_id: {task_id}")),
         |pid| {
@@ -2135,23 +2257,20 @@ async fn release_settled_waiters(
     }
 }
 
-/// The bytes of a script a running-jobs line shows.
-const SCRIPT_PREVIEW_BYTES: usize = 50;
-
-/// The start of `script`, cut at a character boundary at or below
-/// [`SCRIPT_PREVIEW_BYTES`] bytes.
-fn script_preview(script: &str) -> String {
-    if script.len() <= SCRIPT_PREVIEW_BYTES {
+/// The start of `script`, cut at a character boundary at or below `limit`
+/// bytes.
+fn script_preview(script: &str, limit: usize) -> String {
+    if script.len() <= limit {
         return script.to_string();
     }
-    let end = (0..=SCRIPT_PREVIEW_BYTES)
+    let end = (0..=limit)
         .rev()
         .find(|index| script.is_char_boundary(*index))
         .unwrap_or(0);
     format!("{}...", &script[..end])
 }
 
-fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
+fn format_running_jobs(jobs: &HashMap<u32, JobState>, script_preview_bytes: usize) -> String {
     let running: Vec<_> = jobs
         .values()
         .filter(|job| matches!(job.info.status, JobStatus::Running))
@@ -2163,7 +2282,7 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
 
     let mut output = String::new();
     for job in running {
-        let script_preview = script_preview(&job.info.script);
+        let script_preview = script_preview(&job.info.script, script_preview_bytes);
 
         let output_path = job
             .info
@@ -2186,7 +2305,7 @@ fn terminal_read(
     cursor: usize,
     max_bytes: usize,
     lines: bool,
-) -> Result<TerminalDelta, String> {
+) -> Result<JobDelta, String> {
     let buffer = if lines {
         &job.line_buffer
     } else {
@@ -2200,7 +2319,7 @@ fn terminal_read(
         ));
     }
     let end = total_bytes.min(cursor.saturating_add(max_bytes));
-    Ok(TerminalDelta {
+    Ok(JobDelta {
         task_id: job.info.task_id.clone(),
         cursor: end,
         total_bytes,
@@ -2219,7 +2338,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn spawn_registry() -> JobRegistry {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2230,7 +2349,7 @@ mod tests {
     /// job nothing bounded reports none.
     #[tokio::test]
     async fn a_job_reports_the_timeout_it_runs_under() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         tokio::spawn(service.serve());
         let bounded = crate::test_ids::lease("bounded");
         let free = crate::test_ids::lease("free");
@@ -2239,10 +2358,10 @@ mod tests {
             .bound_by_timeout(&bounded, Duration::from_secs(600))
             .await;
         registry
-            .register(1, &bounded, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &bounded, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry
-            .register(2, &free, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &free, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
 
         let info = registry.get(1).await.expect("job exists");
@@ -2261,16 +2380,16 @@ mod tests {
     async fn a_job_keeps_its_task_id_leased_until_the_registry_forgets_it() {
         let ids = crate::test_ids::RecordingIds::default();
         let allocator = ids.allocator();
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         let served = tokio::spawn(service.serve());
 
         let first = allocator.lease().unwrap();
         registry
-            .register(1, &first, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &first, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         let second = allocator.lease().unwrap();
         registry
-            .register(2, &second, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &second, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         drop((first, second));
         registry.complete(1, 0, None).await;
@@ -2279,7 +2398,7 @@ mod tests {
 
         let reused_pid = allocator.lease().unwrap();
         registry
-            .register(1, &reused_pid, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &reused_pid, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         drop(reused_pid);
         // The registry serves commands in order, so this list sees the
@@ -2304,7 +2423,7 @@ mod tests {
         let registry = spawn_registry();
         let river = ids.lease().unwrap();
         registry
-            .register(1, &river, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         drop(river);
         registry.append_stdout(1, b"done\n".to_vec()).await;
@@ -2331,10 +2450,7 @@ mod tests {
         drop(watch);
         assert!(registry.list().await.is_empty(), "the job is forgotten");
         assert!(registry.get_by_task_id("river").await.is_none());
-        assert!(matches!(
-            registry.terminal_read("river", 0, 1024).await,
-            Err(TerminalReadError::Failed(_))
-        ));
+        assert!(registry.terminal_read("river", 0, 1024).await.is_err());
         assert!(!registry.kill_by_task_id("river").await);
         assert!(
             registry
@@ -2347,7 +2463,7 @@ mod tests {
         // repeat of the old job's last one.
         let again = ids.lease().expect("river went back to the allocator");
         registry
-            .register(2, &again, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &again, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry.append_stdout(2, b"done\n".to_vec()).await;
         registry.complete(2, 0, None).await;
@@ -2376,7 +2492,7 @@ mod tests {
         assert!(registry.get_by_task_id("early").await.is_none());
 
         registry
-            .register(9, &early, "exec-e", "run", TerminalMode::Sandboxed, None)
+            .register(9, &early, "exec-e", "run", SandboxMode::Sandboxed, None)
             .await;
         appends.await.expect("appends are released by registration");
         registry.append_stdout(9, b"three\n".to_vec()).await;
@@ -2412,7 +2528,7 @@ mod tests {
         assert!(reporter.await.unwrap_err().is_cancelled());
         let second = ids.lease().expect("parked output holds no lease");
         registry
-            .register(2, &second, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &second, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry
             .append_task_stdout(&second, b"fresh\n".to_vec())
@@ -2431,7 +2547,7 @@ mod tests {
         let registry = spawn_registry();
         let river = ids.lease().unwrap();
         registry
-            .register(1, &river, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry.complete(1, 0, None).await;
         drop(registry.owe_completion("river", Ok(0)).await.unwrap());
@@ -2448,7 +2564,7 @@ mod tests {
         drop(river);
         let again = ids.lease().expect("nothing kept river");
         registry
-            .register(2, &again, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &again, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         let (stdout, _) = registry.terminal_output(2).await.expect("job exists");
         assert!(stdout.is_empty(), "the late report reached no job");
@@ -2463,7 +2579,7 @@ mod tests {
                 &lease("alpha"),
                 "exec-a",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2472,28 +2588,31 @@ mod tests {
         let first = registry
             .terminal_read("alpha", 0, 1024)
             .await
-            .expect("first read succeeds");
+            .expect("first read succeeds")
+            .into_delta()
+            .expect("the first read is a delta");
         let second = registry.terminal_read("alpha", first.cursor, 1024).await;
         assert!(
             matches!(
                 &second,
-                Err(TerminalReadError::Refused(UnchangedTaskRead { task_id }))
-                    if task_id == "alpha"
+                Ok(JobRead::Unchanged { task_id }) if task_id == "alpha"
             ),
-            "an unchanged repeat read must be refused as a poll: {second:?}"
+            "an unchanged repeat read is reported as a poll: {second:?}"
         );
 
         registry.append_stdout(7, b"two".to_vec()).await;
         let third = registry
             .terminal_read("alpha", first.cursor, 1024)
             .await
-            .expect("read succeeds once output changed");
+            .expect("read succeeds once output changed")
+            .into_delta()
+            .expect("changed output reads as a delta");
         assert_eq!(third.bytes, b"two");
     }
 
     #[tokio::test]
     async fn test_job_registry_lifecycle() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2504,7 +2623,7 @@ mod tests {
                 &lease("amber"),
                 "exec-test",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 Some(PathBuf::from("outputs/12345.txt")),
             )
             .await;
@@ -2529,7 +2648,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_format_running_jobs() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2540,7 +2659,7 @@ mod tests {
                 &lease("alpha"),
                 "exec-a",
                 "echo hello",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2550,7 +2669,7 @@ mod tests {
                 &lease("beta"),
                 "exec-b",
                 "sleep 5",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2563,7 +2682,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_redirect_streams_full_output() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2577,7 +2696,7 @@ mod tests {
                 &lease("stream"),
                 "exec-stream",
                 "printf one",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2608,7 +2727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_terminal_delta_reads_incrementally() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2619,14 +2738,19 @@ mod tests {
                 &lease("delta"),
                 "exec-delta",
                 "tail -f log",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
         registry.append_stdout(202, b"hello ".to_vec()).await;
         registry.append_stderr(202, b"world".to_vec()).await;
 
-        let first = registry.terminal_read("delta", 0, 6).await.unwrap();
+        let first = registry
+            .terminal_read("delta", 0, 6)
+            .await
+            .unwrap()
+            .into_delta()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&first.bytes), "hello ");
         assert_eq!(first.cursor, 6);
         assert_eq!(first.total_bytes, 11);
@@ -2635,6 +2759,8 @@ mod tests {
         let second = registry
             .terminal_read("delta", first.cursor, 32)
             .await
+            .unwrap()
+            .into_delta()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&second.bytes), "world");
         assert_eq!(second.cursor, 11);
@@ -2647,7 +2773,7 @@ mod tests {
     /// order.
     #[tokio::test]
     async fn monitor_reads_whole_lines_when_partial_writes_interleave() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2657,7 +2783,7 @@ mod tests {
                 &lease("lines"),
                 "exec-lines",
                 "tail -F f",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2676,6 +2802,8 @@ mod tests {
         let merged = registry
             .terminal_read("lines", 0, usize::MAX)
             .await
+            .unwrap()
+            .into_delta()
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&merged.bytes),
@@ -2685,7 +2813,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_by_execution_key_no_match() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2696,7 +2824,7 @@ mod tests {
                 &lease("alpha"),
                 "exec-a",
                 "echo hello",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2708,7 +2836,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_switch_path_marks_job_killed() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2719,7 +2847,7 @@ mod tests {
                 &lease("switch"),
                 "exec-kill-switch",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2741,7 +2869,7 @@ mod tests {
                 &lease("input"),
                 "exec-input",
                 "cat",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2767,7 +2895,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_does_not_override_killed_status() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2778,7 +2906,7 @@ mod tests {
                 &lease("finished"),
                 "exec-killed-complete",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2795,21 +2923,22 @@ mod tests {
     /// the cut, is listed instead of panicking inside the registry.
     #[tokio::test]
     async fn test_format_running_jobs_cuts_a_multibyte_script_at_a_boundary() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
 
         // Three bytes per character: byte 50 lies inside the 17th.
         let script = "日".repeat(30);
-        assert!(!script.is_char_boundary(SCRIPT_PREVIEW_BYTES));
+        let preview_bytes = crate::output_policy::fixture::LIMITS.job_preview_bytes;
+        assert!(!script.is_char_boundary(preview_bytes));
         registry
             .register(
                 1,
                 &lease("cjk"),
                 "exec-cjk",
                 &script,
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2819,12 +2948,13 @@ mod tests {
             running.contains(&format!("`{}...`", "日".repeat(16))),
             "{running}"
         );
-        assert_eq!(script_preview("short"), "short");
-        assert_eq!(script_preview(&"x".repeat(50)), "x".repeat(50));
+        assert_eq!(script_preview("short", 50), "short");
+        assert_eq!(script_preview(&"x".repeat(50), 50), "x".repeat(50));
         assert_eq!(
-            script_preview(&"x".repeat(51)),
+            script_preview(&"x".repeat(51), 50),
             format!("{}...", "x".repeat(50))
         );
+        assert_eq!(script_preview("abcdef", 3), "abc...");
     }
 
     fn running_job(pid: u32) -> HashMap<u32, JobState> {
@@ -2835,8 +2965,8 @@ mod tests {
             lease("task"),
             "exec".to_string(),
             "true".to_string(),
-            ScriptLanguage::Shell,
-            TerminalMode::Sandboxed,
+            Interpreter::Shell,
+            SandboxMode::Sandboxed,
             None,
             JobPlace::Host,
             None,
@@ -2901,7 +3031,7 @@ mod tests {
     /// the kill records its outcome; the settled read waits for it.
     #[tokio::test]
     async fn the_settled_read_waits_for_a_kill_in_flight() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2911,7 +3041,7 @@ mod tests {
                 &lease("settled"),
                 "exec-settled",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2970,7 +3100,7 @@ mod tests {
                 &lease("owed"),
                 "exec",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -3008,7 +3138,7 @@ mod tests {
                 &lease("lost"),
                 "exec",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -3043,7 +3173,7 @@ mod tests {
                 &lease("kill"),
                 "exec",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -3108,8 +3238,8 @@ mod tests {
             lease("twice"),
             "exec".to_string(),
             "run".to_string(),
-            ScriptLanguage::Shell,
-            TerminalMode::Sandboxed,
+            Interpreter::Shell,
+            SandboxMode::Sandboxed,
             None,
             JobPlace::Host,
             None,

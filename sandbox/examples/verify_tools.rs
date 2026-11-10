@@ -1,11 +1,154 @@
 #![doc = "Verify prepared baseline commands through the real terminal sandbox."]
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    TerminalArgs, TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolTarget,
+    Backend, CallRefusal, CommandBlocked, CommandKilled, FoldedLines, ForegroundWait, HostProgram,
+    ImportBudget, Interpreter, JobInputSent, JobKillAsked, JobRead, JsonAsTsv, LiveDuration,
+    MediaBounds, MonitorRefusal, MonitorStarted, OmittedLines, OutputLimits, OutputPolicy,
+    OutputSaved, RepeatedLines, ReservedForMain, ResponseWindow, RunFailure, Sandbox, Shell,
+    ShellArgs, ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution,
+    ToolIdentity, ToolRegistryBuilder, ToolTarget,
 };
+
+/// The wording of this example's shell: aither ships none, and the example's
+/// only reader is the acceptance script that checks its output.
+struct ExampleWording;
+
+impl ShellWording for ExampleWording {
+    fn job_read(&self, read: &JobRead) -> String {
+        match read {
+            JobRead::Unchanged { task_id } => format!("task {task_id} has no new output"),
+            JobRead::Delta(delta) => String::from_utf8_lossy(&delta.bytes).into_owned(),
+        }
+    }
+
+    fn job_input(&self, sent: &JobInputSent<'_>) -> String {
+        format!("input written to {}", sent.task_id)
+    }
+
+    fn job_kill(&self, kill: &JobKillAsked<'_>) -> String {
+        format!("kill of {}: {}", kill.task_id, kill.killed)
+    }
+
+    fn call_refused(&self, refusal: &CallRefusal) -> String {
+        format!("refused: {refusal:?}")
+    }
+
+    fn run_failure(&self, failure: &RunFailure<'_>) -> String {
+        format!("failed: {failure:?}")
+    }
+
+    fn command_blocked(&self, blocked: &CommandBlocked) -> String {
+        format!("blocked: {}", blocked.reason)
+    }
+
+    fn monitor_refusal(&self, refusal: &MonitorRefusal) -> String {
+        format!("monitor refused: {refusal:?}")
+    }
+
+    fn monitor_started(&self, started: &MonitorStarted<'_>) -> String {
+        format!("monitoring {}", started.task_id)
+    }
+
+    fn reserved_for_main(&self, reserved: &ReservedForMain<'_>) -> String {
+        format!("{} is reserved for the main agent", reserved.command)
+    }
+
+    fn command_killed(&self, killed: &CommandKilled<'_>) -> String {
+        format!("killed: {killed:?}")
+    }
+
+    fn output_saved(&self, saved: &OutputSaved<'_>) -> String {
+        format!(
+            "{}\n[{} lines saved to {}]",
+            saved.preview, saved.line_count, saved.path
+        )
+    }
+
+    fn stored_binary_part(&self, part: &StoredBinaryPart<'_>) -> String {
+        format!("[{} stored at {}]", part.mime, part.path)
+    }
+
+    fn json_as_tsv(&self, json: &JsonAsTsv<'_>) -> String {
+        format!("{}\n[JSON saved to {}]", json.tsv, json.path)
+    }
+
+    fn folded_code(&self, folded: &str) -> String {
+        folded.to_owned()
+    }
+
+    fn blank_lines(&self, count: usize) -> String {
+        format!("[{count} blank lines]")
+    }
+
+    fn folded_lines(&self, folded: &FoldedLines<'_>) -> String {
+        format!("{}  [{} lines folded]", folded.indent, folded.count)
+    }
+
+    fn omitted_lines(&self, omitted: &OmittedLines) -> String {
+        format!(
+            "[lines {}-{} of {} omitted]",
+            omitted.range.first, omitted.range.last, omitted.total
+        )
+    }
+
+    fn repeated_lines(&self, repeated: &RepeatedLines) -> String {
+        format!("[repeated {} times]", repeated.count)
+    }
+}
+
+/// The descriptions of every argument the example's tools take.
+fn arguments() -> BTreeMap<&'static str, Cow<'static, str>> {
+    [
+        "description",
+        "script",
+        "interpreter",
+        "sandbox",
+        "location",
+        "resolution",
+        "max_lines",
+        "raw",
+        "timeout",
+        "background",
+        "task_id",
+        "cursor",
+        "max_bytes",
+        "input",
+        "append_newline",
+    ]
+    .into_iter()
+    .map(|name| (name, Cow::Borrowed("An argument of the example's tools.")))
+    .collect()
+}
+
+fn identity(name: &'static str, description: &'static str) -> ToolIdentity {
+    ToolIdentity {
+        name: name.into(),
+        description: description.into(),
+        arguments: arguments(),
+    }
+}
+
+fn output_policy() -> OutputPolicy {
+    OutputPolicy::new(OutputLimits {
+        inline_bytes: 16_000,
+        preview_bytes: 16_000,
+        default_lines: 200,
+        ceiling_lines: 800,
+        read_bytes: 32 * 1024,
+        media: MediaBounds {
+            low: 512,
+            medium: 1024,
+            high: 2048,
+        },
+        job_preview_bytes: 50,
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,21 +168,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         distribution = distribution.with_github_token(token);
     }
-    let terminal =
-        TerminalTool::new_exact(PathBuf::from(workspace), executor_core::tokio::TokioGlobal)
-            .await?
-            .initialize_tools(&distribution, &PathBuf::from(cache))
-            .await?;
+    let limits = ShellLimits {
+        foreground_wait: ForegroundWait::new(Duration::from_secs(10)),
+        timeout_cap: LiveDuration::new(Duration::from_secs(120 * 60)),
+        long_job_alert: LiveDuration::new(Duration::from_secs(40 * 60)),
+        subagent_import: ImportBudget::new(1024 * 1024 * 1024),
+        response_window: ResponseWindow::new(Duration::from_secs(120)),
+    };
+    let output = output_policy();
+    let cache = PathBuf::from(cache);
+    let heel = distribution
+        .prepare_host_program(HostProgram::Heel, &ToolTarget::native()?, &cache)
+        .await?;
+    let sandbox = Sandbox::new(
+        Backend::Host {
+            heel: heel::HeelBinary::verify(heel.path())?,
+        },
+        executor_core::tokio::TokioGlobal,
+        PathBuf::from(workspace),
+    );
+    let terminal = Shell::builder(sandbox)
+        .interpreters([Interpreter::Shell, Interpreter::Python])
+        .limits(limits)
+        .output(output)
+        .wording(ExampleWording)
+        .tools(ShellToolSettings {
+            shell: identity("terminal", "Run a script."),
+            read: identity("job_read", "Read a job's output."),
+            input: identity("job_input", "Write to a job's stdin."),
+            kill: identity("job_kill", "Kill a job."),
+        })
+        .build()
+        .await?
+        .initialize_tools(&distribution, &cache)
+        .await?;
     let registry = ToolRegistryBuilder::new().build(terminal.output_store().clone());
     let terminal = terminal.with_registry(std::sync::Arc::new(registry));
-    let arguments: TerminalArgs = serde_json::from_value(serde_json::json!({
+    let arguments: ShellArgs = serde_json::from_value(serde_json::json!({
         "description": "Verify prepared search, JSON and edit commands",
         "script": include_str!("../templates/verify_baseline_tools.sh"),
-        "mode": "default",
         "raw": true,
         "timeout": 120
     }))?;
-    let result = terminal.call(arguments, ToolContext::new()).await?;
+    let result = terminal.tool().call(arguments, ToolContext::new()).await?;
     let output = result.render_for_model();
     assert!(output.contains("baseline acceptance passed"), "{output}");
     // `uv --version` and `python3 --version` report the manifest's pins.

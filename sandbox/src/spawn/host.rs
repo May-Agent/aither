@@ -9,13 +9,15 @@ use heel::{
     StdioConfig,
 };
 
-use super::child::{ChildExit, KillHandle, SandboxedChild, Streams, exit_watch};
+use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
 use super::domain::DomainGate;
 use super::stdio::{read_chunks, write_chunks};
-use super::{Backend, Pipe, Sandbox, SpawnError, SpawnSpec, Stdio};
+use super::{Backend, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio};
+#[cfg(target_os = "linux")]
+use crate::process_tree::JobProcess;
 use crate::process_tree::{JobMarker, JobTree};
-use crate::stdin_watch::FeedCounter;
-use crate::terminal::{LocalChild, wait_for_local_process_exit};
+use crate::stdin_watch::{FeedCounter, LocalStdinProbe, StdinWatchSignal};
+use crate::terminal::{LocalChild, LocalStdinWatch, wait_for_local_process_exit};
 
 /// How long a job's descendants may outlive its top-level process, which
 /// decides how a Linux job is supervised.
@@ -229,21 +231,35 @@ impl Sandbox {
 
     /// Starts `spec` on the host under heel and hands back the raw child, for
     /// an embedder that supervises the job itself.
-    pub(crate) async fn spawn_local(
-        &self,
-        spec: SpawnSpec,
-        lifetime: TreeLifetime,
-    ) -> Result<LocalSpawn, SpawnError> {
+    pub(crate) async fn spawn_local(&self, spec: SpawnSpec) -> Result<LocalSpawn, SpawnError> {
         let heel = self.heel_binary()?.clone();
         let SpawnSpec {
-            program,
-            args,
+            command,
             env,
             cwd,
             stdio,
-            extra_grants,
+            grants: extra_grants,
             ipc,
+            lifetime,
         } = spec;
+        // A process on the host is a program: only a container or a server
+        // has a managed shell to run a script in.
+        let SpawnCommand::Program { program, args } = command else {
+            return Err(SpawnError::Unsupported {
+                backend: "host",
+                what: "a script",
+            });
+        };
+        let extra_grants = extra_grants
+            .into_iter()
+            .map(|grant| match grant {
+                SpawnGrant::Host(grant) => Ok(grant),
+                SpawnGrant::Container { .. } => Err(SpawnError::Unsupported {
+                    backend: "host",
+                    what: "a grant on a container path",
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let marker = JobMarker::new();
         let mut env = self.host_environment(env);
         env.push(marker.entry());
@@ -358,18 +374,32 @@ impl Sandbox {
 
     pub(super) async fn spawn_host(&self, spec: SpawnSpec) -> Result<SandboxedChild, SpawnError> {
         let stdio = spec.stdio;
+        let lifetime = spec.lifetime;
         let LocalSpawn {
             mut child,
             tree,
             sandbox,
-        } = self.spawn_local(spec, TreeLifetime::Background).await?;
+        } = self.spawn_local(spec).await?;
         let id = child.id();
 
         let mut streams = Streams::default();
+        let mut stdin_watch = None;
         if stdio.stdin == Pipe::Piped
             && let Some(stdin) = child.take_stdin()
         {
-            streams.stdin = Some(write_chunks(stdin, FeedCounter::default()));
+            let feed = FeedCounter::default();
+            let (signal_tx, signal_rx) = async_channel::unbounded();
+            match LocalStdinProbe::new(id, &stdin) {
+                Ok(probe) => {
+                    stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
+                }
+                // The watch cannot run: say so once, as a running watch would.
+                Err(error) => {
+                    let _ = signal_tx.try_send(StdinWatchSignal::Failed(error.to_string()));
+                }
+            }
+            streams.stdin_blocked = Some(signal_rx);
+            streams.stdin = Some(write_chunks(stdin, feed));
         }
         if stdio.stdout == Pipe::Piped
             && let Some(stdout) = child.take_stdout()
@@ -389,7 +419,9 @@ impl Sandbox {
             .spawn(async move {
                 // Dropping heel's sandbox ends the processes under it.
                 let _sandbox = sandbox;
-                setter.finish(wait_for_exit(&mut child, &watched).await);
+                let (exit, descendants) =
+                    wait_for_exit(&mut child, &watched, lifetime, stdin_watch).await;
+                setter.finish(exit, descendants);
             })
             .detach();
         Ok(SandboxedChild::new(
@@ -412,19 +444,35 @@ fn pump(file: std::fs::File) -> async_channel::Receiver<Vec<u8>> {
     rx
 }
 
-/// Waits until the root process and every process it started have exited.
-///
-/// The root stays unreaped until its tree is gone, so its pid and process
-/// group stay reserved while the job's descendants are tracked by them.
-async fn wait_for_exit(child: &mut LocalChild, tree: &JobTree) -> ChildExit {
-    let exited = match wait_for_local_process_exit(child, None).await {
+/// Waits until the root process has exited and then ends its descendants as
+/// `lifetime` says: a foreground child's are killed, a background child's
+/// waited for. The root stays unreaped until its tree is gone, so its pid and
+/// process group stay reserved while the job's descendants are tracked by
+/// them.
+async fn wait_for_exit(
+    child: &mut LocalChild,
+    tree: &JobTree,
+    lifetime: TreeLifetime,
+    stdin_watch: Option<LocalStdinWatch>,
+) -> (ChildExit, Descendants) {
+    let exited = match wait_for_local_process_exit(child, stdin_watch).await {
         Ok(exited) => exited,
         Err(error) => {
             tree.finish().await;
-            return ChildExit::Failed(error.to_string());
+            return (
+                ChildExit::Failed(error.to_string()),
+                Descendants::Unobserved,
+            );
         }
     };
-    let descendants = tree.wait_descendants_exit().await;
+    let mut killed = Vec::new();
+    let ended = match lifetime {
+        TreeLifetime::Foreground => tree
+            .kill_descendants()
+            .await
+            .map(|processes| killed = processes),
+        TreeLifetime::Background => tree.wait_descendants_exit().await,
+    };
     // The task ends first: afterwards the root's pid may belong to anyone.
     tree.finish().await;
     let status = match exited {
@@ -432,12 +480,32 @@ async fn wait_for_exit(child: &mut LocalChild, tree: &JobTree) -> ChildExit {
         None => child
             .wait_reported()
             .await
-            .map(|(status, _)| status)
+            .map(|(status, report)| {
+                // A supervised foreground job's teardown killed what it found.
+                #[cfg(target_os = "linux")]
+                if let Some(report) = report {
+                    killed.extend(report.killed.into_iter().map(|process| JobProcess {
+                        pid: process.pid,
+                        name: process.name,
+                    }));
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = report;
+                status
+            })
             .map_err(|error| error.to_string()),
     };
-    match (descendants, status) {
+    // A kill that failed ended an unknown part of the tree, so what it did
+    // name is not the whole of it; Windows sees no descendants at all.
+    let descendants = if cfg!(windows) || ended.is_err() {
+        Descendants::Unobserved
+    } else {
+        Descendants::Killed(killed)
+    };
+    let exit = match (ended, status) {
         (Ok(()), Ok(status)) => ChildExit::Exited(status),
         (Err(error), _) => ChildExit::Failed(error.to_string()),
         (Ok(()), Err(error)) => ChildExit::Failed(error),
-    }
+    };
+    (exit, descendants)
 }
