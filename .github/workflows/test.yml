@@ -67,15 +67,11 @@ jobs:
           shared-key: test-${{ matrix.os }}-${{ inputs.cache-key }}
       - uses: ./.github/actions/install-protoc
       - uses: taiki-e/install-action@nextest
-      # The pinned tool artifacts and prepared runtimes the sandbox tests use.
-      - id: tools
-        uses: ./.github/actions/restore-tool-cache
-        with:
-          rustc: true
-          files: |
-            patch/third-party-tools.json
-            agent/templates/test_baseline_tool.rs
-            agent/src/test_support.rs
+      # The fish login shell case of the sandbox's SSH tests runs only where
+      # fish is installed.
+      - name: Install fish
+        if: ${{ runner.os == 'Linux' }}
+        run: sudo apt-get install -y --no-install-recommends fish
       - shell: bash
         env:
           FILTERSET: ${{ inputs.filterset }}
@@ -89,8 +85,3 @@ jobs:
         with:
           name: cargo-timings-test-${{ inputs.cache-key }}-${{ matrix.os }}
           path: target/cargo-timings/
-      - if: success() && steps.tools.outputs.hit != 'true' && github.ref == 'refs/heads/dev'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.tools.outputs.path }}
-          key: ${{ steps.tools.outputs.key }}
