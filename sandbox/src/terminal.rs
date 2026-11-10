@@ -7669,6 +7669,7 @@ mod tests {
         (cache, tool.with_registry(registry))
     }
 
+    #[cfg(unix)]
     fn unsandboxed_args(script: &str) -> TerminalArgs {
         TerminalArgs {
             mode: TerminalExecutionMode::Unsafe,
