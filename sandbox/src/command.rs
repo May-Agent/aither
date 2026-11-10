@@ -34,9 +34,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_core::IdLease;
 use aither_core::llm::tool::{Progress, ProgressSink, ToolResultPart};
 use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolContext, ToolResult};
+use aither_core::{IdLease, WeakIdLease};
 
 use crate::command_set::{AnyCommandSet, CommandSet};
 use askama::Template;
@@ -288,17 +288,25 @@ struct CommandProgressTemplate<'a> {
 /// The output stream of the terminal job a registry serves, where the
 /// progress its commands report is written as it happens.
 ///
-/// It holds the job's lease, so the job's word names no other job while a
-/// command can still report to it.
+/// It refers to the job's lease weakly: the registry it sits in lives as
+/// long as the IPC channels serving it, whose teardown outlasts the job, so
+/// a strong hold would keep the word leased past the job's end. The job's
+/// flow and its registry entry hold the word for as long as the job can be
+/// read, and a report made once they let go is dropped, since nothing could
+/// read it and the word may name another job by then.
 #[derive(Debug, Clone)]
 pub struct JobOutput {
     jobs: crate::job_registry::JobRegistry,
-    task_id: IdLease,
+    task_id: WeakIdLease,
 }
 
 impl JobOutput {
-    pub const fn new(jobs: crate::job_registry::JobRegistry, task_id: IdLease) -> Self {
-        Self { jobs, task_id }
+    #[must_use]
+    pub fn new(jobs: crate::job_registry::JobRegistry, task_id: &IdLease) -> Self {
+        Self {
+            jobs,
+            task_id: task_id.downgrade(),
+        }
     }
 }
 
@@ -311,10 +319,13 @@ impl ProgressSink for JobOutput {
         }
         .render()
         .expect("command progress template must render");
+        let Some(task_id) = self.task_id.upgrade() else {
+            return;
+        };
         // A job still registering holds the line until it has, so no report
         // is lost to the gap between its process starting and its registration.
         self.jobs
-            .append_task_stdout(&self.task_id, line.into_bytes())
+            .append_task_stdout(&task_id, line.into_bytes())
             .await;
     }
 }
@@ -4963,5 +4974,42 @@ mod tests {
             [(CommandRole::Subagent, "shared".to_string())]
         );
         assert!(main.observer().is_some() && unobserved.observer().is_none());
+    }
+
+    /// A job's output reaches the job while its lease is held, yet never
+    /// holds the word itself: an IPC channel that still serves the job's
+    /// registry after the job ended keeps nothing leased, and what it reports
+    /// then reaches no later job leasing the same word.
+    #[tokio::test]
+    async fn a_jobs_output_reports_to_it_without_keeping_its_word_leased() {
+        let (jobs, service) = crate::job_registry::job_registry_channel();
+        tokio::spawn(service.serve());
+        let ids =
+            aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river", "stone"]));
+        let first = ids.lease().expect("river is free");
+        assert_eq!(&*first, "river");
+        jobs.register(1, &first, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        let mut output = JobOutput::new(jobs.clone(), &first);
+        output.report(Progress::new(1.0).with_total(2.0)).await;
+        let (stdout, _) = jobs.terminal_output(1).await.expect("job 1 is registered");
+        assert!(!stdout.is_empty(), "a held lease's report reaches its job");
+
+        // The job's own holds end: its lease, and its entry, which a job
+        // reusing its pid replaces.
+        drop(first);
+        let replacing = ids.lease().expect("stone is free");
+        jobs.register(1, &replacing, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        // The registry serves commands in order, so this list sees the
+        // replacement.
+        assert_eq!(jobs.list().await.len(), 1);
+        let again = ids.lease().expect("the output keeps nothing leased");
+        assert_eq!(&*again, "river");
+        jobs.register(2, &again, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        output.report(Progress::new(2.0).with_total(2.0)).await;
+        let (stdout, _) = jobs.terminal_output(2).await.expect("job 2 is registered");
+        assert!(stdout.is_empty(), "{}", String::from_utf8_lossy(&stdout));
     }
 }
