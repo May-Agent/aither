@@ -10,16 +10,17 @@
 //!
 //! ```
 //! use aither_core::llm::{
-//!     Approval, ApprovalKind, ApprovalRequest, Approver, AnyApprover, ToolContext,
+//!     Approval, ApprovalKind, ApprovalRequest, Approver, ApproverFailure, AnyApprover,
+//!     ToolContext,
 //! };
 //!
 //! struct DenyAll;
 //!
 //! impl Approver for DenyAll {
-//!     async fn approve(&self, request: ApprovalRequest) -> Approval {
-//!         Approval::Denied {
+//!     async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+//!         Ok(Approval::Denied {
 //!             reason: format!("`{}` is not allowed here", request.subject()),
-//!         }
+//!         })
 //!     }
 //! }
 //!
@@ -175,22 +176,42 @@ impl Approval {
 /// a cancelled call withdraws its question.
 pub trait Approver: Send + Sync + 'static {
     /// The answer to `request`.
-    fn approve(&self, request: ApprovalRequest) -> impl Future<Output = Approval> + Send;
+    ///
+    /// # Errors
+    ///
+    /// [`ApproverFailure`] when the approver could not decide, such as when
+    /// the store it records requests in fails. A failure is not a denial:
+    /// the caller sees it as [`ApprovalError::Failed`].
+    fn approve(
+        &self,
+        request: ApprovalRequest,
+    ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send;
 }
+
+/// An [`Approver`] that could not decide, carrying its own error as the
+/// [source](core::error::Error::source).
+#[derive(Debug, thiserror::Error)]
+#[error("the approver could not decide")]
+pub struct ApproverFailure(#[source] Box<dyn core::error::Error + Send + Sync + 'static>);
+
+impl ApproverFailure {
+    /// A failure caused by `error`.
+    #[must_use]
+    pub fn new(error: impl core::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+}
+
+type ApproveFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Approval, ApproverFailure>> + Send + 'a>>;
 
 /// Object-safe twin of [`Approver`], so [`AnyApprover`] can hold any approver.
 trait ApproverImpl: Send + Sync {
-    fn approve(
-        &self,
-        request: ApprovalRequest,
-    ) -> Pin<Box<dyn Future<Output = Approval> + Send + '_>>;
+    fn approve(&self, request: ApprovalRequest) -> ApproveFuture<'_>;
 }
 
 impl<A: Approver> ApproverImpl for A {
-    fn approve(
-        &self,
-        request: ApprovalRequest,
-    ) -> Pin<Box<dyn Future<Output = Approval> + Send + '_>> {
+    fn approve(&self, request: ApprovalRequest) -> ApproveFuture<'_> {
         Box::pin(Approver::approve(self, request))
     }
 }
@@ -209,7 +230,10 @@ impl AnyApprover {
 }
 
 impl Approver for AnyApprover {
-    fn approve(&self, request: ApprovalRequest) -> impl Future<Output = Approval> + Send {
+    fn approve(
+        &self,
+        request: ApprovalRequest,
+    ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
         self.0.approve(request)
     }
 }
@@ -222,7 +246,7 @@ impl Debug for AnyApprover {
 
 /// Why [`ToolContext::approve`](super::ToolContext::approve) produced no
 /// answer.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ApprovalError {
     /// The call's dispatcher attached no approver, so nobody can approve the
     /// action; it must not go ahead.
@@ -233,6 +257,15 @@ pub enum ApprovalError {
     NoApprover {
         /// The kind of the request nobody could answer.
         kind: ApprovalKind,
+    },
+    /// The approver could not decide; the action must not go ahead.
+    #[error("the approver failed on the request for `{kind}`")]
+    Failed {
+        /// The kind of the request the approver failed on.
+        kind: ApprovalKind,
+        /// What went wrong.
+        #[source]
+        failure: ApproverFailure,
     },
     /// The call was cancelled before the approver answered.
     #[error("the tool call was cancelled while waiting for approval")]

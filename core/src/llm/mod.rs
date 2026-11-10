@@ -120,9 +120,9 @@ use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::{
     AgentIdentity, AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
-    CallIdentity, CancelSignal, Canceller, CommandOutcome, CommandResult, CommandStream,
-    Interruption, InterruptionCause, IntoToolResult, StoredFile, SubagentIdentity, Tool,
-    ToolCallId, ToolContext, ToolResult, render_interruptions,
+    ApproverFailure, CallIdentity, CancelSignal, Canceller, CommandOutcome, CommandResult,
+    CommandStream, Interruption, InterruptionCause, IntoToolResult, StoredFile, SubagentIdentity,
+    Tool, ToolCallId, ToolContext, ToolResult, render_interruptions,
 };
 
 use crate::llm::model::Profile;

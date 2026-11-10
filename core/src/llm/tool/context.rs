@@ -217,6 +217,7 @@ impl ToolContext {
     ///
     /// [`ApprovalError::NoApprover`] when the dispatcher attached no
     /// approver: nobody can approve the action, so it must not go ahead.
+    /// [`ApprovalError::Failed`] when the approver could not decide.
     /// [`ApprovalError::Cancelled`] when the call is cancelled before the
     /// approver answers; the approver's pending future is dropped.
     pub fn approve(
@@ -237,7 +238,14 @@ impl ToolContext {
             if cancellation.is_cancelled() {
                 return Err(ApprovalError::Cancelled);
             }
-            futures_lite::future::or(async { Ok(approver.approve(request).await) }, async {
+            let kind = request.kind().clone();
+            let answer = async {
+                approver
+                    .approve(request)
+                    .await
+                    .map_err(|failure| ApprovalError::Failed { kind, failure })
+            };
+            futures_lite::future::or(answer, async {
                 cancellation.cancelled().await;
                 Err(ApprovalError::Cancelled)
             })
@@ -345,6 +353,7 @@ impl Debug for ToolContext {
 mod tests {
     extern crate std;
 
+    use super::super::ApproverFailure;
     use super::*;
     use alloc::vec::Vec;
     use std::sync::mpsc;
@@ -436,17 +445,20 @@ mod tests {
     }
 
     impl Approver for ApproveOnly {
-        fn approve(&self, request: ApprovalRequest) -> impl Future<Output = Approval> + Send {
+        fn approve(
+            &self,
+            request: ApprovalRequest,
+        ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
             self.seen
                 .send(request.call().cloned())
                 .expect("test receiver alive");
-            core::future::ready(if request.subject() == self.allowed {
+            core::future::ready(Ok(if request.subject() == self.allowed {
                 Approval::Approved
             } else {
                 Approval::Denied {
                     reason: alloc::format!("{} is not allowed", request.subject()),
                 }
-            })
+            }))
         }
     }
 
@@ -454,8 +466,25 @@ mod tests {
     struct Unanswered;
 
     impl Approver for Unanswered {
-        async fn approve(&self, _request: ApprovalRequest) -> Approval {
+        async fn approve(&self, _request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
             core::future::pending().await
+        }
+    }
+
+    /// The store an approver records requests in failed.
+    #[derive(Debug, thiserror::Error)]
+    #[error("request store unavailable")]
+    struct StoreDown;
+
+    /// Fails on every request, like an approver whose store is down.
+    struct Broken;
+
+    impl Approver for Broken {
+        fn approve(
+            &self,
+            _request: ApprovalRequest,
+        ) -> impl Future<Output = Result<Approval, ApproverFailure>> + Send {
+            core::future::ready(Err(ApproverFailure::new(StoreDown)))
         }
     }
 
@@ -477,14 +506,14 @@ mod tests {
             }));
 
         assert_eq!(
-            cx.approve(unsandboxed("cargo build")).await,
-            Ok(Approval::Approved)
+            cx.approve(unsandboxed("cargo build")).await.unwrap(),
+            Approval::Approved
         );
         assert_eq!(
-            cx.approve(unsandboxed("rm -rf ~")).await,
-            Ok(Approval::Denied {
+            cx.approve(unsandboxed("rm -rf ~")).await.unwrap(),
+            Approval::Denied {
                 reason: "rm -rf ~ is not allowed".into(),
-            })
+            }
         );
         assert_eq!(
             seen.try_iter().collect::<Vec<_>>(),
@@ -498,16 +527,35 @@ mod tests {
             .approve(unsandboxed("cargo build"))
             .await
             .expect_err("no approver, no approval");
-        assert_eq!(
-            error,
-            ApprovalError::NoApprover {
-                kind: super::super::ApprovalKind::new("unsandboxed"),
-            }
+        assert!(
+            matches!(&error, ApprovalError::NoApprover { kind } if kind.as_str() == "unsandboxed"),
+            "{error:?}"
         );
         assert!(
             alloc::string::ToString::to_string(&error).contains("no approver"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_approver_failure_is_an_error_not_a_denial() {
+        use core::error::Error;
+
+        let error = ToolContext::new()
+            .with_approver(AnyApprover::new(Broken))
+            .approve(unsandboxed("cargo build"))
+            .await
+            .expect_err("a failed approver approves nothing");
+        let ApprovalError::Failed { kind, .. } = &error else {
+            panic!("expected ApprovalError::Failed, got {error:?}");
+        };
+        assert_eq!(kind.as_str(), "unsandboxed");
+        let failure = error
+            .source()
+            .expect("the approver's failure is the source");
+        assert!(failure.is::<ApproverFailure>(), "{failure:?}");
+        let cause = failure.source().expect("the approver's own error");
+        assert!(cause.is::<StoreDown>(), "{cause:?}");
     }
 
     #[tokio::test]
@@ -518,14 +566,18 @@ mod tests {
             .with_cancellation(canceller.signal());
         let pending = cx.approve(unsandboxed("cargo build"));
         futures_lite::pin!(pending);
-        assert_eq!(futures_lite::future::poll_once(&mut pending).await, None);
+        assert!(
+            futures_lite::future::poll_once(&mut pending)
+                .await
+                .is_none()
+        );
         canceller.cancel();
-        assert_eq!(pending.await, Err(ApprovalError::Cancelled));
+        assert!(matches!(pending.await, Err(ApprovalError::Cancelled)));
         // Asking after the cancellation does not reach the approver.
-        assert_eq!(
+        assert!(matches!(
             cx.approve(unsandboxed("cargo build")).await,
             Err(ApprovalError::Cancelled)
-        );
+        ));
     }
 
     #[tokio::test]
