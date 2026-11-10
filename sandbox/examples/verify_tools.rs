@@ -1,10 +1,12 @@
 #![doc = "Verify prepared baseline commands through the real terminal sandbox."]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    TerminalArgs, TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolTarget,
+    MediaBounds, OutputLimits, OutputPolicy, ShellLimits, TerminalArgs, TerminalTool,
+    ToolDistribution, ToolRegistryBuilder, ToolTarget,
 };
 
 #[tokio::main]
@@ -25,11 +27,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         distribution = distribution.with_github_token(token);
     }
-    let terminal =
-        TerminalTool::new_exact(PathBuf::from(workspace), executor_core::tokio::TokioGlobal)
-            .await?
-            .initialize_tools(&distribution, &PathBuf::from(cache))
-            .await?;
+    let limits = ShellLimits::new(
+        Duration::from_secs(10),
+        Duration::from_secs(120 * 60),
+        Duration::from_secs(40 * 60),
+        1024 * 1024 * 1024,
+        Duration::from_secs(120),
+    );
+    let output = OutputPolicy::new(OutputLimits {
+        inline_bytes: 16_000,
+        preview_bytes: 16_000,
+        default_lines: 200,
+        ceiling_lines: 800,
+        read_bytes: 32 * 1024,
+        media: MediaBounds {
+            low: 512,
+            medium: 1024,
+            high: 2048,
+        },
+        job_preview_bytes: 50,
+    });
+    let terminal = TerminalTool::new_exact(
+        PathBuf::from(workspace),
+        executor_core::tokio::TokioGlobal,
+        limits,
+        output,
+    )
+    .await?
+    .initialize_tools(&distribution, &PathBuf::from(cache))
+    .await?;
     let registry = ToolRegistryBuilder::new().build(terminal.output_store().clone());
     let terminal = terminal.with_registry(std::sync::Arc::new(registry));
     let arguments: TerminalArgs = serde_json::from_value(serde_json::json!({

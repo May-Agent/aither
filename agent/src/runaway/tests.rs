@@ -186,7 +186,8 @@ impl Agent {
         machine: Option<(&Machine, &'static str)>,
         cgroup: Option<&Cgroup>,
     ) -> Self {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) =
+            job_registry_channel(aither_sandbox::test_budgets::output_policy());
         tokio::spawn(async move { service.serve().await });
         let footprints = Footprints {
             physical,

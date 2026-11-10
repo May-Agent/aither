@@ -132,8 +132,9 @@ pub fn output_saved_text(
     path: &str,
     line_count: usize,
     byte_count: usize,
+    preview_bytes: usize,
 ) -> String {
-    let preview = crate::output_compress::stored_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
+    let preview = crate::output_compress::stored_preview(rendered, usize::MAX, preview_bytes);
     CommandOutputSavedTemplate {
         preview: preview.trim_end_matches('\n'),
         path,
@@ -700,7 +701,7 @@ struct Resolved<'a> {
     stdin_arg: Option<&'a str>,
 }
 
-use crate::output::{INLINE_OUTPUT_LIMIT, OutputStore};
+use crate::output::OutputStore;
 use crate::permission::TerminalMode;
 use crate::terminal::TerminalBinding;
 
@@ -721,7 +722,7 @@ async fn handle_large_output(output: ToolResult, outputs: &OutputStore) -> Comma
         return CommandEnvelope::success_empty();
     }
 
-    if rendered.len() <= INLINE_OUTPUT_LIMIT {
+    if rendered.len() <= outputs.policy().get().inline_bytes {
         return CommandEnvelope::success(output);
     }
 
@@ -740,6 +741,7 @@ async fn handle_large_output(output: ToolResult, outputs: &OutputStore) -> Comma
             &filepath.to_string_lossy(),
             line_count,
             rendered.len(),
+            outputs.policy().get().preview_bytes,
         ),
     })
 }
@@ -840,6 +842,8 @@ pub struct DynTerminalTool {
     pub(crate) role: CommandRole,
     /// The terminal registry's notices, which its controls render through.
     pub(crate) notices: crate::AnySandboxNotices,
+    /// The output budgets the terminal's controls read with.
+    pub(crate) output: crate::OutputPolicy,
 }
 
 impl DynTerminalTool {
@@ -920,6 +924,7 @@ impl DynTerminalTool {
             erase_terminal_tool(ReadTerminalDeltaTool::new(
                 self.job_registry.clone(),
                 self.notices.clone(),
+                self.output.clone(),
             )),
         ]
     }
@@ -1571,6 +1576,7 @@ impl ToolRegistry {
         controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(
             jobs,
             self.notices.clone(),
+            outputs.policy().clone(),
         ));
         self.entries.extend(controls.entries);
         self.outputs = outputs;
@@ -3369,7 +3375,11 @@ mod tests {
 
     /// An output store in `dir` leasing from the default allocator.
     fn test_outputs(dir: &Path) -> OutputStore {
-        OutputStore::at(dir.to_path_buf(), aither_core::AnyIdAllocator::default())
+        OutputStore::at(
+            dir.to_path_buf(),
+            aither_core::AnyIdAllocator::default(),
+            crate::output_policy::fixture::policy(),
+        )
     }
 
     fn single_stored_file(dir: &Path) -> PathBuf {
@@ -4343,7 +4353,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let output_dir = tmp.path().join("not-a-directory");
         std::fs::write(&output_dir, "occupied").unwrap();
-        let output = ToolResult::text("x".repeat(INLINE_OUTPUT_LIMIT + 1));
+        let output =
+            ToolResult::text("x".repeat(crate::output_policy::fixture::LIMITS.inline_bytes + 1));
 
         let result = handle_large_output(output, &test_outputs(&output_dir)).await;
         assert!(!result.ok);

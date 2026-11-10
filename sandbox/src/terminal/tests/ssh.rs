@@ -207,13 +207,18 @@ async fn terminal_with(
     approver: &Approvals,
     policy: RecordStarts,
 ) -> Terminal {
-    let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-        .await
-        .expect("terminal tool should initialize")
-        .with_approver(approver.clone())
-        .adopt_prepared_tools(registry)
-        .await
-        .expect("prepared tools should be adopted");
+    let tool = TerminalTool::new_exact(
+        dir,
+        executor_core::tokio::TokioGlobal,
+        crate::limits::fixture::limits(),
+        crate::output_policy::fixture::policy(),
+    )
+    .await
+    .expect("terminal tool should initialize")
+    .with_approver(approver.clone())
+    .adopt_prepared_tools(registry)
+    .await
+    .expect("prepared tools should be adopted");
     let mut commands = ToolRegistryBuilder::new();
     commands.script_policy(policy);
     let commands = Arc::new(commands.build(tool.output_store().clone()));
@@ -229,7 +234,7 @@ fn args(script: &str, mode: TerminalExecutionMode, location: &str) -> TerminalAr
         location: Some(location.to_string()),
         expect: OutputFormat::Text,
         resolution: MediaResolution::Auto,
-        max_lines: 50,
+        max_lines: Some(50),
         raw: true,
         timeout: 60,
         background: false,
@@ -447,12 +452,17 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
     let dir = tempfile::tempdir().unwrap();
 
     // No policy decided, and no approver exists: the script is not run.
-    let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-        .await
-        .unwrap()
-        .adopt_prepared_tools(registry.clone())
-        .await
-        .unwrap();
+    let tool = TerminalTool::new_exact(
+        dir.path(),
+        executor_core::tokio::TokioGlobal,
+        crate::limits::fixture::limits(),
+        crate::output_policy::fixture::policy(),
+    )
+    .await
+    .unwrap()
+    .adopt_prepared_tools(registry.clone())
+    .await
+    .unwrap();
     let commands = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
     let tool = tool.with_registry(commands);
     let error = tool
@@ -469,12 +479,17 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
 
     // A policy's allow settles it without the approver; the connection is
     // refused, so the call fails later, and not for want of approval.
-    let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-        .await
-        .unwrap()
-        .adopt_prepared_tools(registry)
-        .await
-        .unwrap();
+    let tool = TerminalTool::new_exact(
+        dir.path(),
+        executor_core::tokio::TokioGlobal,
+        crate::limits::fixture::limits(),
+        crate::output_policy::fixture::policy(),
+    )
+    .await
+    .unwrap()
+    .adopt_prepared_tools(registry)
+    .await
+    .unwrap();
     let mut policies = ToolRegistryBuilder::new();
     policies.script_policy(Decide(ScriptDecision::Allow));
     let commands = Arc::new(policies.build(tool.output_store().clone()));

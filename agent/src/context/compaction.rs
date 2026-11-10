@@ -829,7 +829,7 @@ mod tests {
             ),
             Message::tool(
                 "call_1",
-                aither_sandbox::output_saved_text("head", path, 100, 5000),
+                aither_sandbox::output_saved_text("head", path, 100, 5000, 16_000),
             ),
         ];
         let index = build_file_index(&[], &messages, Some(dir));

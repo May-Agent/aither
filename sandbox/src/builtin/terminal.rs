@@ -127,14 +127,24 @@ impl Tool for InputTerminalTool {
 pub struct ReadTerminalDeltaTool {
     registry: JobRegistry,
     notices: crate::AnySandboxNotices,
+    output: crate::OutputPolicy,
 }
 
 impl ReadTerminalDeltaTool {
     /// Creates a terminal delta reader tool whose refused reads render
-    /// through `notices`.
+    /// through `notices` and whose reads default to the `read_bytes` of
+    /// `output`.
     #[must_use]
-    pub const fn new(registry: JobRegistry, notices: crate::AnySandboxNotices) -> Self {
-        Self { registry, notices }
+    pub const fn new(
+        registry: JobRegistry,
+        notices: crate::AnySandboxNotices,
+        output: crate::OutputPolicy,
+    ) -> Self {
+        Self {
+            registry,
+            notices,
+            output,
+        }
     }
 }
 
@@ -147,12 +157,8 @@ pub struct ReadTerminalDeltaArgs {
     #[serde(default)]
     pub cursor: usize,
     /// Maximum bytes to return in this call.
-    #[serde(default = "default_max_bytes")]
-    pub max_bytes: usize,
-}
-
-const fn default_max_bytes() -> usize {
-    32 * 1024
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
 }
 
 fn job_status_text(status: &JobStatus) -> String {
@@ -225,13 +231,16 @@ impl Tool for ReadTerminalDeltaTool {
         if task_id.is_empty() {
             return Err(anyhow::anyhow!("task_id must not be empty"));
         }
-        if args.max_bytes == 0 {
+        let max_bytes = args
+            .max_bytes
+            .unwrap_or_else(|| self.output.get().read_bytes);
+        if max_bytes == 0 {
             return Err(anyhow::anyhow!("max_bytes must be greater than 0"));
         }
 
         let delta = self
             .registry
-            .terminal_read(task_id, args.cursor, args.max_bytes)
+            .terminal_read(task_id, args.cursor, max_bytes)
             .await
             .map_err(|error| match error {
                 // Kept typed, so the agent loop recognises the refused poll.

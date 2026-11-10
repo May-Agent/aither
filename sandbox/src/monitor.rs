@@ -17,16 +17,25 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::job_registry::{JobRegistry, JobStatus};
+use crate::limits::LiveDuration;
 use crate::notices::{MonitorStarted, Refused};
 use crate::output::{MediaResolution, OutputFormat};
 use crate::script_language::ScriptLanguage;
 use crate::terminal::{Configured, JobAlert, TerminalArgs, TerminalExecutionMode, TerminalTool};
 
-/// The longest a monitor may run: two hours, the same cap `terminal` has.
-pub(crate) const MAX_TIMEOUT_SECS: u64 = 7200;
-
-const fn default_interval_secs() -> u64 {
-    10
+/// What an embedder decides about monitoring: the tool's name and description
+/// and the bounds of a watch. The bounds are live, so changing one reaches
+/// the tools already running.
+#[derive(Debug, Clone)]
+pub struct MonitorSettings {
+    /// The tool's name.
+    pub name: Cow<'static, str>,
+    /// The tool's description, as the model reads it.
+    pub description: Cow<'static, str>,
+    /// The longest a monitor may run.
+    pub max_timeout: LiveDuration,
+    /// The interval between output collections of a call that states none.
+    pub default_interval: LiveDuration,
 }
 
 /// `monitor` arguments.
@@ -38,9 +47,9 @@ pub struct MonitorArgs {
     /// truncation.
     pub source: MonitorSource,
     /// Seconds between output collections; only non-empty increments are
-    /// delivered. Default 10.
-    #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
+    /// delivered. Omitted, the embedder's default.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
     /// Optional regex — only matching new lines are delivered.
     #[serde(default)]
     pub filter: Option<String>,
@@ -55,8 +64,9 @@ pub struct MonitorArgs {
     /// seconds.
     #[serde(default)]
     pub stall_secs: Option<u64>,
-    /// Maximum lifetime in seconds. Required, at most 7200: at the deadline
-    /// the process tree is killed and the end reported as a timeout.
+    /// Maximum lifetime in seconds. Required, at most the embedder's cap: at
+    /// the deadline the process tree is killed and the end reported as a
+    /// timeout.
     pub timeout_secs: u64,
 }
 
@@ -135,8 +145,11 @@ pub enum MonitorEnd {
 /// Why a `monitor` call was refused before anything started.
 #[derive(Debug)]
 pub enum MonitorRefusal {
-    /// `timeout_secs` was 0 or above the 120-minute cap.
-    TimeoutOutOfRange,
+    /// `timeout_secs` was 0 or above the cap.
+    TimeoutOutOfRange {
+        /// The cap in force.
+        max: Duration,
+    },
     /// `interval_secs` was 0.
     IntervalTooSmall,
     /// `filter` or `stop_on` is not a valid regex.
@@ -178,14 +191,26 @@ struct Watch {
 /// and a pump that delivers its increments through [`JobAlert`].
 pub struct MonitorTool<E> {
     terminal: TerminalTool<E, Configured>,
+    settings: MonitorSettings,
+}
+
+/// Settings for tests, whose values stand for nothing.
+#[cfg(any(test, feature = "test-budgets"))]
+pub(crate) fn fixture_settings() -> MonitorSettings {
+    MonitorSettings {
+        name: "monitor".into(),
+        description: "Watches a source.".into(),
+        max_timeout: LiveDuration::new(Duration::from_secs(7200)),
+        default_interval: LiveDuration::new(Duration::from_secs(10)),
+    }
 }
 
 impl<E> MonitorTool<E> {
     /// Creates the tool bound to `terminal`, the configured terminal whose
     /// jobs it watches.
     #[must_use]
-    pub const fn new(terminal: TerminalTool<E, Configured>) -> Self {
-        Self { terminal }
+    pub const fn new(terminal: TerminalTool<E, Configured>, settings: MonitorSettings) -> Self {
+        Self { terminal, settings }
     }
 }
 
@@ -201,6 +226,13 @@ fn single_quote(text: &str) -> String {
 }
 
 impl<E: Executor + Clone + 'static> MonitorTool<E> {
+    /// The seconds between collections a call asks for, the embedder's
+    /// default when it states none.
+    fn interval_secs(&self, args: &MonitorArgs) -> u64 {
+        args.interval_secs
+            .unwrap_or_else(|| self.settings.default_interval.get().as_secs())
+    }
+
     /// The script the monitored job runs for `source` and its language; an
     /// unreadable file is refused before anything spawns.
     fn job_script(
@@ -249,18 +281,11 @@ where
     E: Executor + Clone + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
-        "monitor".into()
+        self.settings.name.clone()
     }
 
     fn description(&self) -> Cow<'static, str> {
-        "Watch a command or a file and receive its new output as it arrives. \
-         The source runs as a background job under the same sandbox as `terminal`; \
-         non-empty increments are delivered at turn boundaries or wake an idle agent. \
-         `source` is `{\"command\": <source>, \"language\": \"shell\"|\"python\"}` or \
-         `{\"file\": <path>}`. `timeout_secs` is required (max 7200). Options: \
-         `interval_secs` (default 10), `filter` regex, `stop_on` regex, `kill_on_stop`, \
-         `stall_secs`."
-            .into()
+        self.settings.description.clone()
     }
 
     type Arguments = MonitorArgs;
@@ -272,7 +297,7 @@ where
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         let notices = self.terminal.notices();
-        let interval_secs = args.interval_secs;
+        let interval_secs = self.interval_secs(&args);
         match self.start(args).await {
             Ok(task_id) => Ok(ToolResult::text(notices.monitor_started(&MonitorStarted {
                 task_id: &task_id,
@@ -288,10 +313,12 @@ where
 impl<E: Executor + Clone + 'static> MonitorTool<E> {
     /// Starts the watched job and its pump; returns the job's task id.
     async fn start(&self, args: MonitorArgs) -> Result<String, MonitorRefusal> {
-        if args.timeout_secs == 0 || args.timeout_secs > MAX_TIMEOUT_SECS {
-            return Err(MonitorRefusal::TimeoutOutOfRange);
+        let max_timeout = self.settings.max_timeout.get();
+        if args.timeout_secs == 0 || args.timeout_secs > max_timeout.as_secs() {
+            return Err(MonitorRefusal::TimeoutOutOfRange { max: max_timeout });
         }
-        if args.interval_secs == 0 {
+        let interval_secs = self.interval_secs(&args);
+        if interval_secs == 0 {
             return Err(MonitorRefusal::IntervalTooSmall);
         }
         let compile = |argument: &'static str, pattern: &Option<String>| {
@@ -322,12 +349,12 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
                 location: None,
                 expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
-                max_lines: 1,
+                max_lines: Some(1),
                 raw: true,
                 // The job's own watchdog stays a minute past the monitor's
                 // deadline, so the pump's kill — not the watchdog's — ends a
                 // timed-out run and the end reports `TimedOut`.
-                timeout: (args.timeout_secs + 60).min(MAX_TIMEOUT_SECS),
+                timeout: (args.timeout_secs + 60).min(max_timeout.as_secs()),
                 background: true,
             })
             .await
@@ -348,7 +375,7 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
             task_id: task_id.clone(),
             registry,
             alerts: self.terminal.job_alert_sender(),
-            interval: Duration::from_secs(args.interval_secs),
+            interval: Duration::from_secs(interval_secs),
             deadline: Instant::now() + Duration::from_secs(args.timeout_secs),
             stall: args.stall_secs.map(Duration::from_secs),
             filter,

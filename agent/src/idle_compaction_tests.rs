@@ -82,9 +82,14 @@ async fn agent_after_one_turn(
     clock: &ManualClock,
 ) -> Agent<ScriptedLlm> {
     let dir = tempdir().expect("temp dir");
-    let terminal = TerminalTool::new_exact(dir.path(), TokioGlobal)
-        .await
-        .expect("terminal tool initializes");
+    let terminal = TerminalTool::new_exact(
+        dir.path(),
+        TokioGlobal,
+        aither_sandbox::test_budgets::limits(),
+        aither_sandbox::test_budgets::output_policy(),
+    )
+    .await
+    .expect("terminal tool initializes");
     let tools = tempdir().expect("tool dir");
     let cache = crate::test_support::TempDir::new();
     let binary = test_support::compile_baseline_fixture(tools.path()).await;

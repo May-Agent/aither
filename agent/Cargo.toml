@@ -72,7 +72,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
 
 [dev-dependencies]
 hex = "0.4"
-aither-sandbox = { workspace = true, features = ["test-git", "test-heel", "test-ids"] }
+aither-sandbox = { workspace = true, features = ["test-budgets", "test-git", "test-heel", "test-ids"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 url = "2.5.8"

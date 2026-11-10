@@ -9286,7 +9286,8 @@ mod tests {
     async fn a_wake_keeps_its_completions_pending_until_the_host_drops_it() {
         let (mut agent, sender, _llm) = detached_agent(Vec::new());
         agent.detached_task_ids.insert("build".to_string());
-        let (jobs, service) = aither_sandbox::job_registry_channel();
+        let (jobs, service) =
+            aither_sandbox::job_registry_channel(aither_sandbox::test_budgets::output_policy());
         tokio::spawn(service.serve());
         jobs.register(
             41,

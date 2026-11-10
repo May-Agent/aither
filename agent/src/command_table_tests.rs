@@ -224,13 +224,18 @@ async fn an_mcp_tool_added_mid_session_runs_at_once_and_is_announced_once() {
         .expect("the scripted server connects");
 
     let dir = tempdir().expect("temp dir");
-    let terminal = TerminalTool::new_exact(dir.path(), TokioGlobal)
-        .await
-        .expect("terminal tool initializes")
-        // The call's own timeout ends `gamma` before the window can promote
-        // it to a background job, however slow the machine: the result is
-        // always in the second request.
-        .with_foreground_wait(GAMMA_TIMEOUT * 2);
+    let terminal = TerminalTool::new_exact(
+        dir.path(),
+        TokioGlobal,
+        aither_sandbox::test_budgets::limits(),
+        aither_sandbox::test_budgets::output_policy(),
+    )
+    .await
+    .expect("terminal tool initializes")
+    // The call's own timeout ends `gamma` before the window can promote
+    // it to a background job, however slow the machine: the result is
+    // always in the second request.
+    .with_foreground_wait(GAMMA_TIMEOUT * 2);
     let tools = tempdir().expect("tool dir");
     let cache = test_support::TempDir::new();
     let binary = test_support::compile_baseline_fixture(tools.path()).await;

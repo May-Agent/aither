@@ -1529,12 +1529,17 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
         let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
-        let terminal = TerminalTool::new_exact(session.path(), TokioGlobal)
-            .await
-            .unwrap()
-            .initialize_tools(&distribution, cache.path())
-            .await
-            .unwrap();
+        let terminal = TerminalTool::new_exact(
+            session.path(),
+            TokioGlobal,
+            aither_sandbox::test_budgets::limits(),
+            aither_sandbox::test_budgets::output_policy(),
+        )
+        .await
+        .unwrap()
+        .initialize_tools(&distribution, cache.path())
+        .await
+        .unwrap();
         let registry =
             std::sync::Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
         let terminal = terminal.with_registry(registry);

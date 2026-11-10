@@ -1183,7 +1183,7 @@ mod tests {
         }
 
         async fn memory_with_jobs() -> JobMemory {
-            let (jobs, service) = job_registry_channel();
+            let (jobs, service) = job_registry_channel(crate::output_policy::fixture::policy());
             tokio::spawn(async move { service.serve().await });
             for (place, pid, task) in [
                 (JobPlace::Host, 1, "host"),

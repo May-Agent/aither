@@ -134,7 +134,7 @@ async fn nothing_is_refreshed_without_a_live_limited_entry() {
 async fn keep_alives_while_waiting_on(timeout: Duration) -> usize {
     let llm = UsageLlm::default();
     let mut agent = waiting_agent(&llm);
-    let (jobs, service) = job_registry_channel();
+    let (jobs, service) = job_registry_channel(aither_sandbox::test_budgets::output_policy());
     tokio::spawn(service.serve());
     let task = lease("build");
     jobs.bound_by_timeout(&task, timeout).await;

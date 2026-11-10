@@ -908,6 +908,7 @@ where
         definitions.push(ToolDefinition::new(&ReadTerminalDeltaTool::new(
             jobs,
             aither_sandbox::AnySandboxNotices::default(),
+            self.terminal_tool.output_store().policy().clone(),
         )));
         let terminal = self.terminal_tool.clone().with_registry(Arc::new(
             ToolRegistryBuilder::new().build(self.terminal_tool.output_store().clone()),
@@ -915,6 +916,7 @@ where
         definitions.push(ToolDefinition::new(&terminal));
         definitions.push(ToolDefinition::new(&aither_sandbox::MonitorTool::new(
             terminal,
+            monitor_settings(),
         )));
         // The registry keys tools by name, so the definition list the built
         // agent sends is name-ordered.
@@ -986,7 +988,11 @@ where
             .inner
             .tool(KillTerminalTool::new(job_registry.clone()))
             .tool(InputTerminalTool::new(job_registry.clone()))
-            .tool(ReadTerminalDeltaTool::new(job_registry, notices.sandbox()))
+            .tool(ReadTerminalDeltaTool::new(
+                job_registry,
+                notices.sandbox(),
+                terminal_tool.output_store().policy().clone(),
+            ))
             .command_catalog(commands);
         let inner = if inner.has_instruction(&InstructionSlot::KNOWLEDGE_AND_TIME) {
             inner
@@ -1046,8 +1052,31 @@ where
         };
         inner
             .terminal(terminal_tool.clone())
-            .tool(aither_sandbox::MonitorTool::new(terminal_tool))
+            .tool(aither_sandbox::MonitorTool::new(
+                terminal_tool,
+                monitor_settings(),
+            ))
             .build()
+    }
+}
+
+/// The `monitor` tool as this agent presents it: its name, description and
+/// bounds are this embedder's, not aither-sandbox's.
+fn monitor_settings() -> aither_sandbox::MonitorSettings {
+    use std::time::Duration;
+
+    aither_sandbox::MonitorSettings {
+        name: "monitor".into(),
+        description: "Watch a command or a file and receive its new output as it arrives. \
+             The source runs as a background job under the same sandbox as `terminal`; \
+             non-empty increments are delivered at turn boundaries or wake an idle agent. \
+             `source` is `{\"command\": <source>, \"language\": \"shell\"|\"python\"}` or \
+             `{\"file\": <path>}`. `timeout_secs` is required (max 7200). Options: \
+             `interval_secs` (default 10), `filter` regex, `stop_on` regex, `kill_on_stop`, \
+             `stall_secs`."
+            .into(),
+        max_timeout: aither_sandbox::LiveDuration::new(Duration::from_secs(7200)),
+        default_interval: aither_sandbox::LiveDuration::new(Duration::from_secs(10)),
     }
 }
 
@@ -1467,9 +1496,14 @@ mod tests {
     }
 
     async fn noop_terminal(dir: &std::path::Path) -> aither_sandbox::TerminalTool<TokioGlobal> {
-        aither_sandbox::TerminalTool::new_exact(dir, TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
+        aither_sandbox::TerminalTool::new_exact(
+            dir,
+            TokioGlobal,
+            aither_sandbox::test_budgets::limits(),
+            aither_sandbox::test_budgets::output_policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
     }
 
     /// Asks for one terminal call running every baseline command, then stops.

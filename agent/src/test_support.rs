@@ -5,9 +5,13 @@ const BASELINE_PYTHON_VERSION: &str = "3.13.1";
 
 /// An output store in `dir`, leasing from the default allocator.
 pub async fn output_store(dir: impl Into<std::path::PathBuf>) -> aither_sandbox::OutputStore {
-    aither_sandbox::OutputStore::new(dir, aither_core::AnyIdAllocator::default())
-        .await
-        .expect("the output directory can be created")
+    aither_sandbox::OutputStore::new(
+        dir,
+        aither_core::AnyIdAllocator::default(),
+        aither_sandbox::test_budgets::output_policy(),
+    )
+    .await
+    .expect("the output directory can be created")
 }
 
 /// Drives `run` to its end without looking at its events.

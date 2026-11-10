@@ -109,8 +109,13 @@ mod tests {
     fn the_saved_output_notice_the_sandbox_renders_is_found() {
         let dir = Path::new("/home/me/My Sessions/s1/outputs");
         let path = dir.join("river.txt");
-        let notice =
-            aither_sandbox::output_saved_text("preview line", &path.to_string_lossy(), 900, 48_000);
+        let notice = aither_sandbox::output_saved_text(
+            "preview line",
+            &path.to_string_lossy(),
+            900,
+            48_000,
+            16_000,
+        );
         let urls = extract_referenced_urls(&notice, Some(dir));
         assert_eq!(
             urls,

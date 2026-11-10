@@ -2970,12 +2970,17 @@ mod tests {
                 ],
             );
 
-            let terminal = TerminalTool::new_exact(&session, TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .initialize_tools(&distribution, cache.path())
-                .await
-                .expect("tools should prepare");
+            let terminal = TerminalTool::new_exact(
+                &session,
+                TokioGlobal,
+                aither_sandbox::test_budgets::limits(),
+                aither_sandbox::test_budgets::output_policy(),
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .expect("tools should prepare");
             let terminal = configure(terminal);
             let registry =
                 Arc::new(ToolRegistryBuilder::new().build(terminal.output_store().clone()));
@@ -4010,7 +4015,8 @@ mod tests {
         aither_sandbox::JobRegistryService,
     ) {
         let (sender, receiver) = aither_sandbox::background_task_channel();
-        let (job_registry, job_service) = aither_sandbox::job_registry_channel();
+        let (job_registry, job_service) =
+            aither_sandbox::job_registry_channel(aither_sandbox::test_budgets::output_policy());
         let child_jobs = job_registry.clone();
         let tool = personas
             .tool(KeepAliveMockLlm {
@@ -4917,13 +4923,18 @@ mod tests {
                 .await
                 .expect("the hooks start"),
             ));
-            let terminal = TerminalTool::new_exact(session.path(), TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .with_approver(approver)
-                .initialize_tools(&distribution, cache.path())
-                .await
-                .expect("tools should prepare");
+            let terminal = TerminalTool::new_exact(
+                session.path(),
+                TokioGlobal,
+                aither_sandbox::test_budgets::limits(),
+                aither_sandbox::test_budgets::output_policy(),
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .with_approver(approver)
+            .initialize_tools(&distribution, cache.path())
+            .await
+            .expect("tools should prepare");
             let mut registry = ToolRegistryBuilder::new();
             registry.script_policy(reviewed);
             commands(&mut registry);
@@ -4981,6 +4992,7 @@ mod tests {
                 .tool(aither_sandbox::builtin::ReadTerminalDeltaTool::new(
                     jobs,
                     aither_sandbox::AnySandboxNotices::default(),
+                    aither_sandbox::test_budgets::output_policy(),
                 ))
                 .fork_source(source)
                 .build()

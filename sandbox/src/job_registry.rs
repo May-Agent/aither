@@ -12,6 +12,7 @@ use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
 use crate::memory::MemoryDomain;
+use crate::output_policy::OutputPolicy;
 use crate::permission::TerminalMode;
 use crate::process_tree::{JobTree, KillTreeError, ProcessScanner};
 use crate::script_language::ScriptLanguage;
@@ -561,11 +562,14 @@ pub struct JobRegistryService {
     /// What each [`PendingCompletion`] reports back on; weak, so the service
     /// still ends with the last handle.
     tx: WeakSender<JobCommand>,
+    /// How much of a script a job listing shows.
+    policy: OutputPolicy,
 }
 
-/// Creates a registry handle and its background service.
+/// Creates a registry handle and its background service; job listings are
+/// cut at the `job_preview_bytes` of `policy`.
 #[must_use]
-pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
+pub fn job_registry_channel(policy: OutputPolicy) -> (JobRegistry, JobRegistryService) {
     let (tx, rx) = async_channel::unbounded();
     let weak = tx.downgrade();
     (
@@ -573,7 +577,11 @@ pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
             tx,
             scanner: ProcessScanner::default(),
         },
-        JobRegistryService { rx, tx: weak },
+        JobRegistryService {
+            rx,
+            tx: weak,
+            policy,
+        },
     )
 }
 
@@ -1255,7 +1263,16 @@ impl JobRegistryService {
                     handle_state_command(&mut jobs, &mut reads, &mut parked, command).await;
                 }
                 JobCommand::Request(request) => {
-                    handle_job_request(&mut jobs, &mut reads, &mut parked, &self.tx, request).await;
+                    let preview = self.policy.get().job_preview_bytes;
+                    handle_job_request(
+                        &mut jobs,
+                        &mut reads,
+                        &mut parked,
+                        &self.tx,
+                        preview,
+                        request,
+                    )
+                    .await;
                 }
             }
         }
@@ -1379,6 +1396,7 @@ async fn handle_job_request(
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
     tx: &WeakSender<JobCommand>,
+    script_preview_bytes: usize,
     request: JobRequest,
 ) {
     match request {
@@ -1486,7 +1504,9 @@ async fn handle_job_request(
             let _ = reply.send(closed).await;
         }
         JobRequest::FormatRunning { reply } => {
-            let _ = reply.send(format_running_jobs(jobs)).await;
+            let _ = reply
+                .send(format_running_jobs(jobs, script_preview_bytes))
+                .await;
         }
         JobRequest::HasRunning { reply } => {
             let _ = reply.send(has_running_job(jobs)).await;
@@ -2135,23 +2155,20 @@ async fn release_settled_waiters(
     }
 }
 
-/// The bytes of a script a running-jobs line shows.
-const SCRIPT_PREVIEW_BYTES: usize = 50;
-
-/// The start of `script`, cut at a character boundary at or below
-/// [`SCRIPT_PREVIEW_BYTES`] bytes.
-fn script_preview(script: &str) -> String {
-    if script.len() <= SCRIPT_PREVIEW_BYTES {
+/// The start of `script`, cut at a character boundary at or below `limit`
+/// bytes.
+fn script_preview(script: &str, limit: usize) -> String {
+    if script.len() <= limit {
         return script.to_string();
     }
-    let end = (0..=SCRIPT_PREVIEW_BYTES)
+    let end = (0..=limit)
         .rev()
         .find(|index| script.is_char_boundary(*index))
         .unwrap_or(0);
     format!("{}...", &script[..end])
 }
 
-fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
+fn format_running_jobs(jobs: &HashMap<u32, JobState>, script_preview_bytes: usize) -> String {
     let running: Vec<_> = jobs
         .values()
         .filter(|job| matches!(job.info.status, JobStatus::Running))
@@ -2163,7 +2180,7 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
 
     let mut output = String::new();
     for job in running {
-        let script_preview = script_preview(&job.info.script);
+        let script_preview = script_preview(&job.info.script, script_preview_bytes);
 
         let output_path = job
             .info
@@ -2219,7 +2236,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn spawn_registry() -> JobRegistry {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2230,7 +2247,7 @@ mod tests {
     /// job nothing bounded reports none.
     #[tokio::test]
     async fn a_job_reports_the_timeout_it_runs_under() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         tokio::spawn(service.serve());
         let bounded = crate::test_ids::lease("bounded");
         let free = crate::test_ids::lease("free");
@@ -2261,7 +2278,7 @@ mod tests {
     async fn a_job_keeps_its_task_id_leased_until_the_registry_forgets_it() {
         let ids = crate::test_ids::RecordingIds::default();
         let allocator = ids.allocator();
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         let served = tokio::spawn(service.serve());
 
         let first = allocator.lease().unwrap();
@@ -2493,7 +2510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_job_registry_lifecycle() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2529,7 +2546,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_format_running_jobs() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2563,7 +2580,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_redirect_streams_full_output() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2608,7 +2625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_terminal_delta_reads_incrementally() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2647,7 +2664,7 @@ mod tests {
     /// order.
     #[tokio::test]
     async fn monitor_reads_whole_lines_when_partial_writes_interleave() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2685,7 +2702,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_by_execution_key_no_match() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2708,7 +2725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_switch_path_marks_job_killed() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2767,7 +2784,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_does_not_override_killed_status() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2795,14 +2812,15 @@ mod tests {
     /// the cut, is listed instead of panicking inside the registry.
     #[tokio::test]
     async fn test_format_running_jobs_cuts_a_multibyte_script_at_a_boundary() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
 
         // Three bytes per character: byte 50 lies inside the 17th.
         let script = "日".repeat(30);
-        assert!(!script.is_char_boundary(SCRIPT_PREVIEW_BYTES));
+        let preview_bytes = crate::output_policy::fixture::LIMITS.job_preview_bytes;
+        assert!(!script.is_char_boundary(preview_bytes));
         registry
             .register(
                 1,
@@ -2819,12 +2837,13 @@ mod tests {
             running.contains(&format!("`{}...`", "日".repeat(16))),
             "{running}"
         );
-        assert_eq!(script_preview("short"), "short");
-        assert_eq!(script_preview(&"x".repeat(50)), "x".repeat(50));
+        assert_eq!(script_preview("short", 50), "short");
+        assert_eq!(script_preview(&"x".repeat(50), 50), "x".repeat(50));
         assert_eq!(
-            script_preview(&"x".repeat(51)),
+            script_preview(&"x".repeat(51), 50),
             format!("{}...", "x".repeat(50))
         );
+        assert_eq!(script_preview("abcdef", 3), "abc...");
     }
 
     fn running_job(pid: u32) -> HashMap<u32, JobState> {
@@ -2901,7 +2920,7 @@ mod tests {
     /// the kill records its outcome; the settled read waits for it.
     #[tokio::test]
     async fn the_settled_read_waits_for_a_kill_in_flight() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();

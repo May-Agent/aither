@@ -117,13 +117,18 @@ async fn terminal(
     TerminalTool<TokioGlobal, aither_sandbox::Configured>,
     ExternalHooks,
 ) {
-    let terminal = TerminalTool::new_exact(dir, TokioGlobal)
-        .await
-        .expect("the terminal initializes")
-        .with_approver(permission)
-        .initialize_tools(&tools.distribution, tools.cache.path())
-        .await
-        .expect("the managed tools are prepared");
+    let terminal = TerminalTool::new_exact(
+        dir,
+        TokioGlobal,
+        aither_sandbox::test_budgets::limits(),
+        aither_sandbox::test_budgets::output_policy(),
+    )
+    .await
+    .expect("the terminal initializes")
+    .with_approver(permission)
+    .initialize_tools(&tools.distribution, tools.cache.path())
+    .await
+    .expect("the managed tools are prepared");
     let host_tools = terminal
         .shell_sessions()
         .host_tools(&tools.distribution, tools.cache.path())

@@ -174,6 +174,34 @@ impl InteractiveDomains {
 }
 
 /// Expand ~ to home directory in a path.
+/// The time budgets this command-line agent runs its shell under.
+fn shell_limits() -> aither_agent::sandbox::ShellLimits {
+    aither_agent::sandbox::ShellLimits::new(
+        Duration::from_secs(10),
+        Duration::from_secs(120 * 60),
+        Duration::from_secs(40 * 60),
+        1024 * 1024 * 1024,
+        Duration::from_secs(120),
+    )
+}
+
+/// The output budgets this command-line agent hands its model.
+fn output_policy() -> aither_agent::sandbox::OutputPolicy {
+    aither_agent::sandbox::OutputPolicy::new(aither_agent::sandbox::OutputLimits {
+        inline_bytes: 16_000,
+        preview_bytes: 16_000,
+        default_lines: 200,
+        ceiling_lines: 800,
+        read_bytes: 32 * 1024,
+        media: aither_agent::sandbox::MediaBounds {
+            low: 512,
+            medium: 1024,
+            high: 2048,
+        },
+        job_preview_bytes: 50,
+    })
+}
+
 fn expand_tilde(path: &std::path::Path) -> PathBuf {
     if let Ok(stripped) = path.strip_prefix("~")
         && let Some(home) = dirs::home_dir()
@@ -423,11 +451,16 @@ async fn acp_session_agent(
 > {
     let to_acp = |err: anyhow::Error| aither_acp::protocol::AcpError::Transport(err.to_string());
 
-    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(&setup.cwd, TokioGlobal)
-        .await
-        .map_err(|err| to_acp(err.into()))?
-        .with_approver(InteractiveApprover)
-        .with_domain_approver(InteractiveDomains::default());
+    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(
+        &setup.cwd,
+        TokioGlobal,
+        shell_limits(),
+        output_policy(),
+    )
+    .await
+    .map_err(|err| to_acp(err.into()))?
+    .with_approver(InteractiveApprover)
+    .with_domain_approver(InteractiveDomains::default());
 
     let agent = setup
         .mcp
@@ -457,10 +490,15 @@ async fn build_agent(
     // - Network (InteractiveDomains): ask once per domain, then remember
     // - Unsafe or on a server: always ask for each script
     let workdir_parent = std::env::temp_dir().join("aither");
-    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(&workdir_parent, TokioGlobal)
-        .await?
-        .with_approver(InteractiveApprover)
-        .with_domain_approver(InteractiveDomains::default());
+    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(
+        &workdir_parent,
+        TokioGlobal,
+        shell_limits(),
+        output_policy(),
+    )
+    .await?
+    .with_approver(InteractiveApprover)
+    .with_domain_approver(InteractiveDomains::default());
 
     // Create terminal-first agent builder
     // All tools become IPC commands accessible via terminal

@@ -112,7 +112,7 @@ async fn polling_agent(
     llm: PollingLlm,
     policy: BackgroundJobPolicy,
 ) -> (Agent<PollingLlm>, BackgroundTaskSender, JobRegistry) {
-    let (registry, service) = job_registry_channel();
+    let (registry, service) = job_registry_channel(aither_sandbox::test_budgets::output_policy());
     tokio::spawn(service.serve());
     registry
         .register(
@@ -133,6 +133,7 @@ async fn polling_agent(
         .tool(ReadTerminalDeltaTool::new(
             registry.clone(),
             aither_sandbox::AnySandboxNotices::default(),
+            aither_sandbox::test_budgets::output_policy(),
         ))
         .build();
     agent.background_receiver = Some(receiver);
