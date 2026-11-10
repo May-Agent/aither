@@ -2892,7 +2892,7 @@ where
             .in_mode(mode)
             .for_job(crate::command::JobOutput::new(
                 self.job_registry.clone(),
-                task_id.clone(),
+                &task_id,
             ));
         let registry = Arc::new(match call {
             Some(call) => registry.for_call(call),
