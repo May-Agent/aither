@@ -16,6 +16,7 @@ use crate::memory::MemoryDomain;
 use crate::output_policy::OutputPolicy;
 use crate::policy::SandboxMode;
 use crate::process_tree::{JobTree, KillTreeError, ProcessScanner};
+use crate::terminal::TimeoutKill;
 
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
@@ -91,9 +92,10 @@ pub enum JobStatus {
 /// Why a job was killed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillCause {
-    /// A request ended it: `terminal_kill`, its `timeout` bound, or the
-    /// shutdown of its terminal.
+    /// A request ended it: `terminal_kill`, or the shutdown of its terminal.
     User,
+    /// Its `timeout` bound passed.
+    Timeout(TimeoutKill),
     /// Its home environment's memory ran out of room for the agent's jobs
     /// (see [`MemoryDomain`]), and the agent left it running past the
     /// response window that followed the final warning.
@@ -253,8 +255,10 @@ impl Drop for JobWatch {
 pub struct OwedCompletion {
     /// Why the job was killed; `None` when it ended on its own.
     pub kill: Option<KillCause>,
-    /// Keeps the completion pending until the agent takes it.
-    pub pending: PendingCompletion,
+    /// Keeps the completion pending until the agent takes it; `None` when a
+    /// waiter ([`JobRegistry::wait_taking`]) already took it, so nothing is
+    /// owed.
+    pub pending: Option<PendingCompletion>,
 }
 
 impl JobRead {
@@ -340,6 +344,10 @@ struct JobState {
     finished_at: Option<Instant>,
     /// Whether the job's [`PendingCompletion`] was handed out.
     completion_owed: bool,
+    /// Whether a waiter took the completion before it was handed out: the
+    /// job then reads [`Delivery::Taken`] the moment it ends and owes
+    /// nothing.
+    claimed: bool,
     /// How many [`JobWatch`]es of the job live.
     watchers: usize,
 }
@@ -485,6 +493,8 @@ enum JobRequest {
     },
     WaitEnded {
         task_id: String,
+        /// Whether the waiter takes the job's completion.
+        claim: bool,
         reply: Sender<Option<JobInfo>>,
     },
     TerminalStreamsClosed {
@@ -895,9 +905,22 @@ impl JobRegistry {
     /// ending of a job whose kill was in flight. `None` for a task the
     /// registry does not hold.
     pub async fn wait_ended(&self, task_id: &str) -> Option<JobInfo> {
+        self.wait(task_id, false).await
+    }
+
+    /// Waits until the job ends, as [`Self::wait_ended`] does, and takes its
+    /// completion: nothing is owed to the agent for a job its waiter read, so
+    /// the job's [`OwedCompletion`] carries no [`PendingCompletion`]. A
+    /// completion already handed out stays with its holder.
+    pub async fn wait_taking(&self, task_id: &str) -> Option<JobInfo> {
+        self.wait(task_id, true).await
+    }
+
+    async fn wait(&self, task_id: &str, claim: bool) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::WaitEnded {
             task_id: task_id.to_string(),
+            claim,
             reply: reply_tx,
         })
         .await;
@@ -999,6 +1022,12 @@ impl JobRegistry {
     /// Kills a running job by its PID.
     pub async fn kill(&self, pid: u32) -> bool {
         self.kill_for(pid, KillCause::User).await
+    }
+
+    /// Kills a running job whose `timeout` bound passed; the job reads
+    /// [`KillCause::Timeout`].
+    pub async fn kill_timed_out(&self, pid: u32, kill: TimeoutKill) -> bool {
+        self.kill_for(pid, KillCause::Timeout(kill)).await
     }
 
     /// Kills a running job whose process tree holds `footprint_bytes` of a
@@ -1514,8 +1543,12 @@ async fn handle_job_request(
                 .map(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
         }
-        JobRequest::WaitEnded { task_id, reply } => {
-            wait_for_end(jobs, &task_id, reply).await;
+        JobRequest::WaitEnded {
+            task_id,
+            claim,
+            reply,
+        } => {
+            wait_for_end(jobs, &task_id, claim, reply).await;
         }
         JobRequest::TerminalStreamsClosed { pid, reply } => {
             let closed = jobs
@@ -1621,6 +1654,7 @@ impl JobState {
             output_redirect: None,
             finished_at: None,
             completion_owed: false,
+            claimed: false,
             watchers: 0,
         }
     }
@@ -1741,14 +1775,23 @@ async fn owe_completion(
         job.info.status
     );
     job.completion_owed = true;
+    let kill = job.info.status.kill_cause();
+    if job.claimed {
+        // A waiter read the job: nothing is owed to the agent.
+        mark_taken(job);
+        return OwedCompletion {
+            kill,
+            pending: None,
+        };
+    }
     OwedCompletion {
-        kill: job.info.status.kill_cause(),
-        pending: PendingCompletion {
+        kill,
+        pending: Some(PendingCompletion {
             tx: tx
                 .upgrade()
                 .expect("a request arrives through a live registry handle"),
             task_id: Some(job.task_id.clone()),
-        },
+        }),
     }
 }
 
@@ -1968,13 +2011,16 @@ fn tracked_delta(
 async fn wait_for_end(
     jobs: &mut HashMap<u32, JobState>,
     task_id: &str,
+    claim: bool,
     reply: Sender<Option<JobInfo>>,
 ) {
     match find_pid_by_task_id(jobs, task_id).and_then(|pid| jobs.get_mut(&pid)) {
         Some(job) if matches!(job.info.status, JobStatus::Running) => {
+            job.claimed |= claim && !job.completion_owed;
             job.ended_waiters.push(reply);
         }
         Some(job) => {
+            job.claimed |= claim && !job.completion_owed;
             let _ = reply.send(Some(job.info.clone())).await;
         }
         None => {

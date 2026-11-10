@@ -1,23 +1,64 @@
 //! A shell's jobs: the handle that lists, reads, feeds, waits for and kills
 //! them.
 
-use aither_core::llm::{CommandOutcome, CommandResult, CommandStream};
+use std::sync::Arc;
+
+use aither_core::llm::{CommandOutcome, CommandResult, CommandStream, Interruption};
 
 use crate::events::ShellEvents;
-use crate::job_registry::{JobInfo, JobRead, JobRegistry, JobStatus};
+use crate::job_registry::{JobInfo, JobRead, JobRegistry, JobStatus, JobWatch, KillCause};
 use crate::output::{MediaResolution, OutputFormat, OutputStore};
 use crate::wording::CommandKilled;
 
-/// What a job that ended returns to its waiter.
-pub type ScriptResult = CommandResult;
+/// How a script ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// It ran to its end.
+    Exited {
+        /// Its exit code.
+        code: i32,
+    },
+    /// It was killed, and why.
+    Killed(KillCause),
+}
+
+/// What a script printed and how it ended, as data: the embedder words it
+/// where it hands a result to its model.
+#[derive(Debug, Clone)]
+pub struct ScriptResult {
+    /// What the script wrote to its stdout.
+    pub stdout: CommandStream,
+    /// What it wrote to its stderr, when it wrote any.
+    pub stderr: Option<CommandStream>,
+    /// How it ended.
+    pub outcome: RunOutcome,
+    /// The sleep and offline intervals it ran through.
+    pub interruptions: Vec<Interruption>,
+}
+
+impl ScriptResult {
+    /// The result a tool returns for the script of task `task_id`, a kill
+    /// worded by the store's wording.
+    pub(crate) fn into_command_result(self, task_id: &str, store: &OutputStore) -> CommandResult {
+        let outcome = match self.outcome {
+            RunOutcome::Exited { code } => CommandOutcome::Exited { code },
+            RunOutcome::Killed(cause) => CommandOutcome::Killed {
+                task_id: task_id.to_owned(),
+                notice: store.wording().command_killed(&CommandKilled::of(&cause)),
+            },
+        };
+        CommandResult {
+            stdout: self.stdout,
+            stderr: self.stderr,
+            outcome,
+            interruptions: self.interruptions,
+        }
+    }
+}
 
 /// Why waiting for a job did not end in a result.
 #[derive(Debug, thiserror::Error)]
 pub enum JobWaitError {
-    /// The shell no longer holds the job: its completion was taken and
-    /// nothing watched it.
-    #[error("the shell no longer holds job {0}")]
-    Gone(String),
     /// The job failed rather than exited.
     #[error("job {task_id} failed: {error}")]
     Failed {
@@ -66,11 +107,16 @@ impl Jobs {
     }
 
     /// The job named `task_id`, when the shell holds it.
+    ///
+    /// The shell keeps the job, and its name, for as long as the handle
+    /// lives, so the handle never addresses another job that is later given
+    /// the same name.
     pub async fn get(&self, task_id: &str) -> Option<Job> {
-        self.registry.get_by_task_id(task_id).await?;
+        let watch = self.registry.watch(task_id).await?;
         Some(Job {
             task_id: task_id.to_owned(),
             jobs: self.clone(),
+            _watch: Arc::new(watch),
         })
     }
 
@@ -93,10 +139,14 @@ impl Jobs {
 }
 
 /// One job of a shell.
+///
+/// Cloning shares the hold on the job.
 #[derive(Debug, Clone)]
 pub struct Job {
     task_id: String,
     jobs: Jobs,
+    /// Keeps the job, and the word naming it, in the shell's registry.
+    _watch: Arc<JobWatch>,
 }
 
 impl Job {
@@ -106,67 +156,69 @@ impl Job {
         &self.task_id
     }
 
-    /// The job as the shell holds it now; `None` once its completion was
-    /// taken and nothing watches it.
-    pub async fn info(&self) -> Option<JobInfo> {
-        self.jobs.registry.get_by_task_id(&self.task_id).await
+    /// The job as the shell holds it now.
+    pub async fn info(&self) -> JobInfo {
+        self.jobs
+            .registry
+            .get_by_task_id(&self.task_id)
+            .await
+            .expect("the job this handle watches is held")
     }
 
     /// Waits for the job to end and returns what it printed and how it
-    /// ended; a job killed ends [`CommandOutcome::Killed`].
+    /// ended. The wait takes the job's completion: a job read here owes its
+    /// agent no turn, so the end it raises carries no
+    /// [pending completion](crate::JobEnded::pending).
     ///
     /// # Errors
-    /// Returns an error when the shell no longer holds the job, the job
-    /// failed, or its output could not be stored.
+    /// Returns an error when the job failed or its output could not be
+    /// stored.
     pub async fn wait(&self) -> Result<ScriptResult, JobWaitError> {
-        let gone = || JobWaitError::Gone(self.task_id.clone());
         let ended = self
             .jobs
             .registry
-            .wait_ended(&self.task_id)
+            .wait_taking(&self.task_id)
             .await
-            .ok_or_else(gone)?;
-        let outcome = match &ended.status {
+            .expect("the job this handle watches is held");
+        let outcome = match ended.status {
             JobStatus::Running => unreachable!("a wait ends once the job stopped running"),
-            JobStatus::Completed { exit_code, .. } => CommandOutcome::Exited { code: *exit_code },
+            JobStatus::Completed { exit_code, .. } => RunOutcome::Exited { code: exit_code },
             JobStatus::Failed { error, .. } => {
                 return Err(JobWaitError::Failed {
                     task_id: self.task_id.clone(),
-                    error: error.clone(),
+                    error,
                 });
             }
-            JobStatus::Killed { .. } => CommandOutcome::Killed {
-                notice: self
-                    .jobs
-                    .outputs
-                    .wording()
-                    .command_killed(&CommandKilled::BeforeTimeout),
-                task_id: self.task_id.clone(),
-            },
+            JobStatus::Killed { cause, .. } => RunOutcome::Killed(cause),
         };
         let (stdout, stderr) = self
             .jobs
             .registry
             .terminal_output(ended.pid)
             .await
-            .ok_or_else(gone)?;
-        let store = |bytes: Vec<u8>| async move {
-            self.jobs
-                .outputs
-                .save(&bytes, OutputFormat::Text, MediaResolution::Auto)
-                .await
-                .map_err(|source| JobWaitError::Output {
-                    task_id: self.task_id.clone(),
-                    source,
-                })
+            .expect("the job this handle watches is held");
+        let outputs = &self.jobs.outputs;
+        let output = |source| JobWaitError::Output {
+            task_id: self.task_id.clone(),
+            source,
         };
-        let stdout = store(stdout).await?;
-        let stderr = store(stderr).await?;
-        let stderr = match &stderr {
-            CommandStream::Inline { text } if text.is_empty() => None,
-            _ => Some(stderr),
-        };
-        Ok(CommandResult {
+        // The output the job already stored is the job's; a new file is
+        // written only for what it did not store.
+        let stdout = match &ended.output_path {
+            Some(path) => outputs.stream_of_file(path).await,
+            None => {
+                outputs
+                    .save(&stdout, OutputFormat::Text, MediaResolution::Auto)
+                    .await
+            }
+        }
+        .map_err(output)?;
+        let stderr = outputs
+            .save(&stderr, OutputFormat::Text, MediaResolution::Auto)
+            .await
+            .map_err(output)?;
+        let stderr = (!stderr.is_empty()).then_some(stderr);
+        Ok(ScriptResult {
             stdout,
             stderr,
             outcome,

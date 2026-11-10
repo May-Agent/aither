@@ -66,8 +66,7 @@ pub async fn compress_text(store: &OutputStore, text: &str) -> std::io::Result<O
         return Ok(None);
     }
 
-    let cleaned =
-        collapse::collapse_blank_runs(&render::render_terminal(text), &**store.wording());
+    let cleaned = collapse::collapse_blank_runs(&render::render_terminal(text), &**store.wording());
 
     if let Some(tsv) = json_tsv::to_tsv(&cleaned) {
         let (url, path) = store.save_raw(cleaned.as_bytes()).await?;

@@ -320,9 +320,9 @@ fn runs_in_shell(script: &str) -> bool {
 /// A command killed because its `timeout` bound passed, with the UTC times it
 /// started and was killed at.
 ///
-/// [`SandboxNotices::command_killed`](crate::SandboxNotices::command_killed)
+/// [`ShellWording::command_killed`](crate::ShellWording::command_killed)
 /// renders the sentence the model reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutKill {
     /// The `timeout` the command was bounded by.
     pub timeout: Duration,
@@ -330,34 +330,6 @@ pub struct TimeoutKill {
     pub started: jiff::Timestamp,
     /// When the kill was issued.
     pub killed: jiff::Timestamp,
-}
-
-/// What the kill watchdog of one job records: when the job started, and when
-/// the watchdog issued the kill, if it did.
-#[derive(Debug)]
-struct TimeoutWatch {
-    timeout: Duration,
-    started: jiff::Timestamp,
-    killed: std::sync::OnceLock<jiff::Timestamp>,
-}
-
-impl TimeoutWatch {
-    fn new(timeout: Duration) -> Self {
-        Self {
-            timeout,
-            started: jiff::Timestamp::now(),
-            killed: std::sync::OnceLock::new(),
-        }
-    }
-
-    /// The kill, once the watchdog has issued one.
-    fn kill(&self) -> Option<TimeoutKill> {
-        self.killed.get().map(|killed| TimeoutKill {
-            timeout: self.timeout,
-            started: self.started,
-            killed: *killed,
-        })
-    }
 }
 
 #[derive(Template)]
@@ -619,15 +591,20 @@ pub struct CompletedCommand {
     pub interruptions: Vec<Interruption>,
 }
 
-impl From<CompletedCommand> for CommandResult {
-    fn from(command: CompletedCommand) -> Self {
-        Self {
-            stdout: command.stdout,
-            stderr: command.stderr,
-            outcome: CommandOutcome::Exited {
-                code: command.exit_code,
-            },
-            interruptions: command.interruptions,
+impl CompletedCommand {
+    /// The command as a result: it exited with its code, or was killed for
+    /// `killed`.
+    fn into_script_result(self, killed: Option<crate::KillCause>) -> crate::ScriptResult {
+        crate::ScriptResult {
+            stdout: self.stdout,
+            stderr: self.stderr,
+            outcome: killed.map_or(
+                crate::RunOutcome::Exited {
+                    code: self.exit_code,
+                },
+                crate::RunOutcome::Killed,
+            ),
+            interruptions: self.interruptions,
         }
     }
 }
@@ -636,14 +613,26 @@ impl From<CompletedCommand> for CommandResult {
 struct BackgroundStartup {
     tx: async_channel::Sender<Result<(), String>>,
     reported: Arc<AtomicBool>,
+    /// Closed once the startup was reported or every clone is gone: nothing
+    /// is sent on it.
+    settled: async_channel::Sender<()>,
+    settled_rx: Receiver<()>,
 }
 
 impl BackgroundStartup {
     fn new(tx: async_channel::Sender<Result<(), String>>) -> Self {
+        let (settled, settled_rx) = async_channel::bounded(1);
         Self {
             tx,
             reported: Arc::new(AtomicBool::new(false)),
+            settled,
+            settled_rx,
         }
+    }
+
+    /// Resolves once the job registered, or failed to start.
+    fn settled(&self) -> Receiver<()> {
+        self.settled_rx.clone()
     }
 
     async fn report_ready(&self) {
@@ -653,6 +642,7 @@ impl BackgroundStartup {
             .is_ok()
         {
             let _ = self.tx.send(Ok(())).await;
+            self.settled.close();
         }
     }
 
@@ -663,6 +653,7 @@ impl BackgroundStartup {
             .is_ok()
         {
             let _ = self.tx.send(Err(error.to_string())).await;
+            self.settled.close();
         }
     }
 }
@@ -2326,7 +2317,8 @@ where
             task_id: task_id.to_string(),
             script: script.clone(),
         });
-        let timeout_watch = self.spawn_kill_watchdog(&task_id, timeout);
+        let background_startup = BackgroundStartup::new(startup_tx);
+        self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
         self.spawn_long_job_alert(&task_id);
 
         let lifetime = if background {
@@ -2336,7 +2328,6 @@ where
                 alerts: self.events_tx.clone(),
             }
         };
-        let background_startup = BackgroundStartup::new(startup_tx);
         let running_tasks = self.running_tasks.clone();
         let completed_tx = self.events_tx.clone();
         let outages = self.outages.clone();
@@ -2354,7 +2345,7 @@ where
                 task_id,
                 execution_id,
                 background,
-                timeout_watch: timeout_watch.clone(),
+                timeout,
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 script,
@@ -2385,7 +2376,6 @@ where
         SpawnedTerminal {
             result: result_rx,
             startup: startup_rx,
-            timeout_watch,
             taken: taken_tx,
         }
     }
@@ -2548,22 +2538,12 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
             Some(Ok(result)) => {
                 let killed = self
                     .job_registry
-                    .get_by_task_id(&prepared.task_id)
+                    .get_by_task_id_settled(&prepared.task_id)
                     .await
-                    .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
-                let command = if killed {
-                    CommandResult {
-                        stdout: result.stdout,
-                        stderr: result.stderr,
-                        interruptions: result.interruptions,
-                        outcome: CommandOutcome::Killed {
-                            task_id: prepared.task_id.to_string(),
-                            notice: self.kill_notice(spawned.timeout_watch.kill().as_ref()),
-                        },
-                    }
-                } else {
-                    CommandResult::from(result)
-                };
+                    .and_then(|job| job.status.kill_cause());
+                let command = result
+                    .into_script_result(killed)
+                    .into_command_result(&prepared.task_id, &self.output_store);
                 spawned.took_result().await;
                 command.into_tool_result()
             }
@@ -2925,15 +2905,6 @@ where
         self.output_store.wording()
     }
 
-    /// Why a foreground command that was killed was killed, as the model
-    /// reads it in the command's result.
-    fn kill_notice(&self, kill: Option<&TimeoutKill>) -> String {
-        let killed = kill.map_or(crate::CommandKilled::BeforeTimeout, |kill| {
-            crate::CommandKilled::TimedOut(kill)
-        });
-        self.wording().command_killed(&killed)
-    }
-
     /// Shared front half of every `terminal` call: argument validation, then
     /// [`Self::admit_command`].
     async fn prepare_execution(
@@ -3204,7 +3175,7 @@ where
     }
 
     /// Runs `run` to its end on this terminal; see [`Shell::run`].
-    async fn run_to_end(&self, run: Script) -> Result<CommandResult, ShellRunError> {
+    async fn run_to_end(&self, run: Script) -> Result<crate::ScriptResult, ShellRunError> {
         let cap = self.limits.timeout_cap.get();
         if run.timeout.is_zero() || run.timeout > cap {
             return Err(ShellRunError::Timeout { cap });
@@ -3268,52 +3239,48 @@ where
             .job_registry
             .get_by_task_id_settled(&prepared.task_id)
             .await
-            .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
-        let timeout_kill = spawned.timeout_watch.kill();
+            .and_then(|job| job.status.kill_cause());
         spawned.took_result().await;
         let result = result?.map_err(TerminalError::Execution)?;
-        if !killed {
-            return Ok(CommandResult::from(result));
-        }
-        Ok(CommandResult {
-            stdout: result.stdout,
-            stderr: result.stderr,
-            interruptions: result.interruptions,
-            outcome: CommandOutcome::Killed {
-                notice: self.kill_notice(timeout_kill.as_ref()),
-                task_id: prepared.task_id.to_string(),
-            },
-        })
+        Ok(result.into_script_result(killed))
     }
 
-    /// Kills the job through the registry once its timeout passes.
+    /// Kills the job through the registry once its timeout passes, the job
+    /// then reading [`KillCause::Timeout`](crate::KillCause::Timeout).
     ///
-    /// The returned watch holds the job's start time and, once the watchdog
-    /// issues the kill, the time it did.
-    fn spawn_kill_watchdog(&self, task_id: &IdLease, timeout: Duration) -> Arc<TimeoutWatch> {
-        let watch = Arc::new(TimeoutWatch::new(timeout));
+    /// A bound that passes before the job registered is enforced the moment
+    /// `registered` closes, which is when the job's startup was reported.
+    fn spawn_kill_watchdog(&self, task_id: &IdLease, timeout: Duration, registered: Receiver<()>) {
         let job_registry = self.job_registry.clone();
+        let started = jiff::Timestamp::now();
         // Weak, so a job that ended gives its word back before the timer
         // fires; a word that went back may name another job by then.
         let task_id = task_id.downgrade();
-        let recorded = watch.clone();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(timeout).await;
+                // Nothing is ever sent: the channel closes once the startup
+                // was reported or its flow is gone.
+                let _ = registered.recv().await;
                 let Some(task_id) = task_id.upgrade() else {
                     return;
                 };
                 if let Some(job) = job_registry.get_by_task_id(&task_id).await
                     && matches!(job.status, JobStatus::Running)
                 {
-                    // Recorded before the kill, so a result that races the
-                    // kill's return already finds it.
-                    let _ = recorded.killed.set(jiff::Timestamp::now());
-                    job_registry.kill(job.pid).await;
+                    job_registry
+                        .kill_timed_out(
+                            job.pid,
+                            TimeoutKill {
+                                timeout,
+                                started,
+                                killed: jiff::Timestamp::now(),
+                            },
+                        )
+                        .await;
                 }
             })
             .detach();
-        watch
     }
 
     /// Raises one [`LongRunning`] when the job crosses the configured
@@ -3728,7 +3695,6 @@ struct TerminalSpawnRequest {
 struct SpawnedTerminal {
     result: Receiver<Result<CompletedCommand, String>>,
     startup: Receiver<Result<(), String>>,
-    timeout_watch: Arc<TimeoutWatch>,
     /// Tells the job's flow the call returned its result itself; dropped
     /// unsent, the job is a background task whose completion the agent takes.
     taken: Sender<Sender<()>>,
@@ -3757,7 +3723,8 @@ struct SpawnedTerminalTask<E> {
     task_id: IdLease,
     execution_id: String,
     background: bool,
-    timeout_watch: Arc<TimeoutWatch>,
+    /// The bound the job runs under.
+    timeout: Duration,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
@@ -3801,7 +3768,7 @@ where
         task_id,
         execution_id,
         background,
-        timeout_watch,
+        timeout,
         carry,
         carried_dir,
         script,
@@ -3828,9 +3795,7 @@ where
         outages,
     } = task;
     // Before the job registers, so the registry reports the bound it runs under.
-    job_registry
-        .bound_by_timeout(&task_id, timeout_watch.timeout)
-        .await;
+    job_registry.bound_by_timeout(&task_id, timeout).await;
     let status_registry = job_registry.clone();
     let policies = registry.policies().clone();
     // What the policies are told the next script starts in, spelled as this
@@ -3924,25 +3889,34 @@ where
     let kill = owed.as_ref().and_then(|owed| owed.kill);
     // The job as it ended, read before a foreground result takes it.
     let info = status_registry.get_by_task_id(&task_id).await;
-    let mut pending = owed.map(|owed| owed.pending);
+    let pending = owed.and_then(|owed| owed.pending);
     // A result the call returned leaves nothing for the agent to take: the
-    // completion is taken here, so the registry forgets the job.
-    if foreground.is_some()
-        && let Some(pending) = pending.take()
+    // completion is taken here, so the registry forgets the job, and the end
+    // is no fact to raise: the call already told it.
+    let pending = match foreground {
+        Some(_) => {
+            if let Some(pending) = pending {
+                pending.take().await;
+            }
+            None
+        }
+        None => pending,
+    };
+    // Only a job, one promoted past the foreground window or started in the
+    // background, reports its end. A command the shell never registered, one
+    // that failed to start, has no job to report.
+    if foreground.is_none()
+        && let Some(info) = info
     {
-        pending.take().await;
-    }
-    // Every job reports completion; the agent reinjects the result only for
-    // tasks it saw promoted or detached (`take_started`), so a plain
-    // foreground result is not delivered twice.
-    // A command the shell never registered, one that failed to start, has no
-    // job to report.
-    if let Some(info) = info {
+        let timeout_kill = match kill {
+            Some(crate::KillCause::Timeout(kill)) => Some(kill),
+            _ => None,
+        };
         let _ = completed_tx
             .send(ShellEvent::JobEnded(Box::new(JobEnded {
                 info,
                 result,
-                timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
+                timeout_kill,
                 pending,
             })))
             .await;
@@ -6997,13 +6971,12 @@ mod tests {
         stderr: Option<CommandStream>,
         exit_code: i32,
     ) -> CommandResult {
-        CompletedCommand {
+        CommandResult {
             stdout,
             stderr,
-            exit_code,
+            outcome: CommandOutcome::Exited { code: exit_code },
             interruptions: Vec::new(),
         }
-        .into()
     }
 
     #[test]
@@ -8994,7 +8967,7 @@ mod tests {
             .await
             .expect("the shell holds the job");
         let result = finished.wait().await.expect("the job ends");
-        assert_eq!(result.outcome, CommandOutcome::Exited { code: 3 });
+        assert_eq!(result.outcome, crate::RunOutcome::Exited { code: 3 });
         assert_eq!(output_text(&result.stdout), Some("done"));
 
         tool.run_background(args("sleep 60"))
@@ -9015,13 +8988,76 @@ mod tests {
         );
         assert_eq!(jobs.kill_all().await, 1);
         let killed = sleeping.wait().await.expect("the killed job ends");
-        assert!(matches!(killed.outcome, CommandOutcome::Killed { .. }));
+        assert_eq!(
+            killed.outcome,
+            crate::RunOutcome::Killed(crate::KillCause::User)
+        );
         assert!(
             jobs.list()
                 .await
                 .iter()
                 .all(|job| !matches!(job.status, JobStatus::Running))
         );
+    }
+
+    /// A result the call returned, and a run, are no job's end: nothing is
+    /// raised for them, so a caller that never reads events piles up none.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreground_result_and_a_run_raise_no_job_end() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let events = tool.background_receiver();
+        tool.call(terminal_args("a call", "printf done"), ToolContext::new())
+            .await
+            .expect("the call returns its result");
+        let start = std::fs::canonicalize(dir.path()).expect("the directory resolves");
+        tool.run(Script::new("printf done", start, Duration::from_secs(30)))
+            .await
+            .expect("the run ends");
+        assert!(events.is_empty(), "no event was raised");
+    }
+
+    /// A job read through its handle owes its agent no turn, and the handle
+    /// keeps the job after its completion was taken.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waited_job_owes_its_agent_nothing_and_its_handle_keeps_it() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        let events = tool.background_receiver();
+        let jobs = tool.jobs();
+        let args = ShellArgs {
+            background: true,
+            ..terminal_args("a job", "sleep 1; printf done")
+        };
+        tool.run_background(args).await.expect("the job starts");
+        let job = jobs
+            .get(&started_task_id(&events))
+            .await
+            .expect("the shell holds the job");
+        let result = job.wait().await.expect("the job ends");
+        assert_eq!(result.outcome, crate::RunOutcome::Exited { code: 0 });
+        let ended = events.recv_completed().await.expect("the end is raised");
+        assert!(ended.pending.is_none(), "a waiter took the completion");
+        drop(ended);
+        // The handle holds the job, which still reads and waits.
+        let again = job.wait().await.expect("the held job waits again");
+        assert_eq!(output_text(&again.stdout), Some("done"));
+        assert_eq!(jobs.list().await.len(), 1);
+        drop(job);
     }
 
     #[cfg(unix)]
@@ -9798,12 +9834,14 @@ mod tests {
             .get_by_task_id(&task_id)
             .await
             .expect("the finished job stays in the registry");
-        assert_eq!(
-            info.status,
-            JobStatus::Killed {
-                cause: crate::KillCause::User,
-                delivery: crate::Delivery::Pending
-            },
+        assert!(
+            matches!(
+                info.status,
+                JobStatus::Killed {
+                    cause: crate::KillCause::Timeout(_),
+                    delivery: crate::Delivery::Pending
+                }
+            ),
             "the promoted job should be killed at its timeout: {completed:?}"
         );
     }
@@ -10265,12 +10303,14 @@ mod tests {
             .get_by_task_id(&task_id)
             .await
             .expect("the finished job stays in the registry");
-        assert_eq!(
-            info.status,
-            JobStatus::Killed {
-                cause: crate::KillCause::User,
-                delivery: crate::Delivery::Pending
-            },
+        assert!(
+            matches!(
+                info.status,
+                JobStatus::Killed {
+                    cause: crate::KillCause::Timeout(_),
+                    delivery: crate::Delivery::Pending
+                }
+            ),
             "{completed:?}"
         );
     }
@@ -10345,12 +10385,14 @@ mod tests {
             .get_by_task_id(&task_id)
             .await
             .expect("the finished job stays in the registry");
-        assert_eq!(
-            info.status,
-            JobStatus::Killed {
-                cause: crate::KillCause::User,
-                delivery: crate::Delivery::Pending
-            },
+        assert!(
+            matches!(
+                info.status,
+                JobStatus::Killed {
+                    cause: crate::KillCause::Timeout(_),
+                    delivery: crate::Delivery::Pending
+                }
+            ),
             "the job should have been killed at its timeout: {completed:?}"
         );
     }
@@ -10410,13 +10452,13 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
 
-        assert_eq!(
-            completed.info.status.kill_cause(),
-            Some(crate::KillCause::User)
-        );
         let kill = completed
             .timeout_kill
             .expect("a job killed at its timeout carries the times");
+        assert_eq!(
+            completed.info.status.kill_cause(),
+            Some(crate::KillCause::Timeout(kill))
+        );
         assert_eq!(kill.timeout, Duration::from_secs(1));
         assert!(
             kill.killed.duration_since(kill.started).as_secs_f64() >= 1.0,
@@ -13397,10 +13439,10 @@ mod tests {
             .await
             .expect("the run ends");
         match (&result.outcome, &result.stdout) {
-            (CommandOutcome::Exited { code }, CommandStream::Inline { text }) => {
+            (crate::RunOutcome::Exited { code }, CommandStream::Inline { text }) => {
                 format!("exit={code} stdout={text}")
             }
-            (CommandOutcome::Killed { .. }, _) => "killed".to_string(),
+            (crate::RunOutcome::Killed(_), _) => "killed".to_string(),
             other => panic!("a run ends exited with inline output or killed: {other:?}"),
         }
     }

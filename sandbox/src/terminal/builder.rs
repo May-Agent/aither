@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use executor_core::AnyExecutor;
 
-use super::{
-    Interpreter, NetworkSettings, Shell, ShellToolSettings, TerminalError, Unconfigured,
-};
+use super::{Interpreter, NetworkSettings, Shell, ShellToolSettings, TerminalError, Unconfigured};
 use crate::heel_binary::SharedHeelBinary;
 use crate::{AnyShellWording, Backend, OutputPolicy, Sandbox, ShellLimits, ShellWording};
 

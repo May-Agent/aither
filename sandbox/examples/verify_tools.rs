@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    Backend, CommandBlocked, HostProgram, Sandbox, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
-    JobRead, ShellToolSettings, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted,
-    OmittedLines, OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain,
-    ShellArgs, ShellLimits, ShellWording, StoredBinaryPart, Shell, ToolDistribution,
-    ToolIdentity, ToolRegistryBuilder, ToolTarget,
+    Backend, CommandBlocked, CommandKilled, FoldedLines, HostProgram, JobInputSent, JobKillAsked,
+    JobRead, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted, OmittedLines, OutputLimits,
+    OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain, Sandbox, Shell, ShellArgs,
+    ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution, ToolIdentity,
+    ToolRegistryBuilder, ToolTarget,
 };
 
 /// The wording of this example's shell: aither ships none, and the example's
@@ -76,10 +76,7 @@ impl ShellWording for ExampleWording {
     }
 
     fn folded_lines(&self, folded: &FoldedLines<'_>) -> String {
-        format!(
-            "{}  [{} lines folded]",
-            folded.indent, folded.count
-        )
+        format!("{}  [{} lines folded]", folded.indent, folded.count)
     }
 
     fn omitted_lines(&self, omitted: &OmittedLines) -> String {

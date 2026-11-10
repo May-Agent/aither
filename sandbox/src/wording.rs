@@ -41,6 +41,17 @@ pub enum CommandKilled<'a> {
     BeforeTimeout,
 }
 
+impl<'a> CommandKilled<'a> {
+    /// The reason a kill of `cause` is worded by.
+    #[must_use]
+    pub const fn of(cause: &'a crate::KillCause) -> Self {
+        match cause {
+            crate::KillCause::Timeout(kill) => Self::TimedOut(kill),
+            crate::KillCause::User | crate::KillCause::MemoryRunaway { .. } => Self::BeforeTimeout,
+        }
+    }
+}
+
 /// Bytes written to a job's stdin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobInputSent<'a> {
@@ -268,4 +279,3 @@ impl<R> fmt::Display for Refused<R> {
 }
 
 impl<R: fmt::Debug> std::error::Error for Refused<R> {}
-

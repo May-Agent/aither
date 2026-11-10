@@ -16,14 +16,14 @@ use executor_core::{Executor, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::events::{EventSender, ShellEvent};
 use crate::interpreter::Interpreter;
 use crate::job_registry::{JobRegistry, JobStatus};
 use crate::limits::LiveDuration;
-use crate::wording::{MonitorStarted, Refused};
 use crate::output::MediaResolution;
 use crate::policy::SandboxMode;
-use crate::events::{EventSender, ShellEvent};
-use crate::terminal::{Configured, ShellArgs, Shell};
+use crate::terminal::{Configured, Shell, ShellArgs};
+use crate::wording::{MonitorStarted, Refused};
 
 /// What an embedder decides about monitoring: the tool's name and description
 /// and the bounds of a watch. The bounds are live, so changing one reaches

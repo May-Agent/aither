@@ -395,6 +395,47 @@ impl OutputStore {
         .await
     }
 
+    /// The stream a file this store already wrote at `path` stands for:
+    /// its text inline when it is small enough, otherwise the file and a
+    /// preview of its head. Nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` is not in this store or cannot be read.
+    pub(crate) async fn stream_of_file(&self, path: &Path) -> std::io::Result<CommandStream> {
+        let name = path.strip_prefix(self.dir()).map_err(|_| {
+            std::io::Error::other(format!(
+                "{} is not a file of the output store",
+                path.display()
+            ))
+        })?;
+        let data = fs::read(path).await?;
+        let policy = self.policy().get();
+        let text = String::from_utf8_lossy(&data);
+        if data.len() <= policy.inline_bytes {
+            return Ok(CommandStream::Inline {
+                text: text.into_owned(),
+            });
+        }
+        let mut preview = String::new();
+        for line in text.lines() {
+            if preview.len() + line.len() > policy.preview_bytes {
+                break;
+            }
+            preview.push_str(line);
+            preview.push('\n');
+        }
+        preview.truncate(preview.trim_end().len());
+        Ok(CommandStream::Stored {
+            file: StoredFile {
+                url: format!("outputs/{}", name.display()),
+                path: path.display().to_string(),
+            },
+            preview,
+            truncated: true,
+        })
+    }
+
     /// Saves raw data to a file without any processing, returning its URL
     /// and absolute path.
     ///

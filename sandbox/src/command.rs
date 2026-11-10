@@ -39,7 +39,9 @@ use aither_core::llm::{CallIdentity, IntoToolResult, Tool, ToolCallId, ToolConte
 use aither_core::{IdLease, WeakIdLease};
 
 use crate::command_set::{AnyCommandSet, CommandSet};
-use crate::wording::{AnyShellWording, OutputSaved, ReservedForMain, ShellWording, StoredBinaryPart};
+use crate::wording::{
+    AnyShellWording, OutputSaved, ReservedForMain, ShellWording, StoredBinaryPart,
+};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use heel::IpcCommand;
@@ -4987,7 +4989,8 @@ mod tests {
     /// then reaches no later job leasing the same word.
     #[tokio::test]
     async fn a_jobs_output_reports_to_it_without_keeping_its_word_leased() {
-        let (jobs, service) = crate::job_registry::job_registry_channel(crate::test_budgets::output_policy());
+        let (jobs, service) =
+            crate::job_registry::job_registry_channel(crate::test_budgets::output_policy());
         tokio::spawn(service.serve());
         let ids =
             aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river", "stone"]));

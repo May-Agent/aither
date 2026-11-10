@@ -31,7 +31,9 @@ pub struct JobStarted {
     pub output_file: StoredFile,
 }
 
-/// A job that ran to its end.
+/// A job that ran to its end: one promoted past the foreground window or
+/// started in the background. A script whose call returned its result, and
+/// every [`Shell::run`](crate::Shell::run), raises none.
 #[derive(Debug)]
 pub struct JobEnded {
     /// The job as it ended: its task id (a word leased from the shell's id
@@ -44,9 +46,9 @@ pub struct JobEnded {
     /// Set when the kill was the job's `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
     /// Keeps the job in its [`Jobs`](crate::Jobs), and its task id leased,
-    /// until the consumer takes the completion by dropping it; `None` for a
-    /// command the shell never registered and for one whose call returned its
-    /// result.
+    /// until the consumer takes the completion by dropping it; `None` when a
+    /// waiter ([`Job::wait`](crate::Job::wait)) took it first, so nothing is
+    /// owed to the agent.
     pub pending: Option<PendingCompletion>,
 }
 
@@ -143,7 +145,6 @@ impl EventSender {
         }
     }
 }
-
 
 /// The reading half of a shell's events.
 ///
