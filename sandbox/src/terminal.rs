@@ -4036,6 +4036,8 @@ where
     };
     let owed = status_registry.owe_completion(&task_id, ending).await;
     let kill = owed.as_ref().and_then(|owed| owed.kill);
+    // The job as it ended, read before a foreground result takes it.
+    let info = status_registry.get_by_task_id(&task_id).await;
     let mut pending = owed.map(|owed| owed.pending);
     // A result the call returned leaves nothing for the agent to take: the
     // completion is taken here, so the registry forgets the job.
@@ -4047,16 +4049,18 @@ where
     // Every job reports completion; the agent reinjects the result only for
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
-    let _ = completed_tx
-        .send(ShellEvent::JobEnded(Box::new(JobEnded {
-            task_id: task_id.to_string(),
-            script,
-            result,
-            kill,
-            timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
-            pending,
-        })))
-        .await;
+    // A command the shell never registered, one that failed to start, has no
+    // job to report.
+    if let Some(info) = info {
+        let _ = completed_tx
+            .send(ShellEvent::JobEnded(Box::new(JobEnded {
+                info,
+                result,
+                timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
+                pending,
+            })))
+            .await;
+    }
     running_tasks.fetch_sub(1, Ordering::AcqRel);
     // The flow's own hold on the word ends before the call returns.
     drop(task_id);
@@ -6995,7 +6999,7 @@ mod tests {
                 if let Some(task) = receiver
                     .take_completed()
                     .into_iter()
-                    .find(|task| task.task_id == task_id)
+                    .find(|task| task.info.task_id == task_id)
                 {
                     return task;
                 }
@@ -8889,7 +8893,7 @@ mod tests {
             .await
             .expect("the job should deliver its completion")
             .expect("the completion channel stays open");
-        assert_eq!(completed.task_id, task_id);
+        assert_eq!(completed.info.task_id, task_id);
         let held = jobs.list().await;
         assert!(
             held.iter().all(|job| job.status != JobStatus::Running),
@@ -10464,7 +10468,10 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
 
-        assert_eq!(completed.kill, Some(crate::KillCause::User));
+        assert_eq!(
+            completed.info.status.kill_cause(),
+            Some(crate::KillCause::User)
+        );
         let kill = completed
             .timeout_kill
             .expect("a job killed at its timeout carries the times");
@@ -10502,7 +10509,10 @@ mod tests {
         let task_id = started_task_id(&background_receiver);
         assert!(tool.job_registry().kill_by_task_id(&task_id).await);
         let completed = wait_for_completed_task(&background_receiver, &task_id).await;
-        assert_eq!(completed.kill, Some(crate::KillCause::User));
+        assert_eq!(
+            completed.info.status.kill_cause(),
+            Some(crate::KillCause::User)
+        );
         assert_eq!(completed.timeout_kill, None);
     }
 

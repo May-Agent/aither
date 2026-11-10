@@ -34,14 +34,13 @@ pub struct JobStarted {
 /// A job that ran to its end.
 #[derive(Debug)]
 pub struct JobEnded {
-    /// The task ID, a word leased from the shell's id allocator.
-    pub task_id: String,
-    /// The script the job ran.
-    pub script: String,
-    /// The result of the execution.
+    /// The job as it ended: its task id (a word leased from the shell's id
+    /// allocator), script, status with the cause of a kill, and the path of
+    /// its stored output.
+    pub info: crate::JobInfo,
+    /// The result of the execution: the output as the model reads it and
+    /// the outages the job ran through.
     pub result: Result<CompletedCommand, TerminalError>,
-    /// Why the job was killed, or `None` when it exited on its own.
-    pub kill: Option<crate::KillCause>,
     /// Set when the kill was the job's `timeout` bound passing.
     pub timeout_kill: Option<TimeoutKill>,
     /// Keeps the job in its [`Jobs`](crate::Jobs), and its task id leased,
