@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
-use aither_sandbox::permission::PermissionRequest;
+use aither_sandbox::permission::{CommandLocation, PermissionRequest};
 use aither_sandbox::{ScriptLanguage, TerminalMode};
 use askama::Template;
 use futures::StreamExt as _;
@@ -372,6 +372,7 @@ async fn run_sample(
                     mode: TerminalMode::Unsafe,
                     script,
                     language: ScriptLanguage::Shell,
+                    location: CommandLocation::Local,
                 },
             )
             .await

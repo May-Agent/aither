@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext, ToolResult};
-use aither_sandbox::permission::{PermissionError, PermissionHandler, TerminalMode};
+use aither_sandbox::permission::{
+    CommandLocation, PermissionError, PermissionHandler, TerminalMode,
+};
 use aither_sandbox::{
     DynTerminalTool, DynToolHandler, ScriptLanguage, SubagentGrant, TerminalTool,
     ToolRegistryBuilder,
@@ -48,6 +50,7 @@ impl PermissionHandler for SandboxOnly {
         mode: TerminalMode,
         script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         self.asked.lock().unwrap().push((mode, script.to_string()));
         std::future::ready(Ok(mode == TerminalMode::Sandboxed))

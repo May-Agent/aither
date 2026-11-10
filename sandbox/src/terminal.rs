@@ -72,14 +72,17 @@ use crate::{
     },
     job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
     output::{INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, stored_path},
-    permission::{PermissionError, PermissionHandler, PermissionRequest, Review, TerminalMode},
+    permission::{
+        CommandLocation, LocationApproval, PermissionError, PermissionHandler, PermissionRequest,
+        Review, TerminalMode,
+    },
     process_tree::{JobMarker, JobProcess, JobTree},
     script_language::ScriptLanguage,
     shell_session::{
         BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry,
     },
-    ssh::{SshClient, SshEnvironment, SshServer},
+    ssh::{ApprovalReach, SshClient, SshEnvironment, SshServer},
     stdin_watch::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
@@ -402,12 +405,15 @@ async fn ensure_mode_allowed<P: PermissionHandler>(
     mode: TerminalMode,
     script: &str,
     language: ScriptLanguage,
+    location: CommandLocation<'_>,
 ) -> Result<(), TerminalError> {
     if !mode.requires_approval() {
         return Ok(());
     }
 
-    let allowed = permission_handler.check(mode, script, language).await?;
+    let allowed = permission_handler
+        .check(mode, script, language, location)
+        .await?;
     if allowed {
         Ok(())
     } else {
@@ -2980,7 +2986,7 @@ where
                     .review(&PermissionRequest::Location { server, role })
                     .await
                 {
-                    Review::Approved => return Ok(()),
+                    Review::Approved => return Ok(ApprovalReach::Session),
                     Review::Denied(reason) => {
                         return Err(TerminalError::from(PermissionError::Denied(reason)));
                     }
@@ -3013,10 +3019,12 @@ where
                     )
                     .await;
                 }
-                if allowed? {
-                    Ok(())
-                } else {
-                    Err(TerminalError::LocationDenied(server.name.clone()))
+                match allowed? {
+                    LocationApproval::Session => Ok(ApprovalReach::Session),
+                    LocationApproval::Once => Ok(ApprovalReach::Once),
+                    LocationApproval::Refused => {
+                        Err(TerminalError::LocationDenied(server.name.clone()))
+                    }
                 }
             })
             .await
@@ -3027,7 +3035,7 @@ where
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
-        location: Option<&str>,
+        location: CommandLocation<'_>,
     ) -> Result<(), TerminalError> {
         if mode.requires_approval() {
             match self
@@ -3036,6 +3044,7 @@ where
                     mode,
                     script,
                     language,
+                    location,
                 })
                 .await
             {
@@ -3048,26 +3057,32 @@ where
         }
         let permission_waits = self
             .permission_handler
-            .will_wait_for_approval(mode, script, language)
+            .will_wait_for_approval(mode, script, language, location)
             .await;
         if permission_waits {
             self.emit_permission_event(
                 mode,
                 script,
                 language,
-                location,
+                location.server(),
                 PermissionEventStage::Waiting,
             )
             .await;
         }
-        let permission_result =
-            ensure_mode_allowed(self.permission_handler.as_ref(), mode, script, language).await;
+        let permission_result = ensure_mode_allowed(
+            self.permission_handler.as_ref(),
+            mode,
+            script,
+            language,
+            location,
+        )
+        .await;
         if permission_waits {
             self.emit_permission_event(
                 mode,
                 script,
                 language,
-                location,
+                location.server(),
                 PermissionEventStage::Resolved,
             )
             .await;
@@ -3704,8 +3719,13 @@ where
                         .await
                         .map_err(TerminalError::from)?;
                 }
-                self.ensure_permission_allowed(mode, admission.script, admission.language, None)
-                    .await?;
+                self.ensure_permission_allowed(
+                    mode,
+                    admission.script,
+                    admission.language,
+                    CommandLocation::Local,
+                )
+                .await?;
                 target
             }
             // Boxed: a server's first command carries its preparation,
@@ -3730,7 +3750,9 @@ where
             mode,
             admission.script,
             admission.language,
-            Some(environment.server().name.as_str()),
+            CommandLocation::Ssh {
+                server: environment.server().name.as_str(),
+            },
         )
         .await?;
         self.resolve_ssh_target(environment, mode).await
@@ -7710,6 +7732,7 @@ mod tests {
             mode: TerminalMode,
             _script: &str,
             _language: ScriptLanguage,
+            _location: CommandLocation<'_>,
         ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
             self.mode_checks.fetch_add(1, AtomicOrdering::Relaxed);
             std::future::ready(Ok(match mode {
@@ -7956,6 +7979,7 @@ mod tests {
             TerminalMode::Unsafe,
             "rm -rf /tmp/demo",
             ScriptLanguage::Shell,
+            CommandLocation::Local,
         )
         .await
         .expect_err("unsafe mode should be denied");
@@ -8011,6 +8035,7 @@ mod tests {
             _mode: TerminalMode,
             _script: &str,
             _language: ScriptLanguage,
+            _location: CommandLocation<'_>,
         ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
             self.checks.fetch_add(1, AtomicOrdering::Relaxed);
             std::future::ready(Ok(true))
@@ -8021,6 +8046,7 @@ mod tests {
             _mode: TerminalMode,
             _script: &str,
             _language: ScriptLanguage,
+            _location: CommandLocation<'_>,
         ) -> impl std::future::Future<Output = bool> + Send {
             self.waits.fetch_add(1, AtomicOrdering::Relaxed);
             std::future::ready(true)
@@ -8049,7 +8075,7 @@ mod tests {
                 TerminalMode::Unsafe,
                 "make install",
                 ScriptLanguage::Shell,
-                None,
+                CommandLocation::Local,
             )
             .await
             .map_err(|error| error.to_string());
@@ -8110,6 +8136,7 @@ mod tests {
                 _mode: TerminalMode,
                 _script: &str,
                 _language: ScriptLanguage,
+                _location: CommandLocation<'_>,
             ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send
             {
                 std::future::ready(Ok(true))
@@ -9931,7 +9958,7 @@ mod tests {
     /// Records the unsafe approvals it is asked for and refuses them.
     #[derive(Default)]
     struct RecordingApprovals {
-        asked: Mutex<Vec<(String, ScriptLanguage)>>,
+        asked: Mutex<Vec<(String, ScriptLanguage, CommandLocation<'static>)>>,
     }
 
     impl PermissionHandler for RecordingApprovals {
@@ -9940,11 +9967,14 @@ mod tests {
             _mode: TerminalMode,
             script: &str,
             language: ScriptLanguage,
+            location: CommandLocation<'_>,
         ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
+            // Only home-environment commands reach this handler in the test.
+            assert_eq!(location, CommandLocation::Local);
             self.asked
                 .lock()
                 .unwrap()
-                .push((script.to_string(), language));
+                .push((script.to_string(), language, CommandLocation::Local));
             std::future::ready(Ok(false))
         }
     }
@@ -9980,7 +10010,11 @@ mod tests {
         assert!(refused.is_err(), "the refused approval stops the run");
         assert_eq!(
             *tool.permission_handler.asked.lock().unwrap(),
-            [(code.to_string(), ScriptLanguage::Python)]
+            [(
+                code.to_string(),
+                ScriptLanguage::Python,
+                CommandLocation::Local
+            )]
         );
     }
 
