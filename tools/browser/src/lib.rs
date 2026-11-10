@@ -2,9 +2,11 @@
 
 use std::borrow::Cow;
 
-use aither_agent::tool_request::{
-    ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
-};
+mod tool_request;
+
+pub use tool_request::ToolRequest;
+use tool_request::{ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel};
+
 use askama::Template;
 
 use aither_core::llm::ToolContext;

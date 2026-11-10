@@ -15,7 +15,7 @@
 //! // With tools and hooks
 //! let agent = Agent::builder(llm)
 //!     .tool(FileSystemTool::read_only("."))
-//!     .hook(LoggingHook)
+//!     .hooks(ReadOnly)
 //!     .build();
 //!
 //! let response = agent.query("List all Rust files").await?;
