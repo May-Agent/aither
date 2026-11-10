@@ -48,6 +48,7 @@ mod outage;
 mod output;
 mod output_compress;
 mod output_policy;
+mod output_treatment;
 mod policy;
 mod process_tree;
 mod shell_session;
@@ -143,6 +144,7 @@ pub use network_policy::{
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use output_policy::{MediaBounds, OutputLimits, OutputPolicy};
+pub use output_treatment::{OutputTreatment, TreatOutput};
 pub use policy::{
     AnyScriptPolicy, Carry, SandboxMode, ScriptCheck, ScriptDecision, ScriptDir, ScriptEnd,
     ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptPolicy, ScriptRefusal,

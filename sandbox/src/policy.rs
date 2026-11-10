@@ -105,7 +105,8 @@ impl ScriptDir {
     }
 }
 
-/// A script about to run, as a [`ScriptPolicy`] sees it.
+/// A script about to run, as a [`ScriptPolicy`] and the shell's
+/// [`TreatOutput`](crate::TreatOutput) see it.
 #[derive(Debug, Clone, Copy)]
 pub struct ScriptCheck<'a> {
     /// The id the script's task gets when it runs; the [`ScriptEnd`] that

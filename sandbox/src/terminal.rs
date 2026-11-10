@@ -66,8 +66,8 @@ use crate::jobs::Jobs;
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
-    Carry, ContainerPath, MountRoot, RemoteLaunch, SandboxMode, ScriptDecision, ScriptDir,
-    ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptRefusal,
+    Carry, ContainerPath, MountRoot, OutputTreatment, RemoteLaunch, SandboxMode, ScriptDecision,
+    ScriptDir, ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptRefusal,
     interpreter::Interpreter,
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     limits::{LiveDuration, ShellLimits},
@@ -786,6 +786,10 @@ pub struct Shell<E> {
     /// The script policies every script of this shell is put to, bound to
     /// the state of the agent the shell serves.
     policies: ScriptPolicies,
+    /// Chooses each script's output treatment, shared with every subagent
+    /// shell derived from this one; without it every output is command
+    /// output.
+    treat_output: Option<crate::output_treatment::AnyTreatOutput>,
     /// The commands the embedder serves to this shell's scripts, shared with
     /// every subagent shell derived from this one.
     ipc: Option<crate::AnyIpcProvider>,
@@ -825,6 +829,7 @@ impl<E: Clone> Clone for Shell<E> {
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.clone(),
+            treat_output: self.treat_output.clone(),
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: self.launches.clone(),
@@ -966,6 +971,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             outages: Outages::none(),
             subagent_spaces: None,
             policies: ScriptPolicies::new(parts.policies),
+            treat_output: parts.treat_output,
             ipc: parts.ipc,
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
@@ -1017,6 +1023,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 events: None,
                 policies: Vec::new(),
                 ipc: None,
+                treat_output: None,
                 host_shell,
             },
         )
@@ -1523,6 +1530,7 @@ where
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.for_agent(),
+            treat_output: self.treat_output.clone(),
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: Arc::default(),
@@ -1721,7 +1729,7 @@ where
             expect,
             resolution,
             max_lines,
-            raw,
+            stdout,
             background,
             timeout,
             carry,
@@ -1785,7 +1793,7 @@ where
                 resolution,
                 outputs: self.output_store.clone(),
                 max_lines,
-                raw,
+                stdout,
                 result_tx,
                 taken: taken_rx,
                 completed_tx,
@@ -1946,7 +1954,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             expect: OutputFormat::Auto,
             resolution: arguments.resolution,
             max_lines: prepared.max_lines,
-            raw: arguments.raw,
+            stdout: StdoutTreatment::of_call(arguments.raw, prepared.treatment),
             background: arguments.background,
             timeout,
             carry: carry.clone(),
@@ -2465,12 +2473,12 @@ where
                 &own,
             ),
         };
-        let clearance = self
-            .check_policies(&task_id, &admission, &start)
+        let checked = self
+            .check_script(&task_id, &admission, &start)
             .await
             .map_err(ShellRunError::Refused);
-        let clearance = match clearance {
-            Ok(clearance) => clearance,
+        let (clearance, treatment) = match checked {
+            Ok(checked) => checked,
             Err(refusal) => {
                 self.end_unrun(&task_id).await;
                 return Err(refusal);
@@ -2489,6 +2497,7 @@ where
             task_id,
             outputs: self.output_store.clone(),
             max_lines,
+            treatment,
             carried_start,
         })
     }
@@ -2507,18 +2516,18 @@ where
             .await;
     }
 
-    /// Puts the script to the shell's script policies, the shell parsed
-    /// once for all of them, and folds their decisions into what admission
-    /// does next.
-    async fn check_policies(
+    /// Puts the script to the shell's script policies and its output
+    /// treatment, the shell parsed once for all of them, and folds the
+    /// policies' decisions into what admission does next.
+    async fn check_script(
         &self,
         task_id: &str,
         admission: &Admission<'_>,
         start: &ScriptDir,
-    ) -> Result<Clearance, ScriptRefusal> {
+    ) -> Result<(Clearance, OutputTreatment), ScriptRefusal> {
         let policies = &self.policies;
-        if policies.is_empty() {
-            return Ok(Clearance::Pass);
+        if policies.is_empty() && self.treat_output.is_none() {
+            return Ok((Clearance::Pass, OutputTreatment::default()));
         }
         let shell = (admission.interpreter == Interpreter::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
@@ -2533,12 +2542,17 @@ where
             start,
             call: admission.call(),
         };
-        match policies.check(&check).await {
-            ScriptDecision::Pass => Ok(Clearance::Pass),
-            ScriptDecision::Allow => Ok(Clearance::Allow),
-            ScriptDecision::Ask(request) => Ok(Clearance::Ask(request)),
-            ScriptDecision::Refuse(refusal) => Err(refusal),
-        }
+        let treatment = self
+            .treat_output
+            .as_ref()
+            .map_or_else(OutputTreatment::default, |treat| treat.treatment(&check));
+        let clearance = match policies.check(&check).await {
+            ScriptDecision::Pass => Clearance::Pass,
+            ScriptDecision::Allow => Clearance::Allow,
+            ScriptDecision::Ask(request) => Clearance::Ask(request),
+            ScriptDecision::Refuse(refusal) => return Err(refusal),
+        };
+        Ok((clearance, treatment))
     }
 
     /// The rest of admission once the policies did not refuse the script.
@@ -2664,7 +2678,7 @@ where
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: prepared.max_lines,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(prepared.treatment),
             background: false,
             timeout: run.timeout,
             carry: Some(start),
@@ -2823,9 +2837,34 @@ struct ExecutionPreparation {
     execution_id: String,
     outputs: OutputStore,
     max_lines: usize,
+    /// How the script's output is cleaned, as the shell's
+    /// [`TreatOutput`](crate::TreatOutput) chose.
+    treatment: OutputTreatment,
     /// The carried directory a foreground command starts in, when the
     /// terminal carries one and it still exists.
     carried_start: Option<PathBuf>,
+}
+
+/// What the output pipeline does to a foreground script's stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdoutTreatment {
+    /// The call asked for the bytes as written (`raw`): no stage applies,
+    /// not even rendering.
+    Raw,
+    /// The pipeline runs under the script's output treatment.
+    Cleaned(OutputTreatment),
+}
+
+impl StdoutTreatment {
+    /// The treatment of a `terminal` call's stdout: `raw` wins over the
+    /// shell's choice.
+    const fn of_call(raw: bool, treatment: OutputTreatment) -> Self {
+        if raw {
+            Self::Raw
+        } else {
+            Self::Cleaned(treatment)
+        }
+    }
 }
 
 /// Where a run starts: `dir` on the host, mapped through the workspace
@@ -2994,7 +3033,7 @@ struct StandaloneExecution<E> {
     resolution: MediaResolution,
     outputs: OutputStore,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
 }
 
 struct StandaloneStart<'a, E> {
@@ -3089,7 +3128,7 @@ struct CompletedProcessOutput<'a> {
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
 }
 
 /// Where a command runs, with the programs the embedder prepared for exactly
@@ -3132,7 +3171,7 @@ struct TerminalSpawnRequest {
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
     background: bool,
     timeout: Duration,
     carry: Option<CwdCarry>,
@@ -3189,7 +3228,7 @@ struct SpawnedTerminalTask<E> {
     resolution: MediaResolution,
     outputs: OutputStore,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
     result_tx: Sender<Result<CompletedCommand, String>>,
     /// Whether the call took the result: see [`SpawnedTerminal::took_result`].
     taken: Receiver<Sender<()>>,
@@ -3230,7 +3269,7 @@ where
         resolution,
         outputs,
         max_lines,
-        raw,
+        stdout,
         result_tx,
         taken,
         completed_tx,
@@ -3279,7 +3318,7 @@ where
         resolution,
         outputs,
         max_lines,
-        raw,
+        stdout,
     })
     .await;
     // A process that never started leaves no job to register.
@@ -3409,7 +3448,7 @@ where
         resolution,
         outputs,
         max_lines,
-        raw,
+        stdout,
     } = request;
 
     info!(
@@ -3456,7 +3495,7 @@ where
         expect,
         resolution,
         max_lines,
-        raw,
+        stdout,
     })
     .await?;
     let exit_code = result.exit_code;
@@ -3611,7 +3650,7 @@ async fn save_completed_process_output(
         expect,
         resolution,
         max_lines,
-        raw,
+        stdout,
     } = request;
     let stdout = save_completed_stdout(
         job_registry,
@@ -3623,7 +3662,7 @@ async fn save_completed_process_output(
             expect,
             resolution,
             max_lines,
-            raw,
+            stdout,
         },
     )
     .await?;
@@ -3644,7 +3683,7 @@ struct CompletedStdoutFormat<'a> {
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
 }
 
 async fn save_completed_stdout(
@@ -3657,7 +3696,7 @@ async fn save_completed_stdout(
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
     } else {
-        compressed_stdout_data(format.outputs, stdout, format.expect, format.raw).await?
+        compressed_stdout_data(format.outputs, stdout, format.expect, format.stdout).await?
     };
 
     match format
@@ -3679,25 +3718,30 @@ async fn save_completed_stdout(
     }
 }
 
-/// Runs the output cleaning pipeline over a completed command's stdout.
+/// Runs the output cleaning pipeline over a completed command's stdout,
+/// under the script's output treatment.
 ///
-/// `raw: true` bypasses it entirely, as do non-text formats and output that
-/// is not valid UTF-8, so the model sees exactly the bytes the command wrote.
+/// [`StdoutTreatment::Raw`] bypasses it entirely, as do non-text formats and
+/// output that is not valid UTF-8, so the model sees exactly the bytes the
+/// command wrote.
 async fn compressed_stdout_data<'a>(
     outputs: &OutputStore,
     stdout: &'a [u8],
     expect: OutputFormat,
-    raw: bool,
+    treatment: StdoutTreatment,
 ) -> Result<Cow<'a, [u8]>, TerminalError> {
     let is_text = matches!(expect, OutputFormat::Text | OutputFormat::Auto);
-    if raw || !is_text || stdout.is_empty() {
+    let StdoutTreatment::Cleaned(treatment) = treatment else {
+        return Ok(Cow::Borrowed(stdout));
+    };
+    if !is_text || stdout.is_empty() {
         return Ok(Cow::Borrowed(stdout));
     }
     let Ok(text) = std::str::from_utf8(stdout) else {
         return Ok(Cow::Borrowed(stdout));
     };
 
-    let cleaned = crate::output_compress::compress_text(outputs, text)
+    let cleaned = crate::output_compress::compress_text(outputs, text, treatment)
         .await
         .map_err(TerminalError::Io)?;
     Ok(cleaned.map_or(Cow::Borrowed(stdout), |cleaned| {
@@ -6077,7 +6121,7 @@ mod tests {
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
             max_lines: 50,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(OutputTreatment::Command),
         })
         .await;
         match result {
@@ -6147,7 +6191,7 @@ mod tests {
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
             max_lines: 50,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(OutputTreatment::Command),
         })
         .await
         .expect("the sandboxed script runs");
@@ -6261,7 +6305,7 @@ mod tests {
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
             max_lines: 200,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(OutputTreatment::Command),
         })
         .await
         .expect("the sandboxed script runs");

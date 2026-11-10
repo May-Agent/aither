@@ -12,10 +12,13 @@
 //!    [`folded_code_content`].
 //! 5. [`preview`] reduces stored text to a head+tail preview for the model.
 //!
-//! Stages 1 and 2 are the only ones applied unconditionally: together they
-//! are what a terminal would have shown, so output delivered inline -- where
-//! no copy is kept -- keeps every character the command actually produced,
-//! down to whether it ended with a line terminator.
+//! Stage 1 applies to every text output: it is what a terminal would have
+//! shown, so output delivered inline -- where no copy is kept -- keeps every
+//! character the command actually produced, down to whether it ended with a
+//! line terminator. Stages 2 and 3 apply to
+//! [`Command`](OutputTreatment::Command) output alone: output the embedder
+//! keeps [`Verbatim`](OutputTreatment::Verbatim), such as a file a script
+//! read, reaches the model as stage 1 rendered it.
 //!
 //! Stages 3 and 4 are lossy and only run where the text they replace is
 //! written to disk and named in the text the model reads. Stage 3 runs in
@@ -30,6 +33,7 @@ mod json_tsv;
 mod preview;
 mod render;
 
+use crate::OutputTreatment;
 use crate::output::OutputStore;
 use crate::wording::{JsonAsTsv, ShellWording};
 
@@ -46,10 +50,10 @@ pub fn folded_code_content(text: &str, wording: &dyn ShellWording) -> Option<Str
     Some(wording.folded_code(folded.trim_end_matches('\n')))
 }
 
-/// Cleans foreground terminal text for the model.
+/// Cleans foreground terminal text for the model under `treatment`.
 ///
-/// Returns `None` when the text is already what a terminal would show and no
-/// stage applied, so the caller can keep the original bytes.
+/// Returns `None` when no stage changed the text, so the caller can keep the
+/// original bytes.
 ///
 /// `store` receives the original of any lossy stage; the returned text
 /// names that file. The returned text is **not** yet split between inline and
@@ -61,12 +65,20 @@ pub fn folded_code_content(text: &str, wording: &dyn ShellWording) -> Option<Str
 ///
 /// Returns an error when a lossy stage applied but its original could not be
 /// written to `store`.
-pub async fn compress_text(store: &OutputStore, text: &str) -> std::io::Result<Option<String>> {
+pub async fn compress_text(
+    store: &OutputStore,
+    text: &str,
+    treatment: OutputTreatment,
+) -> std::io::Result<Option<String>> {
     if text.is_empty() {
         return Ok(None);
     }
 
-    let cleaned = collapse::collapse_blank_runs(&render::render_terminal(text), &**store.wording());
+    let rendered = render::render_terminal(text);
+    let cleaned = match treatment {
+        OutputTreatment::Verbatim => return Ok((rendered != text).then_some(rendered)),
+        OutputTreatment::Command => collapse::collapse_blank_runs(&rendered, &**store.wording()),
+    };
 
     if let Some(tsv) = json_tsv::to_tsv(&cleaned) {
         let (url, path) = store.save_raw(cleaned.as_bytes()).await?;
@@ -98,10 +110,51 @@ mod tests {
     }
 
     async fn compress(text: &str) -> Option<String> {
+        compress_as(text, OutputTreatment::Command).await
+    }
+
+    async fn compress_as(text: &str, treatment: OutputTreatment) -> Option<String> {
         let dir = tempfile::tempdir().expect("tempdir");
-        compress_text(&store(dir.path()), text)
+        compress_text(&store(dir.path()), text, treatment)
             .await
             .expect("compression succeeds")
+    }
+
+    const RECORDS: &str = r#"[
+            {"id": 1, "name": "Alice", "email": "alice@aither.test", "role": "admin"},
+            {"id": 2, "name": "Bob", "email": "bob@aither.test", "role": "user"},
+            {"id": 3, "name": "Charlie", "email": "charlie@aither.test", "role": "user"},
+            {"id": 4, "name": "Diana", "email": "diana@aither.test", "role": "admin"}
+        ]"#;
+
+    #[tokio::test]
+    async fn verbatim_output_keeps_its_blank_runs() {
+        assert!(
+            compress_as("alpha\n\n\n\nbeta\n", OutputTreatment::Verbatim)
+                .await
+                .is_none(),
+            "a verbatim text a terminal shows as written is left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn verbatim_output_is_still_rendered_as_a_terminal_shows_it() {
+        let cleaned = compress_as(
+            "\u{1b}[32mfn main() {}\u{1b}[0m\n\n\n\nFetching 1\rFetching 2\n",
+            OutputTreatment::Verbatim,
+        )
+        .await
+        .expect("escapes and frames are resolved");
+        assert_eq!(cleaned, "fn main() {}\n\n\n\nFetching 2\n");
+    }
+
+    #[tokio::test]
+    async fn a_verbatim_json_table_stays_json() {
+        assert!(
+            compress_as(RECORDS, OutputTreatment::Verbatim)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -158,14 +211,9 @@ mod tests {
 
     #[tokio::test]
     async fn json_table_becomes_tsv_naming_a_readable_original() {
-        let json = r#"[
-            {"id": 1, "name": "Alice", "email": "alice@aither.test", "role": "admin"},
-            {"id": 2, "name": "Bob", "email": "bob@aither.test", "role": "user"},
-            {"id": 3, "name": "Charlie", "email": "charlie@aither.test", "role": "user"},
-            {"id": 4, "name": "Diana", "email": "diana@aither.test", "role": "admin"}
-        ]"#;
+        let json = RECORDS;
         let dir = tempfile::tempdir().expect("tempdir");
-        let cleaned = compress_text(&store(dir.path()), json)
+        let cleaned = compress_text(&store(dir.path()), json, OutputTreatment::Command)
             .await
             .expect("compression succeeds")
             .expect("json becomes tsv");
@@ -238,7 +286,7 @@ mod tests {
         let diff = git_output(repo, &["diff", "--color=always", "--", "main.rs"]);
         assert!(diff.contains('\u{1b}'), "git diff should be coloured");
 
-        let cleaned = compress_text(&store(repo), &diff)
+        let cleaned = compress_text(&store(repo), &diff, OutputTreatment::Command)
             .await
             .expect("compression succeeds")
             .expect("coloured diff is cleaned");
