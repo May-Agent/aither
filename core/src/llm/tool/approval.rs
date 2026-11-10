@@ -50,6 +50,8 @@ use super::CallIdentity;
 /// Claude Agent SDK hands `canUseTool` the tool name, and an ACP permission
 /// request carries the tool call's kind.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct ApprovalKind(Cow<'static, str>);
 
 impl ApprovalKind {

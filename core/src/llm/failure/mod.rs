@@ -13,6 +13,7 @@ pub mod zenwave;
 
 /// What kind of failure a provider error is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FailureKind {
     /// No response came back from the network: DNS failure, refused or reset
     /// connection, TLS failure, stream EOF or reset mid-response, request
@@ -31,6 +32,7 @@ pub enum FailureKind {
 
 /// A classified failure and, when the upstream asked for one, its retry delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Failure {
     /// What kind of failure this is.
     pub kind: FailureKind,

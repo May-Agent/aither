@@ -25,6 +25,7 @@ use super::{
 /// amount there is; both may be fractional and neither has a unit. `message`
 /// is a human-readable line describing the current state.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Progress {
     done: f64,
     total: Option<f64>,

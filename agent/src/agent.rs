@@ -477,7 +477,7 @@ impl<H: Hooks> ToolRun<'_, H> {
             }
             ToolDecision::Abort(reason) => {
                 return Err(AgentError::HookRejected {
-                    hook: "before_tool",
+                    hook: "before_tool".into(),
                     reason,
                 });
             }
@@ -510,7 +510,7 @@ impl<H: Hooks> ToolRun<'_, H> {
             AfterTool::Append(context) => appended = Some(context),
             AfterTool::Abort(reason) => {
                 return Err(AgentError::HookRejected {
-                    hook: "after_tool",
+                    hook: "after_tool".into(),
                     reason,
                 });
             }
@@ -790,6 +790,7 @@ impl std::ops::Deref for RenderedTail {
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CompactResult {
     /// Number of messages that were compacted.
     pub messages_compacted: usize,

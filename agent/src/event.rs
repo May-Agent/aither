@@ -22,6 +22,8 @@ use crate::error::AgentError;
 /// Where an agent stands in the tree of agents a run started: empty for the
 /// main agent, the subagent's name beneath its parent's path otherwise.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct AgentPath(Vec<String>);
 
 impl AgentPath {
@@ -81,6 +83,8 @@ macro_rules! text_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+        #[cfg_attr(feature = "serde", serde(transparent))]
         pub struct $name(String);
 
         impl $name {
@@ -107,6 +111,8 @@ macro_rules! counter_id {
     ($(#[$meta:meta])* $name:ident($inner:ty)) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+        #[cfg_attr(feature = "serde", serde(transparent))]
         pub struct $name($inner);
 
         impl $name {
@@ -139,6 +145,8 @@ text_id! {
 /// Identifies a [context source](crate::ContextSource) in
 /// [`ContextInjected`](AgentEvent::ContextInjected).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct SourceId(String);
 
 impl SourceId {
@@ -179,6 +187,7 @@ counter_id! {
 
 /// What a streamed block of the model's response is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum OutputKind {
     /// Text for the reader.
@@ -189,6 +198,7 @@ pub enum OutputKind {
 
 /// Where a tool call runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum ToolOrigin {
     /// A tool registered on the agent, run by the agent.
@@ -199,6 +209,7 @@ pub enum ToolOrigin {
 
 /// What the agent settled on for a tool call before running it.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum ToolVerdict {
     /// The call runs as the model made it.
@@ -218,6 +229,7 @@ pub enum ToolVerdict {
 
 /// Why a run stopped short of an answer without failing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum RunPause {
     /// The context window is full and the run cannot continue.
@@ -233,6 +245,7 @@ pub enum RunPause {
 
 /// How a run ended.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum RunOutcome {
     /// The model answered and nothing held the run.
@@ -259,6 +272,7 @@ pub enum RunOutcome {
 
 /// How a request ended.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum RequestOutcome {
     /// The response stream ended.
@@ -290,6 +304,7 @@ pub enum RequestOutcome {
 
 /// Why a compaction started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum CompactionTrigger {
     /// [`Agent::compact`](crate::Agent::compact) was called.
@@ -309,6 +324,7 @@ pub enum CompactionTrigger {
 
 /// How a compaction announced by [`AgentEvent::CompactionStarted`] ended.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum CompactionOutcome {
     /// The handoff replaced the conversation below its fork point.
@@ -327,6 +343,7 @@ pub enum CompactionOutcome {
 
 /// What an injection into the conversation was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum InjectionKind {
     /// A durable block appended to the conversation, which stays in the
@@ -340,6 +357,7 @@ pub enum InjectionKind {
 
 /// Why a checkpoint was emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum CheckpointReason {
     /// A turn that called tools ended.
@@ -350,6 +368,7 @@ pub enum CheckpointReason {
 
 /// Events emitted during agent execution.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum AgentEvent {
     /// A run began.
@@ -602,6 +621,7 @@ pub enum AgentEvent {
 /// The time is taken at the emission point inside the run, not when the
 /// consumer reads the event.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct TimedEvent {
     /// When the agent emitted the event.
@@ -624,6 +644,253 @@ impl AgentEvent {
             | Self::TurnEnded { run, .. }
             | Self::Checkpoint { run, .. } => Some(run),
             _ => None,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use aither_core::llm::tool::{ApprovalError, ApproverFailure};
+    use aither_core::llm::{Failure, Message};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::context::{PrefixChain, PrefixRewrites, PromptPrefix};
+
+    fn call() -> ToolCallId {
+        ToolCallId::new("call-1")
+    }
+
+    fn errors() -> Vec<AgentError> {
+        vec![
+            AgentError::Llm {
+                message: "overloaded".into(),
+                failure: Failure::transient().with_retry_after(Some(Duration::from_secs(5))),
+            },
+            AgentError::ToolExecution {
+                name: "terminal".into(),
+                error: "exit 1".into(),
+            },
+            AgentError::MaxIterations { limit: 8 },
+            AgentError::HookRejected {
+                hook: "before_tool".into(),
+                reason: "no".into(),
+            },
+            AgentError::ToolNotFound { name: "x".into() },
+            AgentError::Config("bad".into()),
+            AgentError::Approval(Arc::new(ApprovalError::NoApprover {
+                kind: ApprovalKind::new("run"),
+            })),
+            AgentError::Approval(Arc::new(ApprovalError::Failed {
+                kind: ApprovalKind::new("run"),
+                failure: ApproverFailure::new(std::io::Error::other("closed")),
+            })),
+            AgentError::Approval(Arc::new(ApprovalError::Cancelled)),
+            AgentError::Cancelled,
+            AgentError::Paused(RunPause::ContextExhausted),
+        ]
+    }
+
+    fn outcomes() -> Vec<RunOutcome> {
+        let mut all = vec![
+            RunOutcome::Completed {
+                final_text: "done".into(),
+            },
+            RunOutcome::Paused {
+                pause: RunPause::ContextExhausted,
+            },
+            RunOutcome::Cancelled,
+            RunOutcome::IterationLimit,
+        ];
+        all.extend(
+            errors()
+                .into_iter()
+                .map(|error| RunOutcome::Failed { error }),
+        );
+        all
+    }
+
+    fn events() -> Vec<AgentEvent> {
+        let run = || RunId::new("run-1");
+        let request = || RequestId::new(3);
+        let child = || AgentPath::main().child("reviewer");
+        let mut all = vec![
+            AgentEvent::RunStarted {
+                run: run(),
+                agent: child(),
+            },
+            AgentEvent::TurnStarted {
+                run: run(),
+                turn: 1,
+            },
+            AgentEvent::TurnEnded {
+                run: run(),
+                turn: 1,
+                tool_calls: 2,
+            },
+            AgentEvent::RequestStarted {
+                request: request(),
+                prefix: PromptPrefix {
+                    chain: PrefixChain::of(&[], &[Message::user("hello")]),
+                    rewrites: PrefixRewrites {
+                        compacted: true,
+                        reassembled: false,
+                    },
+                    first_request: true,
+                },
+            },
+            AgentEvent::RequestEnded {
+                request: request(),
+                usage: Some(Usage {
+                    prompt_tokens: Some(10),
+                    ..Usage::default()
+                }),
+                outcome: RequestOutcome::Completed,
+            },
+            AgentEvent::BlockDelta {
+                request: request(),
+                block: BlockId::new(0),
+                kind: OutputKind::Reasoning,
+                text: "hm".into(),
+            },
+            AgentEvent::BlockEnded {
+                request: request(),
+                block: BlockId::new(0),
+                kind: OutputKind::Text,
+            },
+            AgentEvent::ToolCallDelta {
+                call: call(),
+                name: "terminal".into(),
+                arguments_fragment: "{\"cmd".into(),
+            },
+            AgentEvent::ToolCallStarted {
+                call: call(),
+                name: "terminal".into(),
+                arguments: serde_json::json!({"cmd": "ls"}),
+                origin: ToolOrigin::Hosted,
+            },
+            AgentEvent::ToolProgress {
+                call: call(),
+                progress: Progress::new(1.0),
+            },
+            AgentEvent::ToolCallEnded {
+                call: call(),
+                result: ToolResult::text("ok"),
+            },
+            AgentEvent::Paused {
+                pause: PauseId::new(1),
+                call: Some(call()),
+                kind: ApprovalKind::new("run"),
+                subject: "rm -rf".into(),
+            },
+            AgentEvent::Resumed {
+                pause: PauseId::new(1),
+            },
+            AgentEvent::CompactionStarted {
+                trigger: CompactionTrigger::ColdCache,
+            },
+            AgentEvent::CompactionRecovery {
+                error: AgentError::Cancelled,
+                alerts_removed: 1,
+                outputs_spilled: 2,
+            },
+            AgentEvent::ContextInjected {
+                source: SourceId::new("memory"),
+                kind: InjectionKind::LiveChange,
+            },
+            AgentEvent::SubagentStarted {
+                child: child(),
+                name: "reviewer".into(),
+                prompt: "look".into(),
+            },
+            AgentEvent::Checkpoint {
+                run: run(),
+                reason: CheckpointReason::Stop,
+                turn: 2,
+                phase: ContextWindowPhase::Stable,
+                message_count: 4,
+            },
+        ];
+        for decision in [
+            ToolVerdict::Allowed,
+            ToolVerdict::Denied {
+                reason: "nope".into(),
+            },
+            ToolVerdict::Rewritten,
+            ToolVerdict::AwaitingApproval,
+        ] {
+            all.push(AgentEvent::ToolCallDecided {
+                call: call(),
+                decision,
+            });
+        }
+        for outcome in outcomes() {
+            all.push(AgentEvent::RunEnded {
+                run: run(),
+                outcome: outcome.clone(),
+            });
+            all.push(AgentEvent::SubagentEnded {
+                child: child(),
+                outcome,
+            });
+        }
+        for error in errors() {
+            all.push(AgentEvent::RequestEnded {
+                request: request(),
+                usage: None,
+                outcome: RequestOutcome::Failed {
+                    error: error.clone(),
+                },
+            });
+            all.push(AgentEvent::CompactionEnded {
+                outcome: CompactionOutcome::Failed(error),
+            });
+        }
+        all.push(AgentEvent::RequestEnded {
+            request: request(),
+            usage: None,
+            outcome: RequestOutcome::Retrying {
+                error: AgentError::llm_local("x"),
+                retry: 1,
+                max_retries: 3,
+                delay: Duration::from_millis(1500),
+            },
+        });
+        all.push(AgentEvent::CompactionEnded {
+            outcome: CompactionOutcome::Applied(crate::CompactResult {
+                messages_compacted: 5,
+                messages_remaining: 2,
+                summary: "s".into(),
+            }),
+        });
+        all.push(AgentEvent::CompactionEnded {
+            outcome: CompactionOutcome::NothingToCompact,
+        });
+        all.push(AgentEvent::CompactionEnded {
+            outcome: CompactionOutcome::Discarded,
+        });
+        all
+    }
+
+    #[test]
+    fn every_event_survives_a_round_trip() {
+        let at = Timestamp::from_second(1_700_000_000).expect("a valid timestamp");
+        for event in events() {
+            let timed = TimedEvent {
+                at,
+                agent: AgentPath::main().child("reviewer"),
+                event,
+            };
+            let text = serde_json::to_string(&timed).expect("serializes");
+            let back: TimedEvent = serde_json::from_str(&text).expect("deserializes");
+            assert_eq!(back.at, timed.at, "{text}");
+            assert_eq!(back.agent, timed.agent, "{text}");
+            assert_eq!(
+                serde_json::to_string(&back).expect("serializes again"),
+                text,
+                "a decoded event encodes to the same text"
+            );
+            assert_eq!(format!("{:?}", back.event), format!("{:?}", timed.event));
         }
     }
 }

@@ -60,6 +60,10 @@ aither-mcp = { workspace = true, default-features = false, features = ["client"]
 
 [features]
 default = []
+# Serialize and deserialize the event types (`AgentEvent`, `TimedEvent` and
+# everything they carry), for an embedder that sends them across a process
+# boundary. `serde` itself is always a dependency: checkpoints need it.
+serde = ["aither-core/serde"]
 websearch = ["dep:aither-websearch"]
 webfetch = ["dep:aither-webfetch"]
 filesystem = ["dep:aither-fs"]
