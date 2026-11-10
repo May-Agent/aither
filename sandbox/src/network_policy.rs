@@ -2,9 +2,10 @@
 //!
 //! Applications describe which hosts sandboxed commands may reach as a
 //! serializable [`NetworkPolicyConfig`]; compiling it yields a
-//! [`CompiledNetworkPolicy`] whose [`allows_domain`](CompiledNetworkPolicy::allows_domain)
-//! verdicts back a [`PermissionHandler::check_domain`](crate::PermissionHandler::check_domain)
-//! implementation.
+//! [`CompiledNetworkPolicy`] a [`Sandbox`](crate::Sandbox) consults for every
+//! connection. A host the lists allow or deny is decided there; one they
+//! leave [open](NetworkVerdict::Open) goes to the sandbox's
+//! [`DomainApprover`](crate::DomainApprover).
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
@@ -107,6 +108,18 @@ impl NetworkPolicyConfig {
     }
 }
 
+/// What a compiled network policy decides about a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkVerdict {
+    /// The lists allow the host.
+    Allowed,
+    /// The lists deny the host.
+    Denied,
+    /// The lists do not decide: an allow-list does not name the host. The
+    /// sandbox's approver decides.
+    Open,
+}
+
 /// A compiled, matchable network policy.
 #[derive(Debug, Clone)]
 pub struct CompiledNetworkPolicy {
@@ -143,6 +156,21 @@ impl CompiledNetworkPolicy {
                 .matcher
                 .as_ref()
                 .is_some_and(|matcher| matcher.is_match(normalized.as_str())),
+        }
+    }
+}
+
+impl CompiledNetworkPolicy {
+    /// What the lists decide about `domain`: the verdict of
+    /// [`allows_domain`](Self::allows_domain), except that an allow-list that
+    /// does not name the host leaves it [open](NetworkVerdict::Open) for the
+    /// approver instead of denying it.
+    #[must_use]
+    pub fn verdict(&self, domain: &str) -> NetworkVerdict {
+        match (self.mode, self.allows_domain(domain)) {
+            (_, true) => NetworkVerdict::Allowed,
+            (NetworkPolicyMode::AllowList, false) => NetworkVerdict::Open,
+            (_, false) => NetworkVerdict::Denied,
         }
     }
 }

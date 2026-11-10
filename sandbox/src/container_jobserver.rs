@@ -345,10 +345,11 @@ mod tests {
         fn runtime(exec: impl crate::ContainerExec + 'static) -> ContainerShellRuntime {
             ContainerShellRuntime::new(
                 "aither-test-jobserver",
-                crate::ContainerIpcRoute::new(
+                crate::HostRoute::new(
                     "host.docker.internal",
-                    crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1])).unwrap(),
-                ),
+                    std::net::IpAddr::from([127, 0, 0, 1]),
+                )
+                .unwrap(),
                 crate::AnyContainerExec::new(Arc::new(exec)),
             )
         }

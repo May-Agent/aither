@@ -13,17 +13,17 @@
 //! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
 
 use crate::foreground_wait::ForegroundWait;
-use crate::grants::{GitDirAccess, GrantSet, TerminalGrants};
 use crate::heel_binary::SharedHeelBinary;
 use crate::memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
     FootprintRegistry, JobMemory, ProbedContainerMemory, ResponseWindow, SystemFootprints,
 };
+use crate::network_policy::CompiledNetworkPolicy;
 use crate::outage::Outages;
 use std::{
     borrow::Cow,
     future::Future,
-    io::{Read, Write},
+    io::Read,
     net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
     pin::Pin,
@@ -49,13 +49,11 @@ use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
 use heel::{
-    Access, Audited, CpuPriority, DomainRequest, Grant, IoPriority, IpcRouter, NetworkAuditLog,
-    NetworkPolicy, ProcessPriority, ResolvedPath, Sandbox, SandboxConfig, SecurityConfig,
-    StdioConfig, WorkingDir,
+    Access, CpuPriority, Grant, IoPriority, IpcRouter, NetworkAuditLog, ProcessPriority, WorkingDir,
 };
 /// On platforms without `heel supervise` a wait produces no report.
 #[cfg(not(target_os = "linux"))]
-struct TreeReport;
+pub struct TreeReport;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use shell_words::split as split_shell_words;
@@ -76,11 +74,16 @@ use crate::{
         CommandLocation, LocationApproval, PermissionError, PermissionHandler, PermissionRequest,
         Review, TerminalMode,
     },
-    process_tree::{JobMarker, JobProcess, JobTree},
+    process_tree::{JobProcess, JobTree},
     script_language::ScriptLanguage,
     shell_session::{
-        BridgeAddress, ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
+        ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry,
+    },
+    spawn::stdio::{read_chunks, write_chunks},
+    spawn::{
+        AnyDomainApprover, DomainApprover, EnvSource, GrantSnapshot, Grants, LocalSpawn, Pipe,
+        Sandbox, SpawnSpec, Stdio as SpawnStdio, TreeLifetime,
     },
     ssh::{ApprovalReach, SshClient, SshEnvironment, SshServer},
     stdin_watch::{
@@ -127,6 +130,15 @@ where
     }
 }
 
+/// What a terminal's sandboxed network connections are checked against: the
+/// lists, the approver for what they leave open, and the audit log.
+#[derive(Clone, Default)]
+struct NetworkSettings {
+    lists: Option<CompiledNetworkPolicy>,
+    approver: Option<AnyDomainApprover>,
+    audit: Option<NetworkAuditLog>,
+}
+
 /// Opens a daily-rotated network audit log under `dir`, creating the directory if needed.
 ///
 /// Keeps at most `max_files` rotated files. Attach the log with
@@ -145,19 +157,6 @@ pub async fn open_network_audit_log(
     NetworkAuditLog::rolling_daily(dir, max_files).map_err(|error| {
         TerminalError::SandboxSetup(format!("failed to open network audit log: {error}"))
     })
-}
-
-#[derive(Clone)]
-struct PermissionNetworkPolicy<P> {
-    permission_handler: Arc<P>,
-}
-
-impl<P: PermissionHandler + 'static> NetworkPolicy for PermissionNetworkPolicy<P> {
-    async fn check(&self, request: &DomainRequest) -> bool {
-        self.permission_handler
-            .authorize_domain(request.host(), request.port())
-            .await
-    }
 }
 
 fn parse_direct_command(script: &str) -> Result<(String, Vec<String>), TerminalError> {
@@ -244,7 +243,7 @@ fn is_shell_builtin(program: &str) -> bool {
 
 /// The program and arguments that run `script` in a shell. Windows runs
 /// `cmd.exe`; every other platform runs `managed_shell`, the managed bash.
-fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) {
+pub fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) {
     #[cfg(windows)]
     {
         let _ = managed_shell;
@@ -1656,7 +1655,7 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     permission_tx: Sender<PermissionEvent>,
     /// Filesystem grants, shared by every clone; commands snapshot them at
     /// launch.
-    grants: TerminalGrants,
+    grants: Grants,
     /// Set on a subagent's terminal, never on the main agent's.
     subagent: Option<SubagentAuthority>,
     /// The working directory the next foreground command starts in; held on
@@ -1664,9 +1663,9 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     /// its own space.
     carried_dir: Option<CarriedDir>,
     /// Extra environment variables resolved for each spawned execution.
-    env_source: Option<Arc<dyn TerminalEnvSource>>,
+    env_source: Option<Arc<dyn EnvSource>>,
     /// Rolling audit log recording every sandboxed network policy decision.
-    network_audit: Option<NetworkAuditLog>,
+    network: NetworkSettings,
     /// Scheduling priority applied to every sandboxed execution.
     priority: ProcessPriority,
     /// Shared jobserver token broker, when configured.
@@ -1709,7 +1708,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             subagent: self.subagent.clone(),
             carried_dir: self.carried_dir.clone(),
             env_source: self.env_source.clone(),
-            network_audit: self.network_audit.clone(),
+            network: self.network.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
@@ -1761,7 +1760,23 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
     /// into the given rolling audit log.
     #[must_use]
     pub fn with_network_audit_log(mut self, log: NetworkAuditLog) -> Self {
-        self.network_audit = Some(log);
+        self.network.audit = Some(log);
+        self
+    }
+
+    /// Sets the network lists a sandboxed connection is checked against
+    /// first: a host they allow or deny is decided without the approver.
+    #[must_use]
+    pub fn with_network_policy(mut self, policy: CompiledNetworkPolicy) -> Self {
+        self.network.lists = Some(policy);
+        self
+    }
+
+    /// Decides the connections the network lists leave open. Without an
+    /// approver every such connection is denied.
+    #[must_use]
+    pub fn with_domain_approver(mut self, approver: impl DomainApprover + 'static) -> Self {
+        self.network.approver = Some(AnyDomainApprover::new(approver));
         self
     }
 
@@ -1851,11 +1866,11 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             running_tasks,
             permission_rx,
             permission_tx,
-            grants: TerminalGrants::new(),
+            grants: Grants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
             env_source: None,
-            network_audit: None,
+            network: NetworkSettings::default(),
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -1922,11 +1937,11 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             running_tasks,
             permission_rx,
             permission_tx,
-            grants: TerminalGrants::new(),
+            grants: Grants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
             env_source: None,
-            network_audit: None,
+            network: NetworkSettings::default(),
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -1963,7 +1978,7 @@ impl<P, E, State> TerminalTool<P, E, State> {
             subagent: self.subagent,
             carried_dir: self.carried_dir,
             env_source: self.env_source,
-            network_audit: self.network_audit,
+            network: self.network,
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver,
@@ -2049,22 +2064,6 @@ where
     }
 }
 
-/// Supplies extra environment variables resolved for each spawned execution.
-///
-/// Implemented by embedders that need values decided at command time —
-/// secrets read from a live store, per-call overrides — rather than at tool
-/// construction. `Vec<(String, String)>` implements it for static pairs.
-pub trait TerminalEnvSource: std::fmt::Debug + Send + Sync {
-    /// `(name, value)` pairs injected into the spawned command's environment.
-    fn env(&self) -> Vec<(String, String)>;
-}
-
-impl TerminalEnvSource for Vec<(String, String)> {
-    fn env(&self) -> Vec<(String, String)> {
-        self.clone()
-    }
-}
-
 impl<P, E, State> TerminalTool<P, E, State>
 where
     E: Executor + Clone + 'static,
@@ -2118,7 +2117,7 @@ where
     /// host-side values (for example secrets) never reach remote machines.
     /// Caller-provided names override the session's computed environment.
     #[must_use]
-    pub fn with_env_source(mut self, source: impl TerminalEnvSource + 'static) -> Self {
+    pub fn with_env_source(mut self, source: impl EnvSource + 'static) -> Self {
         self.env_source = Some(Arc::new(source));
         self
     }
@@ -2452,7 +2451,7 @@ where
     /// Paths mounted readable for commands, besides the working directory.
     /// The shared runtime grant handle: adding a grant through it affects
     /// every command launched afterwards, on this terminal and its clones.
-    pub fn grants(&self) -> TerminalGrants {
+    pub fn grants(&self) -> Grants {
         self.grants.clone()
     }
 
@@ -2666,7 +2665,11 @@ where
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
-        let grants = TerminalGrants::derived(&self.grants, authority, granted.writable.clone());
+        let grants = self.grants.derived(GrantSnapshot {
+            readable: authority,
+            writable: granted.writable.clone(),
+            ..GrantSnapshot::default()
+        });
         let readable_paths = grants.snapshot().readable.clone();
         let git = match (&container, mount) {
             (Some(confinement), Some(mount)) => {
@@ -2725,7 +2728,7 @@ where
             }),
             carried_dir: None,
             env_source: self.env_source.clone(),
-            network_audit: self.network_audit.clone(),
+            network: self.network.clone(),
             priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
@@ -3136,7 +3139,7 @@ where
             .in_mode(mode)
             .for_job(crate::command::JobOutput::new(
                 self.job_registry.clone(),
-                task_id.clone(),
+                &task_id,
             ));
         let registry = Arc::new(match call {
             Some(call) => registry.for_call(call),
@@ -3173,14 +3176,10 @@ where
         self.executor
             .spawn(execute_terminal_task(SpawnedTerminalTask {
                 working_dir: self.working_dir.clone(),
-                writable_paths: self.grants.snapshot().writable.clone(),
-                readable_paths: self.grants.snapshot().readable.clone(),
-                read_denied_paths: self.grants.snapshot().read_denied.clone(),
-                git_dir: self.grants.snapshot().git_dir,
+                grants: self.grants.clone(),
                 env_source: self.env_source.clone(),
                 executor: self.executor.clone(),
                 registry,
-                permission_handler: self.permission_handler.clone(),
                 job_registry: self.job_registry.clone(),
                 task_id,
                 execution_id,
@@ -3205,7 +3204,7 @@ where
                 taken: taken_rx,
                 completed_tx,
                 running_tasks,
-                network_audit: self.network_audit.clone(),
+                network: self.network.clone(),
                 priority: self.priority,
                 #[cfg(all(unix, feature = "jobserver"))]
                 jobserver: self.jobserver.clone(),
@@ -3445,7 +3444,7 @@ struct CarryContext<'a> {
     carried_dir: Option<&'a CarriedDir>,
     alert_tx: &'a Sender<JobAlert>,
     working_dir: &'a Path,
-    grants: std::sync::Arc<GrantSet>,
+    grants: std::sync::Arc<GrantSnapshot>,
 }
 
 /// Reads and removes a command's directory report, returning the directory
@@ -4057,16 +4056,12 @@ fn background_preview(preview: &str) -> String {
     }
 }
 
-struct StandaloneExecution<P, E> {
+struct StandaloneExecution<E> {
     working_dir: PathBuf,
-    writable_paths: Vec<PathBuf>,
-    readable_paths: Vec<PathBuf>,
-    read_denied_paths: Vec<PathBuf>,
-    git_dir: GitDirAccess,
-    env_source: Option<Arc<dyn TerminalEnvSource>>,
+    grants: Grants,
+    env_source: Option<Arc<dyn EnvSource>>,
     executor: E,
     registry: Arc<ToolRegistry>,
-    permission_handler: Arc<P>,
     job_registry: JobRegistry,
     task_id: IdLease,
     execution_id: String,
@@ -4081,7 +4076,7 @@ struct StandaloneExecution<P, E> {
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: BackgroundStartup,
-    network_audit: Option<NetworkAuditLog>,
+    network: NetworkSettings,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
@@ -4093,16 +4088,12 @@ struct StandaloneExecution<P, E> {
     raw: bool,
 }
 
-struct StandaloneStart<'a, P, E> {
+struct StandaloneStart<'a, E> {
     working_dir: &'a Path,
-    writable_paths: &'a [PathBuf],
-    readable_paths: &'a [PathBuf],
-    read_denied_paths: &'a [PathBuf],
-    git_dir: GitDirAccess,
-    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
+    grants: &'a Grants,
+    env_source: &'a Option<Arc<dyn EnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
-    permission_handler: Arc<P>,
     job_registry: &'a JobRegistry,
     task_id: &'a IdLease,
     execution_id: &'a str,
@@ -4114,7 +4105,7 @@ struct StandaloneStart<'a, P, E> {
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
-    network_audit: Option<NetworkAuditLog>,
+    network: NetworkSettings,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: &'a Option<JobBroker>,
@@ -4124,11 +4115,8 @@ struct StandaloneStart<'a, P, E> {
 struct LocalBackgroundExecution<'a, E> {
     prepared_tools: &'a PreparedTools<PathBuf>,
     working_dir: &'a Path,
-    writable_paths: &'a [PathBuf],
-    readable_paths: &'a [PathBuf],
-    read_denied_paths: &'a [PathBuf],
-    git_dir: GitDirAccess,
-    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
+    grants: &'a Grants,
+    env_source: &'a Option<Arc<dyn EnvSource>>,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a IdLease,
@@ -4142,6 +4130,7 @@ struct LocalBackgroundExecution<'a, E> {
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     priority: ProcessPriority,
+    network: NetworkSettings,
     #[cfg(all(unix, feature = "jobserver"))]
     job_fifo: Option<crate::jobserver::CommandFifo>,
     heel: &'a SharedHeelBinary,
@@ -4149,7 +4138,7 @@ struct LocalBackgroundExecution<'a, E> {
 
 struct ContainerBackgroundExecution<'a, E> {
     executor: E,
-    env_source: &'a Option<Arc<dyn TerminalEnvSource>>,
+    env_source: &'a Option<Arc<dyn EnvSource>>,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a IdLease,
     execution_id: &'a str,
@@ -4266,15 +4255,11 @@ impl SpawnedTerminal {
     }
 }
 
-struct SpawnedTerminalTask<P, E> {
+struct SpawnedTerminalTask<E> {
     working_dir: PathBuf,
-    writable_paths: Vec<PathBuf>,
-    readable_paths: Vec<PathBuf>,
-    read_denied_paths: Vec<PathBuf>,
-    git_dir: GitDirAccess,
+    grants: Grants,
     executor: E,
     registry: Arc<ToolRegistry>,
-    permission_handler: Arc<P>,
     job_registry: JobRegistry,
     task_id: IdLease,
     execution_id: String,
@@ -4300,8 +4285,8 @@ struct SpawnedTerminalTask<P, E> {
     taken: Receiver<Sender<()>>,
     completed_tx: Sender<CompletedTask>,
     running_tasks: Arc<AtomicUsize>,
-    env_source: Option<Arc<dyn TerminalEnvSource>>,
-    network_audit: Option<NetworkAuditLog>,
+    env_source: Option<Arc<dyn EnvSource>>,
+    network: NetworkSettings,
     priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
@@ -4310,21 +4295,16 @@ struct SpawnedTerminalTask<P, E> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn execute_terminal_task<P, E>(task: SpawnedTerminalTask<P, E>)
+async fn execute_terminal_task<E>(task: SpawnedTerminalTask<E>)
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     let SpawnedTerminalTask {
         working_dir,
-        writable_paths,
-        readable_paths,
-        read_denied_paths,
-        git_dir,
+        grants,
         env_source,
         executor,
         registry,
-        permission_handler,
         job_registry,
         task_id,
         execution_id,
@@ -4349,7 +4329,7 @@ where
         taken,
         completed_tx,
         running_tasks,
-        network_audit,
+        network,
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
@@ -4364,14 +4344,10 @@ where
     let policies = registry.policies().clone();
     let result = execute_script_standalone(StandaloneExecution {
         working_dir,
-        writable_paths,
-        readable_paths,
-        read_denied_paths,
-        git_dir,
+        grants,
         env_source,
         executor,
         registry,
-        permission_handler,
         job_registry,
         task_id: task_id.clone(),
         execution_id,
@@ -4386,7 +4362,7 @@ where
         stdin_alerts,
         lifetime,
         background_startup,
-        network_audit,
+        network,
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
@@ -4459,23 +4435,18 @@ where
 
 /// Standalone script execution that can be spawned in a background task.
 #[allow(clippy::too_many_lines)]
-async fn execute_script_standalone<P, E>(
-    request: StandaloneExecution<P, E>,
+async fn execute_script_standalone<E>(
+    request: StandaloneExecution<E>,
 ) -> Result<CompletedCommand, TerminalError>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     let StandaloneExecution {
         working_dir,
-        writable_paths,
-        readable_paths,
-        read_denied_paths,
-        git_dir,
+        grants,
         env_source,
         executor,
         registry,
-        permission_handler,
         job_registry,
         task_id,
         execution_id,
@@ -4490,7 +4461,7 @@ where
         stdin_alerts,
         lifetime,
         background_startup,
-        network_audit,
+        network,
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
@@ -4510,14 +4481,10 @@ where
     debug!(script = %script, "script content");
     let start_result = start_standalone_execution(StandaloneStart {
         working_dir: &working_dir,
-        writable_paths: &writable_paths,
-        readable_paths: &readable_paths,
-        read_denied_paths: &read_denied_paths,
-        git_dir,
+        grants: &grants,
         env_source: &env_source,
         executor,
         registry: &registry,
-        permission_handler,
         job_registry: &job_registry,
         task_id: &task_id,
         execution_id: &execution_id,
@@ -4529,7 +4496,7 @@ where
         stdin_alerts,
         lifetime,
         background_startup: &background_startup,
-        network_audit,
+        network,
         priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver: &jobserver,
@@ -4572,12 +4539,7 @@ where
             carried_dir: carried_dir.as_ref(),
             alert_tx: &alert_tx,
             working_dir: &working_dir,
-            grants: std::sync::Arc::new(GrantSet {
-                readable: readable_paths.clone(),
-                writable: writable_paths.clone(),
-                read_denied: read_denied_paths.clone(),
-                git_dir,
-            }),
+            grants: grants.snapshot(),
         };
         if let Some(reported) = take_cwd_report(carry).await {
             apply_cwd_report(carry, reported, exit_code == 0, &ctx).await;
@@ -4590,11 +4552,10 @@ where
 }
 
 #[allow(clippy::too_many_lines)]
-async fn start_standalone_execution<P, E>(
-    request: StandaloneStart<'_, P, E>,
+async fn start_standalone_execution<E>(
+    request: StandaloneStart<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     let prepared_tools = match request.backend {
@@ -4676,10 +4637,7 @@ where
     let local = LocalBackgroundExecution {
         prepared_tools,
         working_dir: request.working_dir,
-        writable_paths: request.writable_paths,
-        readable_paths: request.readable_paths,
-        read_denied_paths: request.read_denied_paths,
-        git_dir: request.git_dir,
+        grants: request.grants,
         env_source: request.env_source,
         executor: request.executor,
         registry: request.registry,
@@ -4694,41 +4652,14 @@ where
         lifetime: request.lifetime,
         background_startup: request.background_startup,
         priority: request.priority,
+        network: request.network,
         #[cfg(all(unix, feature = "jobserver"))]
         job_fifo,
         heel: request.heel,
     };
-    match request.mode {
-        TerminalMode::Sandboxed => {
-            execute_audited_sandboxed_background(
-                local,
-                PermissionNetworkPolicy {
-                    permission_handler: request.permission_handler,
-                },
-                request.network_audit,
-            )
-            .await
-        }
-        TerminalMode::Unsafe => execute_unsafe_background(local).await,
-    }
-}
-
-/// Runs a sandboxed execution, recording policy verdicts when an audit log is
-/// configured. Unsafe mode bypasses the proxy entirely, so it cannot be
-/// audited at this layer.
-async fn execute_audited_sandboxed_background<E, N>(
-    local: LocalBackgroundExecution<'_, E>,
-    policy: N,
-    audit: Option<NetworkAuditLog>,
-) -> Result<(u32, std::process::Output), TerminalError>
-where
-    E: Executor + Clone + 'static,
-    N: NetworkPolicy + 'static,
-{
-    match audit {
-        Some(log) => execute_sandboxed_background(local, Audited::new(policy, log)).await,
-        None => execute_sandboxed_background(local, policy).await,
-    }
+    // Unsafe mode bypasses the proxy entirely, so its connections are not
+    // audited at this layer.
+    execute_local_background(local).await
 }
 
 async fn save_completed_process_output(
@@ -5007,12 +4938,8 @@ fn committed_git_environment(
     Ok(())
 }
 
-/// The object a spelled path names, in the spelling a resolved grant
-/// checks: canonicalized, without the verbatim prefix Windows adds — an
-/// 8.3 alias or a symlinked component does not name the same object.
-fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
-    ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
-}
+use crate::spawn::resolved;
+use heel::ResolvedPath;
 
 /// The grant a command's jobserver fifo needs: it writes tokens back to it.
 #[cfg(all(unix, feature = "jobserver"))]
@@ -5020,33 +4947,13 @@ pub fn job_fifo_grant(path: &Path) -> heel::Result<Grant> {
     Ok(Grant::new(resolved(path)?, Access::WRITE))
 }
 
-/// The grants a session sandbox gives every command; see
-/// [`crate::SessionSandboxPolicy`], the public way to build them.
-pub fn local_path_grants(
-    writable: &[PathBuf],
-    readable: &[PathBuf],
-    tools: &PreparedTools<PathBuf>,
-) -> heel::Result<Vec<Grant>> {
-    writable
-        .iter()
-        // A grant deleted since it was made grants nothing, and the sandbox
-        // cannot resolve it.
-        .filter(|path| !matches!(path.try_exists(), Ok(false)))
-        // A writable directory also executes: a sandboxed process can already
-        // run anything it writes through an interpreter, and builds must
-        // execute their own outputs.
-        .map(|path| Ok(Grant::new(resolved(path)?, Access::WRITE | Access::EXEC)))
-        .chain(
-            readable
-                .iter()
-                .map(|path| Ok(Grant::new(resolved(path)?, Access::READ))),
-        )
-        .chain(std::iter::once(Ok(Grant::new(
-            resolved(tools.bin_dir())?,
-            Access::EXEC,
-        ))))
-        // The shared `uv` cache and project Python installs, which `uv`
-        // writes and the interpreters it installs execute.
+/// The grants the terminal's tools need in a session sandbox: the managed
+/// tools directory, executable; the shared `uv` directory, which `uv` writes
+/// and the interpreters it installs execute; and the host toolchain homes.
+/// They are the terminal's toolchain specifics, handed to the sandbox as
+/// fixed grants.
+pub fn tool_grants(tools: &PreparedTools<PathBuf>) -> heel::Result<Vec<Grant>> {
+    std::iter::once(Ok(Grant::new(resolved(tools.bin_dir())?, Access::EXEC)))
         .chain(
             tools
                 .uv_dir()
@@ -5054,31 +4961,6 @@ pub fn local_path_grants(
         )
         .chain(toolchain_grants(resolved))
         .collect()
-}
-
-/// The grants that let git work in a granted linked worktree: its common git
-/// directory, with the access `git_dir` gives a writable worktree's (the
-/// worktree's own for a session's terminal, read for a subagent's). The directory is the
-/// repository's, outside the worktree, and a strict sandbox reads only what
-/// is granted. Only a pointer git's back-links confirm
-/// ([`crate::subagent::confirmed_common_dir`]) grants anything, because the
-/// `.git` file sits in a directory the session can write.
-pub async fn linked_worktree_grants(
-    writable: &[PathBuf],
-    readable: &[PathBuf],
-    git_dir: GitDirAccess,
-) -> heel::Result<Vec<Grant>> {
-    let mut grants = Vec::new();
-    for (path, access) in writable
-        .iter()
-        .map(|path| (path, git_dir.writable_worktree_access()))
-        .chain(readable.iter().map(|path| (path, Access::READ)))
-    {
-        if let Some(common) = crate::subagent::confirmed_common_dir(path).await {
-            grants.push(Grant::new(resolved(&common)?, access));
-        }
-    }
-    Ok(grants)
 }
 
 /// Host toolchain homes a local sandbox reaches: (env var, resolved
@@ -5152,17 +5034,6 @@ pub fn session_write_denylist(
     }
 }
 
-/// The paths a local sandbox must not read: heel's credential table plus the
-/// embedder's `denied` absolute paths. Everything else stays readable.
-#[cfg(not(windows))]
-fn session_read_denylist(denied: &[PathBuf]) -> heel::ReadDenylist {
-    denied
-        .iter()
-        .fold(heel::ReadDenylist::credentials(), |denylist, path| {
-            denylist.deny(path)
-        })
-}
-
 /// The toolchain directories a sandboxed build needs: package-manager
 /// installs, compilers, and their caches, each rwx since builds both run
 /// the binaries and write the caches. Credential files inside them stay
@@ -5174,157 +5045,22 @@ fn toolchain_grants(
         .map(move |(_, path)| Ok(Grant::new(resolved(&path)?, Access::WRITE | Access::EXEC)))
 }
 
-async fn execute_sandboxed_background<E, N>(
-    context: LocalBackgroundExecution<'_, E>,
-    policy: N,
-) -> Result<(u32, std::process::Output), TerminalError>
-where
-    E: Executor + Clone + 'static,
-    N: NetworkPolicy + 'static,
-{
-    let (grants, mut runtime_environment, write_denylist) = local_launch_policy(&context).await?;
-    let marker = JobMarker::new();
-    runtime_environment.push(marker.entry());
-    let heel_binary = context
-        .heel
-        .get()
-        .await
-        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
-    let config_builder = SandboxConfig::builder().network(policy);
-    // The Windows backend refuses a write denylist rather than run weaker.
-    // The same holds for the read denylist: reads are open everywhere except
-    // the credential table and the embedder's additions.
-    #[cfg(not(windows))]
-    let config_builder = config_builder
-        .write_denylist(write_denylist)
-        .filesystem_strict(false)
-        .read_denylist(session_read_denylist(context.read_denied_paths));
-    #[cfg(windows)]
-    drop(write_denylist);
-    let config_builder = config_builder
-        .working_dir(
-            // A symlink in the working directory's spelling fails the
-            // sandbox's own resolution — it does not follow a link a
-            // sandboxed process could have planted.
-            std::fs::canonicalize(context.working_dir)
-                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
-        )
-        .grants(grants)
-        .heel_binary(heel_binary)
-        .security(SecurityConfig::interactive())
-        // The session's own commands run their build outputs — anything
-        // written here could already run through an interpreter.
-        .executable_working_dir(true)
-        .priority(context.priority);
-    #[cfg(target_os = "linux")]
-    let config_builder = config_builder.supervised_spawn(true);
-    // `ipc` changes the builder's type, so both arms build where they are.
-    let config = match create_ipc_router(context.registry) {
-        Some(router) => config_builder.ipc(router).build(),
-        None => config_builder.build(),
-    };
-
-    let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
-        .await
-        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
-
-    let launch_script = launch_script(context.language, context.script, context.task_id)?;
-    let launch = build_terminal_launch(
-        &context.prepared_tools.shell()?,
-        &launch_script,
-        context.carry.and_then(|carry| carry.report.as_deref()),
-    )?;
-    let (program, args) = match &launch {
-        TerminalLaunch::Direct { program, args } | TerminalLaunch::Shell { program, args } => {
-            (program, args)
-        }
-    };
-
-    let mut command = sandbox.command(program);
-    if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
-        command = command.current_dir(start);
-    }
-    let (child, tree) = spawn_local_command(
-        command,
-        args,
-        runtime_environment,
-        context.stdin_alerts.as_ref(),
-        &context.lifetime,
-        context.job_registry,
-        &context.executor,
-        &marker,
-    )
-    .await?;
-
-    let pid = child.id();
-    context
-        .job_registry
-        .register_with_tree(
-            pid,
-            context.task_id,
-            context.execution_id,
-            context.script,
-            context.language,
-            context.mode,
-            None,
-            Some(tree.clone()),
-            crate::JobPlace::Host,
-        )
-        .await;
-    context.background_startup.report_ready().await;
-
-    let output = collect_local_process_output(
-        child,
-        context.executor,
-        context.job_registry,
-        pid,
-        LocalJob {
-            tree,
-            lifetime: context.lifetime,
-            stdin_alerts: context.stdin_alerts,
-        },
-        "missing stdout pipe for sandbox process",
-        "missing stderr pipe for sandbox process",
-    )
-    .await?;
-
-    Ok((pid, output))
-}
-
-async fn execute_unsafe_background<E: Executor + Clone + 'static>(
+/// Runs a command on the host: sandboxed through the terminal's [`Sandbox`],
+/// or with host access for an approved `unsafe` one.
+async fn execute_local_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let (_, mut runtime_environment, _) = local_launch_policy(&context).await?;
-    let marker = JobMarker::new();
-    runtime_environment.push(marker.entry());
-    let heel_binary = context
-        .heel
-        .get()
-        .await
-        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
-    let config_builder = SandboxConfig::builder()
-        .working_dir(
-            std::fs::canonicalize(context.working_dir)
-                .unwrap_or_else(|_| context.working_dir.to_path_buf()),
-        )
-        // Unsafe is approved host execution — the user runs the script
-        // themselves in every respect except IPC plumbing, so no
-        // credential or filesystem protection may apply.
-        .host_access()
-        .heel_binary(heel_binary)
-        .executable_working_dir(true)
-        .priority(context.priority);
-    #[cfg(target_os = "linux")]
-    let config_builder = config_builder.supervised_spawn(true);
-    // `ipc` changes the builder's type, so both arms build where they are.
-    let config = match create_ipc_gateway_router(context.registry) {
-        Some(router) => config_builder.ipc(router).build(),
-        None => config_builder.build(),
+    let (sandbox, additions) = local_sandbox(&context).await?;
+    let sandbox = match context.mode {
+        TerminalMode::Sandboxed => sandbox,
+        TerminalMode::Unsafe => sandbox.unconfined(),
     };
-
-    let sandbox = Sandbox::with_config_and_executor(config, context.executor.clone())
-        .await
-        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
+    // The sandboxed IPC router offers the built-in commands and every
+    // command of the mode; the unsafe one the `ipc` gateway.
+    let ipc = match context.mode {
+        TerminalMode::Sandboxed => create_ipc_router(context.registry),
+        TerminalMode::Unsafe => create_ipc_gateway_router(context.registry),
+    };
 
     let launch_script = launch_script(context.language, context.script, context.task_id)?;
     let launch = build_terminal_launch(
@@ -5332,27 +5068,38 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         &launch_script,
         context.carry.and_then(|carry| carry.report.as_deref()),
     )?;
-    let (program, args) = match &launch {
+    let (program, args) = match launch {
         TerminalLaunch::Direct { program, args } | TerminalLaunch::Shell { program, args } => {
             (program, args)
         }
     };
 
-    let mut command = sandbox.command(program);
+    let mut spec = SpawnSpec::new(program)
+        .args(args)
+        .env(additions.environment)
+        .stdio(SpawnStdio {
+            // A background job's stdin is watched; any other reads EOF.
+            stdin: if context.stdin_alerts.is_some() {
+                Pipe::Piped
+            } else {
+                Pipe::Null
+            },
+            ..SpawnStdio::default()
+        });
+    spec.extra_grants = additions.grants;
+    spec.ipc = ipc;
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
-        command = command.current_dir(start);
+        spec = spec.cwd(start);
     }
-    let (child, tree) = spawn_local_command(
-        command,
-        args,
-        runtime_environment,
-        context.stdin_alerts.as_ref(),
-        &context.lifetime,
-        context.job_registry,
-        &context.executor,
-        &marker,
-    )
-    .await?;
+    let lifetime = match context.lifetime {
+        JobLifetime::Foreground { .. } => TreeLifetime::Foreground,
+        JobLifetime::Background => TreeLifetime::Background,
+    };
+    let LocalSpawn {
+        child,
+        tree,
+        sandbox: _sandbox,
+    } = sandbox.spawn_local(spec, lifetime).await?;
 
     let pid = child.id();
     context
@@ -5381,8 +5128,8 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
             lifetime: context.lifetime,
             stdin_alerts: context.stdin_alerts,
         },
-        "missing stdout pipe for unsafe process",
-        "missing stderr pipe for unsafe process",
+        "missing stdout pipe for local process",
+        "missing stderr pipe for local process",
     )
     .await?;
 
@@ -5435,16 +5182,8 @@ impl StdinAlerts {
     }
 }
 
-const fn local_stdin_config(alerts: Option<&StdinAlerts>) -> StdioConfig {
-    if alerts.is_some() {
-        StdioConfig::Piped
-    } else {
-        StdioConfig::Null
-    }
-}
-
 /// Watches one local background job's stdin pipe for a waiting reader.
-struct LocalStdinWatch {
+pub struct LocalStdinWatch {
     probe: LocalStdinProbe,
     feed: FeedCounter,
     detector: EpisodeDetector,
@@ -5520,7 +5259,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
                 alerts,
             });
         }
-        let input_tx = spawn_terminal_stdin_writer(stdin, feed);
+        let input_tx = write_chunks(stdin, feed);
         job_registry.attach_terminal_input(pid, input_tx).await;
     }
 
@@ -5617,12 +5356,12 @@ struct LocalJob {
 /// Generous relative to the few milliseconds a `SIGKILL` exit takes, since a
 /// too-short budget reports survivors that are merely still exiting.
 #[cfg(target_os = "linux")]
-const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A spawned local job: the plain `heel` child on platforms without a
 /// supervisor, or a `heel supervise`-supervised one on Linux, where the
 /// supervisor is the command's parent and owns its whole tree.
-enum LocalChild {
+pub enum LocalChild {
     /// Everywhere but Linux: the sandboxed process itself.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     Plain(heel::Child),
@@ -5638,7 +5377,7 @@ enum LocalChild {
 
 impl LocalChild {
     /// The spawned process's id: the supervisor's on Linux.
-    fn id(&self) -> u32 {
+    pub(crate) fn id(&self) -> u32 {
         match self {
             Self::Plain(child) => child.id(),
             #[cfg(target_os = "linux")]
@@ -5648,7 +5387,7 @@ impl LocalChild {
         }
     }
 
-    fn take_stdin(&mut self) -> Option<std::fs::File> {
+    pub(crate) fn take_stdin(&mut self) -> Option<std::fs::File> {
         match self {
             Self::Plain(child) => child.take_stdin(),
             #[cfg(target_os = "linux")]
@@ -5658,7 +5397,7 @@ impl LocalChild {
         }
     }
 
-    fn take_stdout(&mut self) -> Option<std::fs::File> {
+    pub(crate) fn take_stdout(&mut self) -> Option<std::fs::File> {
         match self {
             Self::Plain(child) => child.take_stdout(),
             #[cfg(target_os = "linux")]
@@ -5668,7 +5407,7 @@ impl LocalChild {
         }
     }
 
-    fn take_stderr(&mut self) -> Option<std::fs::File> {
+    pub(crate) fn take_stderr(&mut self) -> Option<std::fs::File> {
         match self {
             Self::Plain(child) => child.take_stderr(),
             #[cfg(target_os = "linux")]
@@ -5680,7 +5419,7 @@ impl LocalChild {
 
     /// A handle to the supervisor owning the job's tree.
     #[cfg(target_os = "linux")]
-    fn tree_control(&self) -> TreeControl {
+    pub(crate) fn tree_control(&self) -> TreeControl {
         match self {
             Self::Foreground(child) => child.tree_control(),
             #[cfg(target_os = "linux")]
@@ -5692,7 +5431,7 @@ impl LocalChild {
     /// Waits the job out, yielding the command's status and, for a
     /// supervised foreground job, the supervisor's teardown report: what it
     /// found still running under the command and killed.
-    async fn wait_reported(
+    pub(crate) async fn wait_reported(
         &mut self,
     ) -> Result<(std::process::ExitStatus, Option<TreeReport>), heel::Error> {
         match self {
@@ -5705,69 +5444,6 @@ impl LocalChild {
             #[cfg(target_os = "linux")]
             Self::Background(child) => Ok((child.wait().await?, None)),
         }
-    }
-}
-
-/// Spawns a local job's command and hands its tree to whoever owns it.
-///
-/// On Linux the sandbox was built with `supervised_spawn(true)`, so the
-/// command runs under `heel supervise`: a child subreaper inside the sandbox
-/// that owns the whole tree however its members change session, group or
-/// environment. Everywhere else the root's process group is watched through
-/// the process table, keyed by the job's marker.
-#[allow(clippy::too_many_arguments)]
-async fn spawn_local_command<E: Executor + Clone + 'static>(
-    command: heel::Command<'_>,
-    args: &[String],
-    environment: Vec<(String, String)>,
-    stdin_alerts: Option<&StdinAlerts>,
-    lifetime: &JobLifetime,
-    job_registry: &JobRegistry,
-    executor: &E,
-    marker: &JobMarker,
-) -> Result<(LocalChild, JobTree), TerminalError> {
-    let command = command
-        .args(args)
-        .envs(environment)
-        .stdin(local_stdin_config(stdin_alerts))
-        .stdout(StdioConfig::Piped)
-        .stderr(StdioConfig::Piped);
-
-    #[cfg(target_os = "linux")]
-    {
-        let _ = (job_registry, executor, marker);
-        let child = match lifetime {
-            JobLifetime::Foreground { .. } => LocalChild::Foreground(
-                command
-                    .spawn_supervised(heel::supervisor::Foreground {
-                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
-                    })
-                    .await
-                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
-            ),
-            JobLifetime::Background => LocalChild::Background(
-                command
-                    .spawn_supervised(heel::supervisor::Background {
-                        reap_timeout: SUPERVISED_REAP_TIMEOUT,
-                    })
-                    .await
-                    .map_err(|error| TerminalError::Execution(error.to_string()))?,
-            ),
-        };
-        let tree = JobTree::supervised(child.tree_control());
-        Ok((child, tree))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = lifetime;
-        let child = command
-            .spawn()
-            .await
-            .map_err(|error| TerminalError::Execution(error.to_string()))?;
-        let pid = child.id();
-        let tree = job_registry.start_process_tree(executor, pid, marker);
-        Ok((LocalChild::Plain(child), tree))
     }
 }
 
@@ -5809,7 +5485,7 @@ async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), T
 /// answer is `None`); the caller waits for it once its tree is gone. Windows
 /// has no such state and answers the exit status.
 #[cfg_attr(unix, allow(clippy::needless_pass_by_ref_mut))]
-async fn wait_for_local_process_exit(
+pub async fn wait_for_local_process_exit(
     child: &mut LocalChild,
     stdin_watch: Option<LocalStdinWatch>,
 ) -> Result<Option<std::process::ExitStatus>, TerminalError> {
@@ -5899,7 +5575,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     #[cfg(all(unix, feature = "jobserver"))]
     let script = match &context.job_fifo {
         Some(fifo) => {
-            let environment: Arc<dyn TerminalEnvSource> = Arc::new(fifo.environment());
+            let environment: Arc<dyn EnvSource> = Arc::new(fifo.environment());
             inject_env_exports(script, Some(&environment))?
         }
         None => script,
@@ -5957,7 +5633,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             context.executor,
             Arc::clone(context.registry),
             container_runtime.workspace_mount().cloned(),
-            container_runtime.ipc_route().bind(),
+            container_runtime.host_route().address(),
         )?)
     };
     let working_dir = context
@@ -5967,7 +5643,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         &script,
         context.ipc_commands,
         ipc_bridge.as_ref().map(|bridge| ContainerIpcEndpoint {
-            host: container_runtime.ipc_route().host(),
+            host: container_runtime.host_route().name(),
             port: bridge.port(),
         }),
         context.priority,
@@ -6043,57 +5719,16 @@ async fn record_container_exec_outcome(
     }
 }
 
-#[derive(Template)]
-#[template(path = "ssh_tool_execution.sh", escape = "none")]
-struct SshToolExecutionTemplate<'a> {
-    binary: Cow<'a, str>,
-    tools_dir: Cow<'a, str>,
-    /// Read, write and execute access to the shared `uv` directory, quoted.
-    uv_grant: Option<String>,
-    program: Cow<'a, str>,
-    arguments: String,
-}
-
 async fn execute_ssh_background(
     context: SshBackgroundExecution<'_>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let script = context.prepared_tools.wrap_script(&launch_script(
-        context.language,
-        context.script,
-        context.task_id,
-    )?)?;
-    let (program, args) = shell_launch(&context.prepared_tools.shell()?, &script);
     // A default-mode command runs the managed shell under the server's
     // `heel`; an `unsafe` one runs it directly.
-    let remote_cmd = match context.heel {
-        Some(binary) => {
-            let directory = context.prepared_tools.script_bin_dir()?;
-            let uv_grant = context
-                .prepared_tools
-                .uv_dir()
-                .map(|dir| {
-                    let dir = dir
-                        .to_str()
-                        .ok_or_else(|| ToolRuntimeError::InvalidCache(dir.clone()))?;
-                    Ok::<_, ToolRuntimeError>(
-                        shell_words::quote(&format!("{dir}=rwx")).into_owned(),
-                    )
-                })
-                .transpose()?;
-            SshToolExecutionTemplate {
-                binary: shell_words::quote(binary),
-                tools_dir: shell_words::quote(directory),
-                uv_grant,
-                program: shell_words::quote(&program),
-                arguments: shell_words::join(&args),
-            }
-            .render()
-            .map_err(ToolRuntimeError::from)?
-        }
-        None => shell_words::join(
-            std::iter::once(program.as_str()).chain(args.iter().map(String::as_str)),
-        ),
-    };
+    let remote_cmd = crate::spawn::remote_command(
+        context.prepared_tools,
+        context.heel,
+        &launch_script(context.language, context.script, context.task_id)?,
+    )?;
 
     let mut command = context.client.command(context.server, &remote_cmd);
     #[cfg(unix)]
@@ -6155,9 +5790,9 @@ async fn execute_ssh_background(
 /// Prepends a source's env pairs to `script` as `export` statements, for
 /// backends (container exec) whose channel accepts only a script — never an
 /// env channel. Names are validated so a provider can't inject shell syntax.
-fn inject_env_exports(
+pub fn inject_env_exports(
     script: String,
-    env_source: Option<&Arc<dyn TerminalEnvSource>>,
+    env_source: Option<&Arc<dyn EnvSource>>,
 ) -> Result<String, TerminalError> {
     let Some(source) = env_source else {
         return Ok(script);
@@ -6185,7 +5820,7 @@ fn inject_env_exports(
 /// container's memory reader finds the job's processes by: each process the
 /// job starts inherits it.
 fn mark_container_job(script: String, task_id: &str) -> Result<String, TerminalError> {
-    let marker: Arc<dyn TerminalEnvSource> = Arc::new(vec![(
+    let marker: Arc<dyn EnvSource> = Arc::new(vec![(
         crate::memory::JOB_MARKER_ENV.to_string(),
         task_id.to_string(),
     )]);
@@ -6201,34 +5836,101 @@ fn shell_escape(value: &str) -> String {
     output
 }
 
-/// Builds a local command's grants and environment: the session policy
-/// (the one [`crate::SessionSandboxPolicy`] exposes to hosts, with the
-/// command's jobserver fifo), the git shim, committed grant vars, then the
-/// embedder's extra envs (which override).
-async fn local_launch_policy<E: Executor>(
+/// What a session sandbox carries for the terminal's tools: the grants and
+/// environment of its toolchains and the write denylist. The embedder's side
+/// of the sandbox: [`Sandbox`] takes them as fixed grants, environment and
+/// denylist.
+struct SessionBase {
+    grants: Vec<Grant>,
+    environment: Vec<(String, String)>,
+    write_denylist: heel::WriteDenylist,
+}
+
+/// Builds the session base of a session whose directory is `working_dir`:
+/// the session's `HOME`, temporary and cache directories, `PATH` led by the
+/// managed tools directory, `uv` and toolchain variables, and the grants that
+/// let a command run what the `PATH` lists and the tools it needs.
+///
+/// Creates the session's `tmp`, `.cache` and `.config` directories, which
+/// its environment points at.
+async fn session_base(
+    working_dir: &Path,
+    tools: &PreparedTools<PathBuf>,
+) -> Result<SessionBase, TerminalError> {
+    let environment = prepare_session_runtime_environment(working_dir, tools).await?;
+    let setup = |error: heel::Error| TerminalError::SandboxSetup(error.to_string());
+    // The `PATH` directories lead, so a writable grant over one of them is
+    // never narrowed by them.
+    let mut grants = path_directory_grants(&environment).map_err(setup)?;
+    grants.extend(tool_grants(tools).map_err(setup)?);
+    Ok(SessionBase {
+        grants,
+        environment,
+        write_denylist: session_write_denylist(working_dir, tools),
+    })
+}
+
+/// What one local command adds to the sandbox for itself.
+struct CommandAdditions {
+    /// Its jobserver variables and the git shim's committed-grant variables.
+    environment: Vec<(String, String)>,
+    /// Its jobserver fifo, which its build tools write tokens back to.
+    grants: Vec<Grant>,
+}
+
+/// Builds the [`Sandbox`] a local command spawns in, and what the command
+/// adds to it: the session base, the live grants, the network lists with
+/// their approver and audit log, and the embedder's environment source.
+async fn local_sandbox<E: Executor + Clone + 'static>(
     context: &LocalBackgroundExecution<'_, E>,
-) -> Result<(Vec<Grant>, Vec<(String, String)>, heel::WriteDenylist), TerminalError> {
+) -> Result<(Sandbox, CommandAdditions), TerminalError> {
     write_git_shim(context.prepared_tools).await?;
-    let policy = crate::SessionSandboxPolicy::new(
-        context.working_dir,
-        context.writable_paths,
-        context.readable_paths,
-        context.git_dir,
-        context.prepared_tools,
-    )
-    .await?;
-    #[cfg(all(unix, feature = "jobserver"))]
-    let policy = match &context.job_fifo {
-        Some(fifo) => policy.with_job_fifo(fifo)?,
-        None => policy,
+    let session = session_base(context.working_dir, context.prepared_tools).await?;
+    let heel = context
+        .heel
+        .get()
+        .await
+        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
+    let mut additions = CommandAdditions {
+        environment: Vec::new(),
+        grants: Vec::new(),
     };
-    let write_denylist = policy.write_denylist().clone();
-    let (grants, mut env) = policy.into_parts();
-    committed_git_environment(context.registry, &mut env, |path| {
+    #[cfg(all(unix, feature = "jobserver"))]
+    if let Some(fifo) = &context.job_fifo {
+        additions.grants.push(
+            job_fifo_grant(fifo.path())
+                .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?,
+        );
+        additions.environment.extend(fifo.environment());
+    }
+    committed_git_environment(context.registry, &mut additions.environment, |path| {
         Ok(path.display().to_string())
     })?;
-    env.extend(context.env_source.iter().flat_map(|s| s.env()));
-    Ok((grants, env, write_denylist))
+
+    let mut sandbox = Sandbox::new(
+        crate::Backend::Host { heel },
+        context.executor.clone(),
+        context.working_dir,
+    )
+    .with_grants(context.grants.clone())
+    .with_fixed_grants(session.grants)
+    .with_environment(session.environment)
+    .with_write_denylist(session.write_denylist)
+    .with_priority(context.priority)
+    .with_scanner(context.job_registry.scanner());
+    if let Some(source) = context.env_source {
+        sandbox = sandbox.with_env_source(source.clone());
+    }
+    if let Some(lists) = &context.network.lists {
+        sandbox = sandbox.with_network_policy(lists.clone());
+    }
+    if let Some(approver) = &context.network.approver {
+        sandbox = sandbox.with_domain_approver(approver.clone());
+    }
+    if let Some(log) = &context.network.audit {
+        sandbox = sandbox.with_audit_log(log.clone());
+    }
+    Ok((sandbox, additions))
 }
 
 pub async fn prepare_session_runtime_environment(
@@ -6341,7 +6043,7 @@ struct ContainerIpcWrapperTemplate<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct ContainerIpcEndpoint<'a> {
+pub struct ContainerIpcEndpoint<'a> {
     host: &'a str,
     port: u16,
 }
@@ -6354,9 +6056,9 @@ pub const CONTAINER_EXEC_WORKING_DIR: &str = "/workspace";
 /// boundary, but a subagent's keep the per-command sandbox they have on the
 /// host — write access to its own space and its granted paths only.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ContainerConfinement {
-    working_dir: ContainerPath,
-    writable: Vec<ContainerPath>,
+pub struct ContainerConfinement {
+    pub(crate) working_dir: ContainerPath,
+    pub(crate) writable: Vec<ContainerPath>,
 }
 
 /// A container command's sandbox: a subagent's confinement plus write access
@@ -6503,7 +6205,7 @@ fn prioritized_container_script(
     )
 }
 
-fn wrap_container_script(
+pub fn wrap_container_script(
     script: &str,
     ipc_commands: &[String],
     ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
@@ -6591,11 +6293,11 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     executor: E,
     registry: Arc<ToolRegistry>,
     workspace: Option<MountRoot>,
-    bind: BridgeAddress,
+    bind: std::net::IpAddr,
 ) -> Result<ContainerIpcBridge, TerminalError> {
     // The bridge executes host IPC commands for whoever connects, so it binds
     // only the address the container route names — never a wildcard.
-    let listener = StdTcpListener::bind(SocketAddr::new(bind.ip(), 0)).map_err(|e| {
+    let listener = StdTcpListener::bind(SocketAddr::new(bind, 0)).map_err(|e| {
         TerminalError::Execution(format!("failed to bind container IPC tcp port: {e}"))
     })?;
     let local_addr = listener.local_addr().map_err(|e| {
@@ -6834,72 +6536,19 @@ enum TerminalChunk {
     StderrClosed,
 }
 
-fn spawn_terminal_reader<R>(
-    mut reader: R,
-    tx: async_channel::Sender<TerminalChunk>,
-    is_stderr: bool,
-) where
+fn spawn_terminal_reader<R>(reader: R, tx: async_channel::Sender<TerminalChunk>, is_stderr: bool)
+where
     R: Read + Send + 'static,
 {
-    std::thread::spawn(move || {
-        let mut buffer = vec![0_u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    let _ = tx.send_blocking(if is_stderr {
-                        TerminalChunk::StderrClosed
-                    } else {
-                        TerminalChunk::StdoutClosed
-                    });
-                    break;
-                }
-                Ok(count) => {
-                    let chunk = buffer[..count].to_vec();
-                    let _ = tx.send_blocking(if is_stderr {
-                        TerminalChunk::Stderr(chunk)
-                    } else {
-                        TerminalChunk::Stdout(chunk)
-                    });
-                }
-                Err(error) => {
-                    warn!(error = %error, is_stderr, "terminal reader failed");
-                    let _ = tx.send_blocking(if is_stderr {
-                        TerminalChunk::StderrClosed
-                    } else {
-                        TerminalChunk::StdoutClosed
-                    });
-                    break;
-                }
-            }
-        }
+    read_chunks(reader, move |chunk| {
+        let chunk = match (chunk, is_stderr) {
+            (Some(bytes), false) => TerminalChunk::Stdout(bytes),
+            (Some(bytes), true) => TerminalChunk::Stderr(bytes),
+            (None, false) => TerminalChunk::StdoutClosed,
+            (None, true) => TerminalChunk::StderrClosed,
+        };
+        let _ = tx.send_blocking(chunk);
     });
-}
-
-fn spawn_terminal_stdin_writer<W>(
-    mut writer: W,
-    feed: FeedCounter,
-) -> async_channel::Sender<Vec<u8>>
-where
-    W: Write + Send + 'static,
-{
-    let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
-    std::thread::spawn(move || {
-        while let Ok(bytes) = rx.recv_blocking() {
-            if bytes.is_empty() {
-                continue;
-            }
-            feed.record();
-            if let Err(error) = writer.write_all(&bytes) {
-                warn!(error = %error, "terminal stdin write failed");
-                break;
-            }
-            if let Err(error) = writer.flush() {
-                warn!(error = %error, "terminal stdin flush failed");
-                break;
-            }
-        }
-    });
-    tx
 }
 
 async fn drain_terminal_chunks(
@@ -7000,6 +6649,15 @@ pub enum TerminalError {
     Jobserver(#[from] crate::jobserver::JobserverError),
 }
 
+impl From<crate::SpawnError> for TerminalError {
+    fn from(error: crate::SpawnError) -> Self {
+        match error {
+            crate::SpawnError::Setup(message) => Self::SandboxSetup(message),
+            crate::SpawnError::Start(message) => Self::Execution(message),
+        }
+    }
+}
+
 impl<P, E, State> std::fmt::Debug for TerminalTool<P, E, State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalTool")
@@ -7010,10 +6668,12 @@ impl<P, E, State> std::fmt::Debug for TerminalTool<P, E, State> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use super::*;
+    use crate::GitDirAccess;
     #[cfg(unix)]
     use crate::builtin::{InputTerminalArgs, InputTerminalTool};
     use crate::output::empty_stream;
@@ -7076,7 +6736,7 @@ mod tests {
             )
             .await;
         let (ended_tx, ended_rx) = async_channel::bounded::<()>(1);
-        let input_tx = spawn_terminal_stdin_writer(DropSignal(ended_tx), FeedCounter::default());
+        let input_tx = write_chunks(DropSignal(ended_tx), FeedCounter::default());
         registry.attach_terminal_input(9001, input_tx).await;
         registry
             .terminal_input("writer", b"hi\n".to_vec())
@@ -7168,11 +6828,11 @@ mod tests {
     fn test_container_runtime(container_id: &str) -> ContainerShellRuntime {
         ContainerShellRuntime::new(
             container_id,
-            crate::ContainerIpcRoute::new(
+            crate::HostRoute::new(
                 "host.docker.internal",
-                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
-                    .expect("loopback binds the bridge"),
-            ),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+            )
+            .expect("loopback is routable"),
             crate::AnyContainerExec::new(Arc::new(UnreachableContainerExec)),
         )
     }
@@ -7521,7 +7181,7 @@ mod tests {
 
     #[test]
     fn inject_env_exports_prepends_valid_pairs() {
-        let source: Option<Arc<dyn TerminalEnvSource>> = Some(Arc::new(vec![
+        let source: Option<Arc<dyn EnvSource>> = Some(Arc::new(vec![
             ("MY_KEY".to_string(), "it's".to_string()),
             ("OTHER".to_string(), "x".to_string()),
         ]));
@@ -7535,7 +7195,7 @@ mod tests {
 
     #[test]
     fn inject_env_exports_rejects_shell_syntax_names() {
-        let source: Option<Arc<dyn TerminalEnvSource>> =
+        let source: Option<Arc<dyn EnvSource>> =
             Some(Arc::new(vec![("BAD;name".to_string(), "x".to_string())]));
         assert!(inject_env_exports("echo hi".to_string(), source.as_ref()).is_err());
         assert_eq!(
@@ -7599,7 +7259,7 @@ mod tests {
             .await
             .unwrap();
         let uv = ready.uv_dir().expect("the test host has a managed uv");
-        let grants = local_path_grants(&[], &[], &ready).expect("grants build");
+        let grants = tool_grants(&ready).expect("grants build");
         let access_of = |path: &Path| {
             let path = std::fs::canonicalize(path).unwrap();
             grants
@@ -7661,38 +7321,6 @@ mod tests {
         );
     }
 
-    /// Writable working directories execute what they hold — a build output
-    /// or a chmod'd script is runnable.
-    #[tokio::test]
-    async fn local_path_grants_make_writable_dirs_executable() {
-        let workdir = tempfile::tempdir().unwrap();
-        let readonly = tempfile::tempdir().unwrap();
-        let cache = crate::tool_runtime::tests::unlocking_tempdir();
-        let tools = crate::tool_runtime::tests::bundle()
-            .prepare_local(cache.path())
-            .await
-            .unwrap();
-        let grants = local_path_grants(
-            &[workdir.path().to_path_buf()],
-            &[readonly.path().to_path_buf()],
-            &tools,
-        )
-        .expect("grants build");
-        let canonical = |dir: &tempfile::TempDir| std::fs::canonicalize(dir.path()).unwrap();
-        let access_of = |dir: &tempfile::TempDir| {
-            grants
-                .iter()
-                .find(|grant| grant.resolved_path().as_path() == canonical(dir))
-                .map(heel::Grant::access)
-        };
-        let access = access_of(&workdir).expect("workdir grant");
-        assert!(access.can_write());
-        assert!(access.can_execute(), "a writable directory also executes");
-        let access = access_of(&readonly).expect("readonly grant");
-        assert!(!access.can_write());
-        assert!(!access.can_execute());
-    }
-
     fn output_text(output: &CommandStream) -> Option<&str> {
         match output {
             CommandStream::Inline { text } => Some(text.as_str()),
@@ -7724,8 +7352,6 @@ mod tests {
     #[derive(Default)]
     struct TestPermissionHandler {
         mode_checks: AtomicUsize,
-        domain_checks: AtomicUsize,
-        allow_domain: bool,
         allow_unsafe: bool,
     }
 
@@ -7742,15 +7368,6 @@ mod tests {
                 TerminalMode::Sandboxed => true,
                 TerminalMode::Unsafe => self.allow_unsafe,
             }))
-        }
-
-        fn check_domain(
-            &self,
-            _domain: &str,
-            _port: u16,
-        ) -> impl std::future::Future<Output = bool> + Send {
-            self.domain_checks.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(self.allow_domain)
         }
     }
 
@@ -7973,10 +7590,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_mode_allowed_requires_unsafe_approval() {
-        let handler = TestPermissionHandler {
-            allow_domain: true,
-            ..Default::default()
-        };
+        let handler = TestPermissionHandler::default();
         let err = ensure_mode_allowed(
             &handler,
             TerminalMode::Unsafe,
@@ -7991,20 +7605,6 @@ mod tests {
             TerminalError::PermissionDenied(TerminalMode::Unsafe)
         ));
         assert_eq!(handler.mode_checks.load(AtomicOrdering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn permission_network_policy_delegates_domain_checks() {
-        let handler = Arc::new(TestPermissionHandler {
-            allow_domain: true,
-            ..Default::default()
-        });
-        let policy = PermissionNetworkPolicy {
-            permission_handler: handler.clone(),
-        };
-        let request = DomainRequest::new("example.com", 443);
-        assert!(policy.check(&request).await);
-        assert_eq!(handler.domain_checks.load(AtomicOrdering::Relaxed), 1);
     }
 
     /// A handler whose review step answers `review` and whose own route
@@ -8128,64 +7728,6 @@ mod tests {
             ]
         );
         assert_eq!([waits, checks], [1, 1]);
-    }
-
-    #[tokio::test]
-    async fn permission_network_policy_reviews_a_domain_before_asking() {
-        struct Domains(Review, AtomicUsize);
-        impl PermissionHandler for Domains {
-            fn check(
-                &self,
-                _mode: TerminalMode,
-                _script: &str,
-                _language: ScriptLanguage,
-                _location: CommandLocation<'_>,
-            ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send
-            {
-                std::future::ready(Ok(true))
-            }
-            fn review(
-                &self,
-                request: &PermissionRequest<'_>,
-            ) -> impl std::future::Future<Output = Review> + Send {
-                assert_eq!(
-                    *request,
-                    PermissionRequest::Domain {
-                        domain: "example.com",
-                        port: 443
-                    }
-                );
-                std::future::ready(self.0.clone())
-            }
-            fn domain_needs_approval(
-                &self,
-                _domain: &str,
-                _port: u16,
-            ) -> impl std::future::Future<Output = bool> + Send {
-                std::future::ready(true)
-            }
-            fn check_domain(
-                &self,
-                _domain: &str,
-                _port: u16,
-            ) -> impl std::future::Future<Output = bool> + Send {
-                self.1.fetch_add(1, AtomicOrdering::Relaxed);
-                std::future::ready(true)
-            }
-        }
-        let request = DomainRequest::new("example.com", 443);
-        for (review, allowed, asked) in [
-            (Review::Approved, true, 0),
-            (Review::Denied("no".into()), false, 0),
-            (Review::Passed, true, 1),
-        ] {
-            let handler = Arc::new(Domains(review, AtomicUsize::new(0)));
-            let policy = PermissionNetworkPolicy {
-                permission_handler: handler.clone(),
-            };
-            assert_eq!(policy.check(&request).await, allowed);
-            assert_eq!(handler.1.load(AtomicOrdering::Relaxed), asked);
-        }
     }
 
     #[test]
@@ -8782,15 +8324,16 @@ mod tests {
         assert_eq!(grants[0].access(), Access::READ | Access::EXEC);
 
         let session = tempfile::tempdir().unwrap();
-        let config = SandboxConfig::builder()
+        let config = heel::SandboxConfig::builder()
             .network(DenyAll)
             .working_dir(std::fs::canonicalize(session.path()).unwrap())
             .grants(grants)
-            .security(SecurityConfig::interactive())
+            .security(heel::SecurityConfig::interactive())
             .build();
-        let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("sandbox should initialize");
+        let sandbox =
+            heel::Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+                .await
+                .expect("sandbox should initialize");
         let script = format!(
             "{tool}; echo x > {on}/planted 2>/dev/null && echo planted; cat {off}/secret 2>/dev/null; true",
             tool = tool.display(),
@@ -8816,16 +8359,17 @@ mod tests {
     #[tokio::test]
     async fn sandboxed_command_output_executes_pwd() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let config = SandboxConfig::builder()
+        let config = heel::SandboxConfig::builder()
             .network(DenyAll)
             .working_dir(
                 std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf()),
             )
-            .security(SecurityConfig::interactive())
+            .security(heel::SecurityConfig::interactive())
             .build();
-        let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("sandbox should initialize");
+        let sandbox =
+            heel::Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+                .await
+                .expect("sandbox should initialize");
 
         let output = sandbox
             .command("/bin/pwd")
@@ -8861,14 +8405,10 @@ mod tests {
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
             working_dir: tool.working_dir().clone(),
-            writable_paths: Vec::new(),
-            readable_paths: Vec::new(),
-            read_denied_paths: Vec::new(),
-            git_dir: GitDirAccess::ReadWrite,
+            grants: Grants::new(),
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
-            permission_handler: Arc::new(TestPermissionHandler::default()),
             job_registry,
             task_id: crate::test_ids::lease("probe"),
             execution_id: "exec-test".to_string(),
@@ -8885,7 +8425,7 @@ mod tests {
                 alerts: async_channel::unbounded().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
-            network_audit: None,
+            network: NetworkSettings::default(),
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -8906,15 +8446,14 @@ mod tests {
         }
     }
 
-    /// The policy a host gets from `SessionSandboxPolicy` is the one the
-    /// terminal runs a command under: the grants name the writable and
-    /// readable sets, the tools and the `uv` directory with the access the
-    /// terminal gives them, and a sandboxed terminal command sees exactly
-    /// the environment the policy lists and is confined by the same grants.
+    /// The session base is what the terminal runs a command under: the
+    /// grants name the tools and the `uv` directory with the access the
+    /// terminal gives them, and a sandboxed terminal command sees exactly the
+    /// environment the base lists and is confined by the live grants.
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn session_policy_is_the_policy_the_terminal_runs_commands_under() {
+    async fn session_base_is_what_the_terminal_runs_commands_under() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let writable = tempfile::tempdir().unwrap();
         let readable = tempfile::tempdir().unwrap();
@@ -8935,28 +8474,16 @@ mod tests {
         let writable_paths = vec![writable.path().to_path_buf()];
         let readable_paths = vec![readable.path().to_path_buf()];
 
-        let policy = crate::SessionSandboxPolicy::new(
-            &working_dir,
-            &writable_paths,
-            &readable_paths,
-            GitDirAccess::ReadWrite,
-            &tools,
-        )
-        .await
-        .expect("policy builds");
+        let base = session_base(&working_dir, &tools)
+            .await
+            .expect("session base builds");
         let access_of = |path: &Path| {
             let path = std::fs::canonicalize(path).unwrap();
-            policy
-                .grants()
+            base.grants
                 .iter()
                 .find(|grant| grant.resolved_path().as_path() == path)
                 .map(heel::Grant::access)
         };
-        assert_eq!(
-            access_of(writable.path()),
-            Some(Access::WRITE | Access::EXEC)
-        );
-        assert_eq!(access_of(readable.path()), Some(Access::READ));
         assert_eq!(access_of(tools.bin_dir()), Some(Access::EXEC));
         if let Some(uv) = tools.uv_dir() {
             assert_eq!(access_of(uv), Some(Access::WRITE | Access::EXEC));
@@ -8980,14 +8507,15 @@ mod tests {
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
             working_dir,
-            writable_paths,
-            readable_paths,
-            read_denied_paths: Vec::new(),
-            git_dir: GitDirAccess::ReadWrite,
+            grants: test_grants(
+                GitDirAccess::ReadWrite,
+                writable_paths,
+                readable_paths,
+                Vec::new(),
+            ),
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
-            permission_handler: Arc::new(TestPermissionHandler::default()),
             job_registry,
             task_id: crate::test_ids::lease("policy"),
             execution_id: "exec-policy".to_string(),
@@ -9004,7 +8532,7 @@ mod tests {
                 alerts: async_channel::unbounded().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
-            network_audit: None,
+            network: NetworkSettings::default(),
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -9020,8 +8548,8 @@ mod tests {
         let stdout = output_text(&result.stdout).expect("inline stdout");
         let mut lines = stdout.lines();
         for name in names {
-            let expected = policy
-                .environment()
+            let expected = base
+                .environment
                 .iter()
                 .rev()
                 .find_map(|(key, value)| (key == name).then_some(value.as_str()))
@@ -9031,6 +8559,38 @@ mod tests {
         assert_eq!(lines.next(), Some("write-ok"));
         assert_eq!(lines.next(), None, "a readable-only path stays read-only");
         assert!(written.exists() && !refused.exists());
+    }
+
+    /// The grants of a session whose git directory access is `git_dir`: the
+    /// session's own for `ReadWrite`, a child's view for `ReadOnly`.
+    #[cfg(unix)]
+    fn test_grants(
+        git_dir: GitDirAccess,
+        writable: Vec<PathBuf>,
+        readable: Vec<PathBuf>,
+        read_denied: Vec<PathBuf>,
+    ) -> Grants {
+        match git_dir {
+            GitDirAccess::ReadOnly => Grants::new().derived(crate::GrantSnapshot {
+                readable,
+                writable,
+                read_denied,
+                git_dir,
+            }),
+            GitDirAccess::ReadWrite => {
+                let grants = Grants::new();
+                for path in writable {
+                    grants.add_writable(path);
+                }
+                for path in readable {
+                    grants.add_readable(path);
+                }
+                for path in read_denied {
+                    grants.deny_read(path);
+                }
+                grants
+            }
+        }
     }
 
     /// Runs `script` in a sandboxed session with the given grants and returns
@@ -9079,14 +8639,10 @@ mod tests {
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
             working_dir: tool.working_dir().clone(),
-            writable_paths,
-            readable_paths,
-            read_denied_paths,
-            git_dir,
+            grants: test_grants(git_dir, writable_paths, readable_paths, read_denied_paths),
             env_source: None,
             executor: executor_core::tokio::TokioGlobal,
             registry,
-            permission_handler: Arc::new(TestPermissionHandler::default()),
             job_registry: tool.job_registry(),
             task_id: crate::test_ids::lease("grants"),
             execution_id: "exec-grants".to_string(),
@@ -9103,7 +8659,7 @@ mod tests {
                 alerts: async_channel::unbounded().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
-            network_audit: None,
+            network: NetworkSettings::default(),
             priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -9299,9 +8855,12 @@ mod tests {
     /// access; the session's own give it write access.
     #[test]
     fn only_derived_grants_read_worktree_git_data() {
-        let parent = TerminalGrants::new();
+        let parent = Grants::new();
         assert_eq!(parent.snapshot().git_dir, GitDirAccess::ReadWrite);
-        let derived = TerminalGrants::derived(&parent, Vec::new(), vec![PathBuf::from("/w")]);
+        let derived = parent.derived(crate::GrantSnapshot {
+            writable: vec![PathBuf::from("/w")],
+            ..Default::default()
+        });
         assert_eq!(derived.snapshot().git_dir, GitDirAccess::ReadOnly);
     }
 
@@ -9471,7 +9030,7 @@ mod tests {
             Some(main.join(".git")),
         );
         assert_eq!(
-            linked_worktree_grants(&writable, &[], GitDirAccess::ReadWrite)
+            crate::spawn::host::linked_worktree_grants(&writable, &[], GitDirAccess::ReadWrite)
                 .await
                 .unwrap()
                 .len(),
@@ -10119,11 +9678,11 @@ mod tests {
             crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
         let runtime = ContainerShellRuntime::new(
             "aither-test-foreground-stdin",
-            crate::ContainerIpcRoute::new(
+            crate::HostRoute::new(
                 "host.docker.internal",
-                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
-                    .expect("loopback binds the bridge"),
-            ),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+            )
+            .expect("loopback is routable"),
             crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
@@ -10268,11 +9827,11 @@ mod tests {
         let (heard_tx, heard) = async_channel::unbounded();
         let runtime = ContainerShellRuntime::new(
             "aither-test-jobserver",
-            crate::ContainerIpcRoute::new(
+            crate::HostRoute::new(
                 "host.docker.internal",
-                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
-                    .expect("loopback binds the bridge"),
-            ),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+            )
+            .expect("loopback is routable"),
             crate::AnyContainerExec::new(Arc::new(CapturingExec {
                 scripts: scripts_tx,
                 relay_heard: heard_tx,
@@ -11643,13 +11202,9 @@ mod tests {
         builder.configure_tool(ProbeEchoTool);
         let registry = Arc::new(builder.build(test_outputs(outputs.path())));
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
-        let bridge = start_container_ipc_bridge(
-            executor_core::tokio::TokioGlobal,
-            registry,
-            None,
-            BridgeAddress::try_from(loopback).expect("loopback binds the bridge"),
-        )
-        .expect("bridge should start on loopback");
+        let bridge =
+            start_container_ipc_bridge(executor_core::tokio::TokioGlobal, registry, None, loopback)
+                .expect("bridge should start on loopback");
 
         let mut stream = Async::<StdTcpStream>::connect(SocketAddr::new(loopback, bridge.port()))
             .await
@@ -11757,7 +11312,7 @@ mod tests {
     async fn container_bridge_address(
         client: &bollard::Docker,
         container_id: &str,
-    ) -> BridgeAddress {
+    ) -> std::net::IpAddr {
         client
             .inspect_container(
                 container_id,
@@ -11772,8 +11327,6 @@ mod tests {
             .expect("container acceptance requires the bridge network gateway")
             .parse::<std::net::IpAddr>()
             .expect("the bridge gateway should parse as an IP address")
-            .try_into()
-            .expect("the bridge gateway should be a usable bridge address")
     }
 
     /// A Linux `heel` binary for the container under test: `HEEL_BIN` wins,
@@ -11866,11 +11419,11 @@ mod tests {
         // `host.docker.internal` (via `--add-host …:host-gateway`) to exactly
         // that address.
         let bind = container_bridge_address(&client, &container.0).await;
-        println!("ipc bridge bind: {}", bind.ip());
+        println!("ipc bridge bind: {bind}");
         let exec = crate::AnyContainerExec::new(Arc::new(crate::BollardContainerExec::new(client)));
         let runtime = ContainerShellRuntime::new(
             container.0.clone(),
-            crate::ContainerIpcRoute::new("host.docker.internal", bind),
+            crate::HostRoute::new("host.docker.internal", bind).expect("the gateway is routable"),
             exec,
         )
         .with_workspace_mount(MountRoot::new(
@@ -14501,11 +14054,11 @@ mod tests {
         let scripts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let runtime = ContainerShellRuntime::new(
             "aither-test-confinement",
-            crate::ContainerIpcRoute::new(
+            crate::HostRoute::new(
                 "host.docker.internal",
-                crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
-                    .expect("loopback binds the bridge"),
-            ),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+            )
+            .expect("loopback is routable"),
             crate::AnyContainerExec::new(Arc::new(RecordingExec {
                 scripts: scripts.clone(),
             })),
@@ -15295,7 +14848,7 @@ mod tests {
             0,
             "the granted dir is writable"
         );
-        tool.grants().remove_writable(outside.path());
+        tool.grants().revoke(outside.path());
         assert_ne!(
             exit_code_of(
                 &tool,

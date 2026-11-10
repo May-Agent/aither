@@ -61,7 +61,6 @@ mod container;
 #[cfg(all(unix, feature = "jobserver"))]
 mod container_jobserver;
 mod foreground_wait;
-mod grants;
 mod heel_binary;
 mod memory;
 pub mod monitor;
@@ -72,9 +71,9 @@ mod output_compress;
 mod policy;
 mod process_tree;
 mod script_language;
-mod session_policy;
 mod shell_session;
 mod shell_syntax;
+mod spawn;
 mod ssh;
 mod stdin_watch;
 mod subagent;
@@ -130,7 +129,6 @@ pub use container::{
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
 pub use foreground_wait::ForegroundWait;
-pub use grants::{GitDirAccess, GrantSet, TerminalGrants};
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
 /// Re-export of heel's scheduling priority types for terminal-tool configuration.
@@ -156,6 +154,7 @@ pub use monitor::{
 };
 pub use network_policy::{
     CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
+    NetworkVerdict,
 };
 pub use notices::{
     AnySandboxNotices, CommandKilled, DefaultSandboxNotices, MonitorStarted, Refused,
@@ -173,14 +172,18 @@ pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
 pub use script_language::ScriptLanguage;
-pub use session_policy::SessionSandboxPolicy;
 pub use shell_session::{
-    AnyContainerExec, BridgeAddress, BridgeAddressError, ContainerExec, ContainerExecOutcome,
-    ContainerIpcRoute, ContainerProbe, ContainerProbeError, ContainerShellRuntime, ExecLifetime,
-    ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry,
+    AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerProbe, ContainerProbeError,
+    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
+    ShellSessionRegistry,
 };
 pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
+};
+pub use spawn::{
+    AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, DenyAllDomains, DomainApprover,
+    DomainRequest, EnvSource, GitDirAccess, GrantSnapshot, Grants, HostRoute, HostRouteError, Pipe,
+    PreparedSsh, Sandbox, SandboxedChild, SpawnError, SpawnSpec, Stdio,
 };
 pub use ssh::{SshPlatform, SshProbeError, SshServer, SshServerError, probe_ssh_os};
 pub use stdin_watch::StdinWatchSignal;
@@ -195,10 +198,10 @@ pub use terminal::{
     DEFAULT_RESPONSE_WINDOW, DEFAULT_SUBAGENT_IMPORT_LIMIT, DEFAULT_TIMEOUT_CAP, DescendantsKilled,
     DirectoryReset, DirectoryResetReason, JobAlert, LongRunningJob, PermissionEvent,
     PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask, StdinBlockedJob,
-    StdinProbeFailedJob, TerminalArgs, TerminalBinding, TerminalEnvSource, TerminalError,
-    TerminalExecutionMode, TerminalRunError, TerminalRunner, TerminalScript, TerminalTool,
-    TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
-    background_task_channel, open_network_audit_log,
+    StdinProbeFailedJob, TerminalArgs, TerminalBinding, TerminalError, TerminalExecutionMode,
+    TerminalRunError, TerminalRunner, TerminalScript, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryError, TimeoutKill, Unconfigured, background_task_channel,
+    open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,

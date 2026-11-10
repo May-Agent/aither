@@ -13,7 +13,7 @@ use futures_lite::io::AsyncWriteExt;
 
 use crate::memory::MemoryDomain;
 use crate::permission::TerminalMode;
-use crate::process_tree::{JobMarker, JobTree, KillTreeError, ProcessScanner};
+use crate::process_tree::{JobTree, KillTreeError, ProcessScanner};
 use crate::script_language::ScriptLanguage;
 
 /// Information about a running or completed background job.
@@ -651,7 +651,7 @@ impl JobRegistry {
     }
 
     /// Registers a new running job whose process tree was started with
-    /// [`Self::start_process_tree`]: the tree is part of the job from its
+    /// the sandbox that spawned it: the tree is part of the job from its
     /// first moment, so a kill never finds a job without it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn register_with_tree(
@@ -703,19 +703,12 @@ impl JobRegistry {
             .await;
     }
 
-    /// Starts watching the process tree of a local job whose root shell is
-    /// `pid`. Called right after the spawn and before [`Self::register`]:
-    /// the tree follows the root from its first moments, while its children's
-    /// lineage can still be read. The caller keeps `pid` unreaped until it
-    /// calls [`JobTree::finish`].
+    /// The process-table scanner the registry's local jobs share, for the
+    /// sandbox that starts their trees' watch right after the spawn, while the
+    /// children's lineage can still be read.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
-    pub(crate) fn start_process_tree<E: executor_core::Executor>(
-        &self,
-        executor: &E,
-        pid: u32,
-        marker: &JobMarker,
-    ) -> JobTree {
-        JobTree::spawn(executor, self.scanner.clone(), pid, marker)
+    pub(crate) fn scanner(&self) -> ProcessScanner {
+        self.scanner.clone()
     }
 
     /// Appends stdout bytes for a running job.
@@ -1141,8 +1134,8 @@ impl JobRegistry {
 struct ParkedOutput {
     /// Appends waiting for their job to register, by its task id.
     by_task: HashMap<String, Parked>,
-    /// Forgotten jobs whose lease something still holds, such as a command
-    /// that may still report progress.
+    /// Forgotten jobs whose lease something still holds, such as the job's
+    /// flow or a progress report on its way.
     forgotten: Vec<WeakIdLease>,
     /// `timeout` bounds of jobs not registered yet, by task id.
     bounds: HashMap<String, (WeakIdLease, Duration)>,
