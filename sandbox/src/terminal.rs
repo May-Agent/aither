@@ -5029,6 +5029,9 @@ pub fn local_path_grants(
 ) -> heel::Result<Vec<Grant>> {
     writable
         .iter()
+        // A grant deleted since it was made grants nothing, and the sandbox
+        // cannot resolve it.
+        .filter(|path| !matches!(path.try_exists(), Ok(false)))
         // A writable directory also executes: a sandboxed process can already
         // run anything it writes through an interpreter, and builds must
         // execute their own outputs.
@@ -15302,6 +15305,30 @@ mod tests {
             0,
             "the command after the removal is denied the write"
         );
+    }
+
+    /// A writable grant deleted mid-session no longer fails admission, and
+    /// the alert fires when it was the directory the shell had carried.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_writable_grant_does_not_block_the_next_command() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = authority_terminal(dir.path()).await;
+        let receiver = tool.background_receiver();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        let granted = dunce::canonicalize(outside.path()).unwrap();
+        tool.grants().add_writable(&granted);
+        assert_eq!(
+            exit_code_of(&tool, &format!("cd '{}'", granted.display())).await,
+            0
+        );
+        assert!(receiver.take_job_alerts().is_empty());
+
+        std::fs::remove_dir_all(&granted).unwrap();
+        assert_eq!(exit_code_of(&tool, "echo test").await, 0);
+        assert_directory_reset(&receiver, &root, DirectoryResetReason::Removed);
+        assert_eq!(pwd_of(&tool).await, root);
     }
 
     /// Cloned terminals share one grant store: a grant added through the
