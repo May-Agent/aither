@@ -22,11 +22,9 @@ use crate::network_policy::CompiledNetworkPolicy;
 use crate::outage::Outages;
 use std::{
     borrow::Cow,
-    future::Future,
     io::Read,
     net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
-    pin::Pin,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -798,13 +796,11 @@ async fn serve_launches<E>(
     }
 }
 
-/// What a terminal hands the commands bound to it: where it works, the
-/// launcher for the subagents it starts and the runner for the scripts it
-/// runs for them.
+/// What a terminal hands the commands bound to it: where it works and the
+/// launcher for the subagents it starts.
 #[derive(Clone, Debug)]
 pub struct TerminalBinding {
     launcher: TerminalToolFactory,
-    runner: TerminalRunner,
     working_dir: PathBuf,
     role: CommandRole,
     observer: Option<AnyCommandObserver>,
@@ -833,12 +829,6 @@ impl TerminalBinding {
         &self.launcher
     }
 
-    /// Runs scripts on this terminal, under its policy.
-    #[must_use]
-    pub const fn runner(&self) -> &TerminalRunner {
-        &self.runner
-    }
-
     /// The terminal's working directory: the main agent's sandbox, or a
     /// subagent's own space.
     #[must_use]
@@ -860,48 +850,45 @@ impl TerminalBinding {
     }
 }
 
-/// A script a [`TerminalRunner`] runs to its end.
+/// A script [`Shell::run`] runs to its end.
 #[derive(Debug, Clone)]
-pub struct TerminalScript {
-    script: String,
-    working_dir: PathBuf,
-    timeout: Duration,
-    mode: SandboxMode,
+pub struct Script {
+    /// The script's source, in the shell's own interpreter.
+    pub source: String,
+    /// Where it starts: a host path, which for a container shell lies in its
+    /// workspace mount.
+    pub dir: PathBuf,
+    /// The bound after which the script and its process tree are killed.
+    pub timeout: Duration,
+    /// Whether it runs inside the sandbox; an unsandboxed script is put to
+    /// the shell's policies like any other.
+    pub sandbox: SandboxMode,
 }
 
-impl TerminalScript {
-    /// `script`, started in `working_dir` on the host and killed with its
-    /// process tree once `timeout` passes, in [`SandboxMode::Sandboxed`].
-    /// For a container terminal, `working_dir` lies in its workspace mount.
+impl Script {
+    /// `source`, started in `dir` and killed with its process tree once
+    /// `timeout` passes, in [`SandboxMode::Sandboxed`].
     #[must_use]
-    pub fn new(
-        script: impl Into<String>,
-        working_dir: impl Into<PathBuf>,
-        timeout: Duration,
-    ) -> Self {
+    pub fn new(source: impl Into<String>, dir: impl Into<PathBuf>, timeout: Duration) -> Self {
         Self {
-            script: script.into(),
-            working_dir: working_dir.into(),
+            source: source.into(),
+            dir: dir.into(),
             timeout,
-            mode: SandboxMode::Sandboxed,
+            sandbox: SandboxMode::Sandboxed,
         }
     }
 
-    /// Runs the script in `mode`; an unsafe one is put to the terminal's
-    /// permission handler like any unsafe command.
+    /// The same script run in `sandbox`.
     #[must_use]
-    pub const fn with_mode(mut self, mode: SandboxMode) -> Self {
-        self.mode = mode;
+    pub const fn with_sandbox(mut self, sandbox: SandboxMode) -> Self {
+        self.sandbox = sandbox;
         self
     }
 }
 
-/// Why a [`TerminalRunner`] run did not run to an end.
+/// Why a [`Shell::run`] did not run to an end.
 #[derive(Debug, thiserror::Error)]
-pub enum TerminalRunError {
-    /// The terminal that served the command is gone.
-    #[error("the terminal serving this command is gone")]
-    TerminalGone,
+pub enum ShellRunError {
     /// The timeout is zero or above the terminal's cap.
     #[error("timeout must be between 1 and {} seconds", .cap.as_secs())]
     Timeout {
@@ -928,93 +915,6 @@ pub enum TerminalRunError {
     /// Every model-facing id is leased, so the command has no task id.
     #[error(transparent)]
     Ids(#[from] IdsExhausted),
-}
-
-/// Runs scripts on the terminal that serves a terminal-bound command.
-///
-/// A run is under that terminal's whole policy: its grants, network policy,
-/// backend (local sandbox or container), command gate, permission handler,
-/// process priority, environment and jobserver. Each run is a job of the
-/// terminal, listed and killable like any other, but never announced as a
-/// background task: its end is told to the caller alone.
-///
-/// Cloning shares the terminal.
-#[derive(Clone)]
-pub struct TerminalRunner(Arc<dyn TerminalRunnerImpl>);
-
-impl TerminalRunner {
-    /// Runs `script` to its end, through the foreground window and past it,
-    /// and returns its exit status and output; a run its timeout killed ends
-    /// [`CommandOutcome::Killed`].
-    ///
-    /// # Errors
-    /// Returns an error when the terminal is gone, the timeout is out of
-    /// range, the terminal's policy refuses the script, the working
-    /// directory does not map into the terminal's container, or the
-    /// execution fails.
-    pub async fn run(&self, script: TerminalScript) -> Result<CommandResult, TerminalRunError> {
-        self.0.run(script).await
-    }
-}
-
-impl std::fmt::Debug for TerminalRunner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TerminalRunner").finish_non_exhaustive()
-    }
-}
-
-/// The object-safe twin behind [`TerminalRunner`].
-trait TerminalRunnerImpl: Send + Sync {
-    fn run(
-        &self,
-        script: TerminalScript,
-    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, TerminalRunError>> + Send + '_>>;
-}
-
-/// A terminal's runner: the terminal, as configured when its registry was
-/// bound, and that bound registry.
-///
-/// The registry is held weakly: it holds the commands, which hold this
-/// runner, so the terminal's copy here holds no registry of its own and the
-/// runner ends with the terminal.
-struct BoundRunner<E> {
-    terminal: Shell<E, Unconfigured>,
-    registry: std::sync::Weak<ToolRegistry>,
-}
-
-impl<E> TerminalRunnerImpl for BoundRunner<E>
-where
-    E: Executor + Clone + 'static,
-{
-    fn run(
-        &self,
-        script: TerminalScript,
-    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, TerminalRunError>> + Send + '_>> {
-        Box::pin(async move {
-            let registry = self
-                .registry
-                .upgrade()
-                .ok_or(TerminalRunError::TerminalGone)?;
-            self.terminal
-                .clone()
-                .map_state(|Unconfigured| Running { registry })
-                .run_to_end(script)
-                .await
-        })
-    }
-}
-
-/// The registry state of the copy of a terminal one run executes on: the
-/// terminal's bound registry, held for the run.
-#[derive(Clone, Debug)]
-struct Running {
-    registry: Arc<ToolRegistry>,
-}
-
-impl RegistryState for Running {
-    fn registry(&self) -> &Arc<ToolRegistry> {
-        &self.registry
-    }
 }
 
 /// The terminal tool for executing scripts in a sandbox.
@@ -1133,7 +1033,7 @@ struct CwdCarry {
     start: Option<PathBuf>,
     /// The file the command's shell writes its final directory to when it
     /// exits; `None` for a command that carries no directory, such as a
-    /// script a [`TerminalRunner`] runs.
+    /// script [`Shell::run`] runs.
     report: Option<PathBuf>,
     /// Set for a container command: the workspace mount that maps the host
     /// paths above into the container and back.
@@ -1251,7 +1151,7 @@ impl<E: Clone, State: Clone> Clone for Shell<E, State> {
 
 impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
     /// Sets the approver that answers the approvals of scripts no tool call
-    /// carries ([`TerminalRunner::run`] and [`Self::run_background`]), and
+    /// carries ([`Shell::run`] and [`Self::run_background`]), and
     /// of calls whose dispatcher attached none. Without one, such a script
     /// that needs approval does not run.
     #[must_use]
@@ -1493,33 +1393,18 @@ impl<E> Shell<E, Launching>
 where
     E: Executor + Clone + 'static,
 {
-    /// Starts this terminal's launcher and binds its registry to it and to
-    /// its runner.
+    /// Starts this terminal's launcher and binds its registry to it.
     fn into_served(self) -> Shell<E, Configured> {
         let (launcher, requests) = async_channel::unbounded();
-        // A run starts where it is told and leaves the main agent's carried
-        // directory alone.
-        let mut runs_on = self.clone().map_state(|_| Unconfigured);
-        runs_on.carried_dir = None;
-        let mut binding = None;
-        let registry = Arc::new_cyclic(|bound| {
-            let served = TerminalBinding {
-                launcher: TerminalToolFactory { tx: launcher },
-                runner: TerminalRunner(Arc::new(BoundRunner {
-                    terminal: runs_on,
-                    registry: bound.clone(),
-                })),
-                working_dir: self.working_dir.clone(),
-                role: self.registry.registry.role(),
-                observer: self.registry.registry.observer().cloned(),
-                executor: Arc::new(executor_core::AnyExecutor::new(self.executor.clone())),
-                ids: self.ids.clone(),
-            };
-            let registry = ToolRegistry::clone(&self.registry.registry).bind(&served);
-            binding = Some(served);
-            registry
-        });
-        let binding = binding.expect("binding the registry builds the binding");
+        let binding = TerminalBinding {
+            launcher: TerminalToolFactory { tx: launcher },
+            working_dir: self.working_dir.clone(),
+            role: self.registry.registry.role(),
+            observer: self.registry.registry.observer().cloned(),
+            executor: Arc::new(executor_core::AnyExecutor::new(self.executor.clone())),
+            ids: self.ids.clone(),
+        };
+        let registry = Arc::new(ToolRegistry::clone(&self.registry.registry).bind(&binding));
         let source = self.clone();
         self.executor
             .spawn(async move { serve_launches(requests, source).await })
@@ -2336,7 +2221,7 @@ where
 }
 
 /// The execution path every terminal state that serves a registry shares:
-/// a `terminal` call and a [`TerminalRunner`] run go through it alike.
+/// a `terminal` call and a [`Shell::run`] go through it alike.
 impl<E, S> Shell<E, S>
 where
     E: Executor + Clone + 'static,
@@ -2580,6 +2465,27 @@ impl<E: Executor + Clone + 'static> Tool for ShellTool<E> {
 }
 
 impl<E: Executor + Clone + 'static> Shell<E, Configured> {
+    /// Runs `script` to its end, through the foreground window and past it,
+    /// and returns its output and how it ended; a script its timeout killed
+    /// ends [`CommandOutcome::Killed`].
+    ///
+    /// The run is under the shell's whole policy: its grants, network
+    /// policy, backend, policies, priority, environment and jobserver. It
+    /// starts where `script` says and leaves the directory the shell carries
+    /// between calls alone. It is a job of the shell, listed and killable
+    /// like any other, but never announced as one: its end is told to the
+    /// caller alone.
+    ///
+    /// # Errors
+    /// Returns an error when the timeout is out of range, a policy refuses
+    /// the script, the directory does not map into the shell's container, or
+    /// the execution fails.
+    pub async fn run(&self, script: Script) -> Result<crate::ScriptResult, ShellRunError> {
+        let mut shell = self.clone();
+        shell.carried_dir = None;
+        shell.run_to_end(script).await
+    }
+
     /// The model-facing tool of this shell, named and described as the
     /// embedder's [`ShellToolSettings`] say.
     #[must_use]
@@ -3080,7 +2986,7 @@ where
         .await
         .map_err(|error| match error {
             // Kept unwrapped, so the agent loop recognises the refusal.
-            TerminalRunError::Refused(refusal) => anyhow::Error::from(refusal),
+            ShellRunError::Refused(refusal) => anyhow::Error::from(refusal),
             other => anyhow::Error::from(other),
         })
     }
@@ -3097,7 +3003,7 @@ where
         &self,
         admission: Admission<'_>,
         cx: Option<&mut ToolContext>,
-    ) -> Result<ExecutionPreparation, TerminalRunError> {
+    ) -> Result<ExecutionPreparation, ShellRunError> {
         // Leased for as long as the command can be addressed: the registry
         // keeps a clone once the job is registered.
         let task_id = self.ids.lease()?;
@@ -3125,7 +3031,7 @@ where
         let clearance = self
             .check_policies(&task_id, &admission, &start)
             .await
-            .map_err(TerminalRunError::Refused);
+            .map_err(ShellRunError::Refused);
         let clearance = match clearance {
             Ok(clearance) => clearance,
             Err(refusal) => {
@@ -3205,7 +3111,7 @@ where
         environment: Option<&SshEnvironment>,
         clearance: Clearance,
         cx: Option<&mut ToolContext>,
-    ) -> Result<(ExecutionTarget, usize), TerminalRunError> {
+    ) -> Result<(ExecutionTarget, usize), ShellRunError> {
         // Ahead of target resolution and permission, so a blocked command
         // never asks the user for anything. The decision carries no grant.
         // The gate reads shell syntax, so Python source skips it.
@@ -3213,7 +3119,7 @@ where
             && let Some(gate) = self.registry.registry().gate()
             && let GateDecision::Block { reason } = gate.check(admission.script).await
         {
-            return Err(TerminalRunError::Blocked(crate::Refused::rendered(
+            return Err(ShellRunError::Blocked(crate::Refused::rendered(
                 CommandBlocked { reason },
                 |blocked| self.wording().command_blocked(blocked),
             )));
@@ -3317,30 +3223,30 @@ where
         }
     }
 
-    /// Runs `run` to its end on this terminal; see [`TerminalRunner::run`].
-    async fn run_to_end(&self, run: TerminalScript) -> Result<CommandResult, TerminalRunError> {
+    /// Runs `run` to its end on this terminal; see [`Shell::run`].
+    async fn run_to_end(&self, run: Script) -> Result<CommandResult, ShellRunError> {
         let cap = self.limits.timeout_cap.get();
         if run.timeout.is_zero() || run.timeout > cap {
-            return Err(TerminalRunError::Timeout { cap });
+            return Err(ShellRunError::Timeout { cap });
         }
         // A run starts in a host directory, so it resolves the terminal's
         // home backend, never an SSH server.
         let prepared = self
             .admit_command(
                 Admission {
-                    script: &run.script,
+                    script: &run.source,
                     interpreter: Interpreter::Shell,
-                    mode: run.mode,
+                    mode: run.sandbox,
                     location: None,
                     max_lines: None,
                     origin: ScriptOrigin::Run,
                     call: None,
-                    run_dir: Some(&run.working_dir),
+                    run_dir: Some(&run.dir),
                 },
                 None,
             )
             .await?;
-        let start = match run_start(&prepared.target, run.working_dir) {
+        let start = match run_start(&prepared.target, run.dir) {
             Ok(start) => start,
             Err(error) => {
                 self.end_unrun(&prepared.task_id).await;
@@ -3351,7 +3257,7 @@ where
             target: prepared.target,
             task_id: prepared.task_id.clone(),
             execution_id: prepared.execution_id,
-            script: run.script,
+            script: run.source,
             interpreter: Interpreter::Shell,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
@@ -3530,14 +3436,14 @@ struct ExecutionPreparation {
 /// Where a run starts: `dir` on the host, mapped through the workspace
 /// mount for a container command. A run carries no directory, so it writes
 /// no report.
-fn run_start(target: &ExecutionTarget, dir: PathBuf) -> Result<CwdCarry, TerminalRunError> {
+fn run_start(target: &ExecutionTarget, dir: PathBuf) -> Result<CwdCarry, ShellRunError> {
     let container = match &target.backend {
         ExecutionBackend::Local(_) => None,
         ExecutionBackend::Container { runtime, .. } => {
             let mount = runtime
                 .workspace_mount()
                 .cloned()
-                .ok_or(TerminalRunError::NoWorkspaceMount)?;
+                .ok_or(ShellRunError::NoWorkspaceMount)?;
             let start = mount.container_path(&dir)?;
             Some(ContainerCarry {
                 mount,
@@ -13439,58 +13345,8 @@ mod tests {
 
     // ---- terminal runner ----------------------------------------------------
 
-    /// Runs a script on the terminal serving it and answers with how the
-    /// script ended and what it printed.
-    #[cfg(unix)]
-    struct CheckProbe {
-        runner: TerminalRunner,
-    }
-
-    #[cfg(unix)]
-    #[derive(Debug, Deserialize, JsonSchema)]
-    struct CheckProbeArgs {
-        /// The directory the script starts in.
-        dir: String,
-        /// The script.
-        script: String,
-        /// Seconds before the script is killed.
-        timeout: u64,
-    }
-
-    #[cfg(unix)]
-    impl Tool for CheckProbe {
-        fn name(&self) -> Cow<'static, str> {
-            "check_probe".into()
-        }
-
-        type Arguments = CheckProbeArgs;
-        type Res = ToolResult;
-
-        async fn call(
-            &self,
-            arguments: Self::Arguments,
-            _cx: ToolContext,
-        ) -> aither_core::Result<Self::Res> {
-            let result = self
-                .runner
-                .run(TerminalScript::new(
-                    arguments.script,
-                    arguments.dir,
-                    Duration::from_secs(arguments.timeout),
-                ))
-                .await?;
-            let answer = match (&result.outcome, &result.stdout) {
-                (CommandOutcome::Exited { code }, CommandStream::Inline { text }) => {
-                    format!("exit={code} stdout={text}")
-                }
-                (CommandOutcome::Killed { .. }, _) => "killed".to_string(),
-                other => panic!("a run ends exited with inline output or killed: {other:?}"),
-            };
-            Ok(ToolResult::text(answer))
-        }
-    }
-
-    /// Calls `check_probe` on `terminal` and returns its answer.
+    /// Runs a script on `terminal` and answers with how the script ended and
+    /// what it printed.
     #[cfg(unix)]
     async fn run_check_probe(
         terminal: &ConfiguredTestTool,
@@ -13498,31 +13354,24 @@ mod tests {
         script: &str,
         timeout: u64,
     ) -> String {
-        let timeout = timeout.to_string();
-        let answer = query_control(
-            terminal.registry(),
-            "check_probe",
-            &[
-                "--dir",
-                dir.to_str().unwrap(),
-                "--script",
-                script,
-                "--timeout",
-                &timeout,
-            ],
-        )
-        .await;
-        assert_eq!(answer["ok"], true, "{answer}");
-        answer["payload"]["content"].as_str().unwrap().to_string()
+        let result = terminal
+            .run(Script::new(script, dir, Duration::from_secs(timeout)))
+            .await
+            .expect("the run ends");
+        match (&result.outcome, &result.stdout) {
+            (CommandOutcome::Exited { code }, CommandStream::Inline { text }) => {
+                format!("exit={code} stdout={text}")
+            }
+            (CommandOutcome::Killed { .. }, _) => "killed".to_string(),
+            other => panic!("a run ends exited with inline output or killed: {other:?}"),
+        }
     }
 
-    /// A terminal-bound command runs scripts on the terminal serving it,
-    /// under that terminal's policy as it stands at the run — a grant made
-    /// after the registry was bound included — and the runner ends with the
-    /// terminal.
+    /// A run executes a script on the shell, under its policy as it stands at
+    /// the run: a grant made after the registry was bound included.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_terminal_bound_command_runs_a_script_under_its_terminals_policy() {
+    async fn a_run_executes_a_script_under_the_shells_policy() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let clone = tempfile::tempdir().expect("clone dir should be created");
         let read_only = tempfile::tempdir().expect("read-only dir should be created");
@@ -13541,14 +13390,8 @@ mod tests {
         .await
         .expect("prepared tools should be adopted")
         .with_readable_paths([read_only.path()]);
-        let mut builder = ToolRegistryBuilder::new();
-        builder.configure_terminal_bound_tool("check_probe", |binding: &TerminalBinding| {
-            CheckProbe {
-                runner: binding.runner().clone(),
-            }
-        });
         let terminal = tool.with_registry(Arc::new(
-            builder.build(test_outputs(dir.path().join("outputs"))),
+            ToolRegistryBuilder::new().build(test_outputs(dir.path().join("outputs"))),
         ));
         terminal.grants().add_writable(clone.path());
 
@@ -13572,32 +13415,18 @@ mod tests {
         let answer = run_check_probe(&terminal, &clone_dir, "sleep 30", 1).await;
         assert_eq!(answer, "killed", "the timeout kills the run");
 
-        let runner = terminal.binding().runner().clone();
-        let unsafe_run = runner
+        let unsafe_run = terminal
             .run(
-                TerminalScript::new("true", &clone_dir, Duration::from_secs(30))
-                    .with_mode(SandboxMode::Unsandboxed),
+                Script::new("true", &clone_dir, Duration::from_secs(30))
+                    .with_sandbox(SandboxMode::Unsandboxed),
             )
             .await;
         assert!(
             matches!(
                 unsafe_run,
-                Err(TerminalRunError::Terminal(TerminalError::NoApprover(_)))
+                Err(ShellRunError::Terminal(TerminalError::NoApprover(_)))
             ),
             "an unsafe run is put to an approver, and this terminal has none: {unsafe_run:?}"
-        );
-
-        drop(terminal);
-        let gone = runner
-            .run(TerminalScript::new(
-                "true",
-                &clone_dir,
-                Duration::from_secs(30),
-            ))
-            .await;
-        assert!(
-            matches!(gone, Err(TerminalRunError::TerminalGone)),
-            "the runner ends with its terminal: {gone:?}"
         );
     }
 

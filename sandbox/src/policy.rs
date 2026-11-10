@@ -43,7 +43,7 @@ pub enum ScriptOrigin {
     Foreground,
     /// A `terminal` call that detaches the script (`background: true`).
     Background,
-    /// A [`TerminalRunner::run`](crate::TerminalRunner::run) from a
+    /// A [`Shell::run`](crate::Shell::run) from a
     /// terminal-bound command: the embedder's own script, waited on.
     Run,
 }
@@ -260,7 +260,7 @@ impl ScriptDecision {
 /// Decides whether a script may run, before it does.
 ///
 /// Every script of the `terminal` tool, the main agent's and every
-/// subagent's, and every [`TerminalRunner::run`](crate::TerminalRunner::run),
+/// subagent's, and every [`Shell::run`](crate::Shell::run),
 /// is put to every policy of its registry ahead of the command gate and the
 /// approval it needs. The policies of one registry decide concurrently and
 /// the strictest decision wins.

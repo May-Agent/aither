@@ -210,8 +210,8 @@ pub use subagent::{
 };
 pub use terminal::{
     CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, Given, Missing,
-    ShellArgs, ShellBuilder, ShellTool, TerminalBinding, TerminalError, TerminalRunError,
-    TerminalRunner, TerminalScript, Shell, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
+    Script, Shell, ShellArgs, ShellBuilder, ShellRunError, ShellTool, TerminalBinding,
+    TerminalError, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
     open_network_audit_log,
 };
 pub use tool_distribution::{
