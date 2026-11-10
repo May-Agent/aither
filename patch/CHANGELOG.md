@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0](https://github.com/May-Agent/aither/compare/patch-v0.29.0...patch-v0.30.0) - 2026-11-10
+
+### Fixed
+
+- *(sandbox)* pin the heel 0.9.4 executables in the tool distribution
+
 ## [0.27.0](https://github.com/May-Agent/aither/compare/patch-v0.26.0...patch-v0.27.0) - 2026-11-09
 
 ### Added
