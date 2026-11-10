@@ -30,7 +30,8 @@
 //!   a FIFO or of a pipe a child or another thread can write, while a `cat`
 //!   with a private splice pipe does. Kernels before 5.6 sleep
 //!   in `pipe_wait`, shared with blocked writers, and stay undetected. The
-//!   buffered byte count comes from `FIONREAD` on the write end, and the
+//!   buffered byte count comes from `FIONREAD` on a read-only open of the
+//!   reader's descriptor (the probe keeps no descriptor of the pipe), and the
 //!   tree's CPU-idle confirmation works as on macOS.
 //! - Containers: [`CONTAINER_JOB_SCRIPT`] runs the Linux check inside the
 //!   container.
@@ -209,7 +210,7 @@ mod platform {
         fs, io,
         os::{
             fd::AsRawFd,
-            unix::fs::{FileTypeExt, MetadataExt},
+            unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
         },
         path::{Path, PathBuf},
         time::Duration,
@@ -240,17 +241,15 @@ mod platform {
     pub(super) struct Pipe {
         root: u32,
         inode: u64,
-        /// The broker's write end; `FIONREAD` on it reports what the pipe
-        /// buffers right now.
-        write_end: fs::File,
     }
 
     impl Pipe {
+        /// Holds no descriptor of the pipe: a duplicate of the write end
+        /// would keep the job's stdin open after the broker drops its own.
         pub(super) fn new(root: u32, write_end: &fs::File) -> io::Result<Self> {
             Ok(Self {
                 root,
                 inode: write_end.metadata()?.ino(),
-                write_end: write_end.try_clone()?,
             })
         }
 
@@ -259,9 +258,6 @@ mod platform {
         /// that read can be waiting on ([`reader_of_job_pipe`]). The tree's
         /// CPU time rides along for the idle confirmation, as on macOS.
         pub(super) fn probe(&self) -> io::Result<Probe> {
-            if self.buffered()? > 0 {
-                return Ok(Probe::Clear);
-            }
             let mut pending = vec![self.root];
             let mut tree = Vec::new();
             let mut ticks = 0_u64;
@@ -277,24 +273,57 @@ mod platform {
             }
             for (pid, tasks) in &tree {
                 if reader_of_job_pipe(*pid, tasks, self.inode, &tree)? {
+                    if buffered(*pid, self.inode)? > 0 {
+                        return Ok(Probe::Clear);
+                    }
                     return Ok(Probe::BlockedAtCpu(ticks_to_duration(ticks)?));
                 }
             }
             Ok(Probe::Clear)
         }
+    }
 
-        /// Bytes buffered in the job's stdin pipe right now.
-        fn buffered(&self) -> io::Result<libc::c_int> {
+    /// Bytes the job's stdin pipe (`inode`) buffers right now, read through
+    /// a fresh read-only open of the descriptor `pid` holds on it, so no
+    /// descriptor of the pipe outlives the call. Zero when the process or
+    /// descriptor has gone.
+    fn buffered(pid: u32, inode: u64) -> io::Result<libc::c_int> {
+        let fd_dir = proc_dir(pid).join("fd");
+        let entries = match fs::read_dir(&fd_dir) {
+            Ok(entries) => entries,
+            Err(error) if gone(&error) => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            match fs::read_link(&path) {
+                Ok(target) if pipe_inode(&target) == Some(inode) => {}
+                Ok(_) => continue,
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error),
+            }
+            let pipe = match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(pipe) => pipe,
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error),
+            };
             let mut bytes: libc::c_int = 0;
             // SAFETY: `bytes` is a live `c_int`, exactly what `FIONREAD`
             // writes for a pipe descriptor.
-            if unsafe { libc::ioctl(self.write_end.as_raw_fd(), libc::FIONREAD, &raw mut bytes) }
-                < 0
-            {
+            if unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &raw mut bytes) } < 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(bytes)
+            return Ok(bytes);
         }
+        Ok(0)
     }
 
     fn proc_dir(pid: u32) -> PathBuf {

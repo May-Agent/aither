@@ -46,6 +46,7 @@ use aither_core::{AnyIdAllocator, IdLease, IdsExhausted};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
+#[cfg(any(unix, test))]
 use futures_lite::io::AsyncWriteExt;
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
@@ -5764,8 +5765,9 @@ mod tests {
 
     use super::*;
     use crate::GitDirAccess;
+    use crate::JobInputTool;
     #[cfg(unix)]
-    use crate::builtin::{JobInputArgs, JobInputTool};
+    use crate::builtin::JobInputArgs;
     use crate::output::empty_stream;
     use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
     use crate::test_wording::TestWording;

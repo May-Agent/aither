@@ -15,7 +15,9 @@ use crate::interpreter::Interpreter;
 use crate::memory::MemoryDomain;
 use crate::output_policy::OutputPolicy;
 use crate::policy::SandboxMode;
-use crate::process_tree::{JobTree, KillTreeError, ProcessScanner};
+#[cfg(unix)]
+use crate::process_tree::KillTreeError;
+use crate::process_tree::{JobTree, ProcessScanner};
 use crate::terminal::TimeoutKill;
 
 /// Information about a running or completed background job.

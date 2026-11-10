@@ -47,7 +47,9 @@ pub use domain::{
 pub use env::EnvSource;
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
 pub use host::{LocalSpawn, TreeLifetime, resolved};
-pub use launch::{ContainerLaunch, RemoteLaunch, shell_arguments};
+#[cfg(not(windows))]
+pub use launch::shell_arguments;
+pub use launch::{ContainerLaunch, RemoteLaunch};
 pub use route::{HostRoute, HostRouteError};
 
 use crate::network_policy::CompiledNetworkPolicy;
