@@ -29,8 +29,8 @@ pub use lifecycle::{
 };
 pub use live::{HookKind, HookWarning, HooksConfig, HooksConfigError, LiveHooks, LiveHooksError};
 pub use reviewer::{
-    DomainSubject, ReviewAnswer, ReviewRequest, ReviewSubject, ReviewedDomains, ReviewedPermission,
-    ReviewerConfig,
+    CommandSubject, DomainSubject, Review, ReviewAnswer, ReviewRequest, ReviewSubject,
+    ReviewedDomains, ReviewedScripts, ReviewerConfig, ScriptLocation,
 };
 pub use runner::{HookCommand, HookRole, HookRunError, HookRunner};
 pub use script::HookCheckError;

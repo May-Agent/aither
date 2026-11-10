@@ -20,7 +20,6 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use crate::sandbox::TerminalTool;
-use crate::sandbox::permission::NoopPermissionHandler;
 use crate::{AgentOptions, TerminalAgentBuilder, test_support};
 
 const HANDOFF_JSON: &str = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["continue"],"recovery_hints":[],"skills":[]}"#;
@@ -225,7 +224,7 @@ async fn an_mcp_tool_added_mid_session_runs_at_once_and_is_announced_once() {
         .expect("the scripted server connects");
 
     let dir = tempdir().expect("temp dir");
-    let terminal = TerminalTool::new_exact(dir.path(), NoopPermissionHandler, TokioGlobal)
+    let terminal = TerminalTool::new_exact(dir.path(), TokioGlobal)
         .await
         .expect("terminal tool initializes")
         // The call's own timeout ends `gamma` before the window can promote

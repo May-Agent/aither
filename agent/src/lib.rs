@@ -135,7 +135,7 @@ pub use error::AgentError;
 pub use event::{AgentEvent, CompactionOutcome, TimedEvent};
 pub use external_hook::{
     ExternalHooks, HookTestTool, HooksConfig, InjectedContext, LifecycleHookConfig, LiveHooks,
-    ReviewedDomains, ReviewedPermission, ReviewerConfig,
+    ReviewedDomains, ReviewedScripts, ReviewerConfig,
 };
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
@@ -192,7 +192,7 @@ pub use aither_core::llm::Tool;
 ///
 /// let agent = Agent::builder(llm)
 ///     .system_prompt(TERMINAL_SYSTEM_PROMPT)
-///     .terminal(permission_handler, config, output_store)
+///     .terminal(terminal_tool)
 ///     .build();
 /// ```
 pub const TERMINAL_SYSTEM_PROMPT: &str = include_str!("prompts/system.md");

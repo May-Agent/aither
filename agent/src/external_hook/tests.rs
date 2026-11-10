@@ -638,11 +638,11 @@ async fn a_hook_that_fails_in_every_way_is_reported_and_ignored() {
 }
 
 pub mod reviewers {
-    use aither_sandbox::permission::{
-        CommandLocation, PermissionError, PermissionHandler, PermissionRequest, Review,
-        TerminalMode,
+    use aither_sandbox::permission::TerminalMode;
+    use aither_sandbox::{
+        DomainApprover, DomainRequest, SandboxMode, ScriptCheck, ScriptDecision, ScriptDir,
+        ScriptOrigin, ScriptPolicy,
     };
-    use aither_sandbox::{DomainApprover, DomainRequest};
 
     use super::*;
 
@@ -654,12 +654,18 @@ printf '\n' >> "$1"
 printf '%s' "$2"
 "#;
 
-    /// The existing route: records the requests that reach it and answers
-    /// `allow`.
-    #[derive(Clone, Default)]
-    pub struct Route {
-        pub asked: Arc<Mutex<Vec<(TerminalMode, String)>>>,
-        pub allow: bool,
+    /// The reviewers of a scope, asked about one request at a time.
+    pub struct Handler(ExternalHooks);
+
+    impl Handler {
+        pub const fn new(hooks: ExternalHooks) -> Self {
+            Self(hooks)
+        }
+
+        /// The chain's decision on `request`, as the scope's own role.
+        pub async fn review(&self, request: &ReviewSubject<'_>) -> Review {
+            self.0.review(self.0.role(), *request).await
+        }
     }
 
     /// The existing domain route: records the domains that reach it and
@@ -677,25 +683,12 @@ printf '%s' "$2"
         }
     }
 
-    pub const COMMAND: PermissionRequest<'static> = PermissionRequest::Command {
+    pub const COMMAND: ReviewSubject<'static> = ReviewSubject::Command(CommandSubject::Command {
         mode: TerminalMode::Unsafe,
         script: "make install",
         language: ScriptLanguage::Shell,
-        location: CommandLocation::Local,
-    };
-
-    impl PermissionHandler for Route {
-        fn check(
-            &self,
-            mode: TerminalMode,
-            script: &str,
-            _language: ScriptLanguage,
-            _location: CommandLocation<'_>,
-        ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-            self.asked.lock().unwrap().push((mode, script.to_string()));
-            std::future::ready(Ok(self.allow))
-        }
-    }
+        location: ScriptLocation::Local,
+    });
 
     pub fn reviewer(dir: &Path, name: &str, log: &Path, answer: &str) -> ReviewerConfig {
         ReviewerConfig {
@@ -714,20 +707,44 @@ printf '%s' "$2"
         }
     }
 
-    async fn handler(chain: Vec<ReviewerConfig>) -> (ReviewedPermission<Route>, Route) {
+    async fn handler(chain: Vec<ReviewerConfig>) -> Handler {
         let tools = crate::test_support::prepared_fixture().await;
-        let route = Route::default();
-        (
-            ReviewedPermission::new(route.clone(), reviewer_hooks(chain, &tools).await),
-            route,
-        )
+        Handler::new(reviewer_hooks(chain, &tools).await)
+    }
+
+    /// Asks `policy` about `script` run by `call`, outside the sandbox at
+    /// home unless it says otherwise.
+    async fn check(
+        policy: &ReviewedScripts,
+        script: &str,
+        sandbox: SandboxMode,
+        location: Option<&str>,
+        call: Option<&aither_core::llm::CallIdentity>,
+    ) -> ScriptDecision {
+        let start = ScriptDir::Host(std::env::temp_dir());
+        policy
+            .check(
+                &ScriptCheck {
+                    task_id: "task",
+                    script,
+                    language: ScriptLanguage::Shell,
+                    shell: None,
+                    origin: ScriptOrigin::Foreground,
+                    sandbox,
+                    location,
+                    start: &start,
+                    call,
+                },
+                &(),
+            )
+            .await
     }
 
     #[tokio::test]
-    async fn approve_grants_without_reaching_the_route_and_ends_the_chain() {
+    async fn approve_grants_and_ends_the_chain() {
         let dir = tempfile::tempdir().unwrap();
         let (first, second) = (dir.path().join("first"), dir.path().join("second"));
-        let (handler, route) = handler(vec![
+        let handler = handler(vec![
             reviewer(dir.path(), "first", &first, r#"{"decision":"approve"}"#),
             reviewer(
                 dir.path(),
@@ -738,7 +755,6 @@ printf '%s' "$2"
         ])
         .await;
         assert_eq!(bounded(handler.review(&COMMAND)).await, Review::Approved);
-        assert!(route.asked.lock().unwrap().is_empty());
         assert_eq!(logged(&first).len(), 1);
         assert!(!second.exists(), "the first decision ends the chain");
         assert_eq!(
@@ -751,7 +767,7 @@ printf '%s' "$2"
     async fn deny_refuses_with_a_reason_the_model_reads() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let (handler, route) = handler(vec![
+        let handler = handler(vec![
             reviewer(dir.path(), "policy", &log, r#"{"decision":"pass"}"#),
             reviewer(
                 dir.path(),
@@ -768,21 +784,15 @@ printf '%s' "$2"
             reason.trim(),
             "The permission reviewer guard denied this request: touches /etc"
         );
-        assert!(route.asked.lock().unwrap().is_empty());
         assert_eq!(logged(&log).len(), 2, "the passing reviewer ran first");
     }
 
     #[tokio::test]
-    async fn a_request_every_reviewer_passes_reaches_the_existing_route() {
+    async fn a_script_every_reviewer_passes_is_left_to_the_other_policies() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let route = Route {
-            allow: true,
-            ..Route::default()
-        };
         let tools = crate::test_support::prepared_fixture().await;
-        let handler = ReviewedPermission::new(
-            route.clone(),
+        let policy = ReviewedScripts::new(
             reviewer_hooks(
                 vec![
                     reviewer(dir.path(), "a", &log, r#"{"decision":"pass"}"#),
@@ -792,49 +802,65 @@ printf '%s' "$2"
             )
             .await,
         );
-        assert_eq!(bounded(handler.review(&COMMAND)).await, Review::Passed);
-        assert!(
-            bounded(handler.check(
-                TerminalMode::Unsafe,
-                "make install",
-                ScriptLanguage::Shell,
-                CommandLocation::Local
-            ))
-            .await
-            .unwrap()
-        );
-        assert_eq!(
-            *route.asked.lock().unwrap(),
-            [(TerminalMode::Unsafe, "make install".to_string())]
-        );
+        let decision = bounded(check(
+            &policy,
+            "make install",
+            SandboxMode::Unsandboxed,
+            None,
+            None,
+        ))
+        .await;
+        assert!(matches!(decision, ScriptDecision::Pass), "{decision:?}");
         assert_eq!(logged(&log).len(), 2);
     }
 
     #[tokio::test]
-    async fn a_subagents_request_is_labelled_and_reaches_the_same_route() {
+    async fn the_policy_reviews_only_scripts_that_cross_the_boundary_as_the_calling_agent() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let (handler, route) = handler(vec![reviewer(
-            dir.path(),
-            "a",
-            &log,
-            r#"{"decision":"pass"}"#,
-        )])
-        .await;
-        let subagent = handler
-            .for_subagent()
-            .expect("a reviewed handler labels subagents");
-        assert_eq!(bounded(subagent.review(&COMMAND)).await, Review::Passed);
-        bounded(subagent.check(
-            TerminalMode::Unsafe,
-            "make install",
-            ScriptLanguage::Shell,
-            CommandLocation::Local,
+        let tools = crate::test_support::prepared_fixture().await;
+        let policy = ReviewedScripts::new(
+            reviewer_hooks(
+                vec![reviewer(
+                    dir.path(),
+                    "guard",
+                    &log,
+                    r#"{"decision":"deny","reason":"touches /etc"}"#,
+                )],
+                &tools,
+            )
+            .await,
+        );
+
+        let inside = bounded(check(&policy, "ls", SandboxMode::Sandboxed, None, None)).await;
+        assert!(matches!(inside, ScriptDecision::Pass), "{inside:?}");
+        assert!(!log.exists(), "a sandboxed script at home is not reviewed");
+
+        let subagent = aither_core::llm::CallIdentity::new(
+            aither_core::llm::ToolCallId::new("call-1"),
+            aither_core::llm::AgentIdentity::Subagent(aither_core::llm::SubagentIdentity::new(
+                "worker", None,
+            )),
+        );
+        let remote = bounded(check(
+            &policy,
+            "make",
+            SandboxMode::Sandboxed,
+            Some("build"),
+            Some(&subagent),
         ))
-        .await
-        .unwrap();
-        assert_eq!(logged(&log)[0]["role"], "subagent");
-        assert_eq!(route.asked.lock().unwrap().len(), 1);
+        .await;
+        let ScriptDecision::Refuse(refusal) = remote else {
+            panic!("the guard denies a script on a server");
+        };
+        assert_eq!(
+            refusal.text().trim(),
+            "The permission reviewer guard denied this request: touches /etc"
+        );
+        assert_eq!(
+            logged(&log)[0],
+            serde_json::json!({"role": "subagent", "kind": "command", "mode": "sandboxed", "script": "make", "language": "shell", "location": {"kind": "ssh", "server": "build"}})
+        );
     }
 
     #[tokio::test]
@@ -851,7 +877,7 @@ printf '%s' "$2"
                 },
             }
         };
-        let (handler, route) = handler(vec![
+        let handler = handler(vec![
             failing("#!/bin/sh\nexit 3\n", "crashes"),
             failing("#!/bin/sh\nsleep 30\n", "hangs"),
             failing("#!/bin/sh\nprintf 'approve please'\n", "garbles"),
@@ -874,7 +900,6 @@ printf '%s' "$2"
             Review::Passed,
             "a failure grants nothing"
         );
-        assert!(route.asked.lock().unwrap().is_empty());
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "the hang was killed"

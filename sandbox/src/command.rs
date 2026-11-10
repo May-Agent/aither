@@ -830,7 +830,6 @@ impl std::fmt::Debug for DynTerminalToolEntry {
 pub struct DynTerminalTool {
     pub(crate) entries: Vec<DynTerminalToolEntry>,
     pub(crate) background_receiver: crate::terminal::BackgroundTaskReceiver,
-    pub(crate) permission_receiver: crate::terminal::PermissionEventReceiver,
     pub(crate) kept_receiver: KeptExchangeReceiver,
     pub(crate) job_registry: crate::job_registry::JobRegistry,
     pub(crate) working_dir: PathBuf,
@@ -848,12 +847,6 @@ impl DynTerminalTool {
     #[must_use]
     pub fn background_receiver(&self) -> crate::terminal::BackgroundTaskReceiver {
         self.background_receiver.clone()
-    }
-
-    /// Returns the receiver for terminal permission lifecycle events.
-    #[must_use]
-    pub fn permission_receiver(&self) -> crate::terminal::PermissionEventReceiver {
-        self.permission_receiver.clone()
     }
 
     /// Returns the receiver for the terminal calls whose kept commands
@@ -965,7 +958,7 @@ pub struct ToolRegistryBuilder {
     sets: Vec<AnyCommandSet>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
-    policies: Vec<crate::AnyCommandPolicy>,
+    policies: Vec<crate::AnyScriptPolicy>,
     kept: HashSet<String>,
     notices: crate::AnySandboxNotices,
 }
@@ -1262,11 +1255,11 @@ impl ToolRegistryBuilder {
 
     /// Puts every script the registry's terminals run, the main agent's and
     /// every subagent's, to `policy` before it runs; see
-    /// [`CommandPolicy`](crate::CommandPolicy). Policies are asked in the
+    /// [`ScriptPolicy`](crate::ScriptPolicy). Policies are asked in the
     /// order they are added, and each agent's terminal binds every one to
     /// fresh state.
-    pub fn command_policy(&mut self, policy: impl crate::CommandPolicy) {
-        self.policies.push(crate::AnyCommandPolicy::new(policy));
+    pub fn script_policy(&mut self, policy: impl crate::ScriptPolicy) {
+        self.policies.push(crate::AnyScriptPolicy::new(policy));
     }
 
     /// Renders every refusal and notice of the registry, and of the terminals
@@ -1298,7 +1291,7 @@ impl ToolRegistryBuilder {
             mode: None,
             observer: self.observer,
             gate: self.gate,
-            policies: crate::policy::CommandPolicies::new(self.policies),
+            policies: crate::policy::ScriptPolicies::new(self.policies),
             notices: self.notices,
             call: None,
             output: None,
@@ -1520,7 +1513,7 @@ pub struct ToolRegistry {
     gate: Option<AnyCommandGate>,
     /// The command policies, bound to the state of the agent this registry
     /// serves; every view of the registry for that agent shares them.
-    policies: crate::policy::CommandPolicies,
+    policies: crate::policy::ScriptPolicies,
     /// Renders the refusals and notices of the registry and its terminals.
     notices: crate::AnySandboxNotices,
     /// The `terminal` call this registry serves, once [`Self::for_call`] has
@@ -1718,9 +1711,9 @@ impl ToolRegistry {
         self.gate.as_ref()
     }
 
-    /// The command policies every script of the terminal serving this
+    /// The script policies every script of the terminal serving this
     /// registry is put to, bound to its agent's state.
-    pub(crate) const fn policies(&self) -> &crate::policy::CommandPolicies {
+    pub(crate) const fn policies(&self) -> &crate::policy::ScriptPolicies {
         &self.policies
     }
 

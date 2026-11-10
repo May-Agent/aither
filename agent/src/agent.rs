@@ -51,11 +51,9 @@ use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
 
 use aither_sandbox::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, DirectoryResetReason, JobAlert, JobProcess,
-    JobRegistry, MonitorEnd, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
-    TerminalArgs, TerminalExecutionMode, TerminalMode,
+    BackgroundTaskEvent, BackgroundTaskReceiver, JobAlert, JobProcess, JobRegistry, MonitorEnd,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 const BACKGROUND_TASK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -93,11 +91,6 @@ fn request_chars(
         })
         .sum();
     messages + definitions
-}
-
-enum ExecutionSignal<T> {
-    Tool(T),
-    Permission(PermissionEvent),
 }
 
 struct ModelTurn {
@@ -353,13 +346,11 @@ pub struct FinishedToolCall {
     result: aither_core::llm::ToolResult,
     /// The call was refused for re-reading output that had not changed: a
     /// `terminal_read` of a task with no new output
-    /// ([`aither_sandbox::UnchangedTaskRead`]) or a script a command policy
-    /// refused as one ([`aither_sandbox::PolicyRefusal::is_unchanged_read`]).
+    /// ([`aither_sandbox::UnchangedTaskRead`]).
     unchanged_read: bool,
 }
 
 type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
-type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
 
 async fn handle_model_event<H: Hook>(
     hooks: &H,
@@ -611,11 +602,6 @@ enum JobAlertText<'a> {
     StdinBlocked { task_id: &'a str },
     /// Watching the job's stdin failed.
     StdinProbeFailed { task_id: &'a str, error: &'a str },
-    /// The carried working directory was reset.
-    DirectoryReset {
-        dir: String,
-        reason: DirectoryResetReason,
-    },
     /// A monitor delivered new output lines.
     MonitorIncrement {
         task_id: &'a str,
@@ -656,10 +642,6 @@ pub fn default_job_alert(alert: &JobAlert) -> String {
         JobAlert::DescendantsKilled(killed) => JobAlertText::DescendantsKilled {
             processes: &killed.processes,
             omitted: killed.omitted,
-        },
-        JobAlert::DirectoryReset(reset) => JobAlertText::DirectoryReset {
-            dir: reset.dir.display().to_string(),
-            reason: reset.reason,
         },
         JobAlert::LongRunning(job) => JobAlertText::LongRunning {
             task_id: &job.task_id,
@@ -727,66 +709,6 @@ enum BackgroundOutcome<'a> {
     },
     /// The task could not be run or tracked to completion.
     Failed { error: &'a str },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PermissionEventKey {
-    mode: TerminalMode,
-    script: String,
-    /// The SSH server the call names; `None` for the home environment.
-    location: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct PermissionPauseTracker {
-    pending: HashMap<PermissionEventKey, VecDeque<String>>,
-    active: HashMap<PermissionEventKey, VecDeque<String>>,
-}
-
-impl PermissionPauseTracker {
-    fn from_tool_calls(tool_calls: &[aither_core::llm::ToolCall]) -> Self {
-        let mut tracker = Self::default();
-        for call in tool_calls {
-            let Some(key) = permission_event_key_for_call(call.name.as_str(), &call.arguments)
-            else {
-                continue;
-            };
-            tracker
-                .pending
-                .entry(key)
-                .or_default()
-                .push_back(call.id.clone());
-        }
-        tracker
-    }
-
-    fn event_for(&mut self, event: PermissionEvent) -> Option<(RunPauseReason, String)> {
-        let key = PermissionEventKey {
-            mode: event.mode,
-            script: event.script,
-            location: event.location,
-        };
-        match event.stage {
-            PermissionEventStage::Waiting => {
-                let tool_call_id = self.pending.get_mut(&key)?.pop_front()?;
-                self.active
-                    .entry(key)
-                    .or_default()
-                    .push_back(tool_call_id.clone());
-                Some((RunPauseReason::PermissionRequest, tool_call_id))
-            }
-            PermissionEventStage::Resolved => {
-                let tool_call_id = self.active.get_mut(&key)?.pop_front()?;
-                // A call on a server waits again for its `unsafe` approval
-                // once its first-use approval resolves.
-                self.pending
-                    .entry(key)
-                    .or_default()
-                    .push_front(tool_call_id.clone());
-                Some((RunPauseReason::PermissionRequest, tool_call_id))
-            }
-        }
-    }
 }
 
 /// An autonomous agent that processes tasks using tiered language models.
@@ -966,8 +888,6 @@ pub struct Agent<
 
     /// Receiver for completed background terminal tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
-    /// Receiver for permission wait/resume events emitted by terminal execution.
-    pub(crate) permission_receiver: Option<PermissionEventReceiver>,
     /// The terminal calls in which a kept command succeeded.
     pub(crate) kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// Calls reported by `kept_receiver` whose results are not committed yet.
@@ -1121,7 +1041,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, (), LLM> {
             session: SessionPhase::NotStarted,
             connectivity: crate::connectivity::Watch::default(),
             background_receiver: None,
-            permission_receiver: None,
             kept_receiver: None,
             kept_exchanges: HashSet::new(),
             commands: None,
@@ -1496,7 +1415,7 @@ where
         }
 
         Self::push_tool_start_events(&tool_calls, events);
-        self.execute_tool_calls(&tool_calls, turn, events).await;
+        self.execute_tool_calls(&tool_calls, turn).await;
         let polled = self.apply_tool_results(events)?;
         self.push_tool_turn_alerts().await;
         let control = self
@@ -1729,12 +1648,7 @@ where
     /// The results live on the agent rather than in this future so a run
     /// stream dropped mid-execution still leaves the finished ones for
     /// [`Self::settle_interrupted_tool_calls`] to pair.
-    async fn execute_tool_calls(
-        &mut self,
-        tool_calls: &[ToolCall],
-        turn: usize,
-        events: &EventSink,
-    ) {
+    async fn execute_tool_calls(&mut self, tool_calls: &[ToolCall], turn: usize) {
         if let Some(signal) = &self.compact_signal
             && tool_calls
                 .iter()
@@ -1742,8 +1656,6 @@ where
         {
             signal.acted();
         }
-        let permission_receiver = self.permission_receiver.clone();
-        let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(tool_calls);
         let message_count = self.context.len_recent();
         let (hooks, tools, agent) = (&self.hooks, &self.tools, &self.identity);
         let results = &mut self.tool_results;
@@ -1789,23 +1701,8 @@ where
         });
 
         let mut pending = tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
-        while !pending.is_empty() {
-            let next = match &permission_receiver {
-                Some(receiver) => {
-                    futures_lite::future::or(
-                        async { pending.next().await.map(ExecutionSignal::Tool) },
-                        async { receiver.recv().await.map(ExecutionSignal::Permission) },
-                    )
-                    .await
-                }
-                None => pending.next().await.map(ExecutionSignal::Tool),
-            };
-            Self::handle_execution_signal(next, &mut permission_pause_tracker, results, events);
-        }
-        if let Some(receiver) = &permission_receiver {
-            for event in receiver.take_pending() {
-                emit_permission_event(&mut permission_pause_tracker, &event, events);
-            }
+        while let Some(result) = pending.next().await {
+            results.push_back(result);
         }
     }
 
@@ -1836,10 +1733,7 @@ where
                     Err(error) => {
                         let unchanged_read = error
                             .downcast_ref::<aither_sandbox::Refused<aither_sandbox::UnchangedTaskRead>>()
-                            .is_some()
-                            || error
-                                .downcast_ref::<aither_sandbox::PolicyRefusal>()
-                                .is_some_and(aither_sandbox::PolicyRefusal::is_unchanged_read);
+                            .is_some();
                         let mut message = String::from("Error: ");
                         message.push_str(error.to_string().as_str());
                         (aither_core::llm::ToolResult::error(message), unchanged_read)
@@ -1847,21 +1741,6 @@ where
                 };
                 Ok((result, start.elapsed(), unchanged_read))
             }
-        }
-    }
-
-    fn handle_execution_signal(
-        signal: Option<ToolExecutionSignal>,
-        tracker: &mut PermissionPauseTracker,
-        results: &mut VecDeque<ToolExecutionResult>,
-        events: &EventSink,
-    ) {
-        match signal {
-            Some(ExecutionSignal::Tool(result)) => results.push_back(result),
-            Some(ExecutionSignal::Permission(event)) => {
-                emit_permission_event(tracker, &event, events);
-            }
-            None => {}
         }
     }
 
@@ -2329,10 +2208,6 @@ where
                     killed = killed.processes.len() + killed.omitted,
                     "foreground command left processes running; killed"
                 );
-                false
-            }
-            JobAlert::DirectoryReset(reset) => {
-                tracing::info!(dir = %reset.dir.display(), reason = ?reset.reason, "carried working directory reset");
                 false
             }
             JobAlert::LongRunning(job) => {
@@ -4432,32 +4307,6 @@ fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     text
 }
 
-fn permission_event_key_for_call(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-) -> Option<PermissionEventKey> {
-    let args: TerminalArgs = match tool_name {
-        "terminal" => serde_json::from_value(arguments.clone()).ok()?,
-        _ => return None,
-    };
-    let location = args
-        .location
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string);
-    // A home call waits only for an `unsafe` approval; a call on a server
-    // may also wait for the server's first-use approval.
-    if args.mode == TerminalExecutionMode::Default && location.is_none() {
-        return None;
-    }
-    Some(PermissionEventKey {
-        mode: args.mode.into(),
-        script: args.script,
-        location,
-    })
-}
-
 /// Renders a background job's runtime the way the alert text states it.
 fn format_job_elapsed(elapsed: std::time::Duration) -> String {
     let seconds = elapsed.as_secs();
@@ -4473,23 +4322,6 @@ fn pause_reason_for_tool(tool_name: &str) -> Option<RunPauseReason> {
         "ask_user" => Some(RunPauseReason::AskUser),
         "request_workspace" => Some(RunPauseReason::WorkspaceRequest),
         _ => None,
-    }
-}
-
-fn emit_permission_event(
-    tracker: &mut PermissionPauseTracker,
-    event: &PermissionEvent,
-    events: &EventSink,
-) {
-    if let Some((reason, tool_call_id)) = tracker.event_for(event.clone()) {
-        match event.stage {
-            PermissionEventStage::Waiting => {
-                events.emit(AgentEvent::run_paused(reason, tool_call_id));
-            }
-            PermissionEventStage::Resolved => {
-                events.emit(AgentEvent::run_resumed(reason, tool_call_id));
-            }
-        }
     }
 }
 
@@ -4663,26 +4495,6 @@ mod tests {
             }),
             "Monitoring background job 'amber' for stdin reads failed: no /proc — it cannot report being blocked on stdin."
         );
-        for (reason, expected) in [
-            (DirectoryResetReason::Failed, "the last command failed"),
-            (DirectoryResetReason::Unreported, "exit or a signal"),
-            (
-                DirectoryResetReason::OutsideReadable,
-                "paths the terminal can read",
-            ),
-            (DirectoryResetReason::OutsideWorkspace, "workspace mount"),
-            (DirectoryResetReason::Removed, "no longer exists"),
-        ] {
-            let text = job_alert_text(&JobAlertText::DirectoryReset {
-                dir: "/work/space".to_string(),
-                reason,
-            });
-            assert!(
-                text.starts_with("Commands now run in /work/space: "),
-                "{text}"
-            );
-            assert!(text.contains(expected), "{text}");
-        }
         let killed = job_alert_text(&JobAlertText::DescendantsKilled {
             processes: &[
                 JobProcess {
@@ -5658,139 +5470,6 @@ mod tests {
         assert!(prefix.find("<workspace_facts>").expect("workspace facts") < base);
         assert!(base < prefix.find("<external-content-notice>").expect("notice"));
         assert!(!prefix.contains(include_str!("prompts/permissions.txt")));
-    }
-
-    fn terminal_args(
-        script: &str,
-        mode: TerminalExecutionMode,
-        location: Option<&str>,
-    ) -> serde_json::Value {
-        serde_json::to_value(TerminalArgs {
-            description: "run the demo".to_string(),
-            script: script.to_string(),
-            language: aither_sandbox::ScriptLanguage::Shell,
-            mode,
-            location: location.map(str::to_string),
-            expect: aither_sandbox::OutputFormat::Text,
-            resolution: aither_sandbox::MediaResolution::Auto,
-            max_lines: 200,
-            raw: false,
-            timeout: 60,
-            background: false,
-        })
-        .expect("terminal args should serialize")
-    }
-
-    fn permission_event(
-        script: &str,
-        mode: TerminalMode,
-        location: Option<&str>,
-        stage: PermissionEventStage,
-    ) -> PermissionEvent {
-        PermissionEvent {
-            mode,
-            script: script.to_string(),
-            language: aither_sandbox::ScriptLanguage::Shell,
-            location: location.map(str::to_string),
-            stage,
-        }
-    }
-
-    #[test]
-    fn permission_event_key_parses_terminal_modes() {
-        let default_args = terminal_args("ls", TerminalExecutionMode::Default, None);
-        let home_args = terminal_args("pwd", TerminalExecutionMode::Default, Some(" "));
-        let unsafe_args = terminal_args("rm -rf /tmp/demo", TerminalExecutionMode::Unsafe, None);
-        let remote_args = terminal_args("make", TerminalExecutionMode::Default, Some(" build "));
-
-        let unsafe_key = permission_event_key_for_call("terminal", &unsafe_args)
-            .expect("unsafe terminal mode should require permission routing");
-        let remote_key = permission_event_key_for_call("terminal", &remote_args)
-            .expect("a server's first use may wait for approval");
-
-        // A default-mode command at home waits for nothing: network is
-        // available by default and only unsafe escalation is gated.
-        assert!(permission_event_key_for_call("terminal", &default_args).is_none());
-        assert!(permission_event_key_for_call("terminal", &home_args).is_none());
-        assert_eq!(unsafe_key.mode, TerminalMode::Unsafe);
-        assert_eq!(unsafe_key.script, "rm -rf /tmp/demo");
-        assert_eq!(unsafe_key.location, None);
-        assert_eq!(remote_key.mode, TerminalMode::Sandboxed);
-        assert_eq!(remote_key.location.as_deref(), Some("build"));
-    }
-
-    #[test]
-    fn permission_pause_tracker_routes_waiting_and_resolved_events() {
-        let tool_calls = vec![aither_core::llm::ToolCall::new(
-            "tool-1",
-            "terminal",
-            terminal_args("rm -rf /tmp/demo", TerminalExecutionMode::Unsafe, None),
-        )];
-
-        let mut tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
-        let waiting = tracker
-            .event_for(permission_event(
-                "rm -rf /tmp/demo",
-                TerminalMode::Unsafe,
-                None,
-                PermissionEventStage::Waiting,
-            ))
-            .expect("waiting event should map to tool call");
-        let resolved = tracker
-            .event_for(permission_event(
-                "rm -rf /tmp/demo",
-                TerminalMode::Unsafe,
-                None,
-                PermissionEventStage::Resolved,
-            ))
-            .expect("resolved event should map to tool call");
-
-        assert_eq!(
-            waiting,
-            (RunPauseReason::PermissionRequest, "tool-1".to_string())
-        );
-        assert_eq!(
-            resolved,
-            (RunPauseReason::PermissionRequest, "tool-1".to_string())
-        );
-    }
-
-    /// An `unsafe` call on a server waits twice: for the server's first-use
-    /// approval, then for its own.
-    #[test]
-    fn a_call_on_a_server_pauses_for_each_approval_it_waits_for() {
-        let tool_calls = vec![aither_core::llm::ToolCall::new(
-            "tool-1",
-            "terminal",
-            terminal_args("make", TerminalExecutionMode::Unsafe, Some("build")),
-        )];
-        let mut tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
-        for stage in [
-            PermissionEventStage::Waiting,
-            PermissionEventStage::Resolved,
-            PermissionEventStage::Waiting,
-            PermissionEventStage::Resolved,
-        ] {
-            assert_eq!(
-                tracker.event_for(permission_event(
-                    "make",
-                    TerminalMode::Unsafe,
-                    Some("build"),
-                    stage
-                )),
-                Some((RunPauseReason::PermissionRequest, "tool-1".to_string()))
-            );
-        }
-        assert_eq!(
-            tracker.event_for(permission_event(
-                "make",
-                TerminalMode::Unsafe,
-                None,
-                PermissionEventStage::Waiting
-            )),
-            None,
-            "the same script at home is another call"
-        );
     }
 
     #[cfg(feature = "skills")]
@@ -9793,10 +9472,8 @@ mod tests {
         assert!(!agent.compaction.is_active(), "nothing was started");
 
         // The model acts: the valve opens again.
-        let (sender, _events) = async_channel::unbounded();
-        let sink = EventSink { sender };
         let call = ToolCall::new("call-1", "terminal", serde_json::json!({}));
-        agent.execute_tool_calls(&[call], 1, &sink).await;
+        agent.execute_tool_calls(&[call], 1).await;
         assert!(call_compact(&tool).await.contains("Compaction started"));
     }
 

@@ -43,7 +43,7 @@ impl Hook for DebugHook {
             }
         }
 
-        // Permission is handled by TerminalTool's InteractivePermissionHandler
+        // Permission is handled by TerminalTool's InteractiveApprover
         // No need to check here - would cause duplicate prompts
         std::future::ready(PreToolAction::Allow)
     }

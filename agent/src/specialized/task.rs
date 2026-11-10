@@ -2926,7 +2926,6 @@ mod tests {
         _dirs: [tempfile::TempDir; 2],
         _cache: crate::test_support::TempDir,
         terminal: aither_sandbox::TerminalTool<
-            aither_sandbox::permission::NoopPermissionHandler,
             executor_core::tokio::TokioGlobal,
             aither_sandbox::Configured,
         >,
@@ -2935,10 +2934,7 @@ mod tests {
     }
 
     /// The fixture's terminal before its registry is bound.
-    type UnboundTerminal = aither_sandbox::TerminalTool<
-        aither_sandbox::permission::NoopPermissionHandler,
-        executor_core::tokio::TokioGlobal,
-    >;
+    type UnboundTerminal = aither_sandbox::TerminalTool<executor_core::tokio::TokioGlobal>;
 
     impl CommitFixture {
         async fn new() -> Self {
@@ -2948,7 +2944,6 @@ mod tests {
         /// The fixture with `configure` applied to its terminal before the
         /// registry is bound.
         async fn configured(configure: impl FnOnce(UnboundTerminal) -> UnboundTerminal) -> Self {
-            use aither_sandbox::permission::NoopPermissionHandler;
             use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
             use executor_core::tokio::TokioGlobal;
 
@@ -2975,7 +2970,7 @@ mod tests {
                 ],
             );
 
-            let terminal = TerminalTool::new_exact(&session, NoopPermissionHandler, TokioGlobal)
+            let terminal = TerminalTool::new_exact(&session, TokioGlobal)
                 .await
                 .expect("terminal tool should initialize")
                 .initialize_tools(&distribution, cache.path())
@@ -4850,38 +4845,38 @@ mod tests {
         }
     }
 
-    /// Records the permission requests that reach it and denies them.
+    /// Records the kind and subject of the approvals that reach it and
+    /// denies them.
     #[derive(Clone, Default)]
-    struct RecordingPermission {
-        asked: Arc<Mutex<Vec<(aither_sandbox::TerminalMode, String)>>>,
+    struct RecordingApprover {
+        asked: Arc<Mutex<Vec<(String, String)>>>,
     }
 
-    impl aither_sandbox::permission::PermissionHandler for RecordingPermission {
-        fn check(
+    impl aither_core::llm::Approver for RecordingApprover {
+        async fn approve(
             &self,
-            mode: aither_sandbox::TerminalMode,
-            script: &str,
-            _language: aither_sandbox::ScriptLanguage,
-            _location: aither_sandbox::CommandLocation<'_>,
-        ) -> impl std::future::Future<
-            Output = Result<bool, aither_sandbox::permission::PermissionError>,
-        > + Send {
-            self.asked.lock().unwrap().push((mode, script.to_string()));
-            std::future::ready(Ok(false))
+            request: aither_core::llm::ApprovalRequest,
+        ) -> Result<aither_core::llm::Approval, aither_core::llm::ApproverFailure> {
+            self.asked.lock().unwrap().push((
+                request.kind().as_str().to_string(),
+                request.subject().to_string(),
+            ));
+            Ok(aither_core::llm::Approval::Denied {
+                reason: "not approved in this test".to_string(),
+            })
         }
     }
 
-    /// A main agent's terminal whose permission requests are recorded.
+    /// A main agent's terminal whose approval requests are recorded.
     struct ForkFixture {
         _hook_tools: crate::test_support::PreparedFixture,
         _dirs: [tempfile::TempDir; 2],
         _cache: crate::test_support::TempDir,
         terminal: aither_sandbox::TerminalTool<
-            crate::ReviewedPermission<RecordingPermission>,
             executor_core::tokio::TokioGlobal,
             aither_sandbox::Configured,
         >,
-        asked: Arc<Mutex<Vec<(aither_sandbox::TerminalMode, String)>>>,
+        asked: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl ForkFixture {
@@ -4907,31 +4902,30 @@ mod tests {
             let cache = crate::test_support::TempDir::new();
             let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
             let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
-            let permission = RecordingPermission::default();
-            let asked = permission.asked.clone();
+            let approver = RecordingApprover::default();
+            let asked = approver.asked.clone();
             let hook_tools = crate::test_support::prepared_fixture().await;
-            let permission = crate::ReviewedPermission::new(
-                permission,
-                crate::external_hook::ExternalHooks::new(
-                    &crate::external_hook::LiveHooks::start(
-                        crate::external_hook::HooksConfig {
-                            reviewers,
-                            ..crate::external_hook::HooksConfig::default()
-                        },
-                        &hook_tools.tools,
-                        executor_core::AnyExecutor::new(TokioGlobal),
-                    )
-                    .await
-                    .expect("the hooks start"),
-                ),
-            );
-            let terminal = TerminalTool::new_exact(session.path(), permission, TokioGlobal)
+            let reviewed = crate::ReviewedScripts::new(crate::external_hook::ExternalHooks::new(
+                &crate::external_hook::LiveHooks::start(
+                    crate::external_hook::HooksConfig {
+                        reviewers,
+                        ..crate::external_hook::HooksConfig::default()
+                    },
+                    &hook_tools.tools,
+                    executor_core::AnyExecutor::new(TokioGlobal),
+                )
+                .await
+                .expect("the hooks start"),
+            ));
+            let terminal = TerminalTool::new_exact(session.path(), TokioGlobal)
                 .await
                 .expect("terminal tool should initialize")
+                .with_approver(approver)
                 .initialize_tools(&distribution, cache.path())
                 .await
                 .expect("tools should prepare");
             let mut registry = ToolRegistryBuilder::new();
+            registry.script_policy(reviewed);
             commands(&mut registry);
             let registry = Arc::new(registry.build(terminal.output_store().clone()));
             Self {
@@ -5312,11 +5306,8 @@ mod tests {
 
         assert_eq!(
             asked_by_fork,
-            [(
-                aither_sandbox::TerminalMode::Unsafe,
-                "echo forked".to_string()
-            )],
-            "the main agent's permission handler was asked"
+            [("unsandboxed".to_string(), "echo forked".to_string())],
+            "the main agent's approver was asked"
         );
         assert_eq!(asked_by_fork, asked_by_worker);
         drain(&seen_rx);
@@ -5369,7 +5360,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_subagents_request_every_reviewer_passes_reaches_the_main_agent() {
         let (asked, _, _) = subagent_request_behind_reviewer(r#"{"decision":"pass"}"#).await;
-        assert_eq!(asked, 1, "the main agent's permission handler was asked");
+        assert_eq!(asked, 1, "the main agent's approver was asked");
     }
 
     #[cfg(unix)]

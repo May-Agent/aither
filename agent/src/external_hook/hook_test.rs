@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
-use aither_sandbox::permission::{CommandLocation, PermissionRequest};
 use aither_sandbox::{ScriptLanguage, TerminalMode};
 use askama::Template;
 use futures::StreamExt as _;
@@ -19,7 +18,9 @@ use super::lifecycle::{
     SessionStart, Stop, SubagentStart, SubagentStop, UserMessage,
 };
 use super::live::{Entry, HookConfig, HookKind, HookSet, LiveHooks};
-use super::reviewer::{DomainSubject, ReviewAnswer, ReviewRequest, ReviewSubject};
+use super::reviewer::{
+    CommandSubject, DomainSubject, ReviewAnswer, ReviewRequest, ReviewSubject, ScriptLocation,
+};
 use super::runner::{HookCommand, HookRole, HookRunError, HookRunner};
 
 /// How many samples run at once.
@@ -368,11 +369,11 @@ async fn run_sample(
                 runner,
                 command,
                 role,
-                ReviewSubject::Permission(PermissionRequest::Command {
+                ReviewSubject::Command(CommandSubject::Command {
                     mode: TerminalMode::Unsafe,
                     script,
                     language: ScriptLanguage::Shell,
-                    location: CommandLocation::Local,
+                    location: ScriptLocation::Local,
                 }),
             )
             .await

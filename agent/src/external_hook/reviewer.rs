@@ -1,12 +1,11 @@
 //! Reviewers: external hooks on the permission path.
 
-use std::sync::Arc;
-
-use aither_sandbox::permission::{
-    CommandLocation, LocationApproval, PermissionError, PermissionHandler, PermissionRequest,
-    Review, TerminalMode,
+use aither_core::llm::AgentIdentity;
+use aither_sandbox::permission::TerminalMode;
+use aither_sandbox::{
+    DomainApprover, DomainRequest, SandboxMode, ScriptCheck, ScriptDecision, ScriptLanguage,
+    ScriptPolicy, ScriptRefusal,
 };
-use aither_sandbox::{CommandRole, DomainApprover, DomainRequest, ScriptLanguage, SshServer};
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::ExternalHooks;
@@ -36,15 +35,56 @@ pub enum DomainSubject<'a> {
     },
 }
 
-/// What a reviewer is asked about: a permission beyond the sandbox, or a
-/// network domain the sandbox's lists leave open.
+/// Where a reviewed script runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScriptLocation<'a> {
+    /// The home environment.
+    Local,
+    /// A configured SSH server.
+    Ssh {
+        /// The server's name, as the script gave it as its `location`.
+        server: &'a str,
+    },
+}
+
+/// A script that crosses the sandbox boundary, as a reviewer reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandSubject<'a> {
+    /// A command that runs outside the sandbox or on a server.
+    Command {
+        /// The mode the command runs in.
+        mode: TerminalMode,
+        /// The script to run.
+        script: &'a str,
+        /// The language the script is written in.
+        language: ScriptLanguage,
+        /// Where the command runs.
+        location: ScriptLocation<'a>,
+    },
+}
+
+/// What a reviewer is asked about: a script that crosses the sandbox
+/// boundary, or a network domain the sandbox's lists leave open.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(untagged)]
 pub enum ReviewSubject<'a> {
-    /// A command escalation or an SSH location.
-    Permission(PermissionRequest<'a>),
+    /// A script that runs outside the sandbox or on a server.
+    Command(CommandSubject<'a>),
     /// A network domain.
     Domain(DomainSubject<'a>),
+}
+
+/// How the reviewers decided a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Review {
+    /// Granted; nothing else is asked.
+    Approved,
+    /// Refused, with the reason the model reads.
+    Denied(String),
+    /// Not decided; the request goes on to the next route.
+    Passed,
 }
 
 /// What a reviewer reads on stdin.
@@ -87,11 +127,8 @@ impl ExternalHooks {
     /// when no working version is left the user is asked to fix it. Where the
     /// user cannot be asked the failure is reported through `tracing` and
     /// counts as a pass, so a failure never grants anything.
-    async fn review(&self, request: ReviewSubject<'_>) -> Review {
-        let request = ReviewRequest {
-            role: self.role(),
-            request,
-        };
+    pub(super) async fn review(&self, role: HookRole, request: ReviewSubject<'_>) -> Review {
+        let request = ReviewRequest { role, request };
         let set = self.live().set();
         for reviewer in &set.reviewers {
             let answer = self
@@ -125,88 +162,62 @@ impl ExternalHooks {
     }
 }
 
-/// A permission handler with the host's reviewers in front of the existing
-/// route.
+/// The host's reviewers as a [`ScriptPolicy`].
 ///
-/// The reviewers are the handler's [`review`](PermissionHandler::review) step,
-/// which the terminal runs before it asks `inner` anything: the first
-/// reviewer to approve grants the request without reaching `inner`, the first
-/// to deny refuses it, and a request every reviewer passes goes to `inner`
-/// unchanged, including its wait query. A command that needs a mode beyond
-/// the sandbox is reviewed; network domains are reviewed by
-/// [`ReviewedDomains`].
-/// A subagent's terminal gets [`for_subagent`](PermissionHandler::for_subagent),
-/// the same reviewers labelled with the subagent role, over the same `inner`
-/// route.
+/// Every script that crosses the sandbox boundary, unsandboxed or on a
+/// server, goes to the reviewers in order: the first to approve allows it
+/// without asking the approver, the first to deny refuses it with the reason
+/// the model reads, and a script every reviewer passes is left to the other
+/// policies and the approver. Scripts inside the sandbox at home are not
+/// reviewed; network domains are reviewed by [`ReviewedDomains`].
 ///
-/// The reviewers are those of the [`ExternalHooks`] scope the handler is made
-/// with, so they follow the host's live changes like every other hook.
-#[derive(Debug)]
-pub struct ReviewedPermission<P> {
-    inner: Arc<P>,
+/// A reviewer reads the role of the agent that made the call, so one policy
+/// serves the main agent and its subagents. The reviewers are those of the
+/// [`ExternalHooks`] scope the policy is made with, so they follow the
+/// host's live changes like every other hook.
+#[derive(Debug, Clone)]
+pub struct ReviewedScripts {
     hooks: ExternalHooks,
 }
 
-impl<P> ReviewedPermission<P> {
-    /// The main agent's handler: the reviewers of `hooks` in front of
-    /// `inner`.
+impl ReviewedScripts {
+    /// The reviewers of `hooks` as a script policy.
     #[must_use]
-    pub fn new(inner: P, hooks: ExternalHooks) -> Self {
-        Self {
-            inner: Arc::new(inner),
-            hooks,
-        }
+    pub const fn new(hooks: ExternalHooks) -> Self {
+        Self { hooks }
     }
 }
 
-impl<P: PermissionHandler + 'static> PermissionHandler for ReviewedPermission<P> {
-    /// Runs the chain; the first reviewer to decide ends it.
-    async fn review(&self, request: &PermissionRequest<'_>) -> Review {
-        self.hooks.review(ReviewSubject::Permission(*request)).await
-    }
+impl ScriptPolicy for ReviewedScripts {
+    type State = ();
 
-    async fn check(
-        &self,
-        mode: TerminalMode,
-        script: &str,
-        language: ScriptLanguage,
-        location: CommandLocation<'_>,
-    ) -> Result<bool, PermissionError> {
-        self.inner.check(mode, script, language, location).await
-    }
-
-    fn will_wait_for_approval(
-        &self,
-        mode: TerminalMode,
-        script: &str,
-        language: ScriptLanguage,
-        location: CommandLocation<'_>,
-    ) -> impl Future<Output = bool> + Send {
-        self.inner
-            .will_wait_for_approval(mode, script, language, location)
-    }
-
-    fn for_subagent(&self) -> Option<Self> {
-        Some(Self {
-            inner: Arc::clone(&self.inner),
-            hooks: self.hooks.for_subagent(),
-        })
-    }
-
-    fn check_location(
-        &self,
-        server: &SshServer,
-        role: CommandRole,
-    ) -> impl Future<Output = Result<LocationApproval, PermissionError>> + Send {
-        self.inner.check_location(server, role)
-    }
-
-    fn will_wait_for_location(
-        &self,
-        server: &SshServer,
-        role: CommandRole,
-    ) -> impl Future<Output = bool> + Send {
-        self.inner.will_wait_for_location(server, role)
+    async fn check(&self, script: &ScriptCheck<'_>, (): &()) -> ScriptDecision {
+        if script.sandbox == SandboxMode::Sandboxed && script.location.is_none() {
+            return ScriptDecision::Pass;
+        }
+        let role = script
+            .call
+            .map_or(self.hooks.role(), |call| match call.agent() {
+                AgentIdentity::Main => HookRole::Main,
+                AgentIdentity::Subagent(_) => HookRole::Subagent,
+            });
+        let subject =
+            ReviewSubject::Command(CommandSubject::Command {
+                mode: match script.sandbox {
+                    SandboxMode::Sandboxed => TerminalMode::Sandboxed,
+                    SandboxMode::Unsandboxed => TerminalMode::Unsafe,
+                },
+                script: script.script,
+                language: script.language,
+                location: script.location.map_or(ScriptLocation::Local, |server| {
+                    ScriptLocation::Ssh { server }
+                }),
+            });
+        match self.hooks.review(role, subject).await {
+            Review::Approved => ScriptDecision::Allow,
+            Review::Denied(reason) => ScriptDecision::Refuse(ScriptRefusal::new(reason)),
+            Review::Passed => ScriptDecision::Pass,
+        }
     }
 }
 
@@ -250,7 +261,7 @@ impl<A: DomainApprover> DomainApprover for ReviewedDomains<A> {
             domain: &request.host,
             port: request.port,
         });
-        match self.hooks.review(subject).await {
+        match self.hooks.review(self.hooks.role(), subject).await {
             Review::Approved => true,
             Review::Denied(_) => false,
             Review::Passed => self.inner.approve(request).await,

@@ -62,8 +62,8 @@ use crate::{Agent, AgentBuilder, AgentOptions};
 use aither_core::llm::ToolResult;
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
-    ContainerShellRuntime, PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry,
-    SshServer, TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolRuntimeError, Unconfigured,
+    ContainerShellRuntime, ShellRuntimeAvailability, ShellSessionRegistry, SshServer, TerminalTool,
+    ToolDistribution, ToolRegistryBuilder, ToolRuntimeError, Unconfigured,
 };
 
 /// System prompt template for terminal-first agents.
@@ -171,7 +171,6 @@ pub struct Prepared;
 /// [`AgentBuilder`].
 pub struct TerminalAgentBuilder<
     LLM,
-    P,
     E,
     H = (),
     S = Unprepared,
@@ -181,11 +180,10 @@ pub struct TerminalAgentBuilder<
     Schema = crate::HandoffDocument,
 > where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     inner: AgentBuilder<LLM, Balanced, Fast, H, Compactor, Schema>,
-    terminal_tool: TerminalTool<P, E, Unconfigured>,
+    terminal_tool: TerminalTool<E, Unconfigured>,
     registry_builder: ToolRegistryBuilder,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
@@ -224,11 +222,10 @@ impl Default for HostLoadSetup {
     }
 }
 
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema> std::fmt::Debug
-    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
+impl<LLM, E, H, S, Balanced, Fast, Compactor, Schema> std::fmt::Debug
+    for TerminalAgentBuilder<LLM, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -239,10 +236,9 @@ where
     }
 }
 
-impl<LLM, P, E> TerminalAgentBuilder<LLM, P, E, ()>
+impl<LLM, E> TerminalAgentBuilder<LLM, E, ()>
 where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     /// Creates a new terminal-first agent builder.
@@ -252,7 +248,7 @@ where
     /// commands accessible through
     /// `terminal` (registered via `.tool()`). The native control tools address
     /// the same background jobs as `terminal` and are not advertised as commands.
-    pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
+    pub fn new(llm: LLM, mut terminal_tool: TerminalTool<E, Unconfigured>) -> Self {
         let registry_builder = ToolRegistryBuilder::new();
         let tool_descriptions = Vec::new();
 
@@ -280,11 +276,10 @@ where
     }
 }
 
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema> sealed::Sealed
-    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
+impl<LLM, E, H, S, Balanced, Fast, Compactor, Schema> sealed::Sealed
+    for TerminalAgentBuilder<LLM, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     fn settings(&mut self) -> &mut AgentSettings {
@@ -293,20 +288,18 @@ where
 }
 
 /// The terminal agent's options are its inner [`AgentBuilder`]'s settings.
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema> AgentOptions
-    for TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
+impl<LLM, E, H, S, Balanced, Fast, Compactor, Schema> AgentOptions
+    for TerminalAgentBuilder<LLM, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
 }
 
-impl<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
-    TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, Schema>
+impl<LLM, E, H, S, Balanced, Fast, Compactor, Schema>
+    TerminalAgentBuilder<LLM, E, H, S, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
     Balanced: LanguageModel,
     Fast: LanguageModel,
@@ -321,7 +314,7 @@ where
         inner: impl FnOnce(
             AgentBuilder<LLM, Balanced, Fast, H, Compactor, Schema>,
         ) -> AgentBuilder<LLM, NB, NF, NH, NC, NSchema>,
-    ) -> TerminalAgentBuilder<LLM, P, E, NH, NS, NB, NF, NC, NSchema> {
+    ) -> TerminalAgentBuilder<LLM, E, NH, NS, NB, NF, NC, NSchema> {
         TerminalAgentBuilder {
             inner: inner(self.inner),
             terminal_tool: self.terminal_tool,
@@ -669,7 +662,7 @@ where
     pub fn hook<NH: Hook>(
         self,
         hook: NH,
-    ) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>, S, Balanced, Fast, Compactor, Schema>
+    ) -> TerminalAgentBuilder<LLM, E, crate::HCons<NH, H>, S, Balanced, Fast, Compactor, Schema>
     {
         self.rebuild(|inner| inner.hook(hook))
     }
@@ -678,7 +671,7 @@ where
     /// [`AgentBuilder::handoff`].
     pub fn handoff<NSchema: crate::HandoffSchema>(
         self,
-    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, Compactor, NSchema> {
+    ) -> TerminalAgentBuilder<LLM, E, H, S, Balanced, Fast, Compactor, NSchema> {
         self.rebuild(AgentBuilder::handoff::<NSchema>)
     }
 
@@ -688,7 +681,7 @@ where
         self,
         model: NB,
         parameters: aither_core::llm::model::Parameters,
-    ) -> TerminalAgentBuilder<LLM, P, E, H, S, NB, Fast, Compactor, Schema> {
+    ) -> TerminalAgentBuilder<LLM, E, H, S, NB, Fast, Compactor, Schema> {
         self.rebuild(|inner| inner.balanced_model(model, parameters))
     }
 
@@ -698,7 +691,7 @@ where
         self,
         model: NF,
         parameters: aither_core::llm::model::Parameters,
-    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, NF, Compactor, Schema> {
+    ) -> TerminalAgentBuilder<LLM, E, H, S, Balanced, NF, Compactor, Schema> {
         self.rebuild(|inner| inner.fast_model(model, parameters))
     }
 
@@ -709,7 +702,7 @@ where
         self,
         model: NC,
         parameters: aither_core::llm::model::Parameters,
-    ) -> TerminalAgentBuilder<LLM, P, E, H, S, Balanced, Fast, NC, Schema> {
+    ) -> TerminalAgentBuilder<LLM, E, H, S, Balanced, Fast, NC, Schema> {
         self.rebuild(|inner| inner.compaction_model(model, parameters))
     }
 
@@ -1058,11 +1051,10 @@ where
     }
 }
 
-impl<LLM, P, E, H, Balanced, Fast, Compactor, Schema>
-    TerminalAgentBuilder<LLM, P, E, H, Unprepared, Balanced, Fast, Compactor, Schema>
+impl<LLM, E, H, Balanced, Fast, Compactor, Schema>
+    TerminalAgentBuilder<LLM, E, H, Unprepared, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
     Balanced: LanguageModel,
     Fast: LanguageModel,
@@ -1119,7 +1111,7 @@ where
         distribution: &ToolDistribution,
         cache_root: &std::path::Path,
     ) -> Result<
-        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor, Schema>,
+        TerminalAgentBuilder<LLM, E, H, Prepared, Balanced, Fast, Compactor, Schema>,
         ToolRuntimeError,
     > {
         self.terminal_tool = self
@@ -1145,7 +1137,7 @@ where
         mut self,
         sessions: ShellSessionRegistry,
     ) -> Result<
-        TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor, Schema>,
+        TerminalAgentBuilder<LLM, E, H, Prepared, Balanced, Fast, Compactor, Schema>,
         ToolRuntimeError,
     > {
         self.terminal_tool = self.terminal_tool.adopt_prepared_tools(sessions).await?;
@@ -1153,11 +1145,10 @@ where
     }
 }
 
-impl<LLM, P, E, H, Balanced, Fast, Compactor, Schema>
-    TerminalAgentBuilder<LLM, P, E, H, Prepared, Balanced, Fast, Compactor, Schema>
+impl<LLM, E, H, Balanced, Fast, Compactor, Schema>
+    TerminalAgentBuilder<LLM, E, H, Prepared, Balanced, Fast, Compactor, Schema>
 where
     LLM: LanguageModel + Clone,
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     /// The prepared registry, for a later builder to adopt with
@@ -1334,7 +1325,6 @@ mod tests {
     use crate::test_support::{compile_baseline_fixture, fixture_distribution};
     use aither_core::LanguageModel;
     use aither_core::llm::{Event, LLMRequest, Tool, model::Profile as ModelProfile};
-    use aither_sandbox::permission::NoopPermissionHandler;
     use executor_core::tokio::TokioGlobal;
     use futures_core::Stream;
     use schemars::JsonSchema;
@@ -1476,10 +1466,8 @@ mod tests {
         assert!(prompt.contains("<unsafe>"));
     }
 
-    async fn noop_terminal(
-        dir: &std::path::Path,
-    ) -> aither_sandbox::TerminalTool<NoopPermissionHandler, TokioGlobal> {
-        aither_sandbox::TerminalTool::new_exact(dir, NoopPermissionHandler, TokioGlobal)
+    async fn noop_terminal(dir: &std::path::Path) -> aither_sandbox::TerminalTool<TokioGlobal> {
+        aither_sandbox::TerminalTool::new_exact(dir, TokioGlobal)
             .await
             .expect("terminal tool should initialize")
     }
@@ -1932,14 +1920,14 @@ mod tests {
     /// An embedder's policy refusing a foreground `sleep` in its own words.
     struct NoSleep;
 
-    impl aither_sandbox::CommandPolicy for NoSleep {
+    impl aither_sandbox::ScriptPolicy for NoSleep {
         type State = ();
 
         fn check(
             &self,
             script: &aither_sandbox::ScriptCheck<'_>,
             (): &(),
-        ) -> impl std::future::Future<Output = aither_sandbox::PolicyDecision> + Send {
+        ) -> impl std::future::Future<Output = aither_sandbox::ScriptDecision> + Send {
             let sleeps = matches!(
                 script.shell,
                 Some(Ok(shell)) if shell
@@ -1948,11 +1936,11 @@ mod tests {
                     .any(|command| !command.is_background() && command.program() == "sleep")
             );
             std::future::ready(if sleeps {
-                aither_sandbox::PolicyDecision::Refuse(aither_sandbox::PolicyRefusal::new(
+                aither_sandbox::ScriptDecision::Refuse(aither_sandbox::ScriptRefusal::new(
                     "Not run: wait for the job's completion instead of sleeping.",
                 ))
             } else {
-                aither_sandbox::PolicyDecision::Allow
+                aither_sandbox::ScriptDecision::Pass
             })
         }
     }
@@ -2021,7 +2009,7 @@ mod tests {
             noop_terminal(dir.path()).await,
         )
         .max_iterations(3);
-        builder.tool_registry_mut().command_policy(NoSleep);
+        builder.tool_registry_mut().script_policy(NoSleep);
         let mut agent = builder
             .initialize_tools(&distribution, cache.path())
             .await

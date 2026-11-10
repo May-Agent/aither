@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
     TerminalArgs, TerminalTool, ToolDistribution, ToolRegistryBuilder, ToolTarget,
-    permission::NoopPermissionHandler,
 };
 
 #[tokio::main]
@@ -26,14 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         distribution = distribution.with_github_token(token);
     }
-    let terminal = TerminalTool::new_exact(
-        PathBuf::from(workspace),
-        NoopPermissionHandler,
-        executor_core::tokio::TokioGlobal,
-    )
-    .await?
-    .initialize_tools(&distribution, &PathBuf::from(cache))
-    .await?;
+    let terminal =
+        TerminalTool::new_exact(PathBuf::from(workspace), executor_core::tokio::TokioGlobal)
+            .await?
+            .initialize_tools(&distribution, &PathBuf::from(cache))
+            .await?;
     let registry = ToolRegistryBuilder::new().build(terminal.output_store().clone());
     let terminal = terminal.with_registry(std::sync::Arc::new(registry));
     let arguments: TerminalArgs = serde_json::from_value(serde_json::json!({

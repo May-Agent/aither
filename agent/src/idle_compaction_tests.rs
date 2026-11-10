@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::context::CacheLifetime;
 use crate::sandbox::TerminalTool;
-use crate::sandbox::permission::NoopPermissionHandler;
 use crate::{
     Agent, AgentEvent, AgentOptions, CompactionOutcome, ManualClock, TerminalAgentBuilder,
 };
@@ -83,7 +82,7 @@ async fn agent_after_one_turn(
     clock: &ManualClock,
 ) -> Agent<ScriptedLlm> {
     let dir = tempdir().expect("temp dir");
-    let terminal = TerminalTool::new_exact(dir.path(), NoopPermissionHandler, TokioGlobal)
+    let terminal = TerminalTool::new_exact(dir.path(), TokioGlobal)
         .await
         .expect("terminal tool initializes");
     let tools = tempdir().expect("tool dir");

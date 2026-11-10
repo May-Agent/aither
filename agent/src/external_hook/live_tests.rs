@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::GateDecision;
-use aither_sandbox::permission::{PermissionHandler, Review};
 
 use super::live::Watching;
 use super::tests::{executor, live, logged, recorder, reviewers, script};
@@ -153,7 +152,7 @@ async fn a_reviewer_script_change_reaches_running_sessions_without_a_restart() {
         &tools,
     )
     .await;
-    let handler = ReviewedPermission::new(reviewers::Route::default(), ExternalHooks::new(&hooks));
+    let handler = reviewers::Handler::new(ExternalHooks::new(&hooks));
     assert_eq!(
         bounded(handler.review(&reviewers::COMMAND)).await,
         Review::Approved
@@ -289,7 +288,7 @@ async fn a_changed_hook_with_a_syntax_error_warns_and_the_previous_version_keeps
     let hooks = live(config, &tools).await;
     let warnings = hooks.warnings();
     let session = ExternalHooks::new(&hooks);
-    let handler = ReviewedPermission::new(reviewers::Route::default(), session.clone());
+    let handler = reviewers::Handler::new(session.clone());
 
     let rejected = |kind: HookKind, name: &'static str| move |warning: &HookWarning| matches!(warning, HookWarning::Rejected { kind: k, hook, kept_previous: true, .. } if *k == kind && hook == name);
 
@@ -385,7 +384,7 @@ async fn a_changed_reviewer_that_fails_to_run_warns_and_the_previous_version_kee
     )
     .await;
     let warnings = hooks.warnings();
-    let handler = ReviewedPermission::new(reviewers::Route::default(), ExternalHooks::new(&hooks));
+    let handler = reviewers::Handler::new(ExternalHooks::new(&hooks));
 
     rewrite(dir.path(), "guard.sh", CRASH);
     let warning = bounded(async {
@@ -504,10 +503,8 @@ async fn a_reviewer_whose_previous_version_fails_too_pauses_and_asks_the_user() 
     };
     let hooks = live(config(REVIEWER_UNLESS_FLAG), &tools).await;
     let (broker, queue) = ask_user::channel();
-    let handler = ReviewedPermission::new(
-        reviewers::Route::default(),
-        ExternalHooks::new(&hooks).with_user_pause(broker, "session-2"),
-    );
+    let handler =
+        reviewers::Handler::new(ExternalHooks::new(&hooks).with_user_pause(broker, "session-2"));
     assert_eq!(
         bounded(handler.review(&reviewers::COMMAND)).await,
         Review::Approved
@@ -558,7 +555,7 @@ async fn without_a_user_to_ask_a_failing_command_hook_blocks_and_a_failing_revie
         &bounded(session.check_command("ls")).await,
         "gate"
     ));
-    let handler = ReviewedPermission::new(reviewers::Route::default(), session);
+    let handler = reviewers::Handler::new(session);
     assert_eq!(
         bounded(handler.review(&reviewers::COMMAND)).await,
         Review::Passed
@@ -894,7 +891,7 @@ async fn without_a_user_a_new_hook_with_a_syntax_error_blocks_commands_and_passe
             && warning.to_string().contains("the command is blocked"),
         "{warning}"
     );
-    let handler = ReviewedPermission::new(reviewers::Route::default(), session);
+    let handler = reviewers::Handler::new(session);
     assert_eq!(
         bounded(handler.review(&reviewers::COMMAND)).await,
         Review::Passed

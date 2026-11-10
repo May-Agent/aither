@@ -286,8 +286,11 @@ impl aither_core::llm::Tool for PolicyRefusedRead {
         _args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
     ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
-        std::future::ready(Err(aither_sandbox::PolicyRefusal::unchanged_read(
-            "Nothing changed since you last looked.",
+        std::future::ready(Err(aither_sandbox::Refused::rendered(
+            aither_sandbox::UnchangedTaskRead {
+                task_id: "amber".into(),
+            },
+            |_| "Nothing changed since you last looked.".to_string(),
         )
         .into()))
     }

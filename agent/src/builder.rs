@@ -17,7 +17,7 @@ use aither_core::{
     LanguageModel,
     llm::{Tool, tool::ToolDefinition},
 };
-use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, PermissionEventReceiver};
+use aither_sandbox::{BackgroundTaskReceiver, JobRegistry};
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
 use askama::Template;
@@ -162,7 +162,6 @@ struct Wiring {
     tools: AgentTools,
     connectivity: crate::connectivity::Watch,
     background_receiver: Option<BackgroundTaskReceiver>,
-    permission_receiver: Option<PermissionEventReceiver>,
     /// The terminal calls in which a kept command succeeded.
     kept_receiver: Option<aither_sandbox::KeptExchangeReceiver>,
     /// The commands the terminal runs, kept current in the command table.
@@ -870,7 +869,6 @@ where
         }
         let wiring = &mut self.wiring;
         wiring.background_receiver = Some(dyn_tool.background_receiver());
-        wiring.permission_receiver = Some(dyn_tool.permission_receiver());
         wiring.kept_receiver = Some(dyn_tool.kept_receiver());
         wiring.job_registry = Some(dyn_tool.job_registry());
         // Files are restored after compaction, and the working document is kept, in
@@ -941,7 +939,6 @@ where
             effort: fork.effort,
         });
         wiring.background_receiver = Some(terminal.background_receiver());
-        wiring.permission_receiver = Some(terminal.permission_receiver());
         wiring.kept_receiver = Some(terminal.kept_receiver());
         wiring.job_registry = Some(terminal.job_registry());
         // A fork keeps its own working document in its own space, like any
@@ -1092,12 +1089,11 @@ where
     /// Panics if the tool cannot be registered: another tool already uses
     /// its name, or it carries no description for the model to read. Both
     /// are mistakes in the calling program.
-    pub fn terminal<P, E>(
+    pub fn terminal<E>(
         mut self,
-        terminal_tool: aither_sandbox::TerminalTool<P, E, aither_sandbox::Configured>,
+        terminal_tool: aither_sandbox::TerminalTool<E, aither_sandbox::Configured>,
     ) -> Self
     where
-        P: aither_sandbox::PermissionHandler + 'static,
         E: executor_core::Executor + Clone + 'static,
     {
         self.settings.context.instructions_mut().insert(
@@ -1108,7 +1104,6 @@ where
         );
         let wiring = &mut self.wiring;
         wiring.background_receiver = Some(terminal_tool.background_receiver());
-        wiring.permission_receiver = Some(terminal_tool.permission_receiver());
         wiring.kept_receiver = Some(terminal_tool.kept_receiver());
         wiring.job_registry = Some(terminal_tool.job_registry());
         wiring.sandbox_dir = Some(terminal_tool.working_dir().clone());
@@ -1230,7 +1225,6 @@ where
             tools,
             connectivity,
             background_receiver,
-            permission_receiver,
             kept_receiver,
             commands,
             host_load,
@@ -1284,7 +1278,6 @@ where
             profile: inherited.profile,
             compaction_profile: None,
             background_receiver,
-            permission_receiver,
             kept_receiver,
             commands,
             job_registry,
@@ -1528,7 +1521,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_subagent_keeps_its_working_documents_and_files_in_its_own_space() {
-        use aither_sandbox::permission::NoopPermissionHandler;
         use aither_sandbox::{SubagentGrant, TerminalTool, ToolRegistryBuilder};
         use executor_core::tokio::TokioGlobal;
 
@@ -1537,7 +1529,7 @@ mod tests {
         let session = tempfile::tempdir().unwrap();
         let binary = crate::test_support::compile_baseline_fixture(source.path()).await;
         let distribution = crate::test_support::fixture_distribution(&binary, "1.0.0").await;
-        let terminal = TerminalTool::new_exact(session.path(), NoopPermissionHandler, TokioGlobal)
+        let terminal = TerminalTool::new_exact(session.path(), TokioGlobal)
             .await
             .unwrap()
             .initialize_tools(&distribution, cache.path())

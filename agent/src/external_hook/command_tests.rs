@@ -5,13 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure};
 use aither_core::llm::{Tool, ToolContext, ToolResult};
-use aither_sandbox::permission::{
-    CommandLocation, PermissionError, PermissionHandler, TerminalMode,
-};
 use aither_sandbox::{
-    DynTerminalTool, DynToolHandler, ScriptLanguage, SubagentGrant, TerminalTool,
-    ToolRegistryBuilder,
+    DynTerminalTool, DynToolHandler, SubagentGrant, TerminalTool, ToolRegistryBuilder,
 };
 use executor_core::tokio::TokioGlobal;
 
@@ -37,23 +34,22 @@ case $? in
 esac
 "#;
 
-/// A permission handler that grants the sandbox and nothing beyond it, and
-/// records every request it is asked.
+/// An approver that grants nothing beyond the sandbox, and records the kind
+/// and subject of every request it is asked.
 #[derive(Clone, Default)]
 struct SandboxOnly {
-    asked: Arc<Mutex<Vec<(TerminalMode, String)>>>,
+    asked: Arc<Mutex<Vec<(String, String)>>>,
 }
 
-impl PermissionHandler for SandboxOnly {
-    fn check(
-        &self,
-        mode: TerminalMode,
-        script: &str,
-        _language: ScriptLanguage,
-        _location: CommandLocation<'_>,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-        self.asked.lock().unwrap().push((mode, script.to_string()));
-        std::future::ready(Ok(mode == TerminalMode::Sandboxed))
+impl Approver for SandboxOnly {
+    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        self.asked.lock().unwrap().push((
+            request.kind().as_str().to_string(),
+            request.subject().to_string(),
+        ));
+        Ok(Approval::Denied {
+            reason: "only the sandbox is granted".to_string(),
+        })
     }
 }
 
@@ -118,12 +114,13 @@ async fn terminal(
     permission: SandboxOnly,
     command_hooks: Vec<CommandHookConfig>,
 ) -> (
-    TerminalTool<SandboxOnly, TokioGlobal, aither_sandbox::Configured>,
+    TerminalTool<TokioGlobal, aither_sandbox::Configured>,
     ExternalHooks,
 ) {
-    let terminal = TerminalTool::new_exact(dir, permission, TokioGlobal)
+    let terminal = TerminalTool::new_exact(dir, TokioGlobal)
         .await
         .expect("the terminal initializes")
+        .with_approver(permission)
         .initialize_tools(&tools.distribution, tools.cache.path())
         .await
         .expect("the managed tools are prepared");
@@ -162,14 +159,11 @@ fn args(script: &str, mode: &str) -> serde_json::Value {
 
 /// What the model reads for a foreground `terminal` call, or the refusal
 /// that replaced it.
-async fn run<P>(
-    terminal: &TerminalTool<P, TokioGlobal, aither_sandbox::Configured>,
+async fn run(
+    terminal: &TerminalTool<TokioGlobal, aither_sandbox::Configured>,
     script: &str,
     mode: &str,
-) -> Result<String, String>
-where
-    P: PermissionHandler + 'static,
-{
+) -> Result<String, String> {
     let arguments = serde_json::from_value(args(script, mode)).unwrap();
     tokio::time::timeout(BOUND, terminal.call(arguments, ToolContext::new()))
         .await
@@ -301,7 +295,7 @@ async fn allowing_a_command_grants_no_permission_beyond_the_sandbox() {
     assert_eq!(logged(&log).len(), 1, "the hook allowed it");
     assert_eq!(
         *permission.asked.lock().unwrap(),
-        [(TerminalMode::Unsafe, "echo escape-attempt".to_string())],
+        [("unsandboxed".to_string(), "echo escape-attempt".to_string())],
         "the permission path still decided"
     );
 

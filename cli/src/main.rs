@@ -44,16 +44,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
-    DomainApprover, DomainRequest, ScriptLanguage, ToolRegistryBuilder, cli_to_json,
-    permission::{CommandLocation, PermissionError, PermissionHandler, TerminalMode},
-    schema_to_help,
+    DomainApprover, DomainRequest, ToolRegistryBuilder, cli_to_json, schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
 use aither_agent::{
     Agent, AgentEvent, AgentOptions, CompactionOutcome, Hook, TerminalAgentBuilder,
 };
 use aither_core::LanguageModel;
-use aither_core::llm::ToolResult;
+use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure, ToolResult};
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -93,62 +91,35 @@ const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
     "api.github.com",
 ];
 
-/// Interactive permission handler that prompts the user.
-///
-/// - Sandboxed: always allow (no prompt)
-/// - Unsafe: always ask for each script
+/// Interactive approver that prompts the user for each script that crosses
+/// the sandbox boundary, unsandboxed or on a server. Scripts inside the
+/// sandbox are never put to it.
 #[derive(Debug, Default)]
-struct InteractivePermissionHandler;
+struct InteractiveApprover;
 
-impl InteractivePermissionHandler {
-    const fn new() -> Self {
-        Self
-    }
-}
+impl Approver for InteractiveApprover {
+    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        // Display the full script, no truncation.
+        let display_script = request.subject().trim().replace('\n', "; ");
+        eprintln!(
+            "\n\x1b[33m⚠ Permission request: {}\x1b[0m",
+            request.reason().unwrap_or_else(|| request.kind().as_str())
+        );
+        eprintln!("\x1b[2mScript:\x1b[22m {display_script}");
+        eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
+        io::stderr().flush().ok();
 
-impl PermissionHandler for InteractivePermissionHandler {
-    fn check(
-        &self,
-        mode: TerminalMode,
-        script: &str,
-        language: ScriptLanguage,
-        location: CommandLocation<'_>,
-    ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
-        std::future::ready(match mode {
-            TerminalMode::Sandboxed => Ok(true), // Always allow
-            TerminalMode::Unsafe => {
-                // Display script and ask for permission (show full script, no truncation)
-                let mode_desc = mode.description();
-                let display_script = script.trim().replace('\n', "; ");
-                eprintln!("\n\x1b[33m⚠ Permission request: {mode_desc}\x1b[0m");
-                if let Some(server) = location.server() {
-                    eprintln!("\x1b[2mLocation:\x1b[22m SSH server {server}");
-                }
-                eprintln!("\x1b[2mScript ({language:?}):\x1b[22m {display_script}");
-                eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
-                io::stderr().flush().ok();
+        // Read single char in raw mode
+        let approved = read_yes_no().unwrap_or(false);
+        eprintln!();
 
-                // Read single char in raw mode
-                let approved = read_yes_no().unwrap_or(false);
-                eprintln!();
-
-                if approved {
-                    Ok(true)
-                } else {
-                    Err(PermissionError::Denied("user declined".to_string()))
-                }
+        Ok(if approved {
+            Approval::Approved
+        } else {
+            Approval::Denied {
+                reason: "user declined".to_string(),
             }
         })
-    }
-
-    fn will_wait_for_approval(
-        &self,
-        _mode: TerminalMode,
-        _script: &str,
-        _language: ScriptLanguage,
-        _location: CommandLocation<'_>,
-    ) -> impl std::future::Future<Output = bool> + Send {
-        std::future::ready(true)
     }
 }
 
@@ -452,12 +423,11 @@ async fn acp_session_agent(
 > {
     let to_acp = |err: anyhow::Error| aither_acp::protocol::AcpError::Transport(err.to_string());
 
-    let permission_handler = InteractivePermissionHandler::new();
-    let terminal_tool =
-        aither_agent::sandbox::TerminalTool::new_in(&setup.cwd, permission_handler, TokioGlobal)
-            .await
-            .map_err(|err| to_acp(err.into()))?
-            .with_domain_approver(InteractiveDomains::default());
+    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(&setup.cwd, TokioGlobal)
+        .await
+        .map_err(|err| to_acp(err.into()))?
+        .with_approver(InteractiveApprover)
+        .with_domain_approver(InteractiveDomains::default());
 
     let agent = setup
         .mcp
@@ -482,19 +452,15 @@ async fn build_agent(
 {
     // Create terminal tool (heel names its working dir under system temp with
     // four random words; the ids the model reads are leased words)
-    // Uses interactive permission handler:
+    // Uses the interactive approver:
     // - Sandboxed: always allow (no prompt)
     // - Network (InteractiveDomains): ask once per domain, then remember
-    // - Unsafe: always ask for each script
+    // - Unsafe or on a server: always ask for each script
     let workdir_parent = std::env::temp_dir().join("aither");
-    let permission_handler = InteractivePermissionHandler::new();
-    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(
-        &workdir_parent,
-        permission_handler,
-        TokioGlobal,
-    )
-    .await?
-    .with_domain_approver(InteractiveDomains::default());
+    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(&workdir_parent, TokioGlobal)
+        .await?
+        .with_approver(InteractiveApprover)
+        .with_domain_approver(InteractiveDomains::default());
 
     // Create terminal-first agent builder
     // All tools become IPC commands accessible via terminal
