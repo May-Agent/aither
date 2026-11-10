@@ -589,7 +589,10 @@ fn html_to_result_with_metadata(
         .parse()
         .map_err(|e| anyhow!("Content extraction failed: {e}"))?;
 
-    let content = htmd::convert(&extracted.content).map_err(|e| anyhow!("{e}"))?;
+    // A page that marks its main content is converted whole: Readability picks
+    // one article node and drops sibling sections of the same page.
+    let article_html = main_landmark_html(html).unwrap_or_else(|| extracted.content.to_string());
+    let content = htmd::convert(&article_html).map_err(|e| anyhow!("{e}"))?;
 
     // If readability produces minimal content, try fallbacks
     let final_content = if content.len() < 200 {
@@ -616,6 +619,18 @@ fn html_to_result_with_metadata(
         quality_score: None,
         warnings: Vec::new(),
     })
+}
+
+/// The first `<main>` or `role="main"` element of the page, scripts, styles and
+/// noscript removed, or `None` when the page has no main landmark.
+fn main_landmark_html(html: &str) -> Option<String> {
+    let document = dom_query::Document::from(html);
+    let main = document.select("main, [role=main]").first();
+    if !main.exists() {
+        return None;
+    }
+    main.select("script, style, noscript").remove();
+    Some(main.html().to_string())
 }
 
 /// Extract body content from HTML, stripping scripts and styles.
@@ -1550,6 +1565,60 @@ mod tests {
             assert_eq!(mime, "image/jpeg");
             assert_ne!(data.len(), 0);
         }
+    }
+
+    #[test]
+    fn main_landmark_keeps_sibling_sections() {
+        let html = include_str!("../tests/fixtures/rustdoc_vec.html");
+        let result = html_to_result_with_metadata(
+            "https://doc.rust-lang.org/std/vec/struct.Vec.html",
+            html,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(result.content.contains("contiguous growable array"));
+        assert!(
+            result
+                .content
+                .contains("Retains only the elements specified by the predicate.")
+        );
+        assert!(result.content.contains("passing a mutable reference to it"));
+        assert!(result.content.contains("retain_mut"));
+        assert!(!result.content.contains("SIDEBAR_ITEMS"));
+        assert!(!result.content.contains("init()"));
+        assert!(!result.content.contains("width:200px"));
+    }
+
+    #[test]
+    fn role_main_is_treated_as_main_landmark() {
+        let html = r#"<html><head><title>T</title></head><body>
+<div role="main"><section><h1>First</h1><p>alpha</p></section><section><h2>Second</h2><p>beta</p></section><script>var x = 1;</script></div>
+<div><p>outside</p></div></body></html>"#;
+        let content = main_landmark_html(html).unwrap();
+        assert!(content.contains("alpha") && content.contains("beta"));
+        assert!(!content.contains("var x"));
+        assert!(!content.contains("outside"));
+    }
+
+    #[test]
+    fn page_without_main_landmark_goes_through_readability() {
+        let paragraph = "Readability keeps the paragraphs that carry the article text and scores them above the navigation that surrounds them. ";
+        let html = format!(
+            r#"<html><head><title>Plain Article</title></head><body>
+<div class="menu"><a href="/a">Site menu entry</a></div>
+<article><h1>Plain Article</h1><p>{p}</p><p>{p}</p><p>{p}</p></article>
+<div class="footer"><a href="/b">Footer link</a></div></body></html>"#,
+            p = paragraph
+        );
+        assert!(main_landmark_html(&html).is_none());
+
+        let result =
+            html_to_result_with_metadata("https://example.com/post", &html, None, None).unwrap();
+        assert_eq!(result.title.as_deref(), Some("Plain Article"));
+        assert!(result.content.contains("carry the article text"));
+        assert!(!result.content.contains("Site menu entry"));
     }
 
     #[test]
