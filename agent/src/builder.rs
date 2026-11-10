@@ -631,7 +631,10 @@ pub trait AgentOptions: sealed::Sealed + Sized {
     /// background commands.
     ///
     /// `SubagentTool` sets this on child agents; ordinary agents leave it
-    /// off. It is a no-op unless the run's model is an Anthropic one.
+    /// off. While the run waits, a keep-alive goes out shortly before the
+    /// entry expires, and only if some running command's `timeout` bound
+    /// falls after that moment. An embedder refreshes an idle agent's entry
+    /// itself with [`Agent::keep_cache_warm`](crate::Agent::keep_cache_warm).
     #[must_use]
     fn cache_keep_alive(mut self, keep_alive: crate::config::CacheKeepAlive) -> Self {
         self.settings().config.cache_keep_alive = Some(keep_alive);
