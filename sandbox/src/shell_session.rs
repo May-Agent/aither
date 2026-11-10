@@ -76,6 +76,8 @@ pub trait ContainerExec: Send + Sync {
     /// empty. `stdout` is bounded, so a consumer that stops reading holds the
     /// command back. The command is killed, as when `kill_rx` fires, once
     /// `kill_rx` fires or closes, or once `stdout` has no receiver left.
+    /// `lifetime` is [`Self::exec`]'s.
+    #[allow(clippy::too_many_arguments)]
     fn exec_streamed(
         &self,
         container_id: &str,
@@ -84,6 +86,7 @@ pub trait ContainerExec: Send + Sync {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
@@ -103,6 +106,7 @@ pub trait ContainerExecImpl: Send + Sync {
 
     /// Execute a command inside a container, streaming its stdout, through a
     /// boxed future.
+    #[allow(clippy::too_many_arguments)]
     fn exec_streamed_boxed<'a>(
         &'a self,
         container_id: &'a str,
@@ -111,6 +115,7 @@ pub trait ContainerExecImpl: Send + Sync {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
 
@@ -178,6 +183,7 @@ impl ContainerExec for AnyContainerExec {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let inner = Arc::clone(&self.inner);
         let container_id = container_id.to_string();
@@ -193,6 +199,7 @@ impl ContainerExec for AnyContainerExec {
                     kill_rx,
                     stdin_rx,
                     stdout,
+                    lifetime,
                 )
                 .await
         }
@@ -468,8 +475,17 @@ impl<T: ContainerExec> ContainerExecImpl for T {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
-        Box::pin(self.exec_streamed(container_id, script, working_dir, kill_rx, stdin_rx, stdout))
+        Box::pin(self.exec_streamed(
+            container_id,
+            script,
+            working_dir,
+            kill_rx,
+            stdin_rx,
+            stdout,
+            lifetime,
+        ))
     }
 }
 
@@ -665,6 +681,7 @@ mod disk_probe_tests {
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
             _stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
         ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
             std::future::ready(Err("a probe is never streamed".to_string()))
         }

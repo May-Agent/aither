@@ -797,4 +797,10 @@ async fn a_script_spawned_on_a_server_runs_in_the_managed_shell() {
         String::from_utf8_lossy(&failed)
     );
     assert!(exit.success());
+    // The processes on the server are out of sight, and its stdin has no watch.
+    assert_eq!(
+        child.descendants_killed().await,
+        crate::Descendants::Unobserved
+    );
+    assert!(child.take_stdin_blocked().is_none());
 }

@@ -10,4 +10,3 @@ done;
 export PATH="$MAY_IPC_DIR:$PATH";
 hash -r;
 export HEEL_IPC_ENDPOINT="tcp://{{ ipc_host }}:{{ ipc_port }}";
-{{ script }}

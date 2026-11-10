@@ -48,9 +48,7 @@ use executor_core::{Executor, Task};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
-use heel::{
-    Access, CpuPriority, Grant, IoPriority, IpcRouter, NetworkAuditLog, ProcessPriority,
-};
+use heel::{Access, CpuPriority, Grant, IoPriority, IpcRouter, NetworkAuditLog, ProcessPriority};
 /// On platforms without `heel supervise` a wait produces no report.
 #[cfg(not(target_os = "linux"))]
 pub struct TreeReport;
@@ -59,6 +57,12 @@ use serde::{Deserialize, Serialize};
 use shell_words::split as split_shell_words;
 use tracing::{debug, info, warn};
 
+use crate::builtin::ShellToolSettings;
+use crate::events::{
+    EventSender, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
+    StdinWatchFailed, event_channel,
+};
+use crate::jobs::Jobs;
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
@@ -75,13 +79,12 @@ use crate::{
     output_policy::OutputPolicy,
     process_tree::{JobProcess, JobTree},
     shell_session::{
-        ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
-        ShellRuntimeAvailability, ShellSessionRegistry,
+        ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry,
     },
     spawn::stdio::{read_chunks, write_chunks},
     spawn::{
-        AnyDomainApprover, DomainApprover, EnvSource, GrantSnapshot, Grants, LocalSpawn, Pipe,
-        Sandbox, SpawnSpec, Stdio as SpawnStdio, TreeLifetime,
+        AnyDomainApprover, ContainerSetup, Descendants, DomainApprover, EnvSource, GrantSnapshot,
+        Grants, LocalSpawn, Pipe, Sandbox, SpawnSpec, Stdio as SpawnStdio, TreeLifetime,
     },
     ssh::{SshClient, SshEnvironment, SshServer},
     stdin_watch::{
@@ -93,12 +96,6 @@ use crate::{
         SubagentGrant, SubagentGrantError, SubagentSpaces, canonical as canonical_path,
     },
     wording::AnyShellWording,
-};
-use crate::builtin::ShellToolSettings;
-use crate::jobs::Jobs;
-use crate::events::{
-    EventSender, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
-    StdinWatchFailed, event_channel,
 };
 
 mod builder;
@@ -754,10 +751,8 @@ impl TerminalToolFactory {
 /// `source` is the terminal with its registry not yet bound: it holds no
 /// handle to its own launcher, so the loop ends once every terminal-bound
 /// command holding the launcher is gone.
-async fn serve_launches<E>(
-    requests: Receiver<TerminalToolRequest>,
-    source: Shell<E, Launching>,
-) where
+async fn serve_launches<E>(requests: Receiver<TerminalToolRequest>, source: Shell<E, Launching>)
+where
     E: Executor + Clone + 'static,
 {
     let mut history = LaunchHistory::default();
@@ -976,10 +971,6 @@ struct SubagentAuthority {
     committing: Vec<CommittingWorktree>,
     /// Runs git in its sandbox, as it, for the host's view of its commits.
     git: SubagentGit,
-    /// Where its commands run when its home backend is a container: its
-    /// space and granted paths, mapped through the container's workspace
-    /// mount when it was launched.
-    container: Option<ContainerConfinement>,
     /// What the launcher's [`SubagentSpaces`] made in its space; `None` when
     /// the launcher has none.
     prepared: Option<PreparedSpace>,
@@ -1363,14 +1354,11 @@ where
     /// the registry's terminal-bound commands are built for it.
     #[must_use]
     pub fn with_registry(self, registry: Arc<ToolRegistry>) -> Shell<E, Configured> {
-        let registry = Arc::new(
-            Arc::unwrap_or_clone(registry)
-                .with_terminal_controls(
-                    self.jobs(),
-                    &self.job_tools,
-                    self.output_store.clone(),
-                ),
-        );
+        let registry = Arc::new(Arc::unwrap_or_clone(registry).with_terminal_controls(
+            self.jobs(),
+            &self.job_tools,
+            self.output_store.clone(),
+        ));
         self.map_state(|Unconfigured| Launching { registry })
             .into_served()
     }
@@ -2052,7 +2040,6 @@ where
                 _space_name: space_name,
                 committing: granted.committing,
                 git,
-                container,
                 prepared,
             }),
             carried_dir: None,
@@ -2256,9 +2243,7 @@ where
             ));
         }
         let backend = match backend {
-            ShellBackend::Local => {
-                ExecutionBackend::Local(self.sessions.local_tools()?.clone())
-            }
+            ShellBackend::Local => ExecutionBackend::Local(self.sessions.local_tools()?.clone()),
             ShellBackend::Container => ExecutionBackend::Container {
                 runtime: self
                     .sessions
@@ -2266,10 +2251,6 @@ where
                     .cloned()
                     .ok_or(ToolRuntimeError::MissingContainerRuntime)?,
                 tools: self.sessions.container_tools()?.clone(),
-                confinement: self
-                    .subagent
-                    .as_ref()
-                    .and_then(|subagent| subagent.container.clone()),
             },
         };
         Ok(ExecutionTarget { mode, backend })
@@ -3648,8 +3629,10 @@ struct LocalBackgroundExecution<'a, E> {
     heel: &'a SharedHeelBinary,
 }
 
-struct ContainerBackgroundExecution<'a, E> {
+struct ContainerJobExecution<'a, E> {
     executor: E,
+    working_dir: &'a Path,
+    grants: &'a Grants,
     env_source: &'a Option<Arc<dyn EnvSource>>,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a IdLease,
@@ -3659,8 +3642,7 @@ struct ContainerBackgroundExecution<'a, E> {
     mode: SandboxMode,
     container_runtime: &'a ContainerShellRuntime,
     prepared_tools: &'a PreparedTools<ContainerPath>,
-    confinement: Option<&'a ContainerConfinement>,
-    carry: Option<&'a ContainerCarry>,
+    carry: Option<&'a CwdCarry>,
     ipc_commands: &'a [String],
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
@@ -3709,9 +3691,6 @@ enum ExecutionBackend {
     Container {
         runtime: ContainerShellRuntime,
         tools: PreparedTools<ContainerPath>,
-        /// The sandbox a subagent's command runs in inside the container; the
-        /// main agent's commands run unconfined.
-        confinement: Option<ContainerConfinement>,
     },
     /// A remote host over SSH.
     Ssh {
@@ -4105,11 +4084,7 @@ where
 {
     let prepared_tools = match request.backend {
         ExecutionBackend::Local(tools) => tools,
-        ExecutionBackend::Container {
-            runtime,
-            tools,
-            confinement,
-        } => {
+        ExecutionBackend::Container { runtime, tools } => {
             // The command's fifo lives in the container's kernel, brokered
             // by a relay run with the image's managed `python3`.
             #[cfg(all(unix, feature = "jobserver"))]
@@ -4126,8 +4101,10 @@ where
                 None => None,
             };
             let ipc_commands = request.registry.registered_tool_names();
-            return execute_container_background(ContainerBackgroundExecution {
+            return execute_container_job(ContainerJobExecution {
                 executor: request.executor,
+                working_dir: request.working_dir,
+                grants: request.grants,
                 env_source: request.env_source,
                 registry: request.registry,
                 task_id: request.task_id,
@@ -4137,8 +4114,7 @@ where
                 mode: request.mode,
                 container_runtime: runtime,
                 prepared_tools: tools,
-                confinement: confinement.as_ref(),
-                carry: request.carry.and_then(|carry| carry.container.as_ref()),
+                carry: request.carry,
                 ipc_commands: &ipc_commands,
                 job_registry: request.job_registry,
                 stdin_alerts: request.stdin_alerts,
@@ -4633,20 +4609,20 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             },
             ..SpawnStdio::default()
         });
-    spec.extra_grants = additions.grants;
     spec.ipc = ipc;
+    spec = spec.grants(additions.grants);
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         spec = spec.cwd(start);
     }
-    let lifetime = match context.lifetime {
+    let spec = spec.lifetime(match context.lifetime {
         JobLifetime::Foreground { .. } => TreeLifetime::Foreground,
         JobLifetime::Background => TreeLifetime::Background,
-    };
+    });
     let LocalSpawn {
         child,
         tree,
         sandbox: _sandbox,
-    } = sandbox.spawn_local(spec, lifetime).await?;
+    } = sandbox.spawn_local(spec).await?;
 
     let pid = child.id();
     context
@@ -4696,6 +4672,7 @@ enum JobLifetime {
 ///
 /// Its presence is what makes a command a background job: a command without
 /// one reads EOF from a null stdin.
+#[derive(Clone)]
 struct StdinAlerts {
     tx: EventSender,
     task_id: String,
@@ -4703,6 +4680,17 @@ struct StdinAlerts {
 }
 
 impl StdinAlerts {
+    /// Raises an alert for each signal a stdin watch sends, until the watch
+    /// ends.
+    async fn relay(self, signals: async_channel::Receiver<StdinWatchSignal>) {
+        while let Ok(signal) = signals.recv().await {
+            match signal {
+                StdinWatchSignal::Blocked => self.raise().await,
+                StdinWatchSignal::Failed(error) => self.raise_failure(error).await,
+            }
+        }
+    }
+
     async fn raise(&self) {
         debug!(task_id = %self.task_id, "background job is blocked on stdin");
         let _ = self
@@ -4734,12 +4722,28 @@ pub struct LocalStdinWatch {
     probe: LocalStdinProbe,
     feed: FeedCounter,
     detector: EpisodeDetector,
-    alerts: StdinAlerts,
+    signals: async_channel::Sender<StdinWatchSignal>,
 }
 
 impl LocalStdinWatch {
-    /// Probes the pipe every [`STDIN_WATCH_INTERVAL`] and raises one alert per
-    /// blocking episode, for as long as the future is polled.
+    /// A watch of the pipe `probe` looks at that `feed` counts the writes to,
+    /// reporting on `signals`.
+    pub(crate) fn new(
+        probe: LocalStdinProbe,
+        feed: FeedCounter,
+        signals: async_channel::Sender<StdinWatchSignal>,
+    ) -> Self {
+        Self {
+            probe,
+            feed,
+            detector: EpisodeDetector::default(),
+            signals,
+        }
+    }
+
+    /// Probes the pipe every [`STDIN_WATCH_INTERVAL`] and signals one
+    /// [`StdinWatchSignal::Blocked`] per blocking episode, for as long as the
+    /// future is polled.
     async fn run(mut self) -> std::convert::Infallible {
         loop {
             async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
@@ -4747,7 +4751,7 @@ impl LocalStdinWatch {
                 probe,
                 feed,
                 mut detector,
-                alerts,
+                signals,
             } = self;
             let fed = feed.count();
             let (probe, observed) = blocking::unblock(move || {
@@ -4758,14 +4762,16 @@ impl LocalStdinWatch {
             match observed {
                 Ok(observed) => {
                     if detector.observe(fed, observed) {
-                        alerts.raise().await;
+                        let _ = signals.send(StdinWatchSignal::Blocked).await;
                     }
                 }
                 Err(error) => {
                     // Detection cannot run: surface it once, then park — the
                     // job's exit still ends the race in
                     // `wait_for_local_process_exit`.
-                    alerts.raise_failure(error.to_string()).await;
+                    let _ = signals
+                        .send(StdinWatchSignal::Failed(error.to_string()))
+                        .await;
                     std::future::pending::<()>().await;
                 }
             }
@@ -4773,7 +4779,7 @@ impl LocalStdinWatch {
                 probe,
                 feed,
                 detector,
-                alerts,
+                signals,
             };
         }
     }
@@ -4799,12 +4805,9 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         if let Some(alerts) = stdin_alerts {
             let probe = LocalStdinProbe::new(pid, &stdin)
                 .map_err(|error| TerminalError::Execution(format!("stdin probe: {error}")))?;
-            stdin_watch = Some(LocalStdinWatch {
-                probe,
-                feed: feed.clone(),
-                detector: EpisodeDetector::default(),
-                alerts,
-            });
+            let (signal_tx, signal_rx) = async_channel::unbounded();
+            executor.spawn(alerts.relay(signal_rx)).detach();
+            stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
         }
         let input_tx = write_chunks(stdin, feed);
         job_registry.attach_terminal_input(pid, input_tx).await;
@@ -5061,164 +5064,84 @@ pub async fn wait_for_local_process_exit(
     futures_lite::future::or(exit, async { match stdin_watch.run().await {} }).await
 }
 
-/// A container command's full script. A main terminal's git shim and
-/// worktree map travel inside it: the container's tools mount is
-/// read-only, so the command writes the shim where its own `PATH` can
-/// put it first.
-fn container_exec_script(
+/// A container command's script as the shell hands it to the sandbox. A main
+/// terminal's git shim and worktree map travel inside it: the container's
+/// tools mount is read-only, so the command writes the shim where its own
+/// `PATH` can put it first. A command that carries its directory reports the
+/// directory it ended in.
+fn container_job_script(
     registry: &ToolRegistry,
-    container_runtime: &ContainerShellRuntime,
-    prepared_tools: &PreparedTools<ContainerPath>,
-    carry: Option<&ContainerCarry>,
+    workspace: Option<&MountRoot>,
+    report: Option<&ContainerPath>,
     script: &str,
 ) -> Result<String, TerminalError> {
-    let preamble = container_git_preamble(registry, container_runtime.workspace_mount())?;
+    let preamble = container_git_preamble(registry, workspace)?;
     let script = if preamble.is_empty() {
         script.to_string()
     } else {
         format!("{preamble}{script}")
     };
-    let launch = prepared_tools.container_launch();
-    let script = launch
-        .wrap_script(&script)
-        .map_err(ToolRuntimeError::from)?;
-    let script = match carry.and_then(|carry| carry.report.as_ref()) {
-        Some(report) => carry_cwd_script(&script, report.as_str())?,
-        None => script,
-    };
-    Ok(launch
-        .shell_command(&script)
-        .map_err(ToolRuntimeError::from)?)
+    match report {
+        Some(report) => carry_cwd_script(&script, report.as_str()),
+        None => Ok(script),
+    }
 }
 
-#[allow(clippy::too_many_lines)]
-async fn execute_container_background<E: Executor + Clone + 'static>(
-    context: ContainerBackgroundExecution<'_, E>,
+/// What a container command adds to its spawn: the marker its processes carry
+/// for the container's memory reader and its jobserver fifo, the write access
+/// the fifo needs, and the way back to the host's IPC commands.
+struct ContainerJobAdditions {
+    environment: Vec<(String, String)>,
+    setup: ContainerSetup,
+}
+
+/// Runs a command in a container through a [`Sandbox`] on the container's
+/// backend, and answers what the job produced.
+async fn execute_container_job<E: Executor + Clone + 'static>(
+    context: ContainerJobExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    let container_runtime = context.container_runtime;
-    let exec = container_runtime.exec();
-
-    // Use lower 32 bits of a UUID as a synthetic PID for job tracking.
-    let pid = u32::from_le_bytes(
-        uuid::Uuid::new_v4().as_u128().to_le_bytes()[..4]
-            .try_into()
-            .expect("uuid byte slice has four bytes"),
-    );
-    let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-    let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
-    context
-        .job_registry
-        .register_at(
-            crate::JobPlace::Container,
-            pid,
-            context.task_id,
-            context.execution_id,
-            context.script,
-            context.interpreter,
-            context.mode,
-        )
-        .await;
-    let script = container_exec_script(
-        context.registry,
-        context.container_runtime,
-        context.prepared_tools,
-        context.carry,
-        &launch_script(context.interpreter, context.script, context.task_id)?,
-    )?;
-    let script = inject_env_exports(script, context.env_source.as_ref())?;
-    // Exported ahead of the embedder's variables, which win as they do for
-    // a local command.
-    #[cfg(all(unix, feature = "jobserver"))]
-    let script = match &context.job_fifo {
-        Some(fifo) => {
-            let environment: Arc<dyn EnvSource> = Arc::new(fifo.environment());
-            inject_env_exports(script, Some(&environment))?
-        }
-        None => script,
-    };
-    #[cfg(all(unix, feature = "jobserver"))]
-    let confinement = job_confinement(
-        context.confinement,
-        context
-            .job_fifo
-            .as_ref()
-            .map(crate::container_jobserver::ContainerJobFifo::path),
-    );
-    #[cfg(not(all(unix, feature = "jobserver")))]
-    let confinement = context.confinement.cloned();
-    let script = mark_container_job(script, context.task_id)?;
-    // A foreground command gets no input channel: the dropped sender is the
-    // EOF its stdin reads. StdinAlerts may ride along either way; they are
-    // the background job's blocked-reader wiring.
-    let exec_lifetime = if let JobLifetime::Foreground { .. } = context.lifetime {
-        drop(input_tx);
-        ExecLifetime::Foreground
-    } else {
-        context
-            .job_registry
-            .attach_terminal_input(pid, input_tx)
-            .await;
-        let (signal_tx, signal_rx) = async_channel::unbounded::<StdinWatchSignal>();
-        if let Some(alerts) = context.stdin_alerts {
-            context
-                .executor
-                .clone()
-                .spawn(async move {
-                    while let Ok(signal) = signal_rx.recv().await {
-                        match signal {
-                            StdinWatchSignal::Blocked => alerts.raise().await,
-                            StdinWatchSignal::Failed(error) => {
-                                alerts.raise_failure(error).await;
-                            }
-                        }
-                    }
-                })
-                .detach();
-        }
-        ExecLifetime::Background {
-            stdin_blocked: signal_tx,
-        }
-    };
-    context.job_registry.attach_kill_switch(pid, kill_tx).await;
-    context.background_startup.report_ready().await;
-
+    let runtime = context.container_runtime;
     let ipc_bridge = if context.ipc_commands.is_empty() {
         None
     } else {
         Some(start_container_ipc_bridge(
-            context.executor,
+            context.executor.clone(),
             Arc::clone(context.registry),
-            container_runtime.workspace_mount().cloned(),
-            container_runtime.host_route().address(),
+            runtime.workspace_mount().cloned(),
+            runtime.host_route().address(),
         )?)
     };
-    let working_dir = context
-        .carry
-        .map_or(CONTAINER_EXEC_WORKING_DIR, |carry| carry.start.as_str());
-    let wrapped_script = wrap_container_script(
-        &script,
-        context.ipc_commands,
-        ipc_bridge.as_ref().map(|bridge| ContainerIpcEndpoint {
-            host: container_runtime.host_route().name(),
-            port: bridge.port(),
-        }),
-        context.priority,
-        context.prepared_tools.bin_dir(),
-        working_dir,
-        confinement.as_ref(),
-    )?;
 
-    let execution = exec
-        .exec_boxed(
-            container_runtime.container_id(),
-            &wrapped_script,
-            working_dir,
-            kill_rx,
-            input_rx,
-            exec_lifetime,
-        )
-        .await;
+    let mut additions = ContainerJobAdditions {
+        // Exported by the sandbox ahead of the embedder's variables, which win
+        // as they do for a local command.
+        environment: vec![(
+            crate::memory::JOB_MARKER_ENV.to_string(),
+            context.task_id.to_string(),
+        )],
+        setup: ContainerSetup::default(),
+    };
+    #[cfg(all(unix, feature = "jobserver"))]
+    if let Some(fifo) = &context.job_fifo {
+        additions.environment.extend(fifo.environment());
+        // The build tools write tokens back to the fifo.
+        additions.setup.writable.push(fifo.path().clone());
+    }
+    if let Some(bridge) = &ipc_bridge {
+        let ipc = container_ipc_setup(
+            context.ipc_commands,
+            ContainerIpcEndpoint {
+                host: runtime.host_route().name(),
+                port: bridge.port(),
+            },
+        )?;
+        additions.setup = ContainerSetup {
+            writable: additions.setup.writable,
+            ..ipc
+        };
+    }
 
+    let result = spawn_container_job(&context, additions).await;
     if let Some(bridge) = ipc_bridge {
         bridge.stop().await;
     }
@@ -5226,55 +5149,74 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     // returns its tokens once the job's last process holding it is gone.
     #[cfg(all(unix, feature = "jobserver"))]
     drop(context.job_fifo);
-
-    record_container_exec_outcome(context.job_registry, pid, &context.lifetime, execution).await
+    result
 }
 
-/// Records a finished container exec in the job's streams and folds it into
-/// the call's result.
-async fn record_container_exec_outcome(
-    job_registry: &JobRegistry,
-    pid: u32,
-    lifetime: &JobLifetime,
-    execution: Result<ContainerExecOutcome, String>,
+async fn spawn_container_job<E: Executor + Clone + 'static>(
+    context: &ContainerJobExecution<'_, E>,
+    additions: ContainerJobAdditions,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    match execution {
-        Ok(ContainerExecOutcome::Completed { output, killed }) => {
-            if let JobLifetime::Foreground { alerts } = lifetime
-                && !killed.is_empty()
-            {
-                info!(
-                    killed = killed.len(),
-                    "killed processes of a finished foreground container command"
-                );
-                let _ = alerts
-                    .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
-                        killed,
-                    )))
-                    .await;
-            }
-            if !output.stdout.is_empty() {
-                job_registry.append_stdout(pid, output.stdout.clone()).await;
-            }
-            if !output.stderr.is_empty() {
-                job_registry.append_stderr(pid, output.stderr.clone()).await;
-            }
-            job_registry.close_stdout(pid).await;
-            job_registry.close_stderr(pid).await;
-            Ok((pid, output))
-        }
-        Ok(ContainerExecOutcome::Killed) => {
-            job_registry.close_stdout(pid).await;
-            job_registry.close_stderr(pid).await;
-            Err(TerminalError::Execution("container job killed".to_string()))
-        }
-        Err(err) => {
-            job_registry.fail(pid, &err, None).await;
-            job_registry.close_stdout(pid).await;
-            job_registry.close_stderr(pid).await;
-            Err(TerminalError::Execution(err))
-        }
+    let runtime = context.container_runtime;
+    let mut sandbox = Sandbox::new(
+        crate::Backend::Container {
+            runtime: runtime.clone(),
+            launch: context.prepared_tools.container_launch(),
+        },
+        context.executor.clone(),
+        context.working_dir,
+    )
+    .with_grants(context.grants.clone())
+    .with_priority(context.priority);
+    if let Some(source) = context.env_source {
+        sandbox = sandbox.with_env_source(source.clone());
     }
+
+    let carry = context.carry;
+    let script = container_job_script(
+        context.registry,
+        runtime.workspace_mount(),
+        carry
+            .and_then(|carry| carry.container.as_ref())
+            .and_then(|container| container.report.as_ref()),
+        &launch_script(context.interpreter, context.script, context.task_id)?,
+    )?;
+    let foreground = matches!(context.lifetime, JobLifetime::Foreground { .. });
+    let mut spec = SpawnSpec::script(script)
+        .env(additions.environment)
+        .container_setup(additions.setup)
+        .lifetime(if foreground {
+            TreeLifetime::Foreground
+        } else {
+            TreeLifetime::Background
+        })
+        // A foreground command gets no input channel: its stdin reads EOF.
+        .stdio(SpawnStdio {
+            stdin: if foreground { Pipe::Null } else { Pipe::Piped },
+            ..SpawnStdio::default()
+        });
+    if let Some(carry) = carry.filter(|carry| carry.container.is_some())
+        && let Some(start) = &carry.start
+    {
+        spec = spec.cwd(start);
+    }
+    let child = sandbox.spawn(spec).await?;
+    run_spawned_job(
+        child,
+        SpawnedJob {
+            executor: context.executor.clone(),
+            job_registry: context.job_registry,
+            background_startup: context.background_startup,
+            place: crate::JobPlace::Container,
+            task_id: context.task_id,
+            execution_id: context.execution_id,
+            script: context.script,
+            interpreter: context.interpreter,
+            mode: context.mode,
+            stdin_alerts: context.stdin_alerts.clone(),
+            lifetime: context.lifetime.clone(),
+        },
+    )
+    .await
 }
 
 /// Moves the chunks of a spawned process's stream to `tx` until the stream
@@ -5325,59 +5267,103 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
         SandboxMode::Unsandboxed => sandbox.unconfined(),
     };
     let script = launch_script(context.interpreter, context.script, context.task_id)?;
-    let mut child = sandbox.spawn(SpawnSpec::script(script)).await?;
+    let child = sandbox.spawn(SpawnSpec::script(script)).await?;
+    run_spawned_job(
+        child,
+        SpawnedJob {
+            executor: context.executor,
+            job_registry: context.job_registry,
+            background_startup: context.background_startup,
+            // The local `ssh` process stands for a job that runs on the
+            // remote host, whose memory is never judged.
+            place: crate::JobPlace::Remote,
+            task_id: context.task_id,
+            execution_id: context.execution_id,
+            script: context.script,
+            interpreter: context.interpreter,
+            mode: context.mode,
+            stdin_alerts: None,
+            lifetime: JobLifetime::Background,
+        },
+    )
+    .await
+}
+
+/// A job whose process a [`Sandbox`] spawned, and where its results go.
+struct SpawnedJob<'a, E> {
+    executor: E,
+    job_registry: &'a JobRegistry,
+    background_startup: &'a BackgroundStartup,
+    place: crate::JobPlace,
+    task_id: &'a IdLease,
+    execution_id: &'a str,
+    script: &'a str,
+    interpreter: Interpreter,
+    mode: SandboxMode,
+    /// Where a blocked stdin is alerted, for a child that watches its stdin.
+    stdin_alerts: Option<StdinAlerts>,
+    lifetime: JobLifetime,
+}
+
+/// Registers a spawned child as a job, streams its output into the registry
+/// and answers what it produced when it ended.
+async fn run_spawned_job<E: Executor + Clone + 'static>(
+    mut child: crate::SandboxedChild,
+    job: SpawnedJob<'_, E>,
+) -> Result<(u32, std::process::Output), TerminalError> {
     let stdout = child
         .take_stdout()
-        .ok_or_else(|| TerminalError::Execution("missing stdout pipe for ssh process".into()))?;
+        .ok_or_else(|| TerminalError::Execution("missing stdout pipe for the process".into()))?;
     let stderr = child
         .take_stderr()
-        .ok_or_else(|| TerminalError::Execution("missing stderr pipe for ssh process".into()))?;
+        .ok_or_else(|| TerminalError::Execution("missing stderr pipe for the process".into()))?;
+    let stdin = child.take_stdin();
+    let stdin_blocked = child.take_stdin_blocked();
     let child = Arc::new(child);
 
     let pid = child.id();
-    // The local `ssh` process stands for a job that runs on the remote host,
-    // whose memory is never judged.
-    context
-        .job_registry
+    job.job_registry
         .register_at(
-            crate::JobPlace::Remote,
+            job.place,
             pid,
-            context.task_id,
-            context.execution_id,
-            context.script,
-            context.interpreter,
-            context.mode,
+            job.task_id,
+            job.execution_id,
+            job.script,
+            job.interpreter,
+            job.mode,
         )
         .await;
-    // A kill of the job ends the command on the server as well as the local
-    // client.
+    if let Some(stdin) = stdin {
+        job.job_registry.attach_terminal_input(pid, stdin).await;
+    }
+    if let (Some(signals), Some(alerts)) = (stdin_blocked, job.stdin_alerts) {
+        job.executor.spawn(alerts.relay(signals)).detach();
+    }
+    // A kill of the job ends the whole process tree, wherever it runs.
     let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-    context.job_registry.attach_kill_switch(pid, kill_tx).await;
+    job.job_registry.attach_kill_switch(pid, kill_tx).await;
     let killed = Arc::clone(&child);
-    context
-        .executor
+    job.executor
         .spawn(async move {
             if kill_rx.recv().await.is_ok()
                 && let Err(error) = killed.kill().await
             {
-                warn!(%error, "ending the job on the server failed");
+                warn!(%error, "ending the job failed");
             }
         })
         .detach();
-    context.background_startup.report_ready().await;
+    job.background_startup.report_ready().await;
 
     let (chunk_tx, chunk_rx) = async_channel::unbounded();
     for (stream, is_stderr) in [(stdout, false), (stderr, true)] {
-        context
-            .executor
+        job.executor
             .spawn(forward_stream(stream, chunk_tx.clone(), is_stderr))
             .detach();
     }
     drop(chunk_tx);
-    context
-        .executor
+    job.executor
         .spawn(drain_terminal_chunks(
-            context.job_registry.clone(),
+            job.job_registry.clone(),
             pid,
             chunk_rx,
         ))
@@ -5385,22 +5371,37 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
 
     let status = match child.wait().await {
         crate::ChildExit::Exited(status) => status,
-        crate::ChildExit::Killed => unreachable!("an SSH process is ended by its own signal"),
+        // A kill ended it, and the backend has no status to report.
+        crate::ChildExit::Killed => {
+            job.job_registry.close_stdout(pid).await;
+            job.job_registry.close_stderr(pid).await;
+            return Err(TerminalError::Execution("container job killed".to_string()));
+        }
         crate::ChildExit::Failed(error) => {
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
-            context.job_registry.fail(pid, &error, None).await;
+            job.job_registry.close_stdout(pid).await;
+            job.job_registry.close_stderr(pid).await;
+            job.job_registry.fail(pid, &error, None).await;
             return Err(TerminalError::Execution(error));
         }
     };
-    wait_for_terminal_stream_close(context.job_registry, pid).await;
-    let (stdout, stderr) = context
-        .job_registry
-        .terminal_output(pid)
-        .await
-        .ok_or_else(|| {
-            TerminalError::Execution(format!("missing terminal output for pid {pid}"))
-        })?;
+    if let JobLifetime::Foreground { alerts } = &job.lifetime
+        && let Descendants::Killed(killed) = child.descendants_killed().await
+        && !killed.is_empty()
+    {
+        info!(
+            killed = killed.len(),
+            "killed descendants of a finished foreground command"
+        );
+        let _ = alerts
+            .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
+                killed,
+            )))
+            .await;
+    }
+    wait_for_terminal_stream_close(job.job_registry, pid).await;
+    let (stdout, stderr) = job.job_registry.terminal_output(pid).await.ok_or_else(|| {
+        TerminalError::Execution(format!("missing terminal output for pid {pid}"))
+    })?;
     Ok((
         pid,
         std::process::Output {
@@ -5438,17 +5439,6 @@ pub fn inject_env_exports(
     }
     rendered.push_str(&script);
     Ok(rendered)
-}
-
-/// Marks every process of a container job with its task ID, the marker the
-/// container's memory reader finds the job's processes by: each process the
-/// job starts inherits it.
-fn mark_container_job(script: String, task_id: &str) -> Result<String, TerminalError> {
-    let marker: Arc<dyn EnvSource> = Arc::new(vec![(
-        crate::memory::JOB_MARKER_ENV.to_string(),
-        task_id.to_string(),
-    )]);
-    inject_env_exports(script, Some(&marker))
 }
 
 fn shell_escape(value: &str) -> String {
@@ -5658,16 +5648,23 @@ fn path_environment_value(name: &str, path: &Path) -> Result<String, TerminalErr
 }
 
 #[derive(Template)]
-#[template(path = "container_ipc_wrapper.sh", escape = "none")]
-struct ContainerIpcWrapperTemplate<'a> {
+#[template(path = "container_ipc_prelude.sh", escape = "none")]
+struct ContainerIpcPreludeTemplate<'a> {
     escaped_commands: &'a str,
     ipc_host: &'a str,
     ipc_port: u16,
+}
+
+#[derive(Template)]
+#[template(path = "container_setup.sh", escape = "none")]
+struct ContainerSetupTemplate<'a> {
+    setup: &'a str,
     script: &'a str,
 }
 
+/// Where a container's commands reach the host's IPC bridge.
 #[derive(Clone, Copy)]
-pub struct ContainerIpcEndpoint<'a> {
+struct ContainerIpcEndpoint<'a> {
     host: &'a str,
     port: u16,
 }
@@ -5685,19 +5682,6 @@ pub struct ContainerConfinement {
     pub(crate) writable: Vec<ContainerPath>,
 }
 
-/// A container command's sandbox: a subagent's confinement plus write access
-/// to the command's jobserver fifo, which its build tools write tokens back
-/// to. An unconfined command already reaches the fifo.
-#[cfg(all(unix, feature = "jobserver"))]
-fn job_confinement(
-    confinement: Option<&ContainerConfinement>,
-    job_fifo: Option<&ContainerPath>,
-) -> Option<ContainerConfinement> {
-    let mut confinement = confinement?.clone();
-    confinement.writable.extend(job_fifo.cloned());
-    Some(confinement)
-}
-
 /// Where a container command runs: the mounted tools, the exec's working
 /// directory and, for a subagent, its sandbox.
 #[derive(Clone, Copy)]
@@ -5710,14 +5694,13 @@ struct ContainerRunScope<'a> {
 #[derive(Template)]
 #[template(path = "container_heel_run.sh", escape = "none")]
 struct ContainerHeelRunTemplate<'a> {
-    heel_bin: &'a str,
-    resolve_heel: bool,
     escaped_working_dir: &'a str,
     escaped_tools_dir: &'a str,
     /// Set for a subagent: the isolation level and grants replacing the
     /// container-wide permissive one.
     escaped_grants: Option<Vec<String>>,
-    escaped_ipc_endpoint: Option<String>,
+    /// The embedder's shell words, expanded by the exec's shell.
+    sandbox_args: &'a [String],
     nice: Option<u8>,
     io_priority: Option<&'static str>,
     escaped_script: &'a str,
@@ -5729,29 +5712,22 @@ struct ContainerHeelRunTemplate<'a> {
 /// The priority goes through heel's own sandbox configuration: the container
 /// image's `heel` binary runs the script under `heel run`, so the settings are
 /// the same flags the CLI takes everywhere — `nice`/`ionice` are never
-/// reimplemented here. `heel_bin` is the shell expression that resolves the
-/// image's `heel` (`$MAY_IPC_BIN` once the IPC wrapper has resolved it, or
-/// `$MAY_HEEL_BIN` the template resolves itself when `resolve_heel` is set)
-/// and `working_dir` is the exact directory the execution runs in, matching
-/// the directory the container exec applies.
+/// reimplemented here. The command resolves the image's `heel` itself and
+/// fails when the image lacks one; `working_dir` is the exact directory the
+/// execution runs in, matching the directory the container exec applies.
 ///
 /// The container is already the isolation boundary, so the invocation asks for
 /// `permissive` isolation: the script keeps the filesystem permissions it had
 /// as the container caller. The ruleset still exec-denies everything outside
 /// the system directories, so `--executable` grants the mounted tools
 /// directory read-execute — without it every prepared tool fails with
-/// Permission denied. `PATH` and `HOME` are forwarded so the generated
-/// `heel ipc` shims still resolve and the script sees its usual environment.
-/// Networking keeps heel's deny-all default, and no rule is bent to pass the
-/// IPC transport: `--ipc-endpoint` has heel relay the sandbox's local IPC
-/// socket to the bridge endpoint from outside the sandbox, so the sandboxed
-/// `heel ipc` never needs TCP access of its own.
+/// Permission denied. `PATH` and `HOME` are forwarded, so the script sees the
+/// environment a setup prepared. Networking keeps heel's deny-all default.
+/// `sandbox_args` are the embedder's own words for the command line.
 fn heel_run_container_command(
     script: &str,
     priority: ProcessPriority,
-    heel_bin: &str,
-    resolve_heel: bool,
-    ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
+    sandbox_args: &[String],
     scope: ContainerRunScope<'_>,
 ) -> Result<String, TerminalError> {
     let ContainerRunScope {
@@ -5781,17 +5757,12 @@ fn heel_run_container_command(
     });
     let escaped_working_dir = shell_escape(working_dir);
     let escaped_tools_dir = shell_escape(tools_dir.as_str());
-    let escaped_ipc_endpoint = ipc_endpoint
-        .map(|endpoint| format!("tcp://{}:{}", endpoint.host, endpoint.port))
-        .map(|endpoint| shell_escape(&endpoint));
     let escaped_script = shell_escape(script);
     ContainerHeelRunTemplate {
-        heel_bin,
-        resolve_heel,
         escaped_working_dir: &escaped_working_dir,
         escaped_tools_dir: &escaped_tools_dir,
         escaped_grants,
-        escaped_ipc_endpoint,
+        sandbox_args,
         nice,
         io_priority,
         escaped_script: &escaped_script,
@@ -5812,15 +5783,10 @@ fn prioritized_container_script(
     if priority.is_normal() && confinement.is_none() {
         return Ok(script.to_string());
     }
-    // Outside the IPC wrapper no `heel` binary has been resolved yet; the
-    // template resolves it the same way the wrapper does and fails when the
-    // image lacks one.
     heel_run_container_command(
         script,
         priority,
-        "\"$MAY_HEEL_BIN\"",
-        true,
-        None,
+        &[],
         ContainerRunScope {
             tools_dir,
             working_dir,
@@ -5829,26 +5795,50 @@ fn prioritized_container_script(
     )
 }
 
+/// The script a container exec runs for `script`: `setup` first, outside the
+/// sandbox, and then `script` in the sandbox the priority and confinement ask
+/// for, with the setup's sandbox arguments.
 pub fn wrap_container_script(
     script: &str,
-    ipc_commands: &[String],
-    ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
+    setup: Option<&ContainerSetup>,
     priority: ProcessPriority,
     tools_dir: &ContainerPath,
     working_dir: &str,
     confinement: Option<&ContainerConfinement>,
 ) -> Result<String, TerminalError> {
-    if ipc_commands.is_empty() {
+    let Some(setup) = setup else {
         return prioritized_container_script(script, priority, tools_dir, working_dir, confinement);
+    };
+    let script = if priority.is_normal() && confinement.is_none() {
+        script.to_string()
+    } else {
+        heel_run_container_command(
+            script,
+            priority,
+            &setup.sandbox_args,
+            ContainerRunScope {
+                tools_dir,
+                working_dir,
+                confinement,
+            },
+        )?
+    };
+    ContainerSetupTemplate {
+        setup: &setup.script,
+        script: &script,
     }
+    .render()
+    .map_err(|error| TerminalError::Execution(format!("failed to render container setup: {error}")))
+}
 
-    let endpoint = ipc_endpoint.ok_or_else(|| {
-        TerminalError::Execution(
-            "missing container IPC endpoint for wrapped script execution".to_string(),
-        )
-    })?;
-
-    for name in ipc_commands {
+/// The setup a container command needs to reach the host's IPC commands: the
+/// shims for `commands` in a directory of their own, and the endpoint the
+/// sandbox relays to. The sandbox may read and run the shims.
+fn container_ipc_setup(
+    commands: &[String],
+    endpoint: ContainerIpcEndpoint<'_>,
+) -> Result<ContainerSetup, TerminalError> {
+    for name in commands {
         if !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -5858,42 +5848,35 @@ pub fn wrap_container_script(
             )));
         }
     }
-
-    let escaped_commands = ipc_commands
+    let escaped_commands = commands
         .iter()
         .map(|name| shell_escape(name))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = if priority.is_normal() && confinement.is_none() {
-        script.to_string()
-    } else {
-        // The generated shims are written under the shared temp directory,
-        // which stays execute-denied even at `permissive` isolation: the
-        // render below grants them read-and-execute so the sandboxed `PATH`
-        // resolves them — the wrapper writes them before `heel run`, so the
-        // sandbox itself never writes the directory.
-        heel_run_container_command(
-            script,
-            priority,
-            "\"$MAY_IPC_BIN\"",
-            false,
-            Some(endpoint),
-            ContainerRunScope {
-                tools_dir,
-                working_dir,
-                confinement,
-            },
-        )?
-    };
-    ContainerIpcWrapperTemplate {
+    let script = ContainerIpcPreludeTemplate {
         escaped_commands: &escaped_commands,
         ipc_host: endpoint.host,
         ipc_port: endpoint.port,
-        script: &script,
     }
     .render()
     .map_err(|error| {
-        TerminalError::Execution(format!("failed to render container IPC wrapper: {error}"))
+        TerminalError::Execution(format!("failed to render container IPC setup: {error}"))
+    })?;
+    // The shims are written under the shared temp directory, which stays
+    // execute-denied even at `permissive` isolation, so the sandbox is granted
+    // them read-and-execute; the setup writes them before the sandbox starts,
+    // so the sandbox itself never writes the directory. `--ipc-endpoint` has
+    // heel relay the sandbox's local IPC socket to the bridge from outside
+    // it, so the sandboxed `heel ipc` needs no TCP access of its own.
+    Ok(ContainerSetup {
+        script,
+        sandbox_args: vec![
+            "--ipc-endpoint".to_string(),
+            shell_escape(&format!("tcp://{}:{}", endpoint.host, endpoint.port)),
+            "--grant".to_string(),
+            "\"$MAY_IPC_DIR=rx\"".to_string(),
+        ],
+        ..ContainerSetup::default()
     })
 }
 
@@ -6301,6 +6284,7 @@ mod tests {
     #[cfg(unix)]
     use crate::builtin::{JobInputArgs, JobInputTool};
     use crate::output::empty_stream;
+    use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
     use crate::test_wording::TestWording;
     use crate::{ShellWording, ToolRegistryBuilder};
     #[cfg(unix)]
@@ -6455,6 +6439,7 @@ mod tests {
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
             _stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
         ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
         {
             std::future::ready(Err("adoption never executes in the container".to_string()))
@@ -6964,10 +6949,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_completed_task(
-        receiver: &ShellEvents,
-        task_id: &str,
-    ) -> JobEnded {
+    async fn wait_for_completed_task(receiver: &ShellEvents, task_id: &str) -> JobEnded {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(task) = receiver
@@ -7119,19 +7101,34 @@ mod tests {
             .clone()
     }
 
-    #[test]
-    fn wrap_container_script_refreshes_command_hash_table() {
-        let wrapped = wrap_container_script(
-            "websearch \"gold price\"",
-            &[String::from("websearch")],
-            Some(ContainerIpcEndpoint {
-                host: "host.docker.internal",
-                port: 9000,
-            }),
-            ProcessPriority::default(),
+    /// `script` wrapped with the IPC setup for `commands` at `endpoint`.
+    fn wrap_with_ipc(
+        script: &str,
+        commands: &[String],
+        endpoint: ContainerIpcEndpoint<'_>,
+        priority: ProcessPriority,
+    ) -> Result<String, TerminalError> {
+        let setup = container_ipc_setup(commands, endpoint)?;
+        wrap_container_script(
+            script,
+            Some(&setup),
+            priority,
             &container_tools_dir(),
             CONTAINER_EXEC_WORKING_DIR,
             None,
+        )
+    }
+
+    #[test]
+    fn wrap_container_script_refreshes_command_hash_table() {
+        let wrapped = wrap_with_ipc(
+            "websearch \"gold price\"",
+            &[String::from("websearch")],
+            ContainerIpcEndpoint {
+                host: "host.docker.internal",
+                port: 9000,
+            },
+            ProcessPriority::default(),
         )
         .expect("wrap script");
         assert!(wrapped.contains("hash -r;"));
@@ -7142,17 +7139,14 @@ mod tests {
     #[test]
     fn wrap_container_script_preserves_user_script_semantics() {
         let script = "echo '$5,040' && subagent art_direction --prompt-file tmp/prompt.md";
-        let wrapped = wrap_container_script(
+        let wrapped = wrap_with_ipc(
             script,
             &[String::from("subagent")],
-            Some(ContainerIpcEndpoint {
+            ContainerIpcEndpoint {
                 host: "host.docker.internal",
                 port: 9000,
-            }),
+            },
             ProcessPriority::default(),
-            &container_tools_dir(),
-            CONTAINER_EXEC_WORKING_DIR,
-            None,
         )
         .expect("wrap script");
         assert!(wrapped.contains(script));
@@ -7161,17 +7155,14 @@ mod tests {
 
     #[test]
     fn wrap_container_script_rejects_invalid_ipc_command_names() {
-        let error = wrap_container_script(
+        let error = wrap_with_ipc(
             "echo ok",
             &[String::from("bad name")],
-            Some(ContainerIpcEndpoint {
+            ContainerIpcEndpoint {
                 host: "host.docker.internal",
                 port: 9000,
-            }),
+            },
             ProcessPriority::default(),
-            &container_tools_dir(),
-            CONTAINER_EXEC_WORKING_DIR,
-            None,
         )
         .expect_err("invalid command name must fail");
         assert!(
@@ -7183,17 +7174,14 @@ mod tests {
 
     #[test]
     fn wrap_container_script_renders_expected_endpoint() {
-        let wrapped = wrap_container_script(
+        let wrapped = wrap_with_ipc(
             "environment --query deployment",
             &[String::from("environment"), String::from("session")],
-            Some(ContainerIpcEndpoint {
+            ContainerIpcEndpoint {
                 host: "host.containers.internal",
                 port: 43123,
-            }),
+            },
             ProcessPriority::default(),
-            &container_tools_dir(),
-            CONTAINER_EXEC_WORKING_DIR,
-            None,
         )
         .expect("wrap script");
         assert!(wrapped.contains("tcp://host.containers.internal:43123"));
@@ -9349,26 +9337,42 @@ mod tests {
         alerts
     }
 
-    /// A foreground container command gets a live stdin pipe like every
-    /// other job: no EOF shortcut. The exec's stdin channel stays open and
-    /// its blocked watch channel is wired, so a reader can be fed through
-    /// `terminal_input` once the call promotes.
+    /// A foreground container command's stdin reads EOF at once: only a
+    /// background job's stdin is a pipe the agent feeds.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn container_foreground_command_gets_a_live_stdin_pipe() {
-        /// A container executor that asserts stdin is a watched live pipe.
+    async fn container_foreground_command_reads_eof_from_stdin() {
+        /// A container executor that asserts stdin is at EOF.
         struct ForegroundStdinPipeExec;
 
         impl crate::ContainerExec for ForegroundStdinPipeExec {
-            async fn exec(
+            fn exec(
+                &self,
+                _container_id: &str,
+                _script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                _stdin_rx: Receiver<Vec<u8>>,
+                _lifetime: ExecLifetime,
+            ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+            {
+                std::future::ready(Err("a job streams its output".to_string()))
+            }
+
+            async fn exec_streamed(
                 &self,
                 _container_id: &str,
                 _script: &str,
                 _working_dir: &str,
                 _kill_rx: Receiver<()>,
                 stdin_rx: Receiver<Vec<u8>>,
-                _lifetime: ExecLifetime,
+                _stdout: Sender<Vec<u8>>,
+                lifetime: ExecLifetime,
             ) -> Result<ContainerExecOutcome, String> {
+                assert!(
+                    matches!(lifetime, ExecLifetime::Foreground),
+                    "a foreground command's descendants end with it"
+                );
                 let eof = futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
                     async_io::Timer::after(Duration::from_secs(5)).await;
                     None
@@ -9384,19 +9388,6 @@ mod tests {
                     },
                     killed: Vec::new(),
                 })
-            }
-
-            fn exec_streamed(
-                &self,
-                _container_id: &str,
-                _script: &str,
-                _working_dir: &str,
-                _kill_rx: Receiver<()>,
-                _stdin_rx: Receiver<Vec<u8>>,
-                _stdout: Sender<Vec<u8>>,
-            ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
-            {
-                std::future::ready(Err("a foreground command does not stream".to_string()))
             }
         }
 
@@ -9418,8 +9409,10 @@ mod tests {
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let (alert_tx, _alert_rx) = event_channel();
-        let (_pid, output) = execute_container_background(ContainerBackgroundExecution {
+        let (_pid, output) = execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
+            working_dir: dir.path(),
+            grants: &Grants::new(),
             env_source: &None,
             registry: &registry,
             task_id: &crate::test_ids::lease("probe"),
@@ -9439,7 +9432,6 @@ mod tests {
             lifetime: JobLifetime::Foreground { alerts: alert_tx },
             background_startup: &BackgroundStartup::new(startup_tx),
             priority: ProcessPriority::default(),
-            confinement: None,
             carry: None,
             #[cfg(all(unix, feature = "jobserver"))]
             job_fifo: None,
@@ -9447,42 +9439,6 @@ mod tests {
         .await
         .expect("a foreground container exec should complete");
         assert_eq!(output.status.code(), Some(0));
-    }
-
-    /// A subagent's command in a container gets write access to its
-    /// jobserver fifo on top of its confinement; an unconfined command gets
-    /// no grants at all.
-    #[cfg(all(unix, feature = "jobserver"))]
-    #[test]
-    fn container_job_fifo_is_granted_to_a_confined_command() {
-        let fifo = ContainerPath::new("/tmp/aither-jobserver-1.fifo").unwrap();
-        let confinement = ContainerConfinement {
-            working_dir: ContainerPath::new("/workspace/.subagents/a").unwrap(),
-            writable: vec![ContainerPath::new("/workspace/.subagents/a").unwrap()],
-        };
-        assert_eq!(job_confinement(None, Some(&fifo)), None);
-        let confined = job_confinement(Some(&confinement), Some(&fifo)).unwrap();
-        let tools_dir = container_tools_dir();
-        let wrapped = wrap_container_script(
-            "make",
-            &[],
-            None,
-            ProcessPriority::default(),
-            &tools_dir,
-            "/workspace",
-            Some(&confined),
-        )
-        .unwrap();
-        assert!(
-            wrapped.contains(
-                "--grant '/workspace/.subagents/a=rw' --grant '/tmp/aither-jobserver-1.fifo=rw'"
-            ),
-            "{wrapped}"
-        );
-        assert_eq!(
-            job_confinement(Some(&confinement), None).as_ref(),
-            Some(&confinement)
-        );
     }
 
     /// With a pool configured, a container command's script exports the
@@ -9494,39 +9450,50 @@ mod tests {
     struct CapturingExec {
         scripts: Sender<String>,
         relay_heard: Sender<Vec<u8>>,
+        /// How many execs have started: the first is the jobserver relay.
+        started: std::sync::atomic::AtomicUsize,
     }
 
     #[cfg(all(unix, feature = "jobserver"))]
     impl crate::ContainerExec for CapturingExec {
-        async fn exec(
-            &self,
-            _container_id: &str,
-            script: &str,
-            _working_dir: &str,
-            _kill_rx: Receiver<()>,
-            _stdin_rx: Receiver<Vec<u8>>,
-            _lifetime: ExecLifetime,
-        ) -> Result<ContainerExecOutcome, String> {
-            self.scripts.send(script.to_string()).await.unwrap();
-            Ok(ContainerExecOutcome::Completed {
-                output: std::process::Output {
-                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                },
-                killed: Vec::new(),
-            })
-        }
-
-        async fn exec_streamed(
+        fn exec(
             &self,
             _container_id: &str,
             _script: &str,
             _working_dir: &str,
             _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _lifetime: ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("a job streams its output".to_string()))
+        }
+
+        async fn exec_streamed(
+            &self,
+            _container_id: &str,
+            script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
             stdin_rx: Receiver<Vec<u8>>,
             stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
         ) -> Result<ContainerExecOutcome, String> {
+            if self
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                > 0
+            {
+                self.scripts.send(script.to_string()).await.unwrap();
+                return Ok(ContainerExecOutcome::Completed {
+                    output: std::process::Output {
+                        status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    killed: Vec::new(),
+                });
+            }
             stdout.send(b"R".to_vec()).await.unwrap();
             while let Ok(message) = stdin_rx.recv().await {
                 let finished = message == b"F";
@@ -9567,6 +9534,7 @@ mod tests {
             crate::AnyContainerExec::new(Arc::new(CapturingExec {
                 scripts: scripts_tx,
                 relay_heard: heard_tx,
+                started: std::sync::atomic::AtomicUsize::new(0),
             })),
         );
         let job_fifo = crate::container_jobserver::open_container_job_fifo(
@@ -9580,8 +9548,10 @@ mod tests {
         let fifo_path = job_fifo.path().clone();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let (alert_tx, _alert_rx) = event_channel();
-        execute_container_background(ContainerBackgroundExecution {
+        execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
+            working_dir: dir.path(),
+            grants: &Grants::new(),
             env_source: &None,
             registry: &registry,
             task_id: &crate::test_ids::lease("probe"),
@@ -9597,7 +9567,6 @@ mod tests {
             lifetime: JobLifetime::Foreground { alerts: alert_tx },
             background_startup: &BackgroundStartup::new(startup_tx),
             priority: ProcessPriority::default(),
-            confinement: None,
             carry: None,
             job_fifo: Some(job_fifo),
         })
@@ -9605,10 +9574,9 @@ mod tests {
         .expect("the container exec completes");
 
         let script = scripts.recv().await.expect("the command ran");
-        let flags = format!("'-j --jobserver-auth=fifo:{fifo_path}'");
         for name in ["MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS"] {
             assert!(
-                script.contains(&format!("export {name}={flags}\n")),
+                script.contains(&format!("export {name}=")) && script.contains(fifo_path.as_str()),
                 "{name} names the container fifo: {script}"
             );
         }
@@ -10810,13 +10778,17 @@ mod tests {
         );
         let tools_dir = container_tools_dir();
         let executable = format!("--executable {}", shell_escape(tools_dir.as_str()));
-        let wrapped = wrap_container_script(
-            "echo ok",
+        let setup = container_ipc_setup(
             &[String::from("websearch")],
-            Some(ContainerIpcEndpoint {
+            ContainerIpcEndpoint {
                 host: "host.docker.internal",
                 port: 9000,
-            }),
+            },
+        )
+        .expect("ipc setup");
+        let wrapped = wrap_container_script(
+            "echo ok",
+            Some(&setup),
             priority,
             &tools_dir,
             "/workspace",
@@ -10824,7 +10796,7 @@ mod tests {
         )
         .expect("wrap script");
         assert!(wrapped.contains(
-            "\"$MAY_IPC_BIN\" run --isolation permissive --working-dir '/workspace' \
+            "\"$MAY_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
              --env-passthrough PATH --env-passthrough HOME"
         ));
         assert!(wrapped.contains(&executable));
@@ -10834,16 +10806,8 @@ mod tests {
         ));
         assert!(wrapped.contains("HEEL_IPC_ENDPOINT"));
 
-        let bare = wrap_container_script(
-            "echo ok",
-            &[],
-            None,
-            priority,
-            &tools_dir,
-            "/workspace",
-            None,
-        )
-        .expect("wrap script");
+        let bare = wrap_container_script("echo ok", None, priority, &tools_dir, "/workspace", None)
+            .expect("wrap script");
         assert!(bare.contains("MAY_HEEL_BIN=\"$(command -v heel || true)\""));
         assert!(bare.contains(
             "\"$MAY_HEEL_BIN\" run --isolation permissive --working-dir '/workspace' \
@@ -10854,7 +10818,6 @@ mod tests {
 
         let normal = wrap_container_script(
             "echo ok",
-            &[],
             None,
             ProcessPriority::default(),
             &tools_dir,
@@ -10869,7 +10832,6 @@ mod tests {
     fn wrap_container_script_prioritizes_each_half_independently() {
         let io_only = wrap_container_script(
             "echo ok",
-            &[],
             None,
             ProcessPriority::new(CpuPriority::Normal, IoPriority::Utility),
             &container_tools_dir(),
@@ -10882,7 +10844,6 @@ mod tests {
 
         let cpu_only = wrap_container_script(
             "echo ok",
-            &[],
             None,
             ProcessPriority::new(
                 CpuPriority::Nice(NiceLevel::new(9).expect("nice level 9 is in range")),
@@ -11203,6 +11164,7 @@ mod tests {
             kill_rx,
             stdin_rx,
             out_tx,
+            ExecLifetime::Foreground,
         );
         let collect = async {
             let mut total = 0;
@@ -11228,7 +11190,15 @@ mod tests {
         let (out_tx, out_rx) = async_channel::bounded::<Vec<u8>>(1);
         drop(out_rx);
         let outcome = exec
-            .exec_streamed(&container.0, "yes", "/", kill_rx, stdin_rx, out_tx)
+            .exec_streamed(
+                &container.0,
+                "yes",
+                "/",
+                kill_rx,
+                stdin_rx,
+                out_tx,
+                ExecLifetime::Foreground,
+            )
             .await;
         drop(kill_tx);
         assert!(
@@ -13762,6 +13732,7 @@ mod tests {
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
             _stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
         ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
         {
             self.scripts.lock().unwrap().push(script.to_string());
@@ -13861,12 +13832,11 @@ mod tests {
             .find(|job| job.script == "echo marked-command")
             .expect("the job is registered");
         assert_eq!(job.place, crate::JobPlace::Container);
+        // The sandbox exports it ahead of the command, which the managed
+        // shell's command line quotes.
         assert!(
-            script.contains(&format!(
-                "export {}='{}'",
-                crate::memory::JOB_MARKER_ENV,
-                job.task_id
-            )),
+            script.contains(&format!("export {}=", crate::memory::JOB_MARKER_ENV))
+                && script.contains(job.task_id.as_str()),
             "{script}"
         );
     }
@@ -13913,7 +13883,7 @@ mod tests {
             !main.contains(" run --"),
             "the container is the main agent's boundary: {main}"
         );
-        assert!(sub.contains("\"$MAY_IPC_BIN\" run --working-dir"), "{sub}");
+        assert!(sub.contains("\"$MAY_HEEL_BIN\" run --working-dir"), "{sub}");
         assert!(!sub.contains("--isolation permissive"), "{sub}");
         let root = dunce::canonicalize(dir.path()).unwrap();
         let space = child
@@ -14439,10 +14409,7 @@ mod tests {
     use crate::monitor::{MonitorArgs, MonitorEnd, MonitorSource, MonitorTool};
 
     /// Job alerts the monitor produces until `ended` or `duration` passes.
-    async fn monitor_alerts(
-        receiver: &ShellEvents,
-        duration: Duration,
-    ) -> Vec<ShellEvent> {
+    async fn monitor_alerts(receiver: &ShellEvents, duration: Duration) -> Vec<ShellEvent> {
         let deadline = std::time::Instant::now() + duration;
         let mut alerts = Vec::new();
         while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {

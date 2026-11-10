@@ -39,7 +39,7 @@ use std::sync::Arc;
 use executor_core::{AnyExecutor, Executor};
 
 pub use backend::Backend;
-pub use child::{ChildExit, SandboxedChild};
+pub use child::{ChildExit, Descendants, SandboxedChild};
 pub use domain::{
     AnyDomainApprover, ApproveAllDomains, DenyAllDomains, DomainApprover, DomainRequest,
 };
@@ -111,6 +111,38 @@ pub struct SpawnSpec {
     pub(crate) extra_grants: Vec<heel::Grant>,
     /// The commands the process may call back into the host with.
     pub(crate) ipc: Option<heel::IpcRouter>,
+    /// Whether the backend ends the processes the top-level one leaves.
+    pub(crate) lifetime: TreeLifetime,
+    /// What a container process needs set up around its sandbox.
+    pub(crate) setup: Option<ContainerSetup>,
+}
+
+/// What a process in a container needs around its sandbox.
+///
+/// A plain environment and host grants cannot say it: paths inside the
+/// container the process may also write, shell the embedder runs in the exec's
+/// shell before the sandbox starts, and arguments for the sandbox itself that
+/// may use what that shell defined.
+///
+/// Only the container backend takes one; the host and SSH backends refuse a
+/// spec that has one, rather than run the process without it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerSetup {
+    /// Paths inside the container the process may write beyond its
+    /// sandbox's own writable grants, such as a fifo made there. They widen
+    /// only a [derived](Sandbox::derived) sandbox's confinement: any other
+    /// process already writes everywhere in the container.
+    pub writable: Vec<crate::ContainerPath>,
+    /// Shell run in the exec's shell before and outside the sandbox. It owns
+    /// its cleanup (a `trap ... EXIT` runs when the exec ends) and may export
+    /// variables and define shell variables for [`Self::sandbox_args`].
+    pub script: String,
+    /// Words appended to the in-container sandbox's `heel run` command line,
+    /// each one a shell word the exec's shell expands after the setup ran.
+    /// They apply only when the process runs in that sandbox: with
+    /// the default priority and no confinement there is none, and the
+    /// setup's exports are all the process gets.
+    pub sandbox_args: Vec<String>,
 }
 
 impl std::fmt::Debug for SpawnSpec {
@@ -138,6 +170,8 @@ impl SpawnSpec {
             stdio: Stdio::default(),
             extra_grants: Vec::new(),
             ipc: None,
+            lifetime: TreeLifetime::Background,
+            setup: None,
         }
     }
 
@@ -168,6 +202,38 @@ impl SpawnSpec {
     #[must_use]
     pub fn env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
         self.env.extend(env);
+        self
+    }
+
+    /// Grants this process alone beyond the sandbox's, on the host. A
+    /// container or a server never sees them: a grant is a resolved path on
+    /// this machine, and what a process elsewhere needs has no counterpart
+    /// here. A container process's own extra access is
+    /// [`ContainerSetup::writable`].
+    #[must_use]
+    pub fn grants(mut self, grants: impl IntoIterator<Item = heel::Grant>) -> Self {
+        self.extra_grants.extend(grants);
+        self
+    }
+
+    /// Sets how long the process's descendants may outlive it. The default
+    /// is [`TreeLifetime::Background`]: the child lasts until its whole tree
+    /// has exited, and its piped stdin is watched
+    /// ([`SandboxedChild::take_stdin_blocked`]); a container child's watch
+    /// runs, and costs a probe in the container, even when stdin is not
+    /// piped. SSH keeps the default for either value, as it cannot see the
+    /// tree.
+    #[must_use]
+    pub const fn lifetime(mut self, lifetime: TreeLifetime) -> Self {
+        self.lifetime = lifetime;
+        self
+    }
+
+    /// Sets what a container process needs around its sandbox; see
+    /// [`ContainerSetup`].
+    #[must_use]
+    pub fn container_setup(mut self, setup: ContainerSetup) -> Self {
+        self.setup = Some(setup);
         self
     }
 

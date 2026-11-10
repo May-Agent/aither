@@ -134,9 +134,8 @@ pub use builtin::{
 };
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandCall, CommandEnvelope, CommandGate,
-    CommandObserver,
-    CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler, GateDecision,
-    IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
+    CommandObserver, CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler,
+    GateDecision, IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
     ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
     output_saved_text, register_ipc_gateway_command, register_tool_command, register_tool_direct,
     schema_to_help, tool_output_to_payload, validate_positional_layout,
@@ -197,9 +196,10 @@ pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
 };
 pub use spawn::{
-    AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, ContainerLaunch, DenyAllDomains,
-    DomainApprover, DomainRequest, EnvSource, GitDirAccess, GrantSnapshot, Grants, HostRoute,
-    HostRouteError, Pipe, RemoteLaunch, Sandbox, SandboxedChild, SpawnError, SpawnSpec, Stdio,
+    AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, ContainerLaunch, ContainerSetup,
+    DenyAllDomains, Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess,
+    GrantSnapshot, Grants, HostRoute, HostRouteError, Pipe, RemoteLaunch, Sandbox, SandboxedChild,
+    SpawnError, SpawnSpec, Stdio, TreeLifetime,
 };
 pub use ssh::{PreparedSsh, SshPlatform, SshProbeError, SshServer, SshServerError, probe_ssh_os};
 pub use stdin_watch::StdinWatchSignal;
@@ -209,9 +209,9 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, Given, Missing,
-    Script, Shell, ShellArgs, ShellBuilder, ShellRunError, ShellTool, TerminalBinding,
-    TerminalError, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
+    CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, Given, Missing, Script,
+    Shell, ShellArgs, ShellBuilder, ShellRunError, ShellTool, TerminalBinding, TerminalError,
+    TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
     open_network_audit_log,
 };
 pub use tool_distribution::{

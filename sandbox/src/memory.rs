@@ -1097,10 +1097,10 @@ mod tests {
         use async_channel::{Receiver, Sender};
 
         use super::*;
+        use crate::job_registry::job_registry_channel;
         use crate::{
             AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime, SandboxMode,
         };
-        use crate::job_registry::job_registry_channel;
 
         const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -1147,6 +1147,7 @@ mod tests {
                 _kill_rx: Receiver<()>,
                 _stdin_rx: Receiver<Vec<u8>>,
                 _stdout: Sender<Vec<u8>>,
+                _lifetime: crate::ExecLifetime,
             ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
                 std::future::ready(Err("a probe is never streamed".to_string()))
             }

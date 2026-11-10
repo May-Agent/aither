@@ -289,6 +289,7 @@ impl ContainerExec for HangingExec {
         kill_rx: Receiver<()>,
         _stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        _lifetime: crate::ExecLifetime,
     ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send {
         self.scripts.lock().unwrap().push(script.to_string());
         async move {
@@ -358,4 +359,255 @@ async fn a_container_process_streams_and_kill_ends_its_exec() {
         .expect("the killed exec is waited for");
     assert_eq!(exit, ChildExit::Killed);
     assert_eq!(child.wait().await, ChildExit::Killed);
+}
+
+/// A container exec that records how it was started, reports the descendants
+/// it killed and, for a background exec, that its stdin blocked.
+struct ReportingExec {
+    started: Arc<Mutex<Vec<(String, bool)>>>,
+    killed: Vec<crate::JobProcess>,
+}
+
+impl ContainerExec for ReportingExec {
+    fn exec(
+        &self,
+        _container_id: &str,
+        _script: &str,
+        _working_dir: &str,
+        _kill_rx: Receiver<()>,
+        _stdin_rx: Receiver<Vec<u8>>,
+        _lifetime: crate::ExecLifetime,
+    ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        std::future::ready(Err("the spawn layer streams its execs".into()))
+    }
+
+    async fn exec_streamed(
+        &self,
+        _container_id: &str,
+        script: &str,
+        _working_dir: &str,
+        _kill_rx: Receiver<()>,
+        _stdin_rx: Receiver<Vec<u8>>,
+        _stdout: Sender<Vec<u8>>,
+        lifetime: crate::ExecLifetime,
+    ) -> Result<ContainerExecOutcome, String> {
+        let foreground = matches!(lifetime, crate::ExecLifetime::Foreground);
+        self.started
+            .lock()
+            .unwrap()
+            .push((script.to_string(), foreground));
+        if let crate::ExecLifetime::Background { stdin_blocked } = lifetime {
+            let _ = stdin_blocked.send(crate::StdinWatchSignal::Blocked).await;
+        }
+        Ok(ContainerExecOutcome::Completed {
+            output: std::process::Output {
+                status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            killed: self.killed.clone(),
+        })
+    }
+}
+
+fn reporting_sandbox(
+    exec: ReportingExec,
+    working_dir: &Path,
+    mount: Option<crate::MountRoot>,
+) -> Sandbox {
+    let mut runtime = ContainerShellRuntime::new(
+        "aither-test-reporting",
+        HostRoute::new(
+            "host.docker.internal",
+            std::net::IpAddr::from([127, 0, 0, 1]),
+        )
+        .expect("loopback is routable"),
+        AnyContainerExec::new(Arc::new(exec)),
+    );
+    if let Some(mount) = mount {
+        runtime = runtime.with_workspace_mount(mount);
+    }
+    let tools =
+        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
+    Sandbox::new(
+        Backend::Container {
+            runtime,
+            launch: tools.container_launch(),
+        },
+        TokioGlobal,
+        working_dir,
+    )
+}
+
+#[tokio::test]
+async fn a_foreground_container_child_reports_the_descendants_its_exec_killed() {
+    let (_work, work) = canonical_tempdir();
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let survivor = crate::JobProcess {
+        pid: 7,
+        name: "sleep".to_string(),
+    };
+    let sandbox = reporting_sandbox(
+        ReportingExec {
+            started: started.clone(),
+            killed: vec![survivor.clone()],
+        },
+        &work,
+        None,
+    );
+    let child = sandbox
+        .spawn(SpawnSpec::script("sleep 300 &").lifetime(crate::TreeLifetime::Foreground))
+        .await
+        .expect("the exec starts");
+    assert!(child.wait().await.success());
+    assert_eq!(
+        child.descendants_killed().await,
+        crate::Descendants::Killed(vec![survivor])
+    );
+    assert!(started.lock().unwrap()[0].1, "the exec is a foreground one");
+}
+
+#[tokio::test]
+async fn a_background_container_child_signals_a_blocked_stdin() {
+    let (_work, work) = canonical_tempdir();
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let sandbox = reporting_sandbox(
+        ReportingExec {
+            started: started.clone(),
+            killed: Vec::new(),
+        },
+        &work,
+        None,
+    );
+    let mut child = sandbox
+        .spawn(SpawnSpec::script("cat").stdio(Stdio {
+            stdin: Pipe::Piped,
+            ..Stdio::default()
+        }))
+        .await
+        .expect("the exec starts");
+    let signals = child.take_stdin_blocked().expect("stdin is watched");
+    let signal = tokio::time::timeout(BOUND, signals.recv())
+        .await
+        .expect("the watch reports")
+        .expect("the watch is open");
+    assert!(
+        matches!(signal, crate::StdinWatchSignal::Blocked),
+        "{signal:?}"
+    );
+    assert!(
+        !started.lock().unwrap()[0].1,
+        "the exec is a background one"
+    );
+}
+
+#[tokio::test]
+async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets() {
+    let (_work, work) = canonical_tempdir();
+    let space = work.join("space");
+    std::fs::create_dir(&space).unwrap();
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let mount = crate::MountRoot::new(
+        work.clone(),
+        crate::ContainerPath::new("/workspace").unwrap(),
+    );
+    let parent = reporting_sandbox(
+        ReportingExec {
+            started: started.clone(),
+            killed: Vec::new(),
+        },
+        &work,
+        Some(mount),
+    );
+    let child = parent
+        .derived(GrantSnapshot {
+            writable: vec![space.clone()],
+            ..GrantSnapshot::default()
+        })
+        .with_priority(heel::ProcessPriority::new(
+            heel::CpuPriority::Nice(heel::NiceLevel::new(5).unwrap()),
+            heel::IoPriority::Normal,
+        ));
+    let spec = SpawnSpec::script("make").container_setup(super::ContainerSetup {
+        writable: vec![crate::ContainerPath::new("/tmp/aither-test.fifo").unwrap()],
+        script: "SETUP_MARK=1\n".to_string(),
+        sandbox_args: vec!["--extra".to_string(), "\"$SETUP_MARK\"".to_string()],
+    });
+    let process = child.spawn(spec).await.expect("the exec starts");
+    assert!(process.wait().await.success());
+
+    let script = started.lock().unwrap()[0].0.clone();
+    assert!(script.starts_with("SETUP_MARK=1\n"), "{script}");
+    assert!(
+        script.contains("run --working-dir '/workspace' "),
+        "{script}"
+    );
+    assert!(script.contains("--grant '/workspace/space=rw'"), "{script}");
+    assert!(
+        script.contains("--grant '/tmp/aither-test.fifo=rw'"),
+        "{script}"
+    );
+    assert!(
+        script.contains(" --extra \"$SETUP_MARK\" --nice 5 "),
+        "{script}"
+    );
+}
+
+#[tokio::test]
+async fn a_host_spawn_refuses_a_container_setup() {
+    let (_work, work) = canonical_tempdir();
+    let sandbox = host_sandbox(&work).await;
+    let error = sandbox
+        .spawn(SpawnSpec::new("/bin/true").container_setup(super::ContainerSetup::default()))
+        .await
+        .expect_err("the host has no setup to run");
+    assert!(matches!(error, super::SpawnError::Setup(_)), "{error}");
+}
+
+#[tokio::test]
+async fn a_foreground_host_child_reports_the_descendants_it_killed() {
+    let (_work, work) = canonical_tempdir();
+    let sandbox = host_sandbox(&work).await;
+    let spec = SpawnSpec::new("/bin/sh")
+        .args(["-c", "sleep 300 & sleep 300 & exit 0"])
+        .lifetime(crate::TreeLifetime::Foreground);
+    let child = sandbox.spawn(spec).await.expect("the process starts");
+    let exit = tokio::time::timeout(BOUND, child.wait())
+        .await
+        .expect("the process ends");
+    assert!(exit.success(), "{exit:?}");
+    let crate::Descendants::Killed(killed) = child.descendants_killed().await else {
+        panic!("a host child's descendants are observed");
+    };
+    assert_eq!(killed.len(), 2, "{killed:?}");
+    assert!(
+        killed.iter().all(|process| process.name.contains("sleep")),
+        "{killed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_background_host_child_signals_a_blocked_stdin() {
+    let (_work, work) = canonical_tempdir();
+    let sandbox = host_sandbox(&work).await;
+    let spec = SpawnSpec::new("/bin/cat").stdio(Stdio {
+        stdin: Pipe::Piped,
+        ..Stdio::default()
+    });
+    let mut child = sandbox.spawn(spec).await.expect("the process starts");
+    let signals = child.take_stdin_blocked().expect("stdin is watched");
+    let stdin = child.take_stdin().expect("stdin is piped");
+    let signal = tokio::time::timeout(BOUND, signals.recv())
+        .await
+        .expect("the watch reports")
+        .expect("the watch is open");
+    assert!(
+        matches!(signal, crate::StdinWatchSignal::Blocked),
+        "{signal:?}"
+    );
+    drop(stdin);
+    let exit = tokio::time::timeout(BOUND, child.wait())
+        .await
+        .expect("cat ends at EOF");
+    assert!(exit.success(), "{exit:?}");
 }
