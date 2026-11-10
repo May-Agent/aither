@@ -6,8 +6,8 @@ use executor_core::AnyExecutor;
 
 use super::{Interpreter, Shell, ShellToolSettings, TerminalError};
 use crate::{
-    AnyScriptPolicy, AnyShellWording, OutputPolicy, Sandbox, ScriptPolicy, ShellEvents,
-    ShellLimits, ShellWording,
+    AnyIpcProvider, AnyScriptPolicy, AnyShellWording, IpcProvider, OutputPolicy, Sandbox,
+    ScriptPolicy, ShellEvents, ShellLimits, ShellWording,
 };
 
 /// A value the builder has not been given yet.
@@ -27,6 +27,7 @@ pub struct ShellParts {
     pub(crate) tools: ShellToolSettings,
     pub(crate) events: Option<ShellEvents>,
     pub(crate) policies: Vec<AnyScriptPolicy>,
+    pub(crate) ipc: Option<AnyIpcProvider>,
 }
 
 /// Builds a [`Shell`] on the [`Sandbox`] its scripts run in.
@@ -43,6 +44,7 @@ pub struct ShellBuilder<I, L, O, W, T> {
     tools: T,
     events: Option<ShellEvents>,
     policies: Vec<AnyScriptPolicy>,
+    ipc: Option<AnyIpcProvider>,
 }
 
 impl Shell<Arc<AnyExecutor>> {
@@ -62,11 +64,24 @@ impl Shell<Arc<AnyExecutor>> {
             tools: Missing,
             events: None,
             policies: Vec::new(),
+            ipc: None,
         }
     }
 }
 
 impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
+    /// Lets every script of the shell, and of the subagent shells it
+    /// launches, call the commands `provider` serves back on the host. The
+    /// provider is asked once per process the shell starts on the host or in
+    /// a container. A process on an SSH server has no way back to this
+    /// machine, so the shell asks for none there. Without a provider no
+    /// script reaches a command of the embedder.
+    #[must_use]
+    pub fn ipc(mut self, provider: impl IpcProvider) -> Self {
+        self.ipc = Some(AnyIpcProvider::new(provider));
+        self
+    }
+
     /// Puts every script to `policy`, after the policies given before it.
     /// Each agent's shell gets state of its own from the policy's
     /// definition, see [`ScriptPolicies::for_agent`](crate::ScriptPolicies).
@@ -101,6 +116,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
+            ipc: self.ipc,
         }
     }
 
@@ -116,6 +132,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
+            ipc: self.ipc,
         }
     }
 
@@ -131,6 +148,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
+            ipc: self.ipc,
         }
     }
 
@@ -149,6 +167,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
+            ipc: self.ipc,
         }
     }
 
@@ -168,6 +187,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: Given(tools),
             events: self.events,
             policies: self.policies,
+            ipc: self.ipc,
         }
     }
 }
@@ -197,6 +217,7 @@ impl
             tools: Given(tools),
             events,
             policies,
+            ipc,
         } = self;
         let executor = sandbox.executor();
         Shell::from_parts(
@@ -210,6 +231,7 @@ impl
                 tools,
                 events,
                 policies,
+                ipc,
             },
         )
         .await
@@ -248,6 +270,84 @@ mod tests {
             .build()
             .await
             .expect("the shell builds")
+    }
+
+    async fn ipc_shell(
+        directory: &std::path::Path,
+        provider: crate::spawn::ipc_fixture::Recording,
+    ) -> Shell<Arc<AnyExecutor>> {
+        let heel = crate::test_heel::binary().await.expect("a heel for tests");
+        let sandbox = Sandbox::new(
+            Backend::Host {
+                heel,
+                launch: crate::HostLaunch::new("/bin/bash"),
+            },
+            executor_core::tokio::TokioGlobal,
+            directory,
+        );
+        Shell::builder(sandbox)
+            .interpreters([Interpreter::Shell])
+            .limits(test_budgets::limits())
+            .output(test_budgets::output_policy())
+            .wording(test_wording::TestWording)
+            .tools(test_wording::job_tools())
+            .ipc(provider)
+            .build()
+            .await
+            .expect("the shell builds")
+    }
+
+    fn stdout_of(result: &crate::ScriptResult) -> &str {
+        match &result.stdout {
+            aither_core::llm::CommandStream::Inline { text } => text,
+            other => panic!("a short answer is inline: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_calls_the_command_the_providers_router_serves() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = directory.path().canonicalize().unwrap();
+        let provider = crate::spawn::ipc_fixture::Recording::default();
+        let shell = ipc_shell(&start, provider.clone()).await;
+        let result = shell
+            .run(crate::Script::new(
+                "probe",
+                &start,
+                std::time::Duration::from_secs(30),
+            ))
+            .await
+            .expect("the script runs");
+        assert_eq!(
+            stdout_of(&result).trim(),
+            crate::spawn::ipc_fixture::ANSWER,
+            "{result:?}"
+        );
+        let launches = provider.launches.lock().unwrap();
+        assert_eq!(launches.len(), 1, "one process, one question");
+        assert!(launches[0].task_id.is_some(), "{:?}", launches[0]);
+        assert_eq!(launches[0].mode, crate::SandboxMode::Sandboxed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shell_without_a_provider_serves_no_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = directory.path().canonicalize().unwrap();
+        let shell = shell(&start, Grants::new(), &[Interpreter::Shell]).await;
+        let result = shell
+            .run(crate::Script::new(
+                "probe",
+                &start,
+                std::time::Duration::from_secs(30),
+            ))
+            .await
+            .expect("the script runs");
+        assert!(
+            !matches!(result.outcome, crate::RunOutcome::Exited { code: 0 }),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

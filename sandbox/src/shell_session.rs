@@ -4,7 +4,7 @@ use async_channel::{Receiver, Sender};
 
 use askama::Template as _;
 
-use crate::ssh::{PreparedSsh, SshEnvironments, SshServer, SshServerError};
+use crate::ssh::{PrepareSsh, SshEnvironments, SshServer, SshServerError};
 use crate::stdin_watch::StdinWatchSignal;
 use crate::{ContainerPath, HostRoute};
 
@@ -509,17 +509,20 @@ impl std::fmt::Debug for ShellSessionRegistry {
 
 impl ShellSessionRegistry {
     /// Adds `server` to the set commands may run on, for every holder of this
-    /// registry, with what the embedder prepared on it. Its name and target
-    /// are trimmed.
+    /// registry. Its name and target are trimmed.
+    ///
+    /// The server is not contacted: `prepare` runs when the first command
+    /// names it, see [`PrepareSsh`]. A [`PreparedSsh`](crate::PreparedSsh)
+    /// is a preparation already done.
     ///
     /// # Errors
     /// Rejects a blank name or target and a name another server has.
     pub fn add_ssh_server(
         &self,
         server: SshServer,
-        prepared: PreparedSsh,
+        prepare: impl PrepareSsh,
     ) -> Result<(), SshServerError> {
-        self.ssh.add(server, prepared)
+        self.ssh.add(server, prepare)
     }
 
     /// Removes the server named `name`, returning it; `None` when no server
@@ -647,8 +650,8 @@ mod disk_probe_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedSsh, ShellSessionRegistry, SshServer};
-    use crate::RemoteLaunch;
+    use super::{ShellSessionRegistry, SshServer};
+    use crate::{PreparedSsh, RemoteLaunch};
 
     #[test]
     fn every_clone_of_a_registry_shares_its_live_server_set() {

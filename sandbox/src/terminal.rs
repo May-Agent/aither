@@ -741,6 +741,9 @@ pub struct Shell<E> {
     /// The script policies every script of this shell is put to, bound to
     /// the state of the agent the shell serves.
     policies: ScriptPolicies,
+    /// The commands the embedder serves to this shell's scripts, shared with
+    /// every subagent shell derived from this one.
+    ipc: Option<crate::AnyIpcProvider>,
     /// The worktrees this shell's subagents were granted commit in so far,
     /// in grant order: the map the host's `git` shim reads. Shared with
     /// every subagent shell derived from this one.
@@ -774,6 +777,7 @@ impl<E: Clone> Clone for Shell<E> {
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.clone(),
+            ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: self.launches.clone(),
         }
@@ -898,6 +902,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             outages: Outages::none(),
             subagent_spaces: None,
             policies: ScriptPolicies::new(parts.policies),
+            ipc: parts.ipc,
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
         })
@@ -947,6 +952,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 tools,
                 events: None,
                 policies: Vec::new(),
+                ipc: None,
             },
         )
         .await
@@ -1429,6 +1435,7 @@ where
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.for_agent(),
+            ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: Arc::default(),
         })
@@ -1566,12 +1573,16 @@ where
 
     /// A command on `environment` in `mode`. Default mode needs the server's
     /// `heel`.
-    fn resolve_ssh_target(
+    ///
+    /// # Errors
+    /// Fails when the server's first preparation fails; the next command
+    /// prepares again.
+    async fn resolve_ssh_target(
         &self,
         environment: &SshEnvironment,
         mode: SandboxMode,
     ) -> Result<ExecutionTarget, TerminalError> {
-        let prepared = environment.prepared();
+        let prepared = environment.prepared().await?;
         let server = environment.server();
         let heel = match (mode, &prepared.heel) {
             (SandboxMode::Sandboxed, Some(heel)) => Some(heel.clone()),
@@ -1653,6 +1664,7 @@ where
                 sandbox: self.sandbox.clone(),
                 executor: self.executor.clone(),
                 policies: self.policies.clone(),
+                ipc: self.ipc.clone(),
                 committed: self.committed_worktrees(),
                 job_registry: self.job_registry.clone(),
                 task_id,
@@ -2446,7 +2458,7 @@ where
             }
             Some(environment) => {
                 self.clear(admission, clearance, cx).await?;
-                self.resolve_ssh_target(environment, mode)?
+                self.resolve_ssh_target(environment, mode).await?
             }
         };
         Ok((
@@ -2855,6 +2867,8 @@ struct StandaloneExecution<E> {
     /// network policy, priority and home backend.
     sandbox: Sandbox,
     executor: E,
+    /// The commands the job's processes may call back into the host with.
+    ipc: Option<crate::AnyIpcProvider>,
     /// The worktrees the host's `git` shim maps for the command.
     committed: Vec<CommittingWorktree>,
     job_registry: JobRegistry,
@@ -2884,6 +2898,7 @@ struct StandaloneExecution<E> {
 struct StandaloneStart<'a, E> {
     sandbox: &'a Sandbox,
     executor: E,
+    ipc: Option<&'a crate::AnyIpcProvider>,
     committed: &'a [CommittingWorktree],
     job_registry: &'a JobRegistry,
     task_id: &'a IdLease,
@@ -2906,6 +2921,7 @@ struct LocalBackgroundExecution<'a, E> {
     shell: &'a str,
     sandbox: &'a Sandbox,
     executor: E,
+    ipc: Option<&'a crate::AnyIpcProvider>,
     committed: &'a [CommittingWorktree],
     task_id: &'a IdLease,
     info: crate::LaunchInfo,
@@ -2925,6 +2941,7 @@ struct LocalBackgroundExecution<'a, E> {
 struct ContainerJobExecution<'a, E> {
     executor: E,
     sandbox: &'a Sandbox,
+    ipc: Option<&'a crate::AnyIpcProvider>,
     committed: &'a [CommittingWorktree],
     task_id: &'a IdLease,
     info: crate::LaunchInfo,
@@ -3045,6 +3062,7 @@ struct SpawnedTerminalTask<E> {
     sandbox: Sandbox,
     executor: E,
     policies: ScriptPolicies,
+    ipc: Option<crate::AnyIpcProvider>,
     committed: Vec<CommittingWorktree>,
     job_registry: JobRegistry,
     task_id: IdLease,
@@ -3087,6 +3105,7 @@ where
         sandbox,
         executor,
         policies,
+        ipc,
         committed,
         job_registry,
         task_id,
@@ -3131,6 +3150,7 @@ where
     let result = execute_script_standalone(StandaloneExecution {
         sandbox,
         executor,
+        ipc,
         committed,
         job_registry,
         task_id: task_id.clone(),
@@ -3257,6 +3277,7 @@ where
     let StandaloneExecution {
         sandbox,
         executor,
+        ipc,
         committed,
         job_registry,
         task_id,
@@ -3290,6 +3311,7 @@ where
     let start_result = start_standalone_execution(StandaloneStart {
         sandbox: &sandbox,
         executor,
+        ipc: ipc.as_ref(),
         committed: &committed,
         job_registry: &job_registry,
         task_id: &task_id,
@@ -3386,6 +3408,7 @@ where
             return execute_container_job(ContainerJobExecution {
                 executor: request.executor,
                 sandbox: request.sandbox,
+                ipc: request.ipc,
                 committed: request.committed,
                 task_id: request.task_id,
                 info: request.info,
@@ -3440,6 +3463,7 @@ where
         shell,
         sandbox: request.sandbox,
         executor: request.executor,
+        ipc: request.ipc,
         committed: request.committed,
         task_id: request.task_id,
         info: request.info,
@@ -3733,7 +3757,9 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             },
             ..SpawnStdio::default()
         });
-    spec = spec.grants(grants.into_iter().map(crate::SpawnGrant::Host));
+    spec = spec
+        .grants(grants.into_iter().map(crate::SpawnGrant::Host))
+        .ipc(context.ipc.and_then(|ipc| ipc.router(&context.info)));
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         spec = spec.cwd(start);
     }
@@ -4277,6 +4303,7 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
         .env(environment)
         .launch_info(context.info.clone())
         .grants(grants)
+        .ipc(context.ipc.and_then(|ipc| ipc.router(&context.info)))
         .lifetime(if foreground {
             TreeLifetime::Foreground
         } else {
@@ -4373,6 +4400,8 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
         SandboxMode::Unsandboxed => sandbox.unconfined(),
     };
     let script = launch_script(context.interpreter, context.script, context.task_id)?;
+    // No `.ipc(..)`: a server has no way back to this machine, and its
+    // backend refuses a router with `SpawnError::Unsupported`.
     let child = sandbox
         .spawn(SpawnSpec::script(script).launch_info(context.info.clone()))
         .await?;
@@ -4836,6 +4865,10 @@ pub enum TerminalError {
     /// A default-mode command names a server that has no `heel` to sandbox it.
     #[error("default mode runs under `heel`, which `{0}` does not have")]
     NoRemoteSandbox(String),
+    /// The server's preparation failed; the next command naming it prepares
+    /// it again.
+    #[error(transparent)]
+    SshPrepare(#[from] crate::ssh::SshPrepareError),
     /// The approver denied the script; the model reads the reason it gave.
     #[error("{0}")]
     Denied(String),
@@ -5788,6 +5821,7 @@ mod tests {
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
+            ipc: None,
             sandbox: tool.sandbox.clone(),
             executor: executor_core::tokio::TokioGlobal,
             committed: Vec::new(),
@@ -5848,6 +5882,7 @@ mod tests {
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
+            ipc: None,
             sandbox: tool
                 .sandbox
                 .clone()
@@ -5957,6 +5992,7 @@ mod tests {
         let tool = fresh_terminal(dir.path()).await;
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
+            ipc: None,
             // The embedder's persistence denylist, the session's own
             // directory exempt.
             sandbox: tool
@@ -6981,6 +7017,7 @@ mod tests {
         let (_pid, output) = execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
+            ipc: None,
             committed: &[],
             task_id: &crate::test_ids::lease("probe"),
             info: crate::LaunchInfo::default(),
@@ -7004,6 +7041,100 @@ mod tests {
         .await
         .expect("a foreground container exec should complete");
         assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// A container command's exec carries the commands the shell's provider
+    /// serves for that launch. (No container runs here: the exec is a fake
+    /// that records the script it was given, so the serving of the answer is
+    /// covered by `container_ipc_bridge_round_trips_a_command_over_tcp`.)
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_command_is_given_the_providers_router_for_its_launch() {
+        struct RecordingExec(Sender<String>);
+
+        impl crate::ContainerExec for RecordingExec {
+            fn exec(
+                &self,
+                _container_id: &str,
+                _script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                _stdin_rx: Receiver<Vec<u8>>,
+                _lifetime: ExecLifetime,
+            ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+            {
+                std::future::ready(Err("a job streams its output".to_string()))
+            }
+
+            async fn exec_streamed(
+                &self,
+                _container_id: &str,
+                script: &str,
+                _working_dir: &str,
+                _kill_rx: Receiver<()>,
+                _stdin_rx: Receiver<Vec<u8>>,
+                _stdout: Sender<Vec<u8>>,
+                _lifetime: ExecLifetime,
+            ) -> Result<ContainerExecOutcome, String> {
+                self.0.send(script.to_owned()).await.unwrap();
+                Ok(ContainerExecOutcome::Completed {
+                    output: std::process::Output {
+                        status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    killed: Vec::new(),
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (job_registry, job_registry_service) =
+            job_registry_channel(crate::output_policy::fixture::policy());
+        tokio::spawn(async move { job_registry_service.serve().await });
+        let (scripts_tx, scripts) = async_channel::unbounded();
+        let runtime = ContainerShellRuntime::new(
+            "aither-test-ipc-provider",
+            crate::HostRoute::new(
+                "host.docker.internal",
+                std::net::IpAddr::from([127, 0, 0, 1]),
+            )
+            .expect("loopback is routable"),
+            crate::AnyContainerExec::new(Arc::new(RecordingExec(scripts_tx))),
+        );
+        let provider = crate::spawn::ipc_fixture::Recording::default();
+        let erased = crate::AnyIpcProvider::new(provider.clone());
+        let info = crate::LaunchInfo::new("probe", None, SandboxMode::Sandboxed);
+        let (startup_tx, _startup_rx) = async_channel::bounded(1);
+        let alert_tx = ShellEvents::new().sender();
+        execute_container_job(ContainerJobExecution {
+            executor: executor_core::tokio::TokioGlobal,
+            sandbox: &container_sandbox(&runtime, dir.path()),
+            ipc: Some(&erased),
+            committed: &[],
+            task_id: &crate::test_ids::lease("probe"),
+            info: info.clone(),
+            execution_id: "exec-test",
+            script: "probe",
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
+            container_runtime: &runtime,
+            job_registry: &job_registry,
+            stdin_alerts: None,
+            lifetime: foreground_lifetime(alert_tx),
+            background_startup: &BackgroundStartup::new(startup_tx),
+            carry: None,
+            #[cfg(all(unix, feature = "jobserver"))]
+            job_fifo: None,
+        })
+        .await
+        .expect("the exec completes");
+        let script = scripts.recv().await.expect("the exec ran a script");
+        assert!(script.contains("for cmd in 'probe'; do"), "{script}");
+        let launches = provider.launches.lock().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].task_id.as_deref(), Some("probe"));
+        assert_eq!(launches[0].mode, SandboxMode::Sandboxed);
     }
 
     /// With a pool configured, a container command's script exports the
@@ -7113,6 +7244,7 @@ mod tests {
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
+            ipc: None,
             committed: &[],
             task_id: &crate::test_ids::lease("probe"),
             info: crate::LaunchInfo::default(),

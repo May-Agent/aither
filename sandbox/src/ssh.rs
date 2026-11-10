@@ -3,11 +3,14 @@
 //! state of each server and the OS probe an embedder runs when a server is
 //! added.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use async_lock::OnceCell;
 use futures_lite::io::AsyncWriteExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -228,12 +231,98 @@ impl PreparedSsh {
     }
 }
 
+/// Why a server could not be prepared. The server stays in the set, and the
+/// next command naming it prepares it again.
+#[derive(Debug, thiserror::Error)]
+#[error("preparing the SSH server `{server}` failed: {source}")]
+pub struct SshPrepareError {
+    /// The name of the server.
+    pub server: String,
+    /// What the embedder's [`PrepareSsh`] reported.
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// Prepares a server for the shell's scripts: finds or installs its `heel`
+/// and the programs scripts run with.
+///
+/// It runs when the first command names the server, not when the server is
+/// added, so adding a server never waits on it and an unreachable server
+/// fails only the commands that name it. Commands that name the server
+/// together share the one preparation; a preparation that fails fails the
+/// commands waiting on it and is not remembered, so the next command
+/// prepares again. A [`PreparedSsh`] is a preparation already done.
+pub trait PrepareSsh: Send + Sync + 'static {
+    /// Why the preparation failed.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Prepares `server`.
+    fn prepare(
+        &self,
+        server: &SshServer,
+    ) -> impl Future<Output = Result<PreparedSsh, Self::Error>> + Send;
+}
+
+impl PrepareSsh for PreparedSsh {
+    type Error = std::convert::Infallible;
+
+    fn prepare(
+        &self,
+        _server: &SshServer,
+    ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        std::future::ready(Ok(self.clone()))
+    }
+}
+
+/// Object-safe twin of [`PrepareSsh`].
+trait PrepareSshImpl: Send + Sync {
+    fn prepare<'a>(
+        &'a self,
+        server: &'a SshServer,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedSsh, SshPrepareError>> + Send + 'a>>;
+}
+
+impl<T: PrepareSsh> PrepareSshImpl for T {
+    fn prepare<'a>(
+        &'a self,
+        server: &'a SshServer,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedSsh, SshPrepareError>> + Send + 'a>> {
+        Box::pin(async move {
+            PrepareSsh::prepare(self, server)
+                .await
+                .map_err(|error| SshPrepareError {
+                    server: server.name.clone(),
+                    source: Box::new(error),
+                })
+        })
+    }
+}
+
+/// A type-erased [`PrepareSsh`].
+#[derive(Clone)]
+pub struct AnyPrepareSsh(Arc<dyn PrepareSshImpl>);
+
+impl AnyPrepareSsh {
+    /// Erases `prepare`.
+    #[must_use]
+    pub fn new(prepare: impl PrepareSsh) -> Self {
+        Self(Arc::new(prepare))
+    }
+}
+
+impl std::fmt::Debug for AnyPrepareSsh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnyPrepareSsh")
+    }
+}
+
 /// One server of a registry's set and what the embedder prepared on it.
 /// Removing the server drops them.
 #[derive(Debug)]
 pub struct SshEnvironment {
     server: SshServer,
-    prepared: PreparedSsh,
+    prepare: AnyPrepareSsh,
+    prepared: OnceCell<PreparedSsh>,
 }
 
 impl SshEnvironment {
@@ -241,8 +330,16 @@ impl SshEnvironment {
         &self.server
     }
 
-    pub(crate) const fn prepared(&self) -> &PreparedSsh {
-        &self.prepared
+    /// What the embedder prepared on the server, preparing it first when no
+    /// command has yet. Concurrent callers share one preparation.
+    ///
+    /// # Errors
+    /// Fails with what the preparation reported; the next call prepares
+    /// again.
+    pub(crate) async fn prepared(&self) -> Result<&PreparedSsh, SshPrepareError> {
+        self.prepared
+            .get_or_try_init(|| self.prepare.0.prepare(&self.server))
+            .await
     }
 }
 
@@ -268,7 +365,7 @@ impl SshEnvironments {
     pub(crate) fn add(
         &self,
         server: SshServer,
-        prepared: PreparedSsh,
+        prepare: impl PrepareSsh,
     ) -> Result<(), SshServerError> {
         let SshServer { name, target } = server;
         let server = SshServer {
@@ -278,7 +375,11 @@ impl SshEnvironments {
         if server.name.is_empty() || server.target.is_empty() {
             return Err(SshServerError::Blank);
         }
-        let environment = Arc::new(SshEnvironment { server, prepared });
+        let environment = Arc::new(SshEnvironment {
+            server,
+            prepare: AnyPrepareSsh::new(prepare),
+            prepared: OnceCell::new(),
+        });
         let mut duplicate = false;
         self.servers.rcu(|servers| {
             duplicate = servers
@@ -369,5 +470,79 @@ mod tests {
         );
         assert_eq!(set.list(), []);
         assert_eq!(set.remove("build"), None);
+    }
+
+    /// Counts its preparations, takes its time over each and fails the first
+    /// `failures` of them.
+    struct Counting {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        failures: usize,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the server is unreachable")]
+    struct Unreachable;
+
+    impl PrepareSsh for Counting {
+        type Error = Unreachable;
+
+        async fn prepare(&self, _server: &SshServer) -> Result<PreparedSsh, Unreachable> {
+            let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            if run < self.failures {
+                Err(Unreachable)
+            } else {
+                Ok(prepared())
+            }
+        }
+    }
+
+    fn environment(failures: usize) -> (Arc<SshEnvironment>, Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let set = SshEnvironments::default();
+        set.add(
+            server("build", "builder@build.internal"),
+            Counting {
+                runs: Arc::clone(&runs),
+                failures,
+            },
+        )
+        .unwrap();
+        (set.get("build").unwrap(), runs)
+    }
+
+    #[tokio::test]
+    async fn a_server_is_prepared_on_its_first_use_and_only_once() {
+        let (environment, runs) = environment(0);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "adding the server prepares nothing"
+        );
+        let (first, second) = tokio::join!(environment.prepared(), environment.prepared());
+        first.unwrap();
+        second.unwrap();
+        environment.prepared().await.unwrap();
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two concurrent first commands and a later one share one preparation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_preparation_is_reported_and_retried_by_the_next_command() {
+        let (environment, runs) = environment(1);
+        let error = environment.prepared().await.unwrap_err();
+        assert_eq!(error.server, "build");
+        assert!(error.source.to_string().contains("unreachable"), "{error}");
+        environment
+            .prepared()
+            .await
+            .expect("the next command prepares again");
+        environment.prepared().await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

@@ -76,6 +76,7 @@ fn terminal_failure(error: &TerminalError) -> (&'static str, String) {
         TerminalError::InvalidTarget(detail) => ("invalid target", detail.clone()),
         TerminalError::UnknownLocation(name) => ("unknown location", name.clone()),
         TerminalError::NoRemoteSandbox(name) => ("no remote sandbox", name.clone()),
+        TerminalError::SshPrepare(error) => ("ssh prepare", error.to_string()),
         TerminalError::Denied(reason) => ("denied", reason.clone()),
         TerminalError::NoApprover(kind) => ("no approver", kind.to_string()),
         TerminalError::SandboxSetup(detail) => ("sandbox setup failed", detail.clone()),

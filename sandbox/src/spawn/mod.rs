@@ -27,6 +27,7 @@ mod domain;
 mod env;
 mod grants;
 pub mod host;
+mod ipc;
 mod launch;
 mod route;
 mod ssh;
@@ -47,6 +48,9 @@ pub use domain::{
 pub use env::{EnvSource, LaunchInfo};
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
 pub use host::{LocalSpawn, TreeLifetime, resolved};
+#[cfg(test)]
+pub use ipc::fixture as ipc_fixture;
+pub use ipc::{AnyIpcProvider, IpcProvider};
 #[cfg(not(windows))]
 pub use launch::shell_arguments;
 pub use launch::{ContainerLaunch, HostLaunch, RemoteLaunch};

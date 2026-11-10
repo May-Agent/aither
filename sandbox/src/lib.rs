@@ -151,12 +151,16 @@ pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
 };
 pub use spawn::{
-    AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, ContainerLaunch, DenyAllDomains,
-    Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess, GrantSnapshot, Grants,
-    HostLaunch, HostRoute, HostRouteError, LaunchInfo, Pipe, RemoteLaunch, Sandbox, SandboxedChild,
-    SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio, TreeLifetime,
+    AnyDomainApprover, AnyIpcProvider, ApproveAllDomains, Backend, ChildExit, ContainerLaunch,
+    DenyAllDomains, Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess,
+    GrantSnapshot, Grants, HostLaunch, HostRoute, HostRouteError, IpcProvider, LaunchInfo, Pipe,
+    RemoteLaunch, Sandbox, SandboxedChild, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio,
+    TreeLifetime,
 };
-pub use ssh::{PreparedSsh, SshPlatform, SshProbeError, SshServer, SshServerError, probe_ssh_os};
+pub use ssh::{
+    AnyPrepareSsh, PrepareSsh, PreparedSsh, SshPlatform, SshPrepareError, SshProbeError, SshServer,
+    SshServerError, probe_ssh_os,
+};
 pub use stdin_watch::StdinWatchSignal;
 pub use subagent::{
     AnySubagentSpaces, CommitLedger, CommitLedgerError, CommitMark, ImportBudget, PreparedSpace,
