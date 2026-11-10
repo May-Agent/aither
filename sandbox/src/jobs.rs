@@ -161,6 +161,10 @@ impl Job {
     }
 
     /// The job as the shell holds it now.
+    ///
+    /// # Panics
+    /// Panics when the shell no longer holds the job, which a handle's own
+    /// hold on it prevents.
     pub async fn info(&self) -> JobInfo {
         self.jobs
             .registry
@@ -172,11 +176,15 @@ impl Job {
     /// Waits for the job to end and returns what it printed and how it
     /// ended. The wait takes the job's completion: a job read here owes its
     /// agent no turn, so the end it raises carries no
-    /// [pending completion](crate::JobEnded::pending).
+    /// [pending completion](crate::JobEnded::into_parts).
     ///
     /// # Errors
     /// Returns an error when the job failed or its output could not be
     /// stored.
+    ///
+    /// # Panics
+    /// Panics when the shell no longer holds the job, which a handle's own
+    /// hold on it prevents.
     pub async fn wait(&self) -> Result<ScriptResult, JobWaitError> {
         let ended = self
             .jobs

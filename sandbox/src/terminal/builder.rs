@@ -16,7 +16,7 @@ pub struct Missing;
 pub struct Given<T>(T);
 
 /// What a shell is built from besides its sandbox.
-pub(crate) struct ShellParts {
+pub struct ShellParts {
     pub(crate) interpreters: Vec<Interpreter>,
     pub(crate) limits: ShellLimits,
     pub(crate) output: OutputPolicy,
@@ -45,7 +45,9 @@ impl Shell<Arc<AnyExecutor>, Unconfigured> {
     /// live grants, environment source, network policy, priority and
     /// backend are the shell's.
     #[must_use]
-    pub fn builder(sandbox: Sandbox) -> ShellBuilder<Missing, Missing, Missing, Missing, Missing> {
+    pub const fn builder(
+        sandbox: Sandbox,
+    ) -> ShellBuilder<Missing, Missing, Missing, Missing, Missing> {
         ShellBuilder {
             sandbox,
             interpreters: Missing,

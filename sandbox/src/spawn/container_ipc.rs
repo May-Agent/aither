@@ -33,7 +33,7 @@ struct PreludeTemplate<'a> {
 }
 
 /// What an exec's shell runs around the sandbox of a process.
-pub(crate) struct ExecSetup {
+pub struct ExecSetup {
     /// Shell run in the exec's shell before and outside the sandbox. It owns
     /// its cleanup and may define shell variables for [`Self::sandbox_args`].
     pub(crate) script: String,
@@ -44,11 +44,7 @@ pub(crate) struct ExecSetup {
 
 /// The setup that makes `commands` programs in a container and points them at
 /// the listener on `host:port`.
-pub(crate) fn exec_setup(
-    commands: &[String],
-    host: &str,
-    port: u16,
-) -> Result<ExecSetup, SpawnError> {
+pub fn exec_setup(commands: &[String], host: &str, port: u16) -> Result<ExecSetup, SpawnError> {
     for name in commands {
         if !name
             .chars()
@@ -90,7 +86,7 @@ pub(crate) fn exec_setup(
 }
 
 /// A router served to one process, until the exec ends.
-pub(crate) struct ContainerIpc {
+pub struct ContainerIpc {
     shutdown: Sender<()>,
     #[cfg(test)]
     port: u16,

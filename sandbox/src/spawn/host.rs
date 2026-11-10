@@ -495,10 +495,17 @@ async fn wait_for_exit(
             })
             .map_err(|error| error.to_string()),
     };
+    // A kill that failed ended an unknown part of the tree, so what it did
+    // name is not the whole of it; Windows sees no descendants at all.
+    let descendants = if cfg!(windows) || ended.is_err() {
+        Descendants::Unobserved
+    } else {
+        Descendants::Killed(killed)
+    };
     let exit = match (ended, status) {
         (Ok(()), Ok(status)) => ChildExit::Exited(status),
         (Err(error), _) => ChildExit::Failed(error.to_string()),
         (Ok(()), Err(error)) => ChildExit::Failed(error),
     };
-    (exit, Descendants::Killed(killed))
+    (exit, descendants)
 }

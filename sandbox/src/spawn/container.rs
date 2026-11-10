@@ -80,8 +80,8 @@ impl Sandbox {
         }))
     }
 
-    /// `script` as the container's managed shell runs it: the spec's
-    /// environment and then the source's exported ahead of it, the programs'
+    /// `script` as the container's managed shell runs it: the source's
+    /// environment exported, then the spec's, ahead of it, the programs'
     /// directory first on its `PATH`.
     fn exec_script(
         &self,
@@ -104,7 +104,6 @@ impl Sandbox {
         launch: &ContainerLaunch,
         spec: SpawnSpec,
     ) -> Result<SandboxedChild, SpawnError> {
-        let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let SpawnSpec {
             command,
             env,
@@ -114,55 +113,8 @@ impl Sandbox {
             ipc,
             lifetime,
         } = spec;
-
-        let working_dir = match &cwd {
-            Some(cwd) => Self::container_path(runtime, cwd)?,
-            None => ContainerPath::new(CONTAINER_EXEC_WORKING_DIR)
-                .expect("the container working directory is absolute"),
-        };
-        let mut container_grants = Vec::new();
-        for grant in grants {
-            match grant {
-                SpawnGrant::Container { path, access } => container_grants.push((path, access)),
-                SpawnGrant::Host(_) => {
-                    return Err(SpawnError::Unsupported {
-                        backend: "container",
-                        what: "a grant on a host path",
-                    });
-                }
-            }
-        }
-        let confinement = self.container_confinement(runtime, container_grants)?;
-
-        // The exec channel accepts only a script, so the environment travels
-        // as exports ahead of it; the spec's lead the source's.
-        let script = match command {
-            SpawnCommand::Script(script) => script,
-            SpawnCommand::Program { program, args } => {
-                shell_words::join(std::iter::once(&program).chain(&args))
-            }
-        };
-        let script = self.exec_script(launch, script, env)?;
-        // A confined process runs in a sandbox rooted at the sandbox's own
-        // directory; the directory it was asked to start in is entered inside.
-        let script = match (&confinement, cwd.is_some()) {
-            (Some(_), true) => {
-                start_in_container_directory(&script, &working_dir).map_err(|e| failed(&e))?
-            }
-            _ => script,
-        };
-        let ipc = ipc
-            .map(|router| ContainerIpc::serve(&self.inner.executor, router, runtime))
-            .transpose()?;
-        let script = wrap_container_script(
-            &script,
-            ipc.as_ref().map(|ipc| &ipc.setup),
-            self.inner.priority,
-            launch.bin_dir(),
-            working_dir.as_str(),
-            confinement.as_ref(),
-        )
-        .map_err(|e| failed(&e))?;
+        let (script, working_dir, ipc) =
+            self.exec_command(runtime, launch, command, env, cwd.as_deref(), grants, ipc)?;
 
         let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
         let (stdin_tx, stdin_rx) = async_channel::unbounded::<Vec<u8>>();
@@ -237,6 +189,71 @@ impl Sandbox {
             KillHandle::Switch(kill_tx),
             watch,
         ))
+    }
+
+    /// The script a container exec runs for the spec's command, the
+    /// directory it runs in, and the listener serving its commands.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_command(
+        &self,
+        runtime: &ContainerShellRuntime,
+        launch: &ContainerLaunch,
+        command: SpawnCommand,
+        env: Vec<(String, String)>,
+        cwd: Option<&std::path::Path>,
+        grants: Vec<SpawnGrant>,
+        ipc: Option<heel::IpcRouter>,
+    ) -> Result<(String, ContainerPath, Option<ContainerIpc>), SpawnError> {
+        let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
+        let working_dir = match cwd {
+            Some(cwd) => Self::container_path(runtime, cwd)?,
+            None => ContainerPath::new(CONTAINER_EXEC_WORKING_DIR)
+                .expect("the container working directory is absolute"),
+        };
+        let mut container_grants = Vec::new();
+        for grant in grants {
+            match grant {
+                SpawnGrant::Container { path, access } => container_grants.push((path, access)),
+                SpawnGrant::Host(_) => {
+                    return Err(SpawnError::Unsupported {
+                        backend: "container",
+                        what: "a grant on a host path",
+                    });
+                }
+            }
+        }
+        let confinement = self.container_confinement(runtime, container_grants)?;
+
+        // The exec channel accepts only a script, so the environment travels
+        // as exports ahead of it; the source's come first, so the spec's win.
+        let script = match command {
+            SpawnCommand::Script(script) => script,
+            SpawnCommand::Program { program, args } => {
+                shell_words::join(std::iter::once(&program).chain(&args))
+            }
+        };
+        let script = self.exec_script(launch, script, env)?;
+        // A confined process runs in a sandbox rooted at the sandbox's own
+        // directory; the directory it was asked to start in is entered inside.
+        let script = match (&confinement, cwd.is_some()) {
+            (Some(_), true) => {
+                start_in_container_directory(&script, &working_dir).map_err(|e| failed(&e))?
+            }
+            _ => script,
+        };
+        let ipc = ipc
+            .map(|router| ContainerIpc::serve(&self.inner.executor, router, runtime))
+            .transpose()?;
+        let script = wrap_container_script(
+            &script,
+            ipc.as_ref().map(|ipc| &ipc.setup),
+            self.inner.priority,
+            launch.bin_dir(),
+            working_dir.as_str(),
+            confinement.as_ref(),
+        )
+        .map_err(|e| failed(&e))?;
+        Ok((script, working_dir, ipc))
     }
 }
 

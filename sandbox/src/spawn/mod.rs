@@ -22,7 +22,7 @@
 mod backend;
 mod child;
 mod container;
-pub(crate) mod container_ipc;
+pub mod container_ipc;
 mod domain;
 mod env;
 mod grants;

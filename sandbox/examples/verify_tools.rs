@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    Backend, CallRefusal, CommandBlocked, CommandKilled, FoldedLines, HostProgram, Interpreter,
-    JobInputSent, JobKillAsked, JobRead, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted,
-    OmittedLines, OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain, Sandbox,
-    Shell, ShellArgs, ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart,
-    ToolDistribution, ToolIdentity, ToolRegistryBuilder, ToolTarget,
+    Backend, CallRefusal, CommandBlocked, CommandKilled, FoldedLines, ForegroundWait, HostProgram,
+    ImportBudget, Interpreter, JobInputSent, JobKillAsked, JobRead, JsonAsTsv, LiveDuration,
+    MediaBounds, MonitorRefusal, MonitorStarted, OmittedLines, OutputLimits, OutputPolicy,
+    OutputSaved, RepeatedLines, ReservedForMain, ResponseWindow, Sandbox, Shell, ShellArgs,
+    ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution, ToolIdentity,
+    ToolRegistryBuilder, ToolTarget,
 };
 
 /// The wording of this example's shell: aither ships none, and the example's
@@ -163,13 +164,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         distribution = distribution.with_github_token(token);
     }
-    let limits = ShellLimits::new(
-        Duration::from_secs(10),
-        Duration::from_secs(120 * 60),
-        Duration::from_secs(40 * 60),
-        1024 * 1024 * 1024,
-        Duration::from_secs(120),
-    );
+    let limits = ShellLimits {
+        foreground_wait: ForegroundWait::new(Duration::from_secs(10)),
+        timeout_cap: LiveDuration::new(Duration::from_secs(120 * 60)),
+        long_job_alert: LiveDuration::new(Duration::from_secs(40 * 60)),
+        subagent_import: ImportBudget::new(1024 * 1024 * 1024),
+        response_window: ResponseWindow::new(Duration::from_secs(120)),
+    };
     let output = output_policy();
     let cache = PathBuf::from(cache);
     let heel = distribution

@@ -321,6 +321,7 @@ enum TerminalStream {
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct JobState {
     info: JobInfo,
     /// Keeps the job's task id leased while the registry keeps the job.

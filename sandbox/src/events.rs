@@ -91,7 +91,6 @@ impl JobEnded {
     /// consumer takes the completion by dropping it; it is `None` when a
     /// waiter ([`Job::wait`](crate::Job::wait)) took the completion first, so
     /// nothing is owed to the agent.
-    #[must_use]
     pub fn into_parts(
         self,
     ) -> (

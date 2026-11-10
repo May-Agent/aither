@@ -4857,8 +4857,9 @@ async fn execute_container_job<E: Executor + Clone + 'static>(
 async fn spawn_container_job<E: Executor + Clone + 'static>(
     context: &ContainerJobExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    // Exported by the sandbox ahead of the embedder's variables, which win as
-    // they do for a local command.
+    // The spec's variables are exported after the sandbox's source's, so they
+    // win over a source variable of the same name, as they do for a local
+    // command.
     #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
     let mut environment = vec![(
         crate::memory::JOB_MARKER_ENV.to_string(),
@@ -4933,6 +4934,19 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
         },
     )
     .await
+}
+
+/// The status of a process a kill ended, for a backend that has none to
+/// report: ended by `SIGKILL`.
+fn killed_exit_status() -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::ExitStatusExt::from_raw(libc::SIGKILL)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::process::ExitStatusExt::from_raw(1)
+    }
 }
 
 /// Moves the chunks of a spawned process's stream to `tx` until the stream
@@ -5088,12 +5102,9 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
 
     let status = match child.wait().await {
         crate::ChildExit::Exited(status) => status,
-        // A kill ended it, and the backend has no status to report.
-        crate::ChildExit::Killed => {
-            job.job_registry.close_stdout(pid).await;
-            job.job_registry.close_stderr(pid).await;
-            return Err(TerminalError::Execution("container job killed".to_string()));
-        }
+        // A kill ended it, and the backend has no status to report: what it
+        // wrote before is the job's output, and the registry knows the cause.
+        crate::ChildExit::Killed => killed_exit_status(),
         crate::ChildExit::Failed(error) => {
             job.job_registry.close_stdout(pid).await;
             job.job_registry.close_stderr(pid).await;
@@ -5154,7 +5165,7 @@ pub fn inject_env_exports(
     Ok(rendered)
 }
 
-pub(crate) fn shell_escape(value: &str) -> String {
+pub fn shell_escape(value: &str) -> String {
     let escaped = value.replace('\'', "'\"'\"'");
     let mut output = String::with_capacity(escaped.len() + 2);
     output.push('\'');
@@ -5500,7 +5511,7 @@ fn prioritized_container_script(
 /// The script a container exec runs for `script`: `setup` first, outside the
 /// sandbox, and then `script` in the sandbox the priority and confinement ask
 /// for, with the setup's sandbox arguments.
-pub(crate) fn wrap_container_script(
+pub fn wrap_container_script(
     script: &str,
     setup: Option<&ExecSetup>,
     priority: ProcessPriority,
@@ -9521,7 +9532,7 @@ mod tests {
         let alerts = receiver.take_job_alerts();
         match alerts.as_slice() {
             [ShellEvent::DescendantsKilled(killed)] => {
-                assert!(!killed.task_id().is_empty());
+                assert_ne!(killed.task_id(), "");
                 assert!(killed.call().is_none(), "the call carried no identity");
                 // The name is read after the freeze, once the child exec'd.
                 assert_eq!(

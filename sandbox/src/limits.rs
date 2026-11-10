@@ -57,40 +57,20 @@ pub struct ShellLimits {
     pub response_window: ResponseWindow,
 }
 
-impl ShellLimits {
-    /// Limits holding the given values.
-    #[must_use]
-    pub fn new(
-        foreground_wait: Duration,
-        timeout_cap: Duration,
-        long_job_alert: Duration,
-        subagent_import_bytes: u64,
-        response_window: Duration,
-    ) -> Self {
-        Self {
-            foreground_wait: ForegroundWait::new(foreground_wait),
-            timeout_cap: LiveDuration::new(timeout_cap),
-            long_job_alert: LiveDuration::new(long_job_alert),
-            subagent_import: ImportBudget::new(subagent_import_bytes),
-            response_window: ResponseWindow::new(response_window),
-        }
-    }
-}
-
 #[cfg(any(test, feature = "test-budgets"))]
 pub mod fixture {
     use std::time::Duration;
 
-    use super::ShellLimits;
+    use super::{ForegroundWait, ImportBudget, LiveDuration, ResponseWindow, ShellLimits};
 
     /// Limits for tests, whose numbers stand for nothing.
     pub fn limits() -> ShellLimits {
-        ShellLimits::new(
-            Duration::from_secs(10),
-            Duration::from_secs(120 * 60),
-            Duration::from_secs(40 * 60),
-            1024 * 1024 * 1024,
-            Duration::from_secs(120),
-        )
+        ShellLimits {
+            foreground_wait: ForegroundWait::new(Duration::from_secs(10)),
+            timeout_cap: LiveDuration::new(Duration::from_secs(120 * 60)),
+            long_job_alert: LiveDuration::new(Duration::from_secs(40 * 60)),
+            subagent_import: ImportBudget::new(1024 * 1024 * 1024),
+            response_window: ResponseWindow::new(Duration::from_secs(120)),
+        }
     }
 }

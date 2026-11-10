@@ -531,7 +531,7 @@ pub enum GateDecision {
 }
 
 /// A command the gate blocked; the model reads its refusal, rendered by
-/// [`SandboxNotices::command_blocked`](crate::SandboxNotices::command_blocked),
+/// [`ShellWording::command_blocked`](crate::ShellWording::command_blocked),
 /// in place of the command's result.
 #[derive(Debug)]
 pub struct CommandBlocked {
