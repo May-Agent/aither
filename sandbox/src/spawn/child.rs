@@ -162,6 +162,7 @@ impl SandboxedChild {
             }
         };
         match killed {
+            #[cfg(unix)]
             Err(KillTreeError::Ended) => Ok(()),
             other => other,
         }

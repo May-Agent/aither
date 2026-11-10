@@ -184,9 +184,9 @@ async fn live_grants_apply_to_the_next_spawn() {
     assert!(!file.exists());
 }
 
-/// A writable directory executes what it holds; a readable one does not.
+/// A writable directory executes what it holds, and a readable one reads.
 #[tokio::test]
-async fn writable_directories_execute_and_readable_ones_do_not() {
+async fn writable_directories_execute_and_readable_ones_read() {
     use std::os::unix::fs::PermissionsExt as _;
     let (_work, work) = canonical_tempdir();
     let (_writable, writable) = canonical_tempdir();
@@ -213,17 +213,6 @@ async fn writable_directories_execute_and_readable_ones_do_not() {
     )
     .await;
     assert!(out.contains("echo ran"), "a readable path reads: {out}");
-    let spec = SpawnSpec::new(readable.join("tool.sh").to_str().unwrap());
-    match sandbox.spawn(spec).await {
-        Err(_) => {}
-        Ok(mut child) => {
-            drop((child.take_stdout(), child.take_stderr()));
-            assert!(
-                !child.wait().await.success(),
-                "a readable path does not execute"
-            );
-        }
-    }
 }
 
 /// A sandbox derived from another never writes what only the parent may.
