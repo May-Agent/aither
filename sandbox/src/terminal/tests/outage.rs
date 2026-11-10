@@ -64,7 +64,7 @@ async fn run_held(
         during();
         std::fs::write(release, "").expect("release file");
     });
-    let args = TerminalArgs {
+    let args = ShellArgs {
         background,
         ..background_args("hold", &held_script(tool))
     };

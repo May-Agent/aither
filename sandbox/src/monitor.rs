@@ -16,12 +16,13 @@ use executor_core::{Executor, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::interpreter::Interpreter;
 use crate::job_registry::{JobRegistry, JobStatus};
 use crate::limits::LiveDuration;
 use crate::notices::{MonitorStarted, Refused};
-use crate::output::{MediaResolution, OutputFormat};
-use crate::script_language::ScriptLanguage;
-use crate::terminal::{Configured, JobAlert, TerminalArgs, TerminalExecutionMode, TerminalTool};
+use crate::output::MediaResolution;
+use crate::policy::SandboxMode;
+use crate::terminal::{Configured, JobAlert, ShellArgs, TerminalTool};
 
 /// What an embedder decides about monitoring: the tool's name and description
 /// and the bounds of a watch. The bounds are live, so changing one reaches
@@ -41,7 +42,7 @@ pub struct MonitorSettings {
 /// `monitor` arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MonitorArgs {
-    /// What to watch: `{"command": "<source>", "language": "shell"|"python"}`
+    /// What to watch: `{"command": "<source>", "interpreter": "shell"|"python"}`
     /// runs the source inside the sandbox; `{"file": "<path>"}` follows a
     /// file's appended lines inside the sandbox, across rotation and
     /// truncation.
@@ -78,9 +79,9 @@ pub enum MonitorSource {
     Command {
         /// The source to run.
         command: String,
-        /// Its language: `shell` or `python`. Default `shell`.
+        /// Its interpreter: `shell` or `python`. Default `shell`.
         #[serde(default)]
-        language: ScriptLanguage,
+        interpreter: Interpreter,
     },
     /// A file whose appended lines are followed inside the sandbox.
     File {
@@ -233,20 +234,20 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
             .unwrap_or_else(|| self.settings.default_interval.get().as_secs())
     }
 
-    /// The script the monitored job runs for `source` and its language; an
+    /// The script the monitored job runs for `source` and its interpreter; an
     /// unreadable file is refused before anything spawns.
-    fn job_script(
-        &self,
-        source: &MonitorSource,
-    ) -> Result<(String, ScriptLanguage), MonitorRefusal> {
+    fn job_script(&self, source: &MonitorSource) -> Result<(String, Interpreter), MonitorRefusal> {
         match source {
-            MonitorSource::Command { command, language } => {
+            MonitorSource::Command {
+                command,
+                interpreter,
+            } => {
                 if command.trim().is_empty() {
                     return Err(MonitorRefusal::StartFailed {
                         reason: "command must not be empty".to_string(),
                     });
                 }
-                Ok((command.clone(), *language))
+                Ok((command.clone(), *interpreter))
             }
             MonitorSource::File { file } => {
                 let mut path = std::path::PathBuf::from(file);
@@ -269,7 +270,7 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
                 // (the name is reopened) and truncation.
                 Ok((
                     format!("tail -Fn0 {}", single_quote(&path.to_string_lossy())),
-                    ScriptLanguage::Shell,
+                    Interpreter::Shell,
                 ))
             }
         }
@@ -334,20 +335,19 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
         };
         let filter = compile("filter", &args.filter)?;
         let stop_on = compile("stop_on", &args.stop_on)?;
-        let (script, language) = self.job_script(&args.source)?;
+        let (script, interpreter) = self.job_script(&args.source)?;
         let description = match &args.source {
             MonitorSource::Command { .. } => "monitored command".to_string(),
             MonitorSource::File { file } => format!("monitor file {file}"),
         };
         let result = self
             .terminal
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description,
                 script,
-                language,
-                mode: TerminalExecutionMode::Default,
+                interpreter,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: Some(1),
                 raw: true,

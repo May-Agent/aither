@@ -895,7 +895,7 @@ where
     /// registry holds them.
     ///
     /// `terminal` only implements [`Tool`] once it holds a command registry,
-    /// but its definition — the name, the `TerminalArgs` schema and the
+    /// but its definition — the name, the `ShellArgs` schema and the
     /// description the schema carries — is independent of the registry's
     /// contents, so an empty registry yields the same definition `build()`
     /// registers.
@@ -1070,7 +1070,7 @@ fn monitor_settings() -> aither_sandbox::MonitorSettings {
         description: "Watch a command or a file and receive its new output as it arrives. \
              The source runs as a background job under the same sandbox as `terminal`; \
              non-empty increments are delivered at turn boundaries or wake an idle agent. \
-             `source` is `{\"command\": <source>, \"language\": \"shell\"|\"python\"}` or \
+             `source` is `{\"command\": <source>, \"interpreter\": \"shell\"|\"python\"}` or \
              `{\"file\": <path>}`. `timeout_secs` is required (max 7200). Options: \
              `interval_secs` (default 10), `filter` regex, `stop_on` regex, `kill_on_stop`, \
              `stall_secs`."
@@ -1909,7 +1909,7 @@ mod tests {
             &aither_sandbox::test_ids::lease("background"),
             "execution",
             "sleep 60",
-            aither_sandbox::TerminalMode::Sandboxed,
+            aither_sandbox::SandboxMode::Sandboxed,
             None,
         )
         .await;

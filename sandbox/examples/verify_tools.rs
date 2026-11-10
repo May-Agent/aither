@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    MediaBounds, OutputLimits, OutputPolicy, ShellLimits, TerminalArgs, TerminalTool,
+    MediaBounds, OutputLimits, OutputPolicy, ShellArgs, ShellLimits, TerminalTool,
     ToolDistribution, ToolRegistryBuilder, ToolTarget,
 };
 
@@ -58,10 +58,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let registry = ToolRegistryBuilder::new().build(terminal.output_store().clone());
     let terminal = terminal.with_registry(std::sync::Arc::new(registry));
-    let arguments: TerminalArgs = serde_json::from_value(serde_json::json!({
+    let arguments: ShellArgs = serde_json::from_value(serde_json::json!({
         "description": "Verify prepared search, JSON and edit commands",
         "script": include_str!("../templates/verify_baseline_tools.sh"),
-        "mode": "default",
         "raw": true,
         "timeout": 120
     }))?;

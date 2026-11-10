@@ -1,9 +1,8 @@
 //! Reviewers: external hooks on the permission path.
 
 use aither_core::llm::AgentIdentity;
-use aither_sandbox::permission::TerminalMode;
 use aither_sandbox::{
-    DomainApprover, DomainRequest, SandboxMode, ScriptCheck, ScriptDecision, ScriptLanguage,
+    DomainApprover, DomainRequest, Interpreter, SandboxMode, ScriptCheck, ScriptDecision,
     ScriptPolicy, ScriptRefusal,
 };
 use serde::{Deserialize, Serialize};
@@ -54,12 +53,12 @@ pub enum ScriptLocation<'a> {
 pub enum CommandSubject<'a> {
     /// A command that runs outside the sandbox or on a server.
     Command {
-        /// The mode the command runs in.
-        mode: TerminalMode,
+        /// Whether the command runs inside the sandbox.
+        sandbox: SandboxMode,
         /// The script to run.
         script: &'a str,
-        /// The language the script is written in.
-        language: ScriptLanguage,
+        /// The interpreter the script is written for.
+        interpreter: Interpreter,
         /// Where the command runs.
         location: ScriptLocation<'a>,
     },
@@ -90,7 +89,7 @@ pub enum Review {
 /// What a reviewer reads on stdin.
 ///
 /// The role of the agent that asked, and the request, which is either a command escalation (`"kind":"command"` with
-/// `mode`, `script`, its `language` and the `location` it runs at, `{"kind":"local"}` or
+/// `sandbox`, `script`, its `interpreter` and the `location` it runs at, `{"kind":"local"}` or
 /// `{"kind":"ssh","server":…}`) or a network domain (`"kind":"domain"` with `domain`
 /// and `port`).
 #[derive(Debug, Serialize)]
@@ -203,12 +202,9 @@ impl ScriptPolicy for ReviewedScripts {
             });
         let subject =
             ReviewSubject::Command(CommandSubject::Command {
-                mode: match script.sandbox {
-                    SandboxMode::Sandboxed => TerminalMode::Sandboxed,
-                    SandboxMode::Unsandboxed => TerminalMode::Unsafe,
-                },
+                sandbox: script.sandbox,
                 script: script.script,
-                language: script.language,
+                interpreter: script.interpreter,
                 location: script.location.map_or(ScriptLocation::Local, |server| {
                     ScriptLocation::Ssh { server }
                 }),

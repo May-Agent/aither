@@ -5,9 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aither_core::llm::{Event, LLMRequest, LanguageModel, Message, Usage, model::Profile};
-use aither_sandbox::{
-    TerminalMode, background_task_channel, job_registry_channel, test_ids::lease,
-};
+use aither_sandbox::{SandboxMode, background_task_channel, job_registry_channel, test_ids::lease};
 use futures_core::Stream;
 
 use super::*;
@@ -143,7 +141,7 @@ async fn keep_alives_while_waiting_on(timeout: Duration) -> usize {
         &task,
         "exec-build",
         "cargo check",
-        TerminalMode::Sandboxed,
+        SandboxMode::Sandboxed,
         None,
     )
     .await;

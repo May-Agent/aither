@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::tool::{Tool, ToolResult};
-use aither_sandbox::{ScriptLanguage, TerminalMode};
+use aither_sandbox::{Interpreter, SandboxMode};
 use askama::Template;
 use futures::StreamExt as _;
 use schemars::JsonSchema;
@@ -370,9 +370,9 @@ async fn run_sample(
                 command,
                 role,
                 ReviewSubject::Command(CommandSubject::Command {
-                    mode: TerminalMode::Unsafe,
+                    sandbox: SandboxMode::Unsandboxed,
                     script,
-                    language: ScriptLanguage::Shell,
+                    interpreter: Interpreter::Shell,
                     location: ScriptLocation::Local,
                 }),
             )

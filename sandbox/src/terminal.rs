@@ -71,13 +71,12 @@ use crate::{
     command::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
     },
+    interpreter::Interpreter,
     job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
     limits::{LiveDuration, ShellLimits},
     output::{MediaResolution, OutputFormat, OutputStore, stored_path},
     output_policy::OutputPolicy,
-    permission::TerminalMode,
     process_tree::{JobProcess, JobTree},
-    script_language::ScriptLanguage,
     shell_session::{
         ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry,
@@ -265,11 +264,11 @@ pub fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) 
 /// The shell script that runs `script`, written in `language`, for the job
 /// `task_id`.
 fn launch_script<'a>(
-    language: ScriptLanguage,
+    interpreter: Interpreter,
     script: &'a str,
     task_id: &str,
 ) -> Result<Cow<'a, str>, TerminalError> {
-    language.launch_script(script, task_id).map_err(|error| {
+    interpreter.launch_script(script, task_id).map_err(|error| {
         TerminalError::Execution(format!("failed to render the launch script: {error}"))
     })
 }
@@ -453,7 +452,7 @@ fn carry_cwd_script(script: &str, report: &str) -> Result<String, TerminalError>
 /// `language` is `shell` by default; `python` runs `script` as Python source,
 /// without a shell wrapper.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TerminalArgs {
+pub struct ShellArgs {
     /// Short human-readable explanation of what this command is doing.
     /// This is shown in the UI instead of echoing the shell source.
     pub description: String,
@@ -465,27 +464,18 @@ pub struct TerminalArgs {
     /// - "shell" (default): shell source
     /// - "python": Python source, run from a file so tracebacks carry line numbers
     #[serde(default)]
-    pub language: ScriptLanguage,
+    pub interpreter: Interpreter,
 
     /// How the command runs.
-    /// - "default": inside the sandbox, with network enabled
-    /// - "unsafe": without the sandbox, after approval
+    /// - "sandboxed" (default): inside the sandbox
+    /// - "unsandboxed": without the sandbox, after approval
     #[serde(default)]
-    pub mode: TerminalExecutionMode,
+    pub sandbox: SandboxMode,
 
     /// Where the command runs: omitted or empty for the home environment,
     /// otherwise the name of a configured SSH server.
     #[serde(default)]
     pub location: Option<String>,
-
-    /// Expected output format for proper handling.
-    /// - "text" (default): plain text
-    /// - "image": image data (auto-loaded to context)
-    /// - "video": video data
-    /// - "binary": binary data
-    /// - "auto": auto-detect
-    #[serde(default)]
-    pub expect: OutputFormat,
 
     /// Requested delivery resolution for media returned to the model.
     /// - "auto" (default): preserve the source resolution
@@ -524,35 +514,6 @@ pub struct TerminalArgs {
     /// command to a background task.
     #[serde(default)]
     pub background: bool,
-}
-
-/// How a `terminal` command runs, wherever its `location` is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalExecutionMode {
-    /// Inside the sandbox.
-    #[default]
-    Default,
-    /// Without the sandbox, after the permission handler approves it.
-    Unsafe,
-}
-
-impl From<TerminalExecutionMode> for TerminalMode {
-    fn from(mode: TerminalExecutionMode) -> Self {
-        match mode {
-            TerminalExecutionMode::Default => Self::Sandboxed,
-            TerminalExecutionMode::Unsafe => Self::Unsafe,
-        }
-    }
-}
-
-impl From<TerminalMode> for TerminalExecutionMode {
-    fn from(mode: TerminalMode) -> Self {
-        match mode {
-            TerminalMode::Sandboxed => Self::Default,
-            TerminalMode::Unsafe => Self::Unsafe,
-        }
-    }
 }
 
 /// Time bounds applied to every execution this terminal spawns.
@@ -1232,12 +1193,12 @@ pub struct TerminalScript {
     script: String,
     working_dir: PathBuf,
     timeout: Duration,
-    mode: TerminalMode,
+    mode: SandboxMode,
 }
 
 impl TerminalScript {
     /// `script`, started in `working_dir` on the host and killed with its
-    /// process tree once `timeout` passes, in [`TerminalMode::Sandboxed`].
+    /// process tree once `timeout` passes, in [`SandboxMode::Sandboxed`].
     /// For a container terminal, `working_dir` lies in its workspace mount.
     #[must_use]
     pub fn new(
@@ -1249,14 +1210,14 @@ impl TerminalScript {
             script: script.into(),
             working_dir: working_dir.into(),
             timeout,
-            mode: TerminalMode::Sandboxed,
+            mode: SandboxMode::Sandboxed,
         }
     }
 
     /// Runs the script in `mode`; an unsafe one is put to the terminal's
     /// permission handler like any unsafe command.
     #[must_use]
-    pub const fn with_mode(mut self, mode: TerminalMode) -> Self {
+    pub const fn with_mode(mut self, mode: SandboxMode) -> Self {
         self.mode = mode;
         self
     }
@@ -2807,12 +2768,12 @@ where
             .ok_or_else(|| TerminalError::UnknownLocation(name.to_string()))
     }
 
-    fn resolve_home_target(&self, mode: TerminalMode) -> Result<ExecutionTarget, TerminalError> {
+    fn resolve_home_target(&self, mode: SandboxMode) -> Result<ExecutionTarget, TerminalError> {
         let backend = self
             .shell_sessions
             .resolve_local_backend()
             .map_err(TerminalError::InvalidTarget)?;
-        if mode == TerminalMode::Unsafe && backend != ShellBackend::Local {
+        if mode == SandboxMode::Unsandboxed && backend != ShellBackend::Local {
             return Err(TerminalError::InvalidTarget(
                 "unsafe mode is only available in heel local runtime".into(),
             ));
@@ -2842,16 +2803,16 @@ where
     async fn resolve_ssh_target(
         &self,
         environment: &SshEnvironment,
-        mode: TerminalMode,
+        mode: SandboxMode,
     ) -> Result<ExecutionTarget, TerminalError> {
         let prepared = self.shell_sessions.ssh_tools(environment).await?;
         let server = environment.server();
         let heel = match (mode, &prepared.heel) {
-            (TerminalMode::Sandboxed, Some(heel)) => Some(heel.clone()),
-            (TerminalMode::Sandboxed, None) => {
+            (SandboxMode::Sandboxed, Some(heel)) => Some(heel.clone()),
+            (SandboxMode::Sandboxed, None) => {
                 return Err(TerminalError::NoRemoteSandbox(server.name.clone()));
             }
-            (TerminalMode::Unsafe, _) => None,
+            (SandboxMode::Unsandboxed, _) => None,
         };
         Ok(ExecutionTarget {
             mode,
@@ -2870,7 +2831,7 @@ where
             task_id,
             execution_id,
             script,
-            language,
+            interpreter,
             expect,
             resolution,
             max_lines,
@@ -2939,7 +2900,7 @@ where
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 script,
-                language,
+                interpreter,
                 mode,
                 backend,
                 stdin_alerts,
@@ -2977,7 +2938,7 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
         "terminal".into()
     }
 
-    type Arguments = TerminalArgs;
+    type Arguments = ShellArgs;
     type Res = ToolResult;
 
     async fn call(
@@ -2999,15 +2960,15 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
         let carry = if arguments.background {
             None
         } else {
-            self.cwd_carry(&prepared, &arguments.script, arguments.language)
+            self.cwd_carry(&prepared, &arguments.script, arguments.interpreter)
         };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             task_id: prepared.task_id.clone(),
             execution_id: prepared.execution_id,
             script: arguments.script,
-            language: arguments.language,
-            expect: arguments.expect,
+            interpreter: arguments.interpreter,
+            expect: OutputFormat::Auto,
             resolution: arguments.resolution,
             max_lines: prepared.max_lines,
             raw: arguments.raw,
@@ -3086,7 +3047,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
         &self,
         prepared: &ExecutionPreparation,
         script: &str,
-        language: ScriptLanguage,
+        interpreter: Interpreter,
     ) -> Option<CwdCarry> {
         let carried = self.carried_dir.as_ref()?;
         let mount = match &prepared.target.backend {
@@ -3128,7 +3089,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
         // A Python script runs from a shell wrapper, so its report is written
         // like a shell script's.
         let shell =
-            container.is_some() || language == ScriptLanguage::Python || runs_in_shell(script);
+            container.is_some() || interpreter == Interpreter::Python || runs_in_shell(script);
         Some(CwdCarry {
             start,
             report: Some(report),
@@ -3372,9 +3333,9 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
     ///
     /// Fails the way a `terminal` call does: an invalid `timeout`, a
     /// refused permission, a blocked command or a spawn failure.
-    pub async fn run_background(&self, arguments: TerminalArgs) -> aither_core::Result<ToolResult> {
+    pub async fn run_background(&self, arguments: ShellArgs) -> aither_core::Result<ToolResult> {
         self.call(
-            TerminalArgs {
+            ShellArgs {
                 background: true,
                 ..arguments
             },
@@ -3429,7 +3390,7 @@ where
     /// [`Self::admit_command`].
     async fn prepare_execution(
         &self,
-        arguments: &TerminalArgs,
+        arguments: &ShellArgs,
         cx: &mut ToolContext,
     ) -> anyhow::Result<ExecutionPreparation> {
         if arguments.description.trim().is_empty() {
@@ -3444,8 +3405,8 @@ where
         self.admit_command(
             Admission {
                 script: &arguments.script,
-                language: arguments.language,
-                mode: arguments.mode,
+                interpreter: arguments.interpreter,
+                mode: arguments.sandbox,
                 location: arguments.location.as_deref(),
                 max_lines: arguments.max_lines,
                 origin,
@@ -3554,15 +3515,15 @@ where
         if policies.is_empty() {
             return Ok(Clearance::Pass);
         }
-        let shell = (admission.language == ScriptLanguage::Shell)
+        let shell = (admission.interpreter == Interpreter::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
         let check = crate::ScriptCheck {
             task_id,
             script: admission.script,
-            language: admission.language,
+            interpreter: admission.interpreter,
             shell: shell.as_ref().map(Result::as_ref),
             origin: admission.origin,
-            sandbox: SandboxMode::from(TerminalMode::from(admission.mode)),
+            sandbox: admission.mode,
             location: admission.location(),
             start,
             call: admission.call(),
@@ -3586,7 +3547,7 @@ where
         // Ahead of target resolution and permission, so a blocked command
         // never asks the user for anything. The decision carries no grant.
         // The gate reads shell syntax, so Python source skips it.
-        if admission.language == ScriptLanguage::Shell
+        if admission.interpreter == Interpreter::Shell
             && let Some(gate) = self.registry.registry().gate()
             && let GateDecision::Block { reason } = gate.check(admission.script).await
         {
@@ -3595,7 +3556,7 @@ where
                 |blocked| self.notices().command_blocked(blocked),
             )));
         }
-        let mode = TerminalMode::from(admission.mode);
+        let mode = admission.mode;
         let target = match environment {
             None => {
                 let target = self.resolve_home_target(mode)?;
@@ -3633,8 +3594,7 @@ where
         cx: Option<&mut ToolContext>,
     ) -> Result<ExecutionTarget, TerminalError> {
         self.clear(admission, clearance, cx).await?;
-        self.resolve_ssh_target(environment, TerminalMode::from(admission.mode))
-            .await
+        self.resolve_ssh_target(environment, admission.mode).await
     }
 
     /// Settles whether the script may run, once the policies did not refuse
@@ -3707,8 +3667,8 @@ where
             .admit_command(
                 Admission {
                     script: &run.script,
-                    language: ScriptLanguage::Shell,
-                    mode: run.mode.into(),
+                    interpreter: Interpreter::Shell,
+                    mode: run.mode,
                     location: None,
                     max_lines: None,
                     origin: ScriptOrigin::Run,
@@ -3730,7 +3690,7 @@ where
             task_id: prepared.task_id.clone(),
             execution_id: prepared.execution_id,
             script: run.script,
-            language: ScriptLanguage::Shell,
+            interpreter: Interpreter::Shell,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: prepared.max_lines,
@@ -3841,8 +3801,8 @@ where
 /// What [`TerminalTool::admit_command`] admits: a script and how it came.
 struct Admission<'a> {
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalExecutionMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     /// The SSH server the command names; `None` or empty for home.
     location: Option<&'a str>,
     max_lines: Option<u32>,
@@ -3868,12 +3828,12 @@ impl<'a> Admission<'a> {
     /// Whether the script runs outside the sandbox, unsandboxed or on a
     /// server.
     fn crosses_boundary(&self) -> bool {
-        self.mode == TerminalExecutionMode::Unsafe || self.location().is_some()
+        self.mode == SandboxMode::Unsandboxed || self.location().is_some()
     }
 
     /// What the approver is asked about a script the policies only passed.
     fn boundary_request(&self) -> ApprovalRequest {
-        let (kind, reason) = if self.mode == TerminalExecutionMode::Unsafe {
+        let (kind, reason) = if self.mode == SandboxMode::Unsandboxed {
             ("unsandboxed", "the script runs outside the sandbox")
         } else {
             ("remote", "the script runs on a remote server")
@@ -4055,8 +4015,8 @@ struct StandaloneExecution<E> {
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4084,8 +4044,8 @@ struct StandaloneStart<'a, E> {
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     backend: &'a ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4108,8 +4068,8 @@ struct LocalBackgroundExecution<'a, E> {
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4128,8 +4088,8 @@ struct ContainerBackgroundExecution<'a, E> {
     task_id: &'a IdLease,
     execution_id: &'a str,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     container_runtime: &'a ContainerShellRuntime,
     prepared_tools: &'a PreparedTools<ContainerPath>,
     confinement: Option<&'a ContainerConfinement>,
@@ -4151,8 +4111,8 @@ struct SshBackgroundExecution<'a> {
     task_id: &'a IdLease,
     execution_id: &'a str,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     client: &'a SshClient,
     server: &'a SshServer,
     heel: Option<&'a str>,
@@ -4196,7 +4156,7 @@ enum ExecutionBackend {
 }
 
 struct ExecutionTarget {
-    mode: TerminalMode,
+    mode: SandboxMode,
     backend: ExecutionBackend,
 }
 
@@ -4205,7 +4165,7 @@ struct TerminalSpawnRequest {
     task_id: IdLease,
     execution_id: String,
     script: String,
-    language: ScriptLanguage,
+    interpreter: Interpreter,
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
@@ -4253,8 +4213,8 @@ struct SpawnedTerminalTask<E> {
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4297,7 +4257,7 @@ where
         carry,
         carried_dir,
         script,
-        language,
+        interpreter,
         mode,
         backend,
         stdin_alerts,
@@ -4347,7 +4307,7 @@ where
         carry,
         carried_dir,
         script: script.clone(),
-        language,
+        interpreter,
         mode,
         backend,
         stdin_alerts,
@@ -4464,7 +4424,7 @@ where
         carry,
         carried_dir,
         script,
-        language,
+        interpreter,
         mode,
         backend,
         stdin_alerts,
@@ -4499,7 +4459,7 @@ where
         execution_id: &execution_id,
         carry: carry.as_ref(),
         script: &script,
-        language,
+        interpreter,
         mode,
         backend: &backend,
         stdin_alerts,
@@ -4600,7 +4560,7 @@ where
                 task_id: request.task_id,
                 execution_id: request.execution_id,
                 script: request.script,
-                language: request.language,
+                interpreter: request.interpreter,
                 mode: request.mode,
                 container_runtime: runtime,
                 prepared_tools: tools,
@@ -4630,7 +4590,7 @@ where
                 task_id: request.task_id,
                 execution_id: request.execution_id,
                 script: request.script,
-                language: request.language,
+                interpreter: request.interpreter,
                 mode: request.mode,
                 client,
                 server,
@@ -4657,7 +4617,7 @@ where
         execution_id: request.execution_id,
         carry: request.carry,
         script: request.script,
-        language: request.language,
+        interpreter: request.interpreter,
         mode: request.mode,
         job_registry: request.job_registry,
         stdin_alerts: request.stdin_alerts,
@@ -5064,17 +5024,17 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
 ) -> Result<(u32, std::process::Output), TerminalError> {
     let (sandbox, additions) = local_sandbox(&context).await?;
     let sandbox = match context.mode {
-        TerminalMode::Sandboxed => sandbox,
-        TerminalMode::Unsafe => sandbox.unconfined(),
+        SandboxMode::Sandboxed => sandbox,
+        SandboxMode::Unsandboxed => sandbox.unconfined(),
     };
     // The sandboxed IPC router offers the built-in commands and every
     // command of the mode; the unsafe one the `ipc` gateway.
     let ipc = match context.mode {
-        TerminalMode::Sandboxed => create_ipc_router(context.registry),
-        TerminalMode::Unsafe => create_ipc_gateway_router(context.registry),
+        SandboxMode::Sandboxed => create_ipc_router(context.registry),
+        SandboxMode::Unsandboxed => create_ipc_gateway_router(context.registry),
     };
 
-    let launch_script = launch_script(context.language, context.script, context.task_id)?;
+    let launch_script = launch_script(context.interpreter, context.script, context.task_id)?;
     let launch = build_terminal_launch(
         &context.prepared_tools.shell()?,
         &launch_script,
@@ -5121,7 +5081,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             context.task_id,
             context.execution_id,
             context.script,
-            context.language,
+            context.interpreter,
             context.mode,
             None,
             Some(tree.clone()),
@@ -5570,7 +5530,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             context.task_id,
             context.execution_id,
             context.script,
-            context.language,
+            context.interpreter,
             context.mode,
         )
         .await;
@@ -5579,7 +5539,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         context.container_runtime,
         context.prepared_tools,
         context.carry,
-        &launch_script(context.language, context.script, context.task_id)?,
+        &launch_script(context.interpreter, context.script, context.task_id)?,
     )?;
     let script = inject_env_exports(script, context.env_source.as_ref())?;
     // Exported ahead of the embedder's variables, which win as they do for
@@ -5739,7 +5699,7 @@ async fn execute_ssh_background(
     let remote_cmd = crate::spawn::remote_command(
         context.prepared_tools,
         context.heel,
-        &launch_script(context.language, context.script, context.task_id)?,
+        &launch_script(context.interpreter, context.script, context.task_id)?,
     )?;
 
     let mut command = context.client.command(context.server, &remote_cmd);
@@ -5766,7 +5726,7 @@ async fn execute_ssh_background(
             context.task_id,
             context.execution_id,
             context.script,
-            context.language,
+            context.interpreter,
             context.mode,
         )
         .await;
@@ -6748,7 +6708,7 @@ mod tests {
                 &crate::test_ids::lease("writer"),
                 "exec-writer",
                 "cat",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -6960,14 +6920,13 @@ mod tests {
         let terminal = terminal.with_registry(registry);
         let result = terminal
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "report the shell".to_string(),
                     script: "[[ -n $BASH_VERSION ]] && echo \"managed=$AITHER_FIXTURE_BASH bash\""
                         .to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: Some(50),
                     raw: true,
@@ -7015,14 +6974,13 @@ mod tests {
         let terminal = terminal.with_registry(registry);
         let result = terminal
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "run every baseline command".to_string(),
                     script: "apply_patch --version && rg --version && ast-grep --version && jq --version"
                         .to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: Some(50),
                     raw: true,
@@ -7367,13 +7325,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_defaults() {
-        let args: TerminalArgs = serde_json::from_str(
+        let args: ShellArgs = serde_json::from_str(
             r#"{"description":"print a greeting","script":"echo hello","timeout":30}"#,
         )
         .unwrap();
-        assert_eq!(args.expect, OutputFormat::Text);
         assert_eq!(args.resolution, MediaResolution::Auto);
-        assert_eq!(args.mode, TerminalExecutionMode::Default);
+        assert_eq!(args.sandbox, SandboxMode::Sandboxed);
         assert!(!args.background);
     }
 
@@ -7445,7 +7402,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_parsing() {
-        let args: TerminalArgs = serde_json::from_str(
+        let args: ShellArgs = serde_json::from_str(
             r#"{"description":"sleep in background","script":"sleep 5","timeout":30,"background":true}"#,
         )
         .unwrap();
@@ -7453,21 +7410,21 @@ mod tests {
         assert_eq!(args.script, "sleep 5");
         assert!(args.background);
 
-        let missing_timeout = serde_json::from_str::<TerminalArgs>(
+        let missing_timeout = serde_json::from_str::<ShellArgs>(
             r#"{"description":"sleep in background","script":"sleep 5"}"#,
         )
         .unwrap_err();
         assert!(missing_timeout.to_string().contains("timeout"));
 
         let missing_description =
-            serde_json::from_str::<TerminalArgs>(r#"{"script":"echo hello","timeout":1}"#)
+            serde_json::from_str::<ShellArgs>(r#"{"script":"echo hello","timeout":1}"#)
                 .unwrap_err();
         assert!(missing_description.to_string().contains("description"));
     }
 
     #[test]
     fn terminal_args_schema_lists_required_fields() {
-        let schema = serde_json::to_value(schemars::schema_for!(TerminalArgs)).unwrap();
+        let schema = serde_json::to_value(schemars::schema_for!(ShellArgs)).unwrap();
         let properties = schema["properties"].as_object().expect("object schema");
         for field in [
             "description",
@@ -7685,9 +7642,9 @@ mod tests {
         (cache, tool.with_registry(registry))
     }
 
-    fn unsandboxed_args(script: &str) -> TerminalArgs {
-        TerminalArgs {
-            mode: TerminalExecutionMode::Unsafe,
+    fn unsandboxed_args(script: &str) -> ShellArgs {
+        ShellArgs {
+            sandbox: SandboxMode::Unsandboxed,
             ..terminal_args("run outside the sandbox", script)
         }
     }
@@ -7777,7 +7734,7 @@ mod tests {
         );
         assert_eq!((calls.asked().len(), terminals.asked().len()), (1, 0));
 
-        tool.run_background(TerminalArgs {
+        tool.run_background(ShellArgs {
             background: true,
             ..unsandboxed_args("true")
         })
@@ -7795,20 +7752,17 @@ mod tests {
     }
 
     #[test]
-    fn mode_is_default_or_unsafe_and_location_replaces_the_ssh_arguments() {
+    fn sandbox_is_sandboxed_or_unsandboxed_and_location_replaces_the_ssh_arguments() {
         for (text, mode) in [
-            ("\"default\"", TerminalExecutionMode::Default),
-            ("\"unsafe\"", TerminalExecutionMode::Unsafe),
+            ("\"sandboxed\"", SandboxMode::Sandboxed),
+            ("\"unsandboxed\"", SandboxMode::Unsandboxed),
         ] {
-            assert_eq!(
-                serde_json::from_str::<TerminalExecutionMode>(text).unwrap(),
-                mode
-            );
+            assert_eq!(serde_json::from_str::<SandboxMode>(text).unwrap(), mode);
         }
-        for removed in ["\"sandboxed\"", "\"ssh\""] {
-            assert!(serde_json::from_str::<TerminalExecutionMode>(removed).is_err());
+        for removed in ["\"default\"", "\"unsafe\"", "\"ssh\""] {
+            assert!(serde_json::from_str::<SandboxMode>(removed).is_err());
         }
-        let args: TerminalArgs = serde_json::from_value(serde_json::json!({
+        let args: ShellArgs = serde_json::from_value(serde_json::json!({
             "description": "list the build host",
             "script": "ls",
             "timeout": 30,
@@ -7816,8 +7770,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(args.location.as_deref(), Some("build"));
-        assert_eq!(args.mode, TerminalExecutionMode::Default);
-        let schema = serde_json::to_value(schemars::schema_for!(TerminalArgs)).unwrap();
+        assert_eq!(args.sandbox, SandboxMode::Sandboxed);
+        let schema = serde_json::to_value(schemars::schema_for!(ShellArgs)).unwrap();
         assert!(schema["properties"].get("ssh_server_id").is_none());
         assert!(schema["properties"].get("location").is_some());
     }
@@ -7840,7 +7794,7 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         assert!(matches!(
-            tool.resolve_home_target(TerminalMode::Sandboxed),
+            tool.resolve_home_target(SandboxMode::Sandboxed),
             Err(TerminalError::Tools(ToolRuntimeError::NotInitialized(_)))
         ));
     }
@@ -7866,7 +7820,7 @@ mod tests {
                 &crate::test_ids::lease("parent"),
                 "parent-execution",
                 "sleep 30",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -8030,14 +7984,13 @@ mod tests {
 
     /// Background terminal arguments for `script`.
     #[cfg(unix)]
-    fn background_args(description: &str, script: &str) -> TerminalArgs {
-        TerminalArgs {
+    fn background_args(description: &str, script: &str) -> ShellArgs {
+        ShellArgs {
             description: description.to_string(),
             script: script.to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: Some(50),
             raw: false,
@@ -8203,7 +8156,7 @@ mod tests {
         for run in 0..4 {
             let result = terminal
                 .call(
-                    TerminalArgs {
+                    ShellArgs {
                         background: false,
                         ..background_args("finish at once", "exit 0")
                     },
@@ -8482,8 +8435,8 @@ mod tests {
             carry: None,
             carried_dir: None,
             script: "/bin/pwd".to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
@@ -8588,8 +8541,8 @@ mod tests {
             carry: None,
             carried_dir: None,
             script,
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
@@ -8714,8 +8667,8 @@ mod tests {
             carry: None,
             carried_dir: None,
             script,
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
@@ -9146,13 +9099,12 @@ mod tests {
 
         let result = tool
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "exit with non-zero status".to_string(),
                     script: "exit 42".to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: Some(50),
                     raw: false,
@@ -9210,13 +9162,12 @@ mod tests {
         let receiver = tool.background_receiver();
         let jobs = tool.job_registry();
 
-        tool.run_background(TerminalArgs {
+        tool.run_background(ShellArgs {
             description: "finish at once".to_string(),
             script: "exit 3".to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: Some(50),
             raw: false,
@@ -9282,13 +9233,12 @@ mod tests {
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "wait for terminal input and echo it back".to_string(),
                 script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: Some(50),
                 raw: false,
@@ -9354,13 +9304,12 @@ mod tests {
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "start a descendant process".to_string(),
                 script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: Some(50),
                 raw: false,
@@ -9445,14 +9394,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn terminal_args(description: &str, script: &str) -> TerminalArgs {
-        TerminalArgs {
+    fn terminal_args(description: &str, script: &str) -> ShellArgs {
+        ShellArgs {
             description: description.to_string(),
             script: script.to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: Some(50),
             raw: false,
@@ -9468,7 +9416,7 @@ mod tests {
         script: &str,
     ) -> String {
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 background: true,
                 ..terminal_args("background job", script)
             })
@@ -9482,9 +9430,9 @@ mod tests {
 
     /// Python terminal arguments for `code`.
     #[cfg(unix)]
-    fn python_args(code: &str) -> TerminalArgs {
-        TerminalArgs {
-            language: ScriptLanguage::Python,
+    fn python_args(code: &str) -> ShellArgs {
+        ShellArgs {
+            interpreter: Interpreter::Python,
             ..terminal_args("run python", code)
         }
     }
@@ -9559,7 +9507,7 @@ mod tests {
             .iter()
             .find(|job| job.task_id == task_id)
             .expect("the job is recorded");
-        assert_eq!(job.language, ScriptLanguage::Python);
+        assert_eq!(job.interpreter, Interpreter::Python);
         assert!(job.script.contains("time.sleep(60)"), "{}", job.script);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -9590,8 +9538,8 @@ mod tests {
         let code = "import os\nprint(os.getcwd())";
         let refused = tool
             .call(
-                TerminalArgs {
-                    mode: TerminalExecutionMode::Unsafe,
+                ShellArgs {
+                    sandbox: SandboxMode::Unsandboxed,
                     ..python_args(code)
                 },
                 ToolContext::new(),
@@ -9606,13 +9554,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn omitting_language_runs_shell() {
-        let args: TerminalArgs = serde_json::from_value(serde_json::json!({
+        let args: ShellArgs = serde_json::from_value(serde_json::json!({
             "description": "print",
             "script": "echo $((6 * 7))",
             "timeout": 30,
         }))
         .expect("language is optional");
-        assert_eq!(args.language, ScriptLanguage::Shell);
+        assert_eq!(args.interpreter, Interpreter::Shell);
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
@@ -9718,8 +9666,8 @@ mod tests {
             task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
             script: "cat",
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             prepared_tools: &container_tools,
             ipc_commands: &[],
@@ -9880,8 +9828,8 @@ mod tests {
             task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
             script: "make",
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             prepared_tools: &container_tools,
             ipc_commands: &[],
@@ -10074,13 +10022,12 @@ mod tests {
 
         let result = tool
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "start a descendant process".to_string(),
                     script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: Some(50),
                     raw: false,
@@ -10150,13 +10097,12 @@ mod tests {
         let run = || async {
             let result = tool
                 .call(
-                    TerminalArgs {
+                    ShellArgs {
                         description: "outlast the normal window".to_string(),
                         script: "sleep 2 & wait; echo finished".to_string(),
-                        language: ScriptLanguage::Shell,
-                        mode: TerminalExecutionMode::Default,
+                        interpreter: Interpreter::Shell,
+                        sandbox: SandboxMode::Sandboxed,
                         location: None,
-                        expect: OutputFormat::Text,
                         resolution: MediaResolution::Auto,
                         max_lines: Some(50),
                         raw: false,
@@ -10428,7 +10374,7 @@ mod tests {
         timeout: u64,
     ) -> (String, i32) {
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 background: true,
                 timeout,
                 ..terminal_args("background job", script)
@@ -10635,13 +10581,12 @@ mod tests {
         )
         .await;
         let background_receiver = tool.background_receiver();
-        let args = |timeout: u64| TerminalArgs {
+        let args = |timeout: u64| ShellArgs {
             description: "sleep in the background".to_string(),
             script: "sleep 30".to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: Some(50),
             raw: false,
@@ -10696,8 +10641,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn spinning_args(timeout: u64, background: bool) -> TerminalArgs {
-        TerminalArgs {
+    fn spinning_args(timeout: u64, background: bool) -> ShellArgs {
+        ShellArgs {
             description: "spin past the timeout".to_string(),
             script: if background {
                 "while :; do sleep 0.1; done"
@@ -10707,10 +10652,9 @@ mod tests {
                 "nice -n 19 sh -c 'while :; do :; done'"
             }
             .to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: Some(50),
             raw: false,
@@ -10833,13 +10777,12 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let _result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "sleep in the background".to_string(),
                 script: "sleep 30".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: Some(50),
                 raw: false,
@@ -10911,18 +10854,17 @@ mod tests {
     /// so it reports its own `$$` into `pid` and waits for the host's `go`
     /// marker instead of running `nice`.
     #[cfg(unix)]
-    fn pid_probe_args() -> TerminalArgs {
-        TerminalArgs {
+    fn pid_probe_args() -> ShellArgs {
+        ShellArgs {
             description: "report the process pid and wait".to_string(),
             script: concat!(
                 "printf '%s\\n' $$ > \"$PWD/pid\"; ",
                 "while [ ! -f \"$PWD/go\" ]; do :; done"
             )
             .to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: Some(50),
             raw: false,
@@ -10994,13 +10936,12 @@ mod tests {
         // `exec` keeps `$$` — the pid the probe wrote — on the interactive
         // shell the session then drives.
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "start a persistent shell".to_string(),
                 script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
                 max_lines: Some(50),
                 raw: false,
@@ -11051,7 +10992,7 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 background: true,
                 ..pid_probe_args()
             })
@@ -11617,7 +11558,7 @@ mod tests {
 
         let result = tool
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "probe container priority and IPC transport".to_string(),
                     script: concat!(
                         "printf 'nice=%s\\n' \"$(nice)\"; ",
@@ -11626,10 +11567,9 @@ mod tests {
                         "printf 'probe_exit=%s\\n' \"$?\""
                     )
                     .to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
                     max_lines: Some(50),
                     raw: false,
@@ -13481,8 +13421,8 @@ mod tests {
 
         let unsafe_run = tool
             .call(
-                TerminalArgs {
-                    mode: TerminalExecutionMode::Unsafe,
+                ShellArgs {
+                    sandbox: SandboxMode::Unsandboxed,
                     ..terminal_args("host uname", "uname -s; ipc uname")
                 },
                 ToolContext::new(),
@@ -13536,8 +13476,8 @@ mod tests {
     ) -> String {
         let result = tool
             .call(
-                TerminalArgs {
-                    mode: TerminalExecutionMode::Unsafe,
+                ShellArgs {
+                    sandbox: SandboxMode::Unsandboxed,
                     ..terminal_args("unsafe probe", script)
                 },
                 ToolContext::new(),
@@ -13827,7 +13767,7 @@ mod tests {
         let unsafe_run = runner
             .run(
                 TerminalScript::new("true", &clone_dir, Duration::from_secs(30))
-                    .with_mode(TerminalMode::Unsafe),
+                    .with_mode(SandboxMode::Unsandboxed),
             )
             .await;
         assert!(
@@ -14813,7 +14753,7 @@ mod tests {
         MonitorArgs {
             source: MonitorSource::Command {
                 command: command.to_string(),
-                language: ScriptLanguage::Shell,
+                interpreter: Interpreter::Shell,
             },
             interval_secs: Some(1),
             filter: None,

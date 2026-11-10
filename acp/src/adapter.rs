@@ -210,7 +210,7 @@ fn truncate_title(text: &str) -> String {
 fn format_tool_title(name: &str, arguments: &str) -> String {
     match name {
         "terminal" => {
-            if let Ok(args) = serde_json::from_str::<aither_agent::sandbox::TerminalArgs>(arguments)
+            if let Ok(args) = serde_json::from_str::<aither_agent::sandbox::ShellArgs>(arguments)
                 && !args.description.is_empty()
             {
                 // `description` is the UI-facing explanation the model writes

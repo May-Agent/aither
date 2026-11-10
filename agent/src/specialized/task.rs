@@ -4050,7 +4050,7 @@ mod tests {
                 &aither_sandbox::test_ids::lease("amber"),
                 "exec-key",
                 script,
-                aither_sandbox::TerminalMode::Sandboxed,
+                aither_sandbox::SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -5587,7 +5587,7 @@ mod tests {
                 &aither_sandbox::test_ids::lease("primary"),
                 "exec-key",
                 "long running main job",
-                aither_sandbox::TerminalMode::Sandboxed,
+                aither_sandbox::SandboxMode::Sandboxed,
                 None,
             )
             .await;

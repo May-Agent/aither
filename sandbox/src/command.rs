@@ -412,10 +412,10 @@ enum ModeScope {
 impl ModeScope {
     /// Whether a command in this scope answers in `mode`; `None`, a registry
     /// no terminal execution serves, has every command.
-    const fn admits(self, mode: Option<TerminalMode>) -> bool {
+    const fn admits(self, mode: Option<SandboxMode>) -> bool {
         match (self, mode) {
-            (Self::Every, _) | (Self::Sandboxed, None | Some(TerminalMode::Sandboxed)) => true,
-            (Self::Sandboxed, Some(TerminalMode::Unsafe)) => false,
+            (Self::Every, _) | (Self::Sandboxed, None | Some(SandboxMode::Sandboxed)) => true,
+            (Self::Sandboxed, Some(SandboxMode::Unsandboxed)) => false,
         }
     }
 }
@@ -487,7 +487,7 @@ impl<T> RoleEntries<T> {
 
     /// Whether `role` has the command at all in `mode`, reserved or not: a
     /// command absent from it is neither listed nor callable there.
-    const fn exists_for(&self, role: CommandRole, mode: Option<TerminalMode>) -> bool {
+    const fn exists_for(&self, role: CommandRole, mode: Option<SandboxMode>) -> bool {
         self.modes.admits(mode)
             && !matches!(
                 (role, &self.subagent),
@@ -702,7 +702,7 @@ struct Resolved<'a> {
 }
 
 use crate::output::OutputStore;
-use crate::permission::TerminalMode;
+use crate::policy::SandboxMode;
 use crate::terminal::TerminalBinding;
 
 /// Handles large outputs by saving to file in the sandbox output directory.
@@ -954,7 +954,7 @@ impl std::fmt::Debug for DynTerminalTool {
 /// role. A command whose handler depends on the terminal serving it is
 /// registered with [`Self::configure_terminal_bound_tool`] and built anew for
 /// every terminal, a subagent's included. Every command answers in every
-/// [`TerminalMode`]; [`Self::sandboxed_only`] leaves what it registers out of
+/// [`SandboxMode`]; [`Self::sandboxed_only`] leaves what it registers out of
 /// unsafe commands.
 #[derive(Debug, Default)]
 pub struct ToolRegistryBuilder {
@@ -1513,7 +1513,7 @@ pub struct ToolRegistry {
     role: CommandRole,
     /// The mode of the terminal execution this registry serves, once
     /// [`Self::in_mode`] has scoped it to one; `None` has every command.
-    mode: Option<TerminalMode>,
+    mode: Option<SandboxMode>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
     /// The command policies, bound to the state of the agent this registry
@@ -1694,7 +1694,7 @@ impl ToolRegistry {
     /// registry's commands that answer in `mode`, the others neither listed
     /// nor callable (see [`ToolRegistryBuilder::sandboxed_only`]).
     #[must_use]
-    pub fn in_mode(&self, mode: TerminalMode) -> Self {
+    pub fn in_mode(&self, mode: SandboxMode) -> Self {
         Self {
             mode: Some(mode),
             ..self.clone()
@@ -4867,13 +4867,13 @@ mod tests {
         });
         let main = builder.build(test_outputs(tmp.path()));
 
-        let sandboxed = main.in_mode(TerminalMode::Sandboxed);
+        let sandboxed = main.in_mode(SandboxMode::Sandboxed);
         let answered = run_command(&sandboxed, "gh").await;
         assert!(answered.ok, "a sandboxed command has it: {answered:?}");
         assert_eq!(answered.payload.unwrap().render_for_cli(), "use `issue`");
         assert!(sandboxed.registered_tool_names().contains(&"gh".into()));
 
-        let unsafe_mode = main.in_mode(TerminalMode::Unsafe);
+        let unsafe_mode = main.in_mode(SandboxMode::Unsandboxed);
         assert!(!unsafe_mode.is_tool_configured("gh"));
         assert!(!unsafe_mode.registered_tool_names().contains(&"gh".into()));
         let unknown = run_command(&unsafe_mode, "gh").await;
@@ -4882,11 +4882,13 @@ mod tests {
         assert!(run_command(&unsafe_mode, "shared").await.ok);
 
         // The main-only restriction wrapped around the scope keeps it.
-        let subagent = main.for_subagent(None, None).in_mode(TerminalMode::Unsafe);
+        let subagent = main
+            .for_subagent(None, None)
+            .in_mode(SandboxMode::Unsandboxed);
         assert!(!subagent.registered_tool_names().contains(&"gh".into()));
         assert!(
             main.for_subagent(None, None)
-                .in_mode(TerminalMode::Sandboxed)
+                .in_mode(SandboxMode::Sandboxed)
                 .is_reserved("gh")
         );
     }

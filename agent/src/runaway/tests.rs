@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use aither_sandbox::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, CgroupMemory, ContainerMemory,
-    FootprintError, FootprintReader, FootprintRegistry, JobMemory, JobPlace, JobRegistry,
-    JobStatus, KillCause, MemoryDomain, ResponseWindow, ScriptLanguage, TerminalMode,
+    FootprintError, FootprintReader, FootprintRegistry, Interpreter, JobMemory, JobPlace,
+    JobRegistry, JobStatus, KillCause, MemoryDomain, ResponseWindow, SandboxMode,
     job_registry_channel,
 };
 
@@ -230,8 +230,8 @@ impl Agent {
                 &aither_sandbox::test_ids::lease(task_id),
                 "exec",
                 task_id,
-                ScriptLanguage::Shell,
-                TerminalMode::Sandboxed,
+                Interpreter::Shell,
+                SandboxMode::Sandboxed,
             )
             .await;
         let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
@@ -264,8 +264,8 @@ impl Agent {
                 &aither_sandbox::test_ids::lease(task_id),
                 "exec",
                 task_id,
-                ScriptLanguage::Shell,
-                TerminalMode::Sandboxed,
+                Interpreter::Shell,
+                SandboxMode::Sandboxed,
             )
             .await;
         self.footprints.by_pid.lock().unwrap().insert(pid, bytes);
@@ -295,7 +295,7 @@ impl Agent {
                 &aither_sandbox::test_ids::lease(task_id),
                 "exec",
                 task_id,
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;

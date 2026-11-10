@@ -9294,7 +9294,7 @@ mod tests {
             &aither_sandbox::test_ids::lease("build"),
             "exec",
             "make",
-            aither_sandbox::TerminalMode::Sandboxed,
+            aither_sandbox::SandboxMode::Sandboxed,
             None,
         )
         .await;

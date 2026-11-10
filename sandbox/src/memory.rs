@@ -1098,7 +1098,7 @@ mod tests {
 
         use super::*;
         use crate::{
-            AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime, TerminalMode,
+            AnyContainerExec, ContainerExec, ContainerExecOutcome, ExecLifetime, SandboxMode,
             job_registry_channel,
         };
 
@@ -1196,8 +1196,8 @@ mod tests {
                     &crate::test_ids::lease(task),
                     "exec",
                     task,
-                    crate::ScriptLanguage::Shell,
-                    TerminalMode::Sandboxed,
+                    crate::Interpreter::Shell,
+                    SandboxMode::Sandboxed,
                 )
                 .await;
             }

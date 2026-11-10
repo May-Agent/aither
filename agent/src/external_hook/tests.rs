@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use aither_core::llm::{
     Event, LLMRequest, Tool, ToolContext, ToolResult, model::Profile as ModelProfile,
 };
-use aither_sandbox::{ScriptLanguage, ToolRegistryBuilder};
+use aither_sandbox::{Interpreter, ToolRegistryBuilder};
 use futures_core::Stream;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -638,7 +638,6 @@ async fn a_hook_that_fails_in_every_way_is_reported_and_ignored() {
 }
 
 pub mod reviewers {
-    use aither_sandbox::permission::TerminalMode;
     use aither_sandbox::{
         DomainApprover, DomainRequest, SandboxMode, ScriptCheck, ScriptDecision, ScriptDir,
         ScriptOrigin, ScriptPolicy,
@@ -684,9 +683,9 @@ printf '%s' "$2"
     }
 
     pub const COMMAND: ReviewSubject<'static> = ReviewSubject::Command(CommandSubject::Command {
-        mode: TerminalMode::Unsafe,
+        sandbox: SandboxMode::Unsandboxed,
         script: "make install",
-        language: ScriptLanguage::Shell,
+        interpreter: Interpreter::Shell,
         location: ScriptLocation::Local,
     });
 
@@ -727,7 +726,7 @@ printf '%s' "$2"
                 &ScriptCheck {
                     task_id: "task",
                     script,
-                    language: ScriptLanguage::Shell,
+                    interpreter: Interpreter::Shell,
                     shell: None,
                     origin: ScriptOrigin::Foreground,
                     sandbox,
@@ -759,7 +758,7 @@ printf '%s' "$2"
         assert!(!second.exists(), "the first decision ends the chain");
         assert_eq!(
             logged(&first)[0],
-            serde_json::json!({"role": "main", "kind": "command", "mode": "unsafe", "script": "make install", "language": "shell", "location": {"kind": "local"}})
+            serde_json::json!({"role": "main", "kind": "command", "sandbox": "unsandboxed", "script": "make install", "interpreter": "shell", "location": {"kind": "local"}})
         );
     }
 
@@ -859,7 +858,7 @@ printf '%s' "$2"
         );
         assert_eq!(
             logged(&log)[0],
-            serde_json::json!({"role": "subagent", "kind": "command", "mode": "sandboxed", "script": "make", "language": "shell", "location": {"kind": "ssh", "server": "build"}})
+            serde_json::json!({"role": "subagent", "kind": "command", "sandbox": "sandboxed", "script": "make", "interpreter": "shell", "location": {"kind": "ssh", "server": "build"}})
         );
     }
 

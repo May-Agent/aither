@@ -8,7 +8,7 @@ use std::time::Duration;
 use aither_core::llm::{Event, LLMRequest, LanguageModel, ToolCall, model::Profile};
 use aither_sandbox::builtin::ReadTerminalDeltaTool;
 use aither_sandbox::{
-    BackgroundTaskSender, CompletedTask, JobRegistry, TerminalError, TerminalMode,
+    BackgroundTaskSender, CompletedTask, JobRegistry, SandboxMode, TerminalError,
     background_task_channel, job_registry_channel,
 };
 use futures_core::Stream;
@@ -120,7 +120,7 @@ async fn polling_agent(
             &aither_sandbox::test_ids::lease(TASK),
             "exec-build",
             "cargo check",
-            TerminalMode::Sandboxed,
+            SandboxMode::Sandboxed,
             None,
         )
         .await;
