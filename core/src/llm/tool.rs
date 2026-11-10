@@ -221,10 +221,16 @@ pub use mime::Mime;
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::de::DeserializeOwned;
 
+mod approval;
+mod cancel;
 mod command;
 mod context;
 mod identity;
 
+pub use approval::{
+    AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver, ApproverFailure,
+};
+pub use cancel::{CancelSignal, Canceller};
 pub use command::{
     CommandOutcome, CommandResult, CommandStream, Interruption, InterruptionCause, StoredFile,
     render_interruptions,
