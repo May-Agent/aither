@@ -9059,9 +9059,11 @@ mod tests {
 
     /// What a [`CloneSpaces`] was asked to prepare, as `(space, launcher,
     /// caller)`.
+    #[cfg(unix)]
     type SeenSpace = (PathBuf, PathBuf, PathBuf);
 
     /// How a test's [`SubagentSpaces`] fills a space.
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     enum Filling {
         /// Clones the source repository into `repo` and names it.
@@ -9072,18 +9074,21 @@ mod tests {
         Outside,
     }
 
+    #[cfg(unix)]
     #[derive(Debug, thiserror::Error)]
     #[error("the session has no clone to give")]
     struct NoClone;
 
     /// Prepares each space from `source`, the launcher's repository, and
     /// records what it was asked.
+    #[cfg(unix)]
     struct CloneSpaces {
         source: PathBuf,
         filling: Filling,
         seen: async_channel::Sender<SeenSpace>,
     }
 
+    #[cfg(unix)]
     impl SubagentSpaces for CloneSpaces {
         type Error = NoClone;
 
@@ -9122,6 +9127,7 @@ mod tests {
 
     /// A terminal in `dir` whose subagents' spaces `filling` prepares from
     /// the repository `dir/repo`, with the receiver of what it is asked.
+    #[cfg(unix)]
     async fn spaced_terminal(
         dir: &Path,
         filling: Filling,
