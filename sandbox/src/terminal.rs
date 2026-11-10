@@ -5367,7 +5367,7 @@ struct LocalJob {
 /// Generous relative to the few milliseconds a `SIGKILL` exit takes, since a
 /// too-short budget reports survivors that are merely still exiting.
 #[cfg(target_os = "linux")]
-pub(crate) const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A spawned local job: the plain `heel` child on platforms without a
 /// supervisor, or a `heel supervise`-supervised one on Linux, where the
