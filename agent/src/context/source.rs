@@ -184,6 +184,10 @@ pub enum Moment {
 ///     }
 ///
 ///     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+///         self.peek(moment).await
+///     }
+///
+///     async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
 ///         match moment {
 ///             Moment::Request { .. } => vec![ContextBlock::tail("now", "2025-01-01T00:00:00Z")],
 ///             _ => Vec::new(),
@@ -203,6 +207,15 @@ pub trait ContextSource: Send + Sync + 'static {
     /// injected: the source does not return it again unless the window was
     /// rewritten.
     fn blocks(&mut self, moment: Moment) -> impl Future<Output = Vec<ContextBlock>> + Send;
+
+    /// The blocks [`blocks`](Self::blocks) would return now at `moment`,
+    /// without consuming any of them.
+    ///
+    /// A preview of the next request asks this instead of `blocks`, so that
+    /// it shows exactly what the request would carry while a one-shot block
+    /// is still waiting to be delivered by the request itself. It takes
+    /// `&self` because nothing may change.
+    fn peek(&self, moment: Moment) -> impl Future<Output = Vec<ContextBlock>> + Send;
 
     /// Reports the [`Placement::Tail`] blocks that were actually sent.
     ///
@@ -224,6 +237,11 @@ trait ContextSourceImpl: Send + Sync {
         moment: Moment,
     ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>>;
 
+    fn peek<'a>(
+        &'a self,
+        moment: Moment,
+    ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>>;
+
     fn committed<'a>(
         &'a mut self,
         tail: &'a [Block],
@@ -240,6 +258,13 @@ impl<T: ContextSource> ContextSourceImpl for T {
         moment: Moment,
     ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>> {
         Box::pin(ContextSource::blocks(self, moment))
+    }
+
+    fn peek<'a>(
+        &'a self,
+        moment: Moment,
+    ) -> Pin<Box<dyn Future<Output = Vec<ContextBlock>> + Send + 'a>> {
+        Box::pin(ContextSource::peek(self, moment))
     }
 
     fn committed<'a>(
@@ -288,6 +313,11 @@ impl AnyContextSource {
         moment: Moment,
     ) -> impl Future<Output = Vec<ContextBlock>> + Send + '_ {
         self.inner.blocks(moment)
+    }
+
+    /// See [`ContextSource::peek`].
+    pub fn peek(&self, moment: Moment) -> impl Future<Output = Vec<ContextBlock>> + Send + '_ {
+        self.inner.peek(moment)
     }
 
     /// See [`ContextSource::committed`].
@@ -523,6 +553,10 @@ mod tests {
         }
 
         async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+            ContextSource::peek(&*self, moment).await
+        }
+
+        async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
             match moment {
                 Moment::Request { .. } => vec![ContextBlock::tail(
                     "counter",

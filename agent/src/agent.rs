@@ -3165,6 +3165,12 @@ where
     /// are left exactly as a normal first assembly would, because sources are
     /// only told about a request once it is actually sent.
     ///
+    /// The tail and the stable blocks are the ones the request would carry:
+    /// the sources are asked through [`ContextSource::peek`] and the
+    /// `before_request` hook is asked as it would be, so nothing a source
+    /// holds for delivery is consumed. A live source's change is not
+    /// previewed, since staging it writes to the context.
+    ///
     /// # Errors
     ///
     /// Returns an error when the model profiles cannot be fetched during
@@ -3176,11 +3182,34 @@ where
         attachments: impl IntoIterator<Item = Attachment>,
     ) -> Result<Vec<Message>, AgentError> {
         self.ensure_initialized().await?;
+        let moment = Moment::Request {
+            reassembled: self.reassembled,
+        };
+        let mut blocks = Vec::new();
+        for source in &self.context_sources {
+            blocks.extend(source.peek(moment).await);
+        }
         let checkpoint = self.context.checkpoint();
         self.context.extend(extra_messages);
         self.context
             .push(Message::user(prompt).with_attachments(attachments));
-        let messages = self.context.build_request(&self.last_tail);
+        let run = RunId::new("preview");
+        let request = RequestCx {
+            run: &run,
+            turn: 1,
+            message_count: self.context.len_recent(),
+        };
+        blocks.extend(self.hooks.before_request(&request).await);
+        let mut tail = Vec::new();
+        for block in blocks {
+            match block.placement() {
+                Placement::Stable => {
+                    self.context.push_block_alert(block.block());
+                }
+                Placement::Tail => tail.push(block.block().clone()),
+            }
+        }
+        let messages = self.request_messages(&tail);
         self.context.restore(checkpoint);
         Ok(messages)
     }

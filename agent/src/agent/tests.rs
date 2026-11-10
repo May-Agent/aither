@@ -435,6 +435,10 @@ impl ContextSource for Notes {
     }
 
     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        self.peek(moment).await
+    }
+
+    async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
         match moment {
             Moment::Request { reassembled: true } => vec![
                 ContextBlock::stable("note", "stable-note"),
@@ -488,6 +492,10 @@ impl ContextSource for BadTail {
     }
 
     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        self.peek(moment).await
+    }
+
+    async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
         match moment {
             Moment::FinalTurn => vec![ContextBlock::tail("oops", "tail at the end")],
             _ => Vec::new(),
@@ -582,4 +590,80 @@ async fn a_childs_events_reach_the_parents_stream_with_its_path() {
         AgentEvent::SubagentEnded { child, outcome: RunOutcome::Completed { .. } } if *child == path
     )));
     let _ = Duration::ZERO;
+}
+
+/// A tail block that reads the source's state and a one-shot stable block
+/// that `blocks` consumes and `peek` leaves in place.
+struct OneShot {
+    pending: bool,
+}
+
+impl ContextSource for OneShot {
+    fn id(&self) -> SourceId {
+        SourceId::new("one-shot")
+    }
+
+    async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        let blocks = self.peek(moment).await;
+        if matches!(moment, Moment::Request { .. }) {
+            self.pending = false;
+        }
+        blocks
+    }
+
+    async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
+        let Moment::Request { .. } = moment else {
+            return Vec::new();
+        };
+        let mut blocks = vec![ContextBlock::tail("state", "tail-state")];
+        if self.pending {
+            blocks.push(ContextBlock::stable("correction", "one-shot-correction"));
+        }
+        blocks
+    }
+}
+
+fn texts(messages: &[aither_core::llm::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .map(|message| format!("{message:?}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_preview_carries_what_the_run_then_sends_and_consumes_nothing() {
+    let llm = Scripted::new([say("hi")]);
+    let mut agent = AgentBuilder::new(llm.clone())
+        .context_source(OneShot { pending: true })
+        .build();
+
+    let previewed = agent
+        .preview_request_messages("go", std::iter::empty())
+        .await
+        .expect("the preview renders");
+    let again = agent
+        .preview_request_messages("go", std::iter::empty())
+        .await
+        .expect("a second preview renders");
+    assert_eq!(
+        texts(&previewed),
+        texts(&again),
+        "a preview consumes nothing"
+    );
+
+    let (result, _) = run_to_end(&mut agent, "go").await;
+    result.expect("the run completes");
+
+    let sent = llm.requests()[0].messages().to_vec();
+    assert_eq!(
+        texts(&previewed),
+        texts(&sent),
+        "the preview is the request the run sends"
+    );
+    let sent_text = texts(&sent).join("\n");
+    assert!(sent_text.contains("tail-state"), "{sent_text}");
+    assert!(
+        sent_text.contains("one-shot-correction"),
+        "the one-shot block reaches the run after a preview: {sent_text}"
+    );
 }
