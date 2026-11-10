@@ -6,6 +6,7 @@ use aither_core::llm::{Classify, Failure};
 
 /// Errors that can occur during agent execution.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AgentError {
     /// LLM returned an error.
     Llm {
@@ -47,6 +48,25 @@ pub enum AgentError {
 
     /// Configuration error.
     Config(String),
+
+    /// A tool call needed an approval and none could be had: the agent has
+    /// no approver, the approver failed, or the run was cancelled while
+    /// waiting.
+    Approval(std::sync::Arc<aither_core::llm::tool::ApprovalError>),
+
+    /// The run was cancelled.
+    ///
+    /// A cancelled [`Run`](crate::Run) ends with
+    /// [`RunOutcome::Cancelled`](crate::RunOutcome::Cancelled) and `drive`
+    /// returns normally; this is what [`Agent::query`](crate::Agent::query),
+    /// which returns a reply, reports.
+    Cancelled,
+
+    /// The run paused for a reason that needs the embedder; see
+    /// [`RunPause`](crate::RunPause).
+    /// [`Agent::query`](crate::Agent::query) reports it, since it has no
+    /// reply to return.
+    Paused(crate::RunPause),
 }
 
 impl fmt::Display for AgentError {
@@ -66,6 +86,9 @@ impl fmt::Display for AgentError {
                 write!(f, "tool '{name}' not found")
             }
             Self::Config(msg) => write!(f, "configuration error: {msg}"),
+            Self::Approval(error) => write!(f, "{error}"),
+            Self::Cancelled => f.write_str("the run was cancelled"),
+            Self::Paused(pause) => write!(f, "the run paused: {pause:?}"),
         }
     }
 }

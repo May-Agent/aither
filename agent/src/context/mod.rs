@@ -19,28 +19,22 @@
 //! - [`compaction`] forks a typed handoff at a request boundary and applies
 //!   it at the next one, so the run never stops to summarize itself;
 //! - [`reassembly`] re-reads what the handoff named, within budget;
-//! - [`source`] is how everything ambient — working documents, running jobs,
-//!   active skills — reaches the model without the agent loop knowing about
-//!   any of it in particular, in the tail or, for live content, in the
-//!   cacheable prefix;
-//! - [`state`] tells the model of keyed conditions — memory pressure,
-//!   machine load — only when their value differs from what it last saw;
-//! - [`event`] tells it of each thing that happened once;
+//! - [`source`] is how everything ambient — state changes, events, running
+//!   jobs — reaches the model without the agent loop knowing about any of it
+//!   in particular, in the tail or, appended once, in the cacheable prefix;
 //! - [`live`] is how prefix content that changes mid-session — `AGENTS.md`,
-//!   the command table — reaches the model as one diff while the prefix is
+//!   a command table — reaches the model as one diff while the prefix is
 //!   cached and as its clean version after the next reassembly.
 
 pub mod budget;
 pub mod cache;
 pub mod compaction;
-pub mod event;
 pub mod live;
 pub mod policy;
 pub mod prefix;
 pub mod reassembly;
 pub(crate) mod recovery;
 pub mod source;
-pub mod state;
 pub mod system;
 pub mod window;
 
@@ -52,13 +46,15 @@ pub use compaction::{
     HandoffSchema, InvalidHandoff, KeptAttachment, LineRange, PendingCompaction, Restoration,
     SkillCatalogEntry, build_file_index,
 };
-pub use event::{AnyEventSource, EventSource};
+pub use crate::event::SourceId;
 pub use live::{LiveContent, LiveUpdate};
 pub use policy::ContextPolicy;
 pub use prefix::{PrefixBlock, PrefixChain, PrefixRewrites, PromptPrefix};
 pub use reassembly::restore_context;
-pub use source::{AnyContextSource, AnyLiveSource, Block, ContextSource, LiveChange, LiveSource};
-pub use state::{AnyStateSource, StateChange, StateSource};
+pub use source::{
+    AnyContextSource, AnyLiveSource, Block, ContextBlock, ContextSource, LiveChange, LiveSource,
+    Moment, Placement,
+};
 pub use system::{
     BlockKind, External, ExternalContent, ExternalSlot, Instruction, InstructionSlot, Slot,
     Sourced, SourcedSlot, SystemLayout, SystemRegion,

@@ -73,29 +73,32 @@ pub use aither_webfetch as webfetch;
 pub use aither_websearch as websearch;
 
 // Public API
-pub use agent::{Agent, CompactResult, Run};
+pub use agent::{Agent, CancelHandle, CompactResult, Run};
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
 pub use config::AgentConfig;
 pub use context::{
-    AnyContextSource, AnyEventSource, AnyFileReferences, AnyLiveSource, AnyStateSource,
-    AttachmentCatalogEntry, AttachmentRef, Block, CompactionError, CompletedCompaction, Context,
-    ContextBudget, ContextCheckpoint, ContextFile, ContextItem, ContextPolicy, ContextSource,
-    EventSource, ExternalContent, ExternalSlot, FileReferences, Handoff, HandoffDocument,
-    HandoffPrompt, HandoffSchema, InstructionSlot, InvalidHandoff, KeptAttachment, LineRange,
-    LiveChange, LiveContent, LiveSource, LiveUpdate, PrefixBlock, PrefixChain, PrefixRewrites,
-    PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, Sourced,
-    SourcedSlot, StateChange, StateSource, SystemLayout,
+    AnyContextSource, AnyFileReferences, AnyLiveSource, AttachmentCatalogEntry, AttachmentRef,
+    Block, CompactionError, CompletedCompaction, Context, ContextBlock, ContextBudget,
+    ContextCheckpoint, ContextFile, ContextItem, ContextPolicy, ContextSource, ExternalContent,
+    ExternalSlot, FileReferences, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema,
+    InstructionSlot, InvalidHandoff, KeptAttachment, LineRange, LiveChange, LiveContent,
+    LiveSource, LiveUpdate, Moment, Placement, PrefixBlock, PrefixChain, PrefixRewrites,
+    PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, SourceId,
+    Sourced, SourcedSlot, SystemLayout,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
-pub use event::{AgentEvent, CompactionOutcome, TimedEvent};
+pub use event::{
+    AgentEvent, AgentPath, BlockId, CheckpointReason, CompactionOutcome, CompactionTrigger,
+    InjectionKind, OutputKind, PauseId, RequestId, RequestOutcome, RunId, RunOutcome, RunPause,
+    TimedEvent, ToolOrigin, ToolVerdict,
+};
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
-    AnyStopHook, CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction,
-    StopContext, StopDecision, StopHook, StopReason, ToolResultContext, ToolUseContext,
+    AfterTool, Hooks, RequestCx, StopCx, StopDecision, ToolDecision, ToolInvocation, ToolOutcome,
     TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use tools::AgentTools;

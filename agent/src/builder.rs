@@ -9,7 +9,11 @@ use std::sync::Arc;
 
 use aither_core::{
     LanguageModel,
-    llm::{Tool, model::Parameters, tool::ToolDefinition},
+    llm::{
+        Tool,
+        model::Parameters,
+        tool::{AnyApprover, Approver, ToolDefinition},
+    },
 };
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
@@ -18,12 +22,11 @@ use crate::{
     agent::Agent,
     config::AgentConfig,
     context::{
-        AnyContextSource, AnyEventSource, AnyFileReferences, AnyLiveSource, AnyStateSource,
-        Context, ContextPolicy, ContextSource, EventSource, ExternalContent, ExternalSlot,
-        FileReferences, HandoffDocument, HandoffSchema, InstructionSlot, LiveSource, StateSource,
-        SystemLayout,
+        AnyContextSource, AnyFileReferences, AnyLiveSource, Context, ContextPolicy, ContextSource,
+        ExternalContent, ExternalSlot, FileReferences, HandoffDocument, HandoffSchema,
+        InstructionSlot, LiveSource, SystemLayout,
     },
-    hook::{HCons, Hook},
+    hook::Hooks,
     request_parameters::WithParameters,
     tools::AgentTools,
 };
@@ -64,9 +67,7 @@ pub struct AgentBuilder<M, H = (), C = M, Schema = HandoffDocument> {
     clock: crate::AnyClock,
     context_sources: Vec<AnyContextSource>,
     live_sources: Vec<AnyLiveSource>,
-    state_sources: Vec<AnyStateSource>,
-    event_sources: Vec<AnyEventSource>,
-    stop_hook: Option<crate::AnyStopHook>,
+    approver: Option<AnyApprover>,
     fork_source: Option<crate::fork::ForkSource>,
     identity: aither_core::llm::AgentIdentity,
     tools: AgentTools,
@@ -112,9 +113,7 @@ impl<M: LanguageModel> AgentBuilder<M> {
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
             live_sources: Vec::new(),
-            state_sources: Vec::new(),
-            event_sources: Vec::new(),
-            stop_hook: None,
+            approver: None,
             fork_source: None,
             identity: aither_core::llm::AgentIdentity::Main,
             tools: AgentTools::new(),
@@ -133,7 +132,7 @@ impl<M, H, C, Schema> AgentBuilder<M, H, C, Schema>
 where
     M: LanguageModel + 'static,
     C: LanguageModel + 'static,
-    H: Hook,
+    H: Hooks,
     Schema: HandoffSchema,
 {
     /// Sets the identity every tool call of the built agent carries as the
@@ -206,25 +205,15 @@ where
         self
     }
 
-    /// Registers state: keyed conditions the model is told about, as a
-    /// request is assembled, only when a value differs from the one it last
-    /// saw (see [`StateSource`]).
-    pub fn state_source<S: StateSource>(mut self, source: S) -> Self {
-        self.state_sources.push(AnyStateSource::new(source));
-        self
-    }
-
-    /// Registers events, each told to the model once with the next request
-    /// (see [`EventSource`]).
-    pub fn event_source<S: EventSource>(mut self, source: S) -> Self {
-        self.event_sources.push(AnyEventSource::new(source));
-        self
-    }
-
-    /// Decides through `hook` whether the run ends each time the model ends
-    /// its turn. Without one, the run ends unless a context source objects.
-    pub fn stop_hook(mut self, hook: crate::AnyStopHook) -> Self {
-        self.stop_hook = Some(hook);
+    /// Sets who answers the approval requests of tool calls: a
+    /// [`ToolDecision::Ask`](crate::ToolDecision::Ask) from a hook, and the
+    /// requests tools make of their own.
+    ///
+    /// Without one, a request fails the run with
+    /// [`AgentError::Approval`](crate::AgentError::Approval). The run emits
+    /// [`Paused`](crate::AgentEvent::Paused) while an approval is pending.
+    pub fn approver(mut self, approver: impl Approver) -> Self {
+        self.approver = Some(AnyApprover::new(approver));
         self
     }
 
@@ -352,9 +341,7 @@ where
             clock: self.clock,
             context_sources: self.context_sources,
             live_sources: self.live_sources,
-            state_sources: self.state_sources,
-            event_sources: self.event_sources,
-            stop_hook: self.stop_hook,
+            approver: self.approver,
             fork_source: self.fork_source,
             identity: self.identity,
             tools: self.tools,
@@ -399,9 +386,7 @@ where
             clock: self.clock,
             context_sources: self.context_sources,
             live_sources: self.live_sources,
-            state_sources: self.state_sources,
-            event_sources: self.event_sources,
-            stop_hook: self.stop_hook,
+            approver: self.approver,
             fork_source: self.fork_source,
             identity: self.identity,
             tools: self.tools,
@@ -415,15 +400,13 @@ where
         }
     }
 
-    /// Adds a hook to intercept agent operations.
-    ///
-    /// Hooks are composed using the `HCons` pattern, allowing multiple
-    /// hooks to be chained at compile time.
-    pub fn hook<NH: Hook>(self, hook: NH) -> AgentBuilder<M, HCons<NH, H>, C, Schema> {
+    /// Sets the embedder's decisions at the loop's control points, in place
+    /// of any set before (see [`Hooks`]).
+    pub fn hooks<NH: Hooks>(self, hooks: NH) -> AgentBuilder<M, NH, C, Schema> {
         AgentBuilder {
             model: self.model,
             compaction_model: self.compaction_model,
-            hooks: HCons::new(hook, self.hooks),
+            hooks,
             parameters: self.parameters,
             config: self.config,
             context: self.context,
@@ -431,9 +414,7 @@ where
             clock: self.clock,
             context_sources: self.context_sources,
             live_sources: self.live_sources,
-            state_sources: self.state_sources,
-            event_sources: self.event_sources,
-            stop_hook: self.stop_hook,
+            approver: self.approver,
             fork_source: self.fork_source,
             identity: self.identity,
             tools: self.tools,
@@ -563,11 +544,13 @@ where
             prompt_cache: self.prompt_cache,
             context_sources: self.context_sources,
             live_sources: self.live_sources,
-            state_sources: self.state_sources,
-            event_sources: self.event_sources,
+            approver: self.approver,
+            pauses: std::sync::Arc::default(),
+            last_tail: Vec::new(),
             reassembled: false,
             prefix_rewrites: crate::context::PrefixRewrites::default(),
             requests_sent: 0,
+            request_ids: 0,
             compaction: crate::compaction_state::CompactionState::default(),
             compaction_failure: None,
             compaction_announced: false,
@@ -576,7 +559,6 @@ where
             compaction_profile: None,
             initialized,
             connectivity: self.connectivity,
-            stop_hook: self.stop_hook,
             restore_dir: self.restore_dir,
             file_references: self.file_references,
             last_request: None,

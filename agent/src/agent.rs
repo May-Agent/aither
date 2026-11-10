@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -16,19 +17,23 @@ use crate::{
     compaction_state::CompactionState,
     config::AgentConfig,
     context::{
-        AnyContextSource, AnyEventSource, AnyFileReferences, AnyLiveSource, AnyStateSource,
-        AttachmentRef, Block, CacheLifetime, CompactionFork, CompletedCompaction, Context,
-        ContextBudget, HandoffDocument, PendingCompaction, PrefixChain, PrefixRewrites,
-        PromptCache, PromptPrefix,
+        AnyContextSource, AnyFileReferences, AnyLiveSource, AttachmentRef, Block, CacheLifetime,
+        CompactionFork, CompletedCompaction, Context, ContextBlock, ContextBudget, HandoffDocument,
+        Moment, PendingCompaction, Placement, PrefixChain, PrefixRewrites, PromptCache,
+        PromptPrefix, SourceId,
         recovery::{SpillLimits, clean_for_recovery},
         restore_context,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
-    event::{AgentEvent, CompactionOutcome, RunPauseReason, TimedEvent},
+    event::{
+        AgentEvent, AgentPath, BlockId, CheckpointReason, CompactionOutcome, CompactionTrigger,
+        InjectionKind, OutputKind, PauseId, RequestId, RequestOutcome, RunId, RunOutcome,
+        RunPause, TimedEvent, ToolOrigin, ToolVerdict,
+    },
     hook::{
-        CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
-        StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
+        AfterTool, Hooks, RequestCx, StopCx, StopDecision, ToolDecision, ToolInvocation,
+        ToolOutcome, TurnBoundaryAction, TurnBoundaryContext,
     },
     request_parameters::WithParameters,
     tools::AgentTools,
@@ -38,9 +43,11 @@ use crate::context::SkillCatalogEntry;
 use aither_core::{
     LanguageModel,
     llm::{
-        Attachment, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role, TokenCounting,
-        ToolCall,
+        AnyApprover, Approval, ApprovalRequest, Approver, ApproverFailure, Attachment, CancelSignal,
+        Canceller, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role, TokenCounting,
+        ToolCall, ToolCallId,
         model::{Ability, Parameters, Profile as ModelProfile},
+        tool::{Progress, ProgressSink},
     },
 };
 use askama::Template;
@@ -94,6 +101,8 @@ struct ModelTurn {
     /// Replayed on the next request: providers that verify their own reasoning
     /// reject a turn whose blocks were reordered or partially dropped.
     reasoning: Vec<ReasoningState>,
+    /// What the provider reported the request used, if it did.
+    usage: Option<aither_core::llm::Usage>,
     malformed_function_call: bool,
 }
 
@@ -104,23 +113,41 @@ struct ModelTurn {
 #[derive(Clone)]
 struct EventSink {
     sender: async_channel::Sender<TimedEvent>,
+    /// The agent the sink emits for, stamped on every event.
+    agent: AgentPath,
 }
 
 impl EventSink {
-    /// A sink whose events nobody reads, for tests driving one step of the
-    /// loop.
-    #[cfg(test)]
-    fn discarding() -> Self {
-        Self {
-            sender: async_channel::unbounded().0,
-        }
-    }
-
     fn emit(&self, event: AgentEvent) {
         let _ = self.sender.try_send(TimedEvent {
             at: jiff::Timestamp::now(),
+            agent: self.agent.clone(),
             event,
         });
+    }
+}
+
+/// Cancels a [`Run`] from outside, such as from another task while the run is
+/// being driven. Cloneable and cheap.
+#[derive(Debug, Clone, Default)]
+pub struct CancelHandle(Arc<Canceller>);
+
+impl CancelHandle {
+    /// Cancels the run: it stops at its next await point and ends with
+    /// [`RunOutcome::Cancelled`]. Calling it again, or after the run ended,
+    /// does nothing.
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    /// Whether the run was cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    fn signal(&self) -> CancelSignal {
+        self.0.signal()
     }
 }
 
@@ -129,18 +156,25 @@ impl EventSink {
 /// A run does nothing until [`drive`](Self::drive) consumes it. Driving hands
 /// each event to the caller's handler while the run itself keeps going, so a
 /// handler that waits on something the run holds lets the run release it.
+///
+/// A run ends with exactly one [`AgentEvent::RunEnded`]: cancelling it with
+/// [`cancel`](Self::cancel) or a [`CancelHandle`] ends it with
+/// [`RunOutcome::Cancelled`], and so does dropping it unfinished (though a
+/// dropped run has no consumer left to read the event).
 #[must_use = "a run does nothing until it is driven"]
 pub struct Run<F> {
     /// The run's state machine spans every turn and is tens of kilobytes;
     /// boxed so a `Run` moves into the caller's future without copying it.
     run: Pin<Box<F>>,
     events: async_channel::Receiver<TimedEvent>,
+    cancel: CancelHandle,
 }
 
 impl<F> std::fmt::Debug for Run<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Run")
             .field("queued_events", &self.events.len())
+            .field("cancelled", &self.cancel.is_cancelled())
             .finish_non_exhaustive()
     }
 }
@@ -149,13 +183,26 @@ impl<F> Run<F>
 where
     F: Future<Output = Result<(), AgentError>>,
 {
-    fn new(start: impl FnOnce(EventSink) -> F) -> Self {
+    fn new(agent: AgentPath, start: impl FnOnce(EventSink, CancelSignal) -> F) -> Self {
         let (sender, events) = async_channel::unbounded();
+        let cancel = CancelHandle::default();
         // The run owns the sink and drops it as it finishes.
         Self {
-            run: Box::pin(start(EventSink { sender })),
+            run: Box::pin(start(EventSink { sender, agent }, cancel.signal())),
             events,
+            cancel,
         }
+    }
+
+    /// Cancels the run. Driving a cancelled run ends it at once with
+    /// [`RunOutcome::Cancelled`].
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// A handle that cancels this run after [`drive`](Self::drive) took it.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.cancel.clone()
     }
 
     /// Runs to the end, handing each event to `handler` in the order the run
@@ -170,16 +217,18 @@ where
     /// [`ControlFlow::Continue`] for the next. Threading it through, rather
     /// than capturing it in an async closure, keeps the driven future `Send`
     /// whenever the state is. A handler returns [`ControlFlow::Break`] to
-    /// stop: the run is cancelled, its queued events are discarded, and
-    /// `drive` returns that `Break`. Otherwise `drive` returns the state in
-    /// `Continue` once the run has finished and its every event was handled.
+    /// stop: the run is cancelled and dropped, its queued events are
+    /// discarded, and `drive` returns that `Break`. Otherwise `drive` returns
+    /// the state in `Continue` once the run has finished and its every event
+    /// was handled.
     ///
     /// `stop` cancels the run from outside, such as on a user's request: it
     /// is polled, ahead of the run and its next event, only while no handler
     /// call is in progress, so a call already running always finishes. Once
-    /// it completes, the run is dropped with its queued events and `drive`
-    /// returns its value in `Break`. A caller with nothing to stop on passes
-    /// [`std::future::pending`].
+    /// it completes, the run is cancelled and driven to its end, so the
+    /// handler still sees the run's [`RunEnded`](AgentEvent::RunEnded) with
+    /// [`RunOutcome::Cancelled`], and `drive` returns the value in `Break`. A
+    /// caller with nothing to stop on passes [`std::future::pending`].
     ///
     /// # Errors
     ///
@@ -194,13 +243,20 @@ where
     where
         H: Future<Output = ControlFlow<B, S>>,
     {
-        let Self { mut run, events } = self;
+        let Self {
+            mut run,
+            events,
+            cancel,
+        } = self;
         futures_lite::pin!(events);
         futures_lite::pin!(stop);
         let mut outcome = None;
+        let mut stopped = None;
         loop {
             let next = std::future::poll_fn(|cx| {
-                if let Poll::Ready(value) = stop.as_mut().poll(cx) {
+                if stopped.is_none()
+                    && let Poll::Ready(value) = stop.as_mut().poll(cx)
+                {
                     return Poll::Ready(RunStep::Stopped(value));
                 }
                 poll_run(run.as_mut(), &mut outcome, cx);
@@ -226,9 +282,16 @@ where
                 RunStep::Event(event) => event,
                 RunStep::Finished(result) => {
                     result?;
-                    return Ok(ControlFlow::Continue(state));
+                    return Ok(match stopped {
+                        Some(value) => ControlFlow::Break(value),
+                        None => ControlFlow::Continue(state),
+                    });
                 }
-                RunStep::Stopped(value) => return Ok(ControlFlow::Break(value)),
+                RunStep::Stopped(value) => {
+                    stopped = Some(value);
+                    cancel.cancel();
+                    continue;
+                }
             };
             let call = handler(state, event);
             futures_lite::pin!(call);
@@ -239,7 +302,10 @@ where
             .await;
             state = match flow {
                 ControlFlow::Continue(state) => state,
-                ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
+                ControlFlow::Break(value) => {
+                    cancel.cancel();
+                    return Ok(ControlFlow::Break(value));
+                }
             };
         }
     }
@@ -267,24 +333,25 @@ fn poll_run<F>(
     }
 }
 
-struct RunLoopOutcome {
-    final_text: String,
-    stop_reason: StopReason,
-    iteration: usize,
+/// How the loop of a run ended, short of an error.
+enum LoopEnd {
+    /// The model answered and nothing held the run, on turn `turn`.
+    Answered { final_text: String, turn: usize },
+    /// The run stopped for a reason that needs the embedder.
+    Paused(RunPause),
+}
+
+/// What the loop of one run works with.
+#[derive(Clone, Copy)]
+struct RunCx<'a> {
+    events: &'a EventSink,
+    cancel: &'a CancelSignal,
+    run: &'a RunId,
 }
 
 enum TurnControl {
     Continue,
-    Break {
-        final_text: String,
-        stop_reason: StopReason,
-    },
-}
-
-enum ModelEventAction {
-    Emit(AgentEvent),
-    Continue,
-    RetryMalformed,
+    Break(LoopEnd),
 }
 
 /// A response stream that ended with an error instead of finishing.
@@ -292,79 +359,371 @@ struct BrokenStream {
     error: AgentError,
     /// Whether an event arrived before the error: the stream had opened.
     opened: bool,
+    /// What the provider reported the broken request used, if it did.
+    usage: Option<aither_core::llm::Usage>,
 }
 
 /// A finished tool call, waiting to be paired with its call in the context.
 #[derive(Debug)]
-pub struct FinishedToolCall {
+pub(crate) struct FinishedToolCall {
     id: String,
-    name: String,
-    result: aither_core::llm::ToolResult,
+    outcome: ToolOutcome,
+    /// Context an `after_tool` hook appended, to follow the turn's results.
+    appended: Option<String>,
 }
 
-type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
+pub(crate) type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
 
-async fn handle_model_event<H: Hook>(
-    hooks: &H,
+/// One tool call on its way through the hooks and the tool.
+struct ToolRun<'a, H> {
+    hooks: &'a H,
+    tools: &'a AgentTools,
+    events: &'a EventSink,
+    cancel: &'a CancelSignal,
+    approver: Option<&'a AnyApprover>,
+    identity: aither_core::llm::CallIdentity,
+    turn: usize,
+    message_count: usize,
+}
+
+impl<H: Hooks> ToolRun<'_, H> {
+    fn decided(&self, decision: ToolVerdict) {
+        self.events.emit(AgentEvent::ToolCallDecided {
+            call: self.identity.call().clone(),
+            decision,
+        });
+    }
+
+    /// What the tool is given besides its arguments.
+    fn context(&self) -> aither_core::llm::ToolContext {
+        let mut cx = aither_core::llm::ToolContext::with_progress(ProgressEvents {
+            events: self.events.clone(),
+            call: self.identity.call().clone(),
+        })
+        .with_identity(self.identity.clone())
+        .with_cancellation(self.cancel.clone());
+        if let Some(approver) = self.approver {
+            cx = cx.with_approver(approver.clone());
+        }
+        cx
+    }
+
+    /// Puts `request` to the approver.
+    async fn ask(&self, request: ApprovalRequest) -> Result<Approval, AgentError> {
+        let kind = request.kind().clone();
+        let Some(approver) = self.approver else {
+            return Err(AgentError::Approval(Arc::new(
+                aither_core::llm::ApprovalError::NoApprover { kind },
+            )));
+        };
+        let request = if request.call().is_some() {
+            request
+        } else {
+            request.with_call(self.identity.clone())
+        };
+        approver.approve(request).await.map_err(|failure| {
+            AgentError::Approval(Arc::new(aither_core::llm::ApprovalError::Failed {
+                kind,
+                failure,
+            }))
+        })
+    }
+
+    async fn execute(self, call: &ToolCall) -> ToolExecutionResult {
+        let invocation = ToolInvocation {
+            call: &self.identity,
+            name: &call.name,
+            arguments: &call.arguments,
+            turn: self.turn,
+            message_count: self.message_count,
+        };
+        let mut arguments = call.arguments.clone();
+        let mut denied = None;
+        match self.hooks.before_tool(&invocation).await {
+            ToolDecision::Allow => self.decided(ToolVerdict::Allowed),
+            ToolDecision::Deny(reason) => {
+                self.decided(ToolVerdict::Denied {
+                    reason: reason.clone(),
+                });
+                denied = Some(reason);
+            }
+            ToolDecision::Rewrite(rewritten) => {
+                self.decided(ToolVerdict::Rewritten);
+                arguments = rewritten;
+            }
+            ToolDecision::Ask(request) => {
+                self.decided(ToolVerdict::AwaitingApproval);
+                match self.ask(request).await? {
+                    Approval::Approved => self.decided(ToolVerdict::Allowed),
+                    Approval::Denied { reason } => {
+                        self.decided(ToolVerdict::Denied {
+                            reason: reason.clone(),
+                        });
+                        denied = Some(reason);
+                    }
+                }
+            }
+            ToolDecision::Abort(reason) => {
+                return Err(AgentError::HookRejected {
+                    hook: "before_tool",
+                    reason,
+                });
+            }
+        }
+
+        let (result, duration) = if let Some(reason) = denied {
+            (Ok(aither_core::llm::ToolResult::error(reason)), Duration::ZERO)
+        } else {
+            let start = Instant::now();
+            let result = self
+                .tools
+                .call(&call.name, &arguments.to_string(), self.context())
+                .await;
+            (result, start.elapsed())
+        };
+        let mut outcome = ToolOutcome {
+            call: self.identity.clone(),
+            name: call.name.clone(),
+            arguments,
+            result,
+            duration,
+        };
+        let mut appended = None;
+        match self.hooks.after_tool(&outcome).await {
+            AfterTool::Keep => {}
+            AfterTool::Replace(replacement) => outcome.result = Ok(replacement),
+            AfterTool::Append(context) => appended = Some(context),
+            AfterTool::Abort(reason) => {
+                return Err(AgentError::HookRejected {
+                    hook: "after_tool",
+                    reason,
+                });
+            }
+        }
+        self.events.emit(AgentEvent::ToolCallEnded {
+            call: self.identity.call().clone(),
+            result: outcome.for_model(),
+        });
+        Ok(FinishedToolCall {
+            id: call.id.clone(),
+            outcome,
+            appended,
+        })
+    }
+}
+
+/// Reports a running tool's progress as events.
+struct ProgressEvents {
+    events: EventSink,
+    call: ToolCallId,
+}
+
+impl ProgressSink for ProgressEvents {
+    async fn report(&mut self, progress: Progress) {
+        self.events.emit(AgentEvent::ToolProgress {
+            call: self.call.clone(),
+            progress,
+        });
+    }
+}
+
+/// Wraps the embedder's approver so a wait for an answer is visible: a
+/// [`Paused`](AgentEvent::Paused) goes out only when the answer is not there
+/// on the first poll, and a [`Resumed`](AgentEvent::Resumed) when it comes.
+struct PausingApprover {
+    inner: AnyApprover,
+    events: EventSink,
+    pauses: Arc<AtomicU64>,
+}
+
+impl Approver for PausingApprover {
+    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        let call = request.call().map(|identity| identity.call().clone());
+        let kind = request.kind().clone();
+        let subject = request.subject().to_string();
+        let answer = self.inner.approve(request);
+        futures_lite::pin!(answer);
+        if let Some(settled) = futures_lite::future::poll_once(answer.as_mut()).await {
+            return settled;
+        }
+        let pause = PauseId::new(self.pauses.fetch_add(1, Ordering::Relaxed));
+        self.events.emit(AgentEvent::Paused {
+            pause,
+            call,
+            kind,
+            subject,
+        });
+        let settled = answer.await;
+        self.events.emit(AgentEvent::Resumed { pause });
+        settled
+    }
+}
+
+/// Ends the run's event stream with [`RunOutcome::Cancelled`] when the run
+/// is dropped before it ended itself.
+struct RunEndGuard {
+    events: EventSink,
+    run: RunId,
+    ended: bool,
+}
+
+impl RunEndGuard {
+    fn end(&mut self, outcome: RunOutcome) {
+        self.ended = true;
+        self.events.emit(AgentEvent::RunEnded {
+            run: self.run.clone(),
+            outcome,
+        });
+    }
+}
+
+impl Drop for RunEndGuard {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.end(RunOutcome::Cancelled);
+        }
+    }
+}
+
+/// The blocks of one response, as they stream in.
+struct Response<'a> {
+    events: &'a EventSink,
+    request: RequestId,
+    text_chunks: Vec<String>,
+    tool_calls: Vec<ToolCall>,
+    reasoning: Vec<ReasoningState>,
+    /// The block open now, and the id the next one gets.
+    open: Option<(BlockId, OutputKind)>,
+    next_block: u32,
+    usage: Option<aither_core::llm::Usage>,
+}
+
+impl<'a> Response<'a> {
+    const fn new(events: &'a EventSink, request: RequestId) -> Self {
+        Self {
+            events,
+            request,
+            text_chunks: Vec::new(),
+            tool_calls: Vec::new(),
+            reasoning: Vec::new(),
+            open: None,
+            next_block: 0,
+            usage: None,
+        }
+    }
+
+    /// Streams `text` into a block of `kind`, closing the open block when it
+    /// is of another kind.
+    fn delta(&mut self, kind: OutputKind, text: String) {
+        let block = match self.open {
+            Some((block, open)) if open == kind => block,
+            _ => {
+                self.end_block();
+                let block = BlockId::new(self.next_block);
+                self.next_block += 1;
+                self.open = Some((block, kind));
+                block
+            }
+        };
+        self.events.emit(AgentEvent::BlockDelta {
+            request: self.request,
+            block,
+            kind,
+            text,
+        });
+    }
+
+    fn end_block(&mut self) {
+        if let Some((block, kind)) = self.open.take() {
+            self.events.emit(AgentEvent::BlockEnded {
+                request: self.request,
+                block,
+                kind,
+            });
+        }
+    }
+}
+
+/// What a model event asks the stream loop to do.
+enum ModelEventAction {
+    Continue,
+    RetryMalformed,
+}
+
+fn handle_model_event(
     cache_stats: &mut crate::CacheStats,
     budget: &mut ContextBudget,
     event: Result<Event, AgentError>,
-    text_chunks: &mut Vec<String>,
-    tool_calls: &mut Vec<ToolCall>,
-    reasoning: &mut Vec<ReasoningState>,
+    response: &mut Response<'_>,
 ) -> Result<ModelEventAction, AgentError> {
     match event {
         Ok(Event::Text(text)) => {
-            hooks.on_text(&text).await;
-            text_chunks.push(text.clone());
-            Ok(ModelEventAction::Emit(AgentEvent::Text(text)))
+            response.text_chunks.push(text.clone());
+            response.delta(OutputKind::Text, text);
+            Ok(ModelEventAction::Continue)
         }
         Ok(Event::Reasoning(reasoning)) => {
-            Ok(ModelEventAction::Emit(AgentEvent::Reasoning(reasoning)))
+            response.delta(OutputKind::Reasoning, reasoning);
+            Ok(ModelEventAction::Continue)
         }
         Ok(Event::ToolCallDelta {
             id,
             name,
             arguments_fragment,
-        }) => Ok(ModelEventAction::Emit(AgentEvent::ToolCallDelta {
-            id,
-            name,
-            arguments_fragment,
-        })),
+        }) => {
+            response.end_block();
+            response.events.emit(AgentEvent::ToolCallDelta {
+                call: ToolCallId::new(id),
+                name,
+                arguments_fragment,
+            });
+            Ok(ModelEventAction::Continue)
+        }
         Ok(Event::ToolCall(call)) => {
-            tool_calls.push(call);
+            response.end_block();
+            response.tool_calls.push(call);
             Ok(ModelEventAction::Continue)
         }
         // State, unlike Reasoning, is not for the reader: it is collected so
         // the next request can hand it back to the provider.
         Ok(Event::ReasoningState(state)) => {
-            reasoning.push(state);
+            response.reasoning.push(state);
             Ok(ModelEventAction::Continue)
         }
         Ok(Event::BuiltInToolCall { id, tool, detail }) => {
+            response.end_block();
             if !detail.is_empty() {
-                text_chunks.push(format_builtin_tool_result(&tool, &detail));
+                response
+                    .text_chunks
+                    .push(format_builtin_tool_result(&tool, &detail));
             }
-            Ok(ModelEventAction::Emit(AgentEvent::BuiltInToolCall {
-                id,
-                tool,
-                detail,
-            }))
+            let call = ToolCallId::new(id);
+            response.events.emit(AgentEvent::ToolCallStarted {
+                call,
+                name: tool,
+                arguments: serde_json::Value::String(detail),
+                origin: ToolOrigin::Hosted,
+            });
+            Ok(ModelEventAction::Continue)
         }
         Ok(Event::BuiltInToolResult { id, tool, result }) => {
-            text_chunks.push(format_builtin_tool_result(&tool, &result));
-            Ok(ModelEventAction::Emit(AgentEvent::BuiltInToolResult {
-                id,
-                tool,
-                result,
-            }))
+            response.end_block();
+            response
+                .text_chunks
+                .push(format_builtin_tool_result(&tool, &result));
+            response.events.emit(AgentEvent::ToolCallEnded {
+                call: ToolCallId::new(id),
+                result: aither_core::llm::ToolResult::text(result),
+            });
+            Ok(ModelEventAction::Continue)
         }
         Ok(Event::Usage(usage)) => {
             cache_stats.record(&usage);
             // The provider just counted the prompt it received; that is the
             // only honest measure of how much window the window costs.
             budget.calibrate(&usage);
-            Ok(ModelEventAction::Emit(AgentEvent::Usage(usage)))
+            response.usage = Some(usage);
+            Ok(ModelEventAction::Continue)
         }
         Err(AgentError::Llm { message, .. }) if message.contains("malformed function call") => {
             tracing::warn!("Model generated malformed function call, retrying...");
@@ -396,14 +755,14 @@ fn ensure_non_empty_tool_call_ids(
     )))
 }
 
-/// The blocks rendered into a request's tail, each with the context source
-/// that rendered it, so a commit reaches only that source.
+/// The blocks collected into a request's tail, each with the context source
+/// that returned it, so a commit reaches only that source.
 #[derive(Debug, Default)]
 struct RenderedTail {
     blocks: Vec<Block>,
-    /// The index into the agent's context sources of the source that rendered
-    /// the block at the same position.
-    sources: Vec<usize>,
+    /// The index into the agent's context sources of the source that returned
+    /// the block at the same position; `None` for a hook's block.
+    sources: Vec<Option<usize>>,
 }
 
 impl std::ops::Deref for RenderedTail {
@@ -423,12 +782,6 @@ pub struct CompactResult {
     pub messages_remaining: usize,
     /// The generated summary.
     pub summary: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EmittedCheckpoint {
-    phase: ContextWindowPhase,
-    message_count: usize,
 }
 
 /// A stop hook's reminder, as the model reads it.
@@ -500,8 +853,15 @@ pub struct Agent<M, H = (), C = M, Schema = HandoffDocument> {
     /// Registered tools.
     pub(crate) tools: AgentTools,
 
-    /// Composed hooks.
+    /// The embedder's decisions.
     pub(crate) hooks: H,
+
+    /// Answers the approvals tool calls and hooks ask for; without one an
+    /// approval fails.
+    pub(crate) approver: Option<AnyApprover>,
+
+    /// The pauses emitted, numbering the next.
+    pub(crate) pauses: Arc<AtomicU64>,
 
     /// Agent configuration.
     pub(crate) config: AgentConfig,
@@ -522,23 +882,23 @@ pub struct Agent<M, H = (), C = M, Schema = HandoffDocument> {
     /// system prompt, in this order.
     pub(crate) live_sources: Vec<AnyLiveSource>,
 
-    /// State, with the values the model has seen, read in this order as a
-    /// request is assembled.
-    pub(crate) state_sources: Vec<AnyStateSource>,
-
-    /// Events, delivered in this order as a request is assembled.
-    pub(crate) event_sources: Vec<AnyEventSource>,
+    /// The tail of the request assembled last, which a preview or a
+    /// measurement of the window shows.
+    pub(crate) last_tail: Vec<Block>,
 
     /// Whether the window was rewritten since the sources last heard a
     /// request begin, which wipes every durable alert they pushed before.
     pub(crate) reassembled: bool,
 
     /// What rewrote the prompt prefix since the previous request, reported
-    /// with the next one's [`AgentEvent::PromptPrefix`].
+    /// with the next one's [`AgentEvent::RequestStarted`].
     pub(crate) prefix_rewrites: PrefixRewrites,
 
-    /// How many requests this agent has sent.
+    /// How many requests this agent has assembled.
     pub(crate) requests_sent: u64,
+
+    /// The next [`RequestId`]: every attempt at a response is one.
+    pub(crate) request_ids: u64,
 
     /// The one compaction in the making: running alongside the turn, or
     /// finished and waiting for a request boundary.
@@ -549,7 +909,7 @@ pub struct Agent<M, H = (), C = M, Schema = HandoffDocument> {
     pub(crate) compaction_failure: Option<crate::context::CompactionError>,
 
     /// Whether an [`AgentEvent::CompactionStarted`] was emitted whose
-    /// [`AgentEvent::CompactionFinished`] is still owed.
+    /// [`AgentEvent::CompactionEnded`] is still owed.
     pub(crate) compaction_announced: bool,
 
     /// Results of the tool calls of the turn in flight, in completion order,
@@ -570,9 +930,6 @@ pub struct Agent<M, H = (), C = M, Schema = HandoffDocument> {
     /// Ends a provider stream in flight when the machine wakes or goes
     /// offline.
     pub(crate) connectivity: crate::connectivity::Watch,
-
-    /// The embedder's stop rule, asked each time the model ends its turn.
-    pub(crate) stop_hook: Option<crate::AnyStopHook>,
 
     /// Directory files are restored from after a forked compaction.
     pub(crate) restore_dir: Option<PathBuf>,
@@ -635,17 +992,19 @@ impl<M: LanguageModel> Agent<M> {
             idle_compacted: false,
             tools: AgentTools::new(),
             hooks: (),
+            approver: None,
+            pauses: Arc::default(),
             config,
             context: Context::default(),
             budget: ContextBudget::default(),
             prompt_cache,
             context_sources: Vec::new(),
             live_sources: Vec::new(),
-            state_sources: Vec::new(),
-            event_sources: Vec::new(),
+            last_tail: Vec::new(),
             reassembled: false,
             prefix_rewrites: PrefixRewrites::default(),
             requests_sent: 0,
+            request_ids: 0,
             compaction: CompactionState::default(),
             compaction_failure: None,
             compaction_announced: false,
@@ -654,7 +1013,6 @@ impl<M: LanguageModel> Agent<M> {
             compaction_profile: None,
             initialized: false,
             connectivity: crate::connectivity::Watch::default(),
-            stop_hook: None,
             restore_dir: None,
             file_references: None,
             last_request: None,
@@ -681,7 +1039,7 @@ where
     // Owned by the compaction future, which outlives the turn it races
     // against.
     C: LanguageModel + 'static,
-    H: Hook,
+    H: Hooks,
 {
     /// Response stream of the model, boxed so the provider's concrete stream
     /// type does not inflate this async chain's poll frames in debug builds
@@ -716,13 +1074,27 @@ where
     async fn collect_model_turn(
         &mut self,
         mut request: LLMRequest,
+        prefix: &PromptPrefix,
         events: &EventSink,
     ) -> Result<ModelTurn, AgentError> {
         let policy = self.retry_policy();
         let mut retries = 0;
         loop {
-            let broken = match self.stream_model_turn(request, events).await {
-                Ok(turn) => return Ok(turn),
+            let id = RequestId::new(self.request_ids);
+            self.request_ids += 1;
+            events.emit(AgentEvent::RequestStarted {
+                request: id,
+                prefix: prefix.clone(),
+            });
+            let broken = match self.stream_model_turn(request, id, events).await {
+                Ok(turn) => {
+                    events.emit(AgentEvent::RequestEnded {
+                        request: id,
+                        usage: turn.usage.clone(),
+                        outcome: RequestOutcome::Completed,
+                    });
+                    return Ok(turn);
+                }
                 Err(broken) => broken,
             };
             let failure = match broken.error.failure() {
@@ -733,7 +1105,16 @@ where
                 {
                     *failure
                 }
-                _ => return Err(broken.error),
+                _ => {
+                    events.emit(AgentEvent::RequestEnded {
+                        request: id,
+                        usage: broken.usage,
+                        outcome: RequestOutcome::Failed {
+                            error: broken.error.clone(),
+                        },
+                    });
+                    return Err(broken.error);
+                }
             };
             let delay = policy.delay(retries, &failure);
             retries += 1;
@@ -744,11 +1125,15 @@ where
                 error = %broken.error,
                 "model response stream broke mid-response; sending the request again"
             );
-            events.emit(AgentEvent::ResponseRetry {
-                error: broken.error,
-                retry: retries,
-                max_retries: policy.max_retries,
-                delay,
+            events.emit(AgentEvent::RequestEnded {
+                request: id,
+                usage: broken.usage,
+                outcome: RequestOutcome::Retrying {
+                    error: broken.error,
+                    retry: retries,
+                    max_retries: policy.max_retries,
+                    delay,
+                },
             });
             async_io::Timer::after(delay).await;
             request = self
@@ -762,11 +1147,10 @@ where
     async fn stream_model_turn(
         &mut self,
         request: LLMRequest,
+        id: RequestId,
         events: &EventSink,
     ) -> Result<ModelTurn, BrokenStream> {
-        let mut text_chunks = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut reasoning = Vec::new();
+        let mut response = Response::new(events, id);
         let mut malformed_function_call = false;
         let mut opened = false;
 
@@ -774,35 +1158,32 @@ where
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
             let received = event.is_ok();
-            let action = handle_model_event(
-                &self.hooks,
-                &mut self.cache_stats,
-                &mut self.budget,
-                event,
-                &mut text_chunks,
-                &mut tool_calls,
-                &mut reasoning,
-            )
-            .await
-            .map_err(|error| BrokenStream { error, opened })?;
+            let action =
+                handle_model_event(&mut self.cache_stats, &mut self.budget, event, &mut response)
+                    .map_err(|error| {
+                        response.end_block();
+                        BrokenStream {
+                            error,
+                            opened,
+                            usage: response.usage.take(),
+                        }
+                    })?;
             if received && let Some(carried) = self.delivering.take() {
                 self.context.mark_delivered_below(carried);
             }
             opened |= received;
-            match action {
-                ModelEventAction::Emit(event) => events.emit(event),
-                ModelEventAction::Continue => {}
-                ModelEventAction::RetryMalformed => {
-                    malformed_function_call = true;
-                    break;
-                }
+            if matches!(action, ModelEventAction::RetryMalformed) {
+                malformed_function_call = true;
+                break;
             }
         }
+        response.end_block();
 
         Ok(ModelTurn {
-            response_text: text_chunks.join(""),
-            tool_calls,
-            reasoning,
+            response_text: response.text_chunks.join(""),
+            tool_calls: response.tool_calls,
+            reasoning: response.reasoning,
+            usage: response.usage,
             malformed_function_call,
         })
     }
@@ -813,92 +1194,138 @@ where
         prompt: String,
         attachments: Vec<Attachment>,
         events: &EventSink,
+        cancel: &CancelSignal,
     ) -> Result<(), AgentError> {
-        let run_id = uuid::Uuid::new_v4().to_string();
-        events.emit(AgentEvent::run_start(
-            run_id.clone(),
-            self.config.max_iterations,
-        ));
-        self.finish_lost_compaction(events);
-        self.ensure_initialized().await?;
-        self.settle_interrupted_tool_calls();
-        // An effort change lands before the user message it applies to.
-        self.settle_effort()?;
-        self.context
-            .push(Message::user(prompt).with_attachments(attachments));
-
-        let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
-        self.push_stop_events(run_id.as_str(), outcome, events)
+        self.run_to_end(events, cancel, Some(Message::user(prompt).with_attachments(attachments)))
             .await
     }
 
     /// A run without a new user message: the model acts on what the host
     /// pushed with [`push_message`](Self::push_message).
-    async fn resume_streaming(&mut self, events: &EventSink) -> Result<(), AgentError> {
-        let run_id = uuid::Uuid::new_v4().to_string();
-        events.emit(AgentEvent::run_start(
-            run_id.clone(),
-            self.config.max_iterations,
-        ));
-        self.finish_lost_compaction(events);
-        self.ensure_initialized().await?;
-        self.settle_interrupted_tool_calls();
-        self.settle_effort()?;
-        let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
-        self.push_stop_events(run_id.as_str(), outcome, events)
-            .await
+    async fn resume_streaming(
+        &mut self,
+        events: &EventSink,
+        cancel: &CancelSignal,
+    ) -> Result<(), AgentError> {
+        self.run_to_end(events, cancel, None).await
     }
 
-    async fn run_agent_loop(
+    /// Runs the loop on `message` (when there is one) and ends the run's
+    /// event stream with exactly one [`AgentEvent::RunEnded`], whatever way
+    /// the run ends.
+    async fn run_to_end(
         &mut self,
-        run_id: &str,
-        turn_offset: usize,
         events: &EventSink,
-    ) -> Result<RunLoopOutcome, AgentError> {
-        let mut iteration = 0;
+        cancel: &CancelSignal,
+        message: Option<Message>,
+    ) -> Result<(), AgentError> {
+        let run = RunId::new(uuid::Uuid::new_v4().to_string());
+        events.emit(AgentEvent::RunStarted {
+            run: run.clone(),
+            agent: events.agent.clone(),
+        });
+        let mut guard = RunEndGuard {
+            events: events.clone(),
+            run: run.clone(),
+            ended: false,
+        };
+        let cx = RunCx {
+            events,
+            cancel,
+            run: &run,
+        };
+        let finished = futures_lite::future::or(
+            async { Some(self.run_body(&cx, message).await) },
+            async {
+                cancel.cancelled().await;
+                None
+            },
+        )
+        .await;
+        match finished {
+            Some(Ok(LoopEnd::Answered { final_text, .. })) => {
+                guard.end(RunOutcome::Completed { final_text });
+                Ok(())
+            }
+            Some(Ok(LoopEnd::Paused(pause))) => {
+                guard.end(RunOutcome::Paused { pause });
+                Ok(())
+            }
+            Some(Err(error @ AgentError::MaxIterations { .. })) => {
+                guard.end(RunOutcome::IterationLimit);
+                Err(error)
+            }
+            Some(Err(error)) => {
+                guard.end(RunOutcome::Failed {
+                    error: error.clone(),
+                });
+                Err(error)
+            }
+            None => {
+                guard.end(RunOutcome::Cancelled);
+                Ok(())
+            }
+        }
+    }
+
+    async fn run_body(
+        &mut self,
+        cx: &RunCx<'_>,
+        message: Option<Message>,
+    ) -> Result<LoopEnd, AgentError> {
+        self.finish_lost_compaction(cx.events);
+        self.ensure_initialized().await?;
+        self.settle_interrupted_tool_calls();
+        // An effort change lands before the user message it applies to.
+        self.settle_effort()?;
+        if let Some(message) = message {
+            self.context.push(message);
+        }
+        let end = self.run_agent_loop(cx).await?;
+        if let LoopEnd::Answered { turn, .. } = &end {
+            self.emit_checkpoint(cx, CheckpointReason::Stop, *turn);
+        }
+        Ok(end)
+    }
+
+    async fn run_agent_loop(&mut self, cx: &RunCx<'_>) -> Result<LoopEnd, AgentError> {
+        let mut turn = 0;
         loop {
-            iteration += 1;
-            let turn = turn_offset + iteration;
+            turn += 1;
             if turn > self.config.max_iterations {
                 return Err(AgentError::MaxIterations {
                     limit: self.config.max_iterations,
                 });
             }
-            match self.run_agent_turn(run_id, turn, events).await? {
+            cx.events.emit(AgentEvent::TurnStarted {
+                run: cx.run.clone(),
+                turn,
+            });
+            match self.run_agent_turn(cx, turn).await? {
                 TurnControl::Continue => {}
-                TurnControl::Break {
-                    final_text,
-                    stop_reason,
-                } => {
-                    return Ok(RunLoopOutcome {
-                        final_text,
-                        stop_reason,
-                        iteration: turn,
-                    });
-                }
+                TurnControl::Break(end) => return Ok(end),
             }
         }
     }
 
     async fn run_agent_turn(
         &mut self,
-        run_id: &str,
+        cx: &RunCx<'_>,
         turn: usize,
-        events: &EventSink,
     ) -> Result<TurnControl, AgentError> {
-        let Some(request) = self.prepare_request(events).await? else {
-            events.emit(AgentEvent::run_paused(
-                RunPauseReason::ContextExhausted,
-                String::new(),
-            ));
-            return Ok(TurnControl::Break {
-                final_text: String::new(),
-                stop_reason: StopReason::NoToolCalls,
-            });
+        let events = cx.events;
+        let Some((request, prefix)) = self.prepare_request(cx, turn).await? else {
+            Self::end_turn(cx, turn, 0);
+            return Ok(TurnControl::Break(LoopEnd::Paused(
+                RunPause::ContextExhausted,
+            )));
         };
-        let model_turn = self.run_turn_racing_compaction(request, events).await?;
+        let model_turn = self
+            .run_turn_racing_compaction(request, &prefix, events)
+            .await?;
 
         if model_turn.malformed_function_call {
+            Self::end_turn(cx, turn, 0);
             return Ok(TurnControl::Continue);
         }
         let response_text = model_turn.response_text;
@@ -907,15 +1334,23 @@ where
 
         self.commit_assistant_turn(&response_text, &tool_calls, model_turn.reasoning);
         if tool_calls.is_empty() {
-            return self.finish_no_tool_turn(response_text, turn, events).await;
+            return self.finish_no_tool_turn(cx, response_text, turn).await;
         }
 
         Self::push_tool_start_events(&tool_calls, events);
-        self.execute_tool_calls(&tool_calls, turn).await;
-        self.apply_tool_results(events)?;
-        self.push_tool_turn_alerts().await;
-        self.push_turn_boundary_events(run_id, turn, &response_text, events)
+        self.execute_tool_calls(cx, &tool_calls, turn).await;
+        let (outcomes, appended) = self.apply_tool_results()?;
+        self.push_tool_turn_context(cx, appended).await;
+        self.push_turn_boundary_events(cx, turn, &response_text, &outcomes)
             .await
+    }
+
+    fn end_turn(cx: &RunCx<'_>, turn: usize, tool_calls: usize) {
+        cx.events.emit(AgentEvent::TurnEnded {
+            run: cx.run.clone(),
+            turn,
+            tool_calls,
+        });
     }
 
     /// Runs one model turn while a forked compaction keeps running.
@@ -928,13 +1363,14 @@ where
     async fn run_turn_racing_compaction(
         &mut self,
         request: LLMRequest,
+        prefix: &PromptPrefix,
         events: &EventSink,
     ) -> Result<ModelTurn, AgentError> {
         let mut pending = self.compaction.take_running();
         let mut landed = None;
 
         let turn = {
-            let turn = self.collect_model_turn(request, events);
+            let turn = self.collect_model_turn(request, prefix, events);
             futures_lite::pin!(turn);
             loop {
                 let step = match pending.as_mut() {
@@ -993,13 +1429,13 @@ where
 
     async fn finish_no_tool_turn(
         &mut self,
+        cx: &RunCx<'_>,
         response_text: String,
         turn: usize,
-        events: &EventSink,
     ) -> Result<TurnControl, AgentError> {
-        events.emit(AgentEvent::turn_complete(turn, false));
-        let objected = self.push_final_turn_alerts().await;
-        let held = self.decide_stop(&response_text, turn).await;
+        Self::end_turn(cx, turn, 0);
+        let objected = self.push_final_turn_context(cx).await;
+        let held = self.decide_stop(cx, &response_text, turn).await;
         if objected || held {
             // The alerts stay in the conversation either way; a host that has
             // a message waiting ends the run here so the message travels with
@@ -1008,19 +1444,20 @@ where
                 assistant_text: &response_text,
                 turn,
                 message_count: self.context.len_recent(),
+                outcomes: &[],
             };
             if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn {
-                return Ok(TurnControl::Break {
+                return Ok(TurnControl::Break(LoopEnd::Answered {
                     final_text: response_text,
-                    stop_reason: StopReason::EndTurn,
-                });
+                    turn,
+                }));
             }
             return Ok(TurnControl::Continue);
         }
-        Ok(TurnControl::Break {
+        Ok(TurnControl::Break(LoopEnd::Answered {
             final_text: response_text,
-            stop_reason: StopReason::NoToolCalls,
-        })
+            turn,
+        }))
     }
 
     /// Gives every tool call in the context a result.
@@ -1047,7 +1484,7 @@ where
                 .position(|result| matches!(result, Ok(finished) if finished.id == call.id))
                 .and_then(|index| parked.remove(index));
             let content = match finished {
-                Some(Ok(finished)) => finished.result.render_for_model(),
+                Some(Ok(finished)) => finished.outcome.for_model().render_for_model(),
                 _ => CancelledToolCallTemplate { tool: &call.name }
                     .render()
                     .expect("cancelled tool call template must render"),
@@ -1058,11 +1495,11 @@ where
 
     fn push_tool_start_events(tool_calls: &[ToolCall], events: &EventSink) {
         for call in tool_calls {
-            let args = call.arguments.to_string();
-            events.emit(AgentEvent::ToolCallStart {
-                id: call.id.clone(),
+            events.emit(AgentEvent::ToolCallStarted {
+                call: ToolCallId::new(call.id.clone()),
                 name: call.name.clone(),
-                arguments: args,
+                arguments: call.arguments.clone(),
+                origin: ToolOrigin::Local,
             });
         }
     }
@@ -1073,47 +1510,35 @@ where
     /// The results live on the agent rather than in this future so a run
     /// stream dropped mid-execution still leaves the finished ones for
     /// [`Self::settle_interrupted_tool_calls`] to pair.
-    async fn execute_tool_calls(&mut self, tool_calls: &[ToolCall], turn: usize) {
+    async fn execute_tool_calls(&mut self, cx: &RunCx<'_>, tool_calls: &[ToolCall], turn: usize) {
         let message_count = self.context.len_recent();
+        let approver = self.approver.clone().map(|inner| {
+            AnyApprover::new(PausingApprover {
+                inner,
+                events: cx.events.clone(),
+                pauses: Arc::clone(&self.pauses),
+            })
+        });
         let (hooks, tools, agent) = (&self.hooks, &self.tools, &self.identity);
         let results = &mut self.tool_results;
         let tool_futures = tool_calls.iter().map(|call| {
-            let args_json = call.arguments.to_string();
             let identity = aither_core::llm::CallIdentity::new(
-                aither_core::llm::ToolCallId::new(call.id.clone()),
+                ToolCallId::new(call.id.clone()),
                 agent.clone(),
             );
+            let approver = approver.clone();
             async move {
-                let tool_ctx = ToolUseContext {
-                    call: &identity,
-                    tool_name: &call.name,
-                    arguments: &args_json,
+                let run = ToolRun {
+                    hooks,
+                    tools,
+                    events: cx.events,
+                    cancel: cx.cancel,
+                    approver: approver.as_ref(),
+                    identity,
                     turn,
                     message_count,
                 };
-                let (result, duration) =
-                    Self::call_tool_with_hooks(hooks, tools, call, &args_json, &tool_ctx).await?;
-                let result_ctx = ToolResultContext {
-                    tool_name: &call.name,
-                    arguments: &args_json,
-                    result: &result,
-                    duration,
-                };
-                let tool_result = match hooks.post_tool_use(&result_ctx).await {
-                    PostToolAction::Abort(reason) => {
-                        return Err(AgentError::HookRejected {
-                            hook: "post_tool_use",
-                            reason,
-                        });
-                    }
-                    PostToolAction::Replace(replacement) => replacement,
-                    PostToolAction::Keep => result,
-                };
-                Ok(FinishedToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    result: tool_result,
-                })
+                run.execute(call).await
             }
         });
 
@@ -1123,89 +1548,46 @@ where
         }
     }
 
-    async fn call_tool_with_hooks(
-        hooks: &H,
-        tools: &AgentTools,
-        call: &ToolCall,
-        args_json: &str,
-        tool_ctx: &ToolUseContext<'_>,
-    ) -> Result<(aither_core::llm::ToolResult, Duration), AgentError> {
-        match hooks.pre_tool_use(tool_ctx).await {
-            PreToolAction::Abort(reason) => Err(AgentError::HookRejected {
-                hook: "pre_tool_use",
-                reason,
-            }),
-            PreToolAction::Deny(reason) => {
-                Ok((aither_core::llm::ToolResult::error(reason), Duration::ZERO))
-            }
-            PreToolAction::Allow => {
-                let start = Instant::now();
-                // The agent loop has nowhere to show a tool's progress, but
-                // the tool learns which call, of which agent, it serves.
-                let cx = aither_core::llm::ToolContext::new().with_identity(tool_ctx.call.clone());
-                let result = match tools.call(&call.name, args_json, cx).await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let mut message = String::from("Error: ");
-                        message.push_str(error.to_string().as_str());
-                        aither_core::llm::ToolResult::error(message)
-                    }
-                };
-                Ok((result, start.elapsed()))
-            }
-        }
-    }
-
-    /// Moves the parked tool results into the context.
+    /// Moves the parked tool results into the context, and returns the
+    /// turn's outcomes and the context its `after_tool` hooks appended.
     ///
     /// Results not reached because one failed stay parked for
     /// [`Self::settle_interrupted_tool_calls`].
-    fn apply_tool_results(&mut self, events: &EventSink) -> Result<(), AgentError> {
+    fn apply_tool_results(&mut self) -> Result<(Vec<ToolOutcome>, Vec<String>), AgentError> {
+        let mut outcomes = Vec::new();
+        let mut appended = Vec::new();
         while let Some(result) = self.tool_results.pop_front() {
-            let FinishedToolCall {
-                id: call_id,
-                name: call_name,
-                result: tool_result,
-            } = result?;
-            events.emit(AgentEvent::ToolCallEnd {
-                id: call_id.clone(),
-                name: call_name,
-                result: tool_result.clone(),
-            });
-            self.context
-                .push(Message::tool(&call_id, tool_result.render_for_model()));
+            let finished = result?;
+            self.context.push(Message::tool(
+                &finished.id,
+                finished.outcome.for_model().render_for_model(),
+            ));
+            outcomes.push(finished.outcome);
+            appended.extend(finished.appended);
         }
-        Ok(())
+        Ok((outcomes, appended))
     }
 
     async fn push_turn_boundary_events(
-        &self,
-        run_id: &str,
+        &mut self,
+        cx: &RunCx<'_>,
         turn: usize,
         response_text: &str,
-        events: &EventSink,
+        outcomes: &[ToolOutcome],
     ) -> Result<TurnControl, AgentError> {
         let boundary_ctx = TurnBoundaryContext {
             assistant_text: response_text,
             turn,
             message_count: self.context.len_recent(),
+            outcomes,
         };
-        let checkpoint = self
-            .emit_checkpoint(CheckpointReason::TurnBoundary, response_text, turn)
-            .await?;
-        events.emit(AgentEvent::checkpoint(
-            run_id.to_string(),
-            CheckpointReason::TurnBoundary,
-            turn,
-            checkpoint.phase,
-            checkpoint.message_count,
-        ));
-        events.emit(AgentEvent::turn_complete(turn, true));
+        self.emit_checkpoint(cx, CheckpointReason::TurnBoundary, turn);
+        Self::end_turn(cx, turn, outcomes.len());
         if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn {
-            Ok(TurnControl::Break {
+            Ok(TurnControl::Break(LoopEnd::Answered {
                 final_text: response_text.to_string(),
-                stop_reason: StopReason::EndTurn,
-            })
+                turn,
+            }))
         } else {
             Ok(TurnControl::Continue)
         }
@@ -1293,44 +1675,6 @@ where
         self.prompt_cache.lifetime()
     }
 
-    async fn push_stop_events(
-        &self,
-        run_id: &str,
-        outcome: RunLoopOutcome,
-        events: &EventSink,
-    ) -> Result<(), AgentError> {
-        let checkpoint = self
-            .emit_checkpoint(
-                CheckpointReason::Stop,
-                &outcome.final_text,
-                outcome.iteration,
-            )
-            .await?;
-        events.emit(AgentEvent::checkpoint(
-            run_id.to_string(),
-            CheckpointReason::Stop,
-            outcome.iteration,
-            checkpoint.phase,
-            checkpoint.message_count,
-        ));
-        let stop_ctx = StopContext {
-            final_text: &outcome.final_text,
-            turns: outcome.iteration,
-            reason: outcome.stop_reason,
-        };
-        if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
-            return Err(AgentError::HookRejected {
-                hook: "on_stop",
-                reason,
-            });
-        }
-        events.emit(AgentEvent::Complete {
-            final_text: outcome.final_text,
-            turns: outcome.iteration,
-        });
-        Ok(())
-    }
-
     /// Performs a one-shot query and returns the final response.
     ///
     /// This is the simplest way to use the agent. The agent handles tool
@@ -1342,27 +1686,30 @@ where
     /// - The LLM returns an error
     /// - A hook aborts the operation
     /// - Tool execution fails
+    /// - The run paused ([`AgentError::Paused`]) or was cancelled
+    ///   ([`AgentError::Cancelled`]) before it had a reply
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
+        let limit = self.config.max_iterations;
+        let agent = AgentPath::of(&self.identity);
         let flow = self
             .run(prompt, std::iter::empty())
-            .drive(
-                String::new(),
-                std::future::pending(),
-                |mut text, timed| async move {
-                    match timed.event {
-                        AgentEvent::Text(chunk) => text.push_str(&chunk),
-                        AgentEvent::Complete { final_text, .. } => {
-                            return ControlFlow::Break(final_text);
-                        }
-                        _ => {}
-                    }
-                    ControlFlow::Continue(text)
-                },
-            )
+            .drive((), std::future::pending(), |(), timed| {
+                let own_end = timed.agent == agent;
+                std::future::ready(match timed.event {
+                    AgentEvent::RunEnded { outcome, .. } if own_end => ControlFlow::Break(outcome),
+                    _ => ControlFlow::Continue(()),
+                })
+            })
             .await?;
-        Ok(match flow {
-            ControlFlow::Break(text) | ControlFlow::Continue(text) => text,
-        })
+        match flow {
+            ControlFlow::Break(RunOutcome::Completed { final_text }) => Ok(final_text),
+            ControlFlow::Break(RunOutcome::Paused { pause }) => Err(AgentError::Paused(pause)),
+            ControlFlow::Break(RunOutcome::Failed { error }) => Err(error),
+            ControlFlow::Break(RunOutcome::IterationLimit) => {
+                Err(AgentError::MaxIterations { limit })
+            }
+            ControlFlow::Break(_) | ControlFlow::Continue(()) => Err(AgentError::Cancelled),
+        }
     }
 
     /// Starts a run on `prompt`; [`Run::drive`] runs it and hands each event
@@ -1377,7 +1724,7 @@ where
     /// agent
     ///     .run("Implement the feature", std::iter::empty())
     ///     .drive(&mut shown, std::future::pending(), |shown, timed| async move {
-    ///         if let AgentEvent::Text(text) = timed.event {
+    ///         if let AgentEvent::BlockDelta { kind: OutputKind::Text, text, .. } = timed.event {
     ///             shown.push_str(&text);
     ///         }
     ///         ControlFlow::<(), _>::Continue(shown)
@@ -1391,14 +1738,18 @@ where
     ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         let prompt = prompt.to_string();
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
-        Run::new(move |sink| async move { self.run_streaming(prompt, attachments, &sink).await })
+        Run::new(AgentPath::of(&self.identity), move |sink, cancel| async move {
+            self.run_streaming(prompt, attachments, &sink, &cancel).await
+        })
     }
 
     /// Continues the conversation without a new user message, so the model
     /// acts on the messages the host added with
     /// [`push_message`](Self::push_message). Driven like [`run`](Self::run).
     pub fn resume(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
-        Run::new(move |sink| async move { self.resume_streaming(&sink).await })
+        Run::new(AgentPath::of(&self.identity), move |sink, cancel| async move {
+            self.resume_streaming(&sink, &cancel).await
+        })
     }
 
     /// Registers a tool for the agent to use.
@@ -1465,7 +1816,7 @@ where
     /// [`run`](Self::run).
     ///
     /// The run emits [`AgentEvent::CompactionStarted`] and then
-    /// [`AgentEvent::CompactionFinished`], whose
+    /// [`AgentEvent::CompactionEnded`], whose
     /// [`CompactionOutcome`] carries the [`CompactResult`] when the handoff
     /// applied. A compaction forked earlier alongside a run is stale once this
     /// one starts: it finishes as [`CompactionOutcome::Discarded`] first.
@@ -1479,9 +1830,9 @@ where
         focus: Option<&str>,
     ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         let focus = focus.map(str::to_string);
-        Run::new(move |sink| async move {
+        Run::new(AgentPath::of(&self.identity), move |sink, _cancel| async move {
             self.finish_lost_compaction(&sink);
-            Box::pin(self.compact_streaming(focus.as_deref(), &sink))
+            Box::pin(self.compact_streaming(focus.as_deref(), CompactionTrigger::Requested, &sink))
                 .await
                 .map(drop)
         })
@@ -1491,6 +1842,7 @@ where
     async fn compact_streaming(
         &mut self,
         focus: Option<&str>,
+        trigger: CompactionTrigger,
         events: &EventSink,
     ) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await?;
@@ -1499,7 +1851,7 @@ where
         // compaction forked earlier, running or landed, is stale from here.
         self.compaction.retire();
         self.finish_compaction(events, CompactionOutcome::Discarded);
-        self.announce_compaction(events);
+        self.announce_compaction(events, trigger);
         match self.fork_and_apply(focus, events).await {
             Ok(Some(result)) => Ok(Some(result)),
             Ok(None) => {
@@ -1523,9 +1875,8 @@ where
         if self.context.is_conversation_empty() {
             return Ok(None);
         }
-        let tail = self.render_tail().await;
         let definitions = self.tools.active_definitions();
-        let messages = self.request_messages(&tail);
+        let messages = self.request_messages(&self.last_tail);
         let request = self.compaction_request(messages, definitions);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
@@ -1816,12 +2167,13 @@ where
     /// [`drive`](Run::drive) returns the compaction failure; the window is
     /// left as it was.
     pub fn compact_when_idle(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
-        Run::new(move |sink| async move {
+        Run::new(AgentPath::of(&self.identity), move |sink, _cancel| async move {
             self.finish_lost_compaction(&sink);
             if self.idle_compaction_due_in() != Some(Duration::ZERO) {
                 return Ok(());
             }
-            let result = Box::pin(self.compact_streaming(None, &sink)).await?;
+            let result =
+                Box::pin(self.compact_streaming(None, CompactionTrigger::Idle, &sink)).await?;
             self.idle_compacted = true;
             if let Some(result) = &result {
                 tracing::info!(
@@ -1865,7 +2217,7 @@ where
                     usage = self.budget.usage(),
                     "forking compaction alongside the run"
                 );
-                self.announce_compaction(events);
+                self.announce_compaction(events, CompactionTrigger::WindowFilling);
                 self.compaction.start(self.start_pending_compaction(fork));
             }
             Err(error) => {
@@ -1898,20 +2250,20 @@ where
     ///
     /// Panics when the compaction announced before it has not finished:
     /// compactions never overlap.
-    fn announce_compaction(&mut self, events: &EventSink) {
+    fn announce_compaction(&mut self, events: &EventSink, trigger: CompactionTrigger) {
         assert!(
             !self.compaction_announced,
             "a compaction started before the previous one finished"
         );
         self.compaction_announced = true;
-        events.emit(AgentEvent::CompactionStarted);
+        events.emit(AgentEvent::CompactionStarted { trigger });
     }
 
     /// Reports on `events` how the announced compaction ended, if one is
     /// announced and not yet finished.
     fn finish_compaction(&mut self, events: &EventSink, outcome: CompactionOutcome) {
         if std::mem::take(&mut self.compaction_announced) {
-            events.emit(AgentEvent::CompactionFinished { outcome });
+            events.emit(AgentEvent::CompactionEnded { outcome });
         }
     }
 
@@ -2038,7 +2390,13 @@ where
         }
         let failure = match failure {
             Some(failure) => failure,
-            None => match Box::pin(self.compact_streaming(None, events)).await {
+            None => match Box::pin(self.compact_streaming(
+                None,
+                CompactionTrigger::PausePoint,
+                events,
+            ))
+            .await
+            {
                 Ok(result) => return Ok(result.is_some()),
                 Err(error) => {
                     tracing::warn!(%error, "compaction failed with the window exhausted");
@@ -2077,37 +2435,31 @@ where
         });
         self.reassembled = true;
         self.prefix_rewrites.reassembled = true;
-        let result = Box::pin(self.compact_streaming(None, events)).await?;
+        let result = Box::pin(self.compact_streaming(
+            None,
+            CompactionTrigger::PausePoint,
+            events,
+        ))
+        .await?;
         Ok(result.is_some())
     }
 
-    /// Renders every context source into the volatile tail of a request.
+    /// Tells each source which of its tail blocks have been sent.
     ///
-    /// Pure: sources are only read, so a preview or a measurement can use
-    /// this without consuming a diff the next real request should carry.
-    /// Rendering is concurrent because the sources are independent — one
-    /// reading a file from disk must not wait on another polling a registry.
-    async fn render_tail(&self) -> RenderedTail {
-        let rendered =
-            futures::future::join_all(self.context_sources.iter().map(AnyContextSource::render))
-                .await;
-        let mut tail = RenderedTail::default();
-        for (source, block) in rendered.into_iter().enumerate() {
-            if let Some(block) = block {
-                tail.blocks.push(block);
-                tail.sources.push(source);
-            }
-        }
-        tail
-    }
-
-    /// Tells each source that the block it produced has been sent.
-    ///
-    /// Separate from rendering so that only a request that actually goes out
-    /// advances a source's baseline.
+    /// Separate from assembling the tail so that only a request that
+    /// actually goes out advances a source's baseline.
     async fn commit_tail(&mut self, tail: &RenderedTail) {
-        for (block, source) in tail.blocks.iter().zip(&tail.sources) {
-            self.context_sources[*source].commit(block).await;
+        for (index, source) in self.context_sources.iter_mut().enumerate() {
+            let sent: Vec<Block> = tail
+                .blocks
+                .iter()
+                .zip(&tail.sources)
+                .filter(|(_, owner)| **owner == Some(index))
+                .map(|(block, _)| block.clone())
+                .collect();
+            if !sent.is_empty() {
+                source.committed(&sent).await;
+            }
         }
     }
 
@@ -2130,7 +2482,7 @@ where
     /// announced once, by the alert the source writes for it, and the next
     /// reassembly folds the new block into the prefix. Rendering is
     /// concurrent because the sources are independent.
-    async fn sync_live_sources(&mut self) {
+    async fn sync_live_sources(&mut self, events: &EventSink) {
         let rendered =
             futures::future::join_all(self.live_sources.iter().map(AnyLiveSource::render)).await;
         for (source, desired) in self.live_sources.iter().zip(rendered) {
@@ -2141,124 +2493,172 @@ where
                     .update_live_source(&source.slot(), desired, |change| source.announce(change))
             {
                 self.budget.append(alert);
+                events.emit(AgentEvent::ContextInjected {
+                    source: SourceId::new(source.tag()),
+                    kind: InjectionKind::LiveChange,
+                });
             }
         }
     }
 
-    /// Delivers the events every event source raised since the last
-    /// request, each as an alert of its own.
-    async fn push_event_alerts(&mut self) {
-        let delivered =
-            futures::future::join_all(self.event_sources.iter_mut().map(AnyEventSource::deliver))
-                .await;
-        self.append_alerts(delivered, Context::push_block_alert);
-    }
-
-    /// Appends every source's alerts to the conversation with `push`,
-    /// counting each against the budget.
-    fn append_alerts(&mut self, alerts: Vec<Vec<Block>>, push: fn(&mut Context, &Block) -> u64) {
-        for block in alerts.into_iter().flatten() {
-            self.budget.append(block.len());
-            push(&mut self.context, &block);
-        }
-    }
-
-    /// Appends an alert for every state whose value differs from what the
-    /// model last saw, which the context keeps, and records what it has
-    /// seen then.
-    async fn push_state_alerts(&mut self) {
-        let seen = &self.context;
-        let answers = futures::future::join_all(self.state_sources.iter_mut().map(|source| {
-            let stored = seen.seen_states().get(source.id()).cloned();
-            source.on_request(stored)
-        }))
-        .await;
-        let mut changed = Vec::with_capacity(answers.len());
-        for (source, (alerts, seen)) in self.state_sources.iter().zip(answers) {
-            self.context.set_seen_states(source.id(), seen);
-            changed.push(alerts);
-        }
-        self.append_alerts(changed, Context::push_state_alert);
-    }
-
-    /// Collects the durable alerts sources raise as a request begins: the
-    /// one moment state, live content and events are read, so nothing is
-    /// written while the agent is idle.
-    ///
-    /// Tells the sources whether the window was reassembled since the last
-    /// time, which is when their earlier alerts stopped being in it.
-    async fn push_request_alerts(&mut self) {
-        self.sync_live_sources().await;
-        let reassembled = std::mem::take(&mut self.reassembled);
-        self.push_event_alerts().await;
-        self.push_state_alerts().await;
-        for index in 0..self.context_sources.len() {
-            if let Some(block) = self.context_sources[index].on_request(reassembled).await {
-                self.push_source_alert(&block);
-            }
-        }
-    }
-
-    /// Appends a source's durable alert to the conversation.
-    fn push_source_alert(&mut self, block: &Block) {
+    /// Appends a source's durable block to the conversation.
+    fn push_stable_block(&mut self, events: &EventSink, source: &SourceId, block: &Block) {
         self.budget.append(block.len());
         self.context.push_block_alert(block);
+        events.emit(AgentEvent::ContextInjected {
+            source: source.clone(),
+            kind: InjectionKind::Stable,
+        });
     }
 
-    /// Collects the durable alerts sources raise after a tool turn.
-    async fn push_tool_turn_alerts(&mut self) {
-        for index in 0..self.context_sources.len() {
-            if let Some(block) = self.context_sources[index].on_tool_turn_end().await {
-                self.push_source_alert(&block);
+    /// Takes in the blocks one source or hook returned at `moment`: a stable
+    /// block becomes a durable alert at once, a tail block joins `tail`.
+    ///
+    /// Returns whether any block was stable.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a tail block at any moment but a request: only a request
+    /// has a tail, so the source breaks its contract.
+    fn take_blocks(
+        &mut self,
+        events: &EventSink,
+        source: &SourceId,
+        owner: Option<usize>,
+        moment: Moment,
+        blocks: Vec<ContextBlock>,
+        tail: &mut RenderedTail,
+    ) -> bool {
+        let mut stable = false;
+        for block in blocks {
+            match block.placement() {
+                Placement::Stable => {
+                    self.push_stable_block(events, source, block.block());
+                    stable = true;
+                }
+                Placement::Tail => {
+                    assert!(
+                        matches!(moment, Moment::Request { .. }),
+                        "context source `{}` returned a tail block at {moment:?}; only a request has a tail",
+                        source.as_str(),
+                    );
+                    events.emit(AgentEvent::ContextInjected {
+                        source: source.clone(),
+                        kind: InjectionKind::Tail,
+                    });
+                    tail.blocks.push(block.block().clone());
+                    tail.sources.push(owner);
+                }
             }
+        }
+        stable
+    }
+
+    /// Collects what the sources and the `before_request` hook put in front
+    /// of a request: the one moment live content and sources are read, so
+    /// nothing is written while the agent is idle.
+    ///
+    /// Stable blocks are appended to the conversation; tail blocks are
+    /// returned, and kept as the tail previews and snapshots show. Sources
+    /// are told whether the window was reassembled since the last time,
+    /// which is when their earlier stable blocks stopped being in it.
+    async fn collect_request_context(&mut self, cx: &RunCx<'_>, turn: usize) -> RenderedTail {
+        self.sync_live_sources(cx.events).await;
+        let reassembled = std::mem::take(&mut self.reassembled);
+        let moment = Moment::Request { reassembled };
+        let mut tail = RenderedTail::default();
+        for index in 0..self.context_sources.len() {
+            let blocks = self.context_sources[index].blocks(moment).await;
+            let id = self.context_sources[index].id();
+            self.take_blocks(cx.events, &id, Some(index), moment, blocks, &mut tail);
+        }
+        let request = RequestCx {
+            run: cx.run,
+            turn,
+            message_count: self.context.len_recent(),
+        };
+        let blocks = self.hooks.before_request(&request).await;
+        self.take_blocks(
+            cx.events,
+            &SourceId::new("hooks"),
+            None,
+            moment,
+            blocks,
+            &mut tail,
+        );
+        tail
+    }
+
+    /// Collects what sources return after a tool turn, and the context the
+    /// turn's `after_tool` hooks appended.
+    async fn push_tool_turn_context(&mut self, cx: &RunCx<'_>, appended: Vec<String>) {
+        let mut tail = RenderedTail::default();
+        for index in 0..self.context_sources.len() {
+            let blocks = self.context_sources[index]
+                .blocks(Moment::ToolTurnEnd)
+                .await;
+            let id = self.context_sources[index].id();
+            self.take_blocks(
+                cx.events,
+                &id,
+                Some(index),
+                Moment::ToolTurnEnd,
+                blocks,
+                &mut tail,
+            );
+        }
+        let hooks = SourceId::new("hooks");
+        for content in appended {
+            self.push_stable_block(cx.events, &hooks, &Block::new("tool-context", content));
         }
     }
 
-    /// Collects the alerts sources raise when the model wants to stop.
+    /// Collects what sources return when the model wants to stop.
     ///
     /// Returns `true` when at least one source objected, which keeps the loop
     /// running for another turn so the model can act on the objection.
-    async fn push_final_turn_alerts(&mut self) -> bool {
-        let mut pushed = false;
+    async fn push_final_turn_context(&mut self, cx: &RunCx<'_>) -> bool {
+        let mut tail = RenderedTail::default();
+        let mut objected = false;
         for index in 0..self.context_sources.len() {
-            if let Some(block) = self.context_sources[index].on_final_turn().await {
-                self.push_source_alert(&block);
-                pushed = true;
-            }
+            let blocks = self.context_sources[index].blocks(Moment::FinalTurn).await;
+            let id = self.context_sources[index].id();
+            objected |= self.take_blocks(
+                cx.events,
+                &id,
+                Some(index),
+                Moment::FinalTurn,
+                blocks,
+                &mut tail,
+            );
         }
-        pushed
+        objected
     }
 
-    /// Asks the stop hook whether the run ends as the model ends its turn,
-    /// and pushes the hook's reminder when it holds the run.
+    /// Asks the `on_stop` hook whether the run ends as the model ends its
+    /// turn, and pushes the hook's reason as a reminder when it holds the
+    /// run.
     ///
-    /// Returns whether the stop hook holds the run.
-    async fn decide_stop(&mut self, response_text: &str, turn: usize) -> bool {
-        let decision = match &self.stop_hook {
-            Some(hook) => {
-                let ctx = TurnBoundaryContext {
-                    assistant_text: response_text,
-                    turn,
-                    message_count: self.context.len_recent(),
-                };
-                hook.on_turn_end(&ctx).await
-            }
-            None => crate::StopDecision::End,
+    /// Returns whether the hook holds the run.
+    async fn decide_stop(&mut self, cx: &RunCx<'_>, response_text: &str, turn: usize) -> bool {
+        let stop = StopCx {
+            final_text: response_text,
+            turn,
+            message_count: self.context.len_recent(),
         };
-        let held = matches!(decision, crate::StopDecision::Hold { .. });
-        if let crate::StopDecision::Hold {
-            reminder: Some(reminder),
-        } = decision
-        {
-            let block = Block::new(
-                "system_reminder",
-                SystemReminderTemplate { content: reminder }
-                    .render()
-                    .expect("system reminder template must render"),
-            );
-            self.push_source_alert(&block);
+        match self.hooks.on_stop(&stop).await {
+            StopDecision::End => false,
+            StopDecision::Continue { reason } => {
+                let block = Block::new(
+                    "system_reminder",
+                    SystemReminderTemplate { content: reason }
+                        .render()
+                        .expect("system reminder template must render"),
+                );
+                self.push_stable_block(cx.events, &SourceId::new("hooks"), &block);
+                true
+            }
         }
-        held
     }
 
     /// Returns the current conversation history.
@@ -2327,8 +2727,7 @@ where
     /// initialization.
     pub async fn snapshot_context_window(&mut self) -> Result<ContextWindowSnapshot, AgentError> {
         self.ensure_initialized().await?;
-        let tail = self.render_tail().await;
-        Ok(self.context_window_snapshot(&tail))
+        Ok(self.context_window_snapshot(&self.last_tail))
     }
 
     /// Returns the model profile if available.
@@ -2466,15 +2865,16 @@ where
     /// [`ContextPolicy::start_point`]: crate::ContextPolicy::start_point
     async fn prepare_request(
         &mut self,
-        events: &EventSink,
-    ) -> Result<Option<LLMRequest>, AgentError> {
+        cx: &RunCx<'_>,
+        turn: usize,
+    ) -> Result<Option<(LLMRequest, PromptPrefix)>, AgentError> {
+        let events = cx.events;
         self.apply_completed_compaction(events).await;
         self.rebuild_if_cache_is_cold(events).await?;
         self.settle_effort()?;
-        self.push_request_alerts().await;
 
         let definitions = self.tools.active_definitions();
-        let mut tail = self.render_tail().await;
+        let mut tail = self.collect_request_context(cx, turn).await;
         let mut messages = self.request_messages(&tail);
         self.measure_assembled(&messages, &definitions).await;
 
@@ -2500,8 +2900,7 @@ where
             if !self.make_room(events).await? {
                 return Ok(None);
             }
-            self.push_request_alerts().await;
-            tail = self.render_tail().await;
+            tail = self.collect_request_context(cx, turn).await;
             messages = self.request_messages(&tail);
             self.measure_assembled(&messages, &definitions).await;
             // A landed compaction is still no guarantee the rebuilt request
@@ -2521,13 +2920,14 @@ where
         self.warmth.start_entry_now();
         self.idle_compacted = false;
         self.publish_fork_snapshot(&tail, &definitions);
+        self.last_tail.clone_from(&tail.blocks);
 
         let has_tools = !definitions.is_empty();
-        events.emit(AgentEvent::PromptPrefix(PromptPrefix {
+        let prefix = PromptPrefix {
             chain: PrefixChain::of(&definitions, &messages),
             rewrites: std::mem::take(&mut self.prefix_rewrites),
             first_request: self.requests_sent == 0,
-        }));
+        };
         self.requests_sent += 1;
         self.prompt_cache
             .observe_prefix(self.context.stable_prefix_fingerprint());
@@ -2541,7 +2941,7 @@ where
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
         self.last_request = Some(request.clone());
-        Ok(Some(request))
+        Ok(Some((request, prefix)))
     }
 
     /// Publishes the request about to be sent for a fork to start from.
@@ -2605,7 +3005,13 @@ where
         }
         // Boxed: the compaction future is large and sits on every run's path
         // (see `run_futures_stay_small_with_a_real_provider_type`).
-        if let Some(result) = Box::pin(self.compact_streaming(None, events)).await? {
+        if let Some(result) = Box::pin(self.compact_streaming(
+            None,
+            CompactionTrigger::ColdCache,
+            events,
+        ))
+        .await?
+        {
             tracing::info!(
                 compacted = result.messages_compacted,
                 "compacted the context before sending on a cold cache"
@@ -2737,41 +3143,22 @@ where
         self.context.extend(extra_messages);
         self.context
             .push(Message::user(prompt).with_attachments(attachments));
-        let tail = self.render_tail().await;
-        let messages = self.context.build_request(&tail);
+        let messages = self.context.build_request(&self.last_tail);
         self.context.restore(checkpoint);
         Ok(messages)
     }
 
-    async fn emit_checkpoint(
-        &self,
-        reason: CheckpointReason,
-        assistant_text: &str,
-        turn: usize,
-    ) -> Result<EmittedCheckpoint, AgentError> {
-        let context = self.context.checkpoint();
-        let tool_surface_hash = self.tool_surface_hash();
-        let tail = self.render_tail().await;
-        let window = self.context_window_snapshot(&tail);
-        let checkpoint_ctx = CheckpointContext {
+    /// Tells the embedder the agent's state changed, so it can persist it
+    /// with [`export_checkpoint`](Self::export_checkpoint).
+    fn emit_checkpoint(&self, cx: &RunCx<'_>, reason: CheckpointReason, turn: usize) {
+        let window = self.context_window_snapshot(&self.last_tail);
+        cx.events.emit(AgentEvent::Checkpoint {
+            run: cx.run.clone(),
             reason,
-            assistant_text,
             turn,
-            message_count: self.context.len_recent(),
-            context: &context,
-            tool_surface_hash: &tool_surface_hash,
-            window: &window,
-        };
-        if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
-            return Err(AgentError::HookRejected {
-                hook: "on_checkpoint",
-                reason,
-            });
-        }
-        Ok(EmittedCheckpoint {
             phase: window.phase,
             message_count: self.context.len_recent(),
-        })
+        });
     }
 }
 

@@ -48,7 +48,6 @@ use aither_core::llm::{Message, Role, ToolCall};
 use super::compaction::{AttachmentCatalogEntry, AttachmentRef, Handoff};
 use super::live::{LiveContent, LiveUpdate};
 use super::source::{Block, LiveChange};
-use super::state::SeenStates;
 use super::system::{
     External, Instruction, Sourced, SourcedSlot, SystemLayout, SystemRegion, TaggedBlockTemplate,
     render_prefix,
@@ -175,11 +174,6 @@ pub struct Context {
     /// change is staged and announced instead of written into it.
     #[serde(default)]
     prefix_sent: bool,
-
-    /// What the model has seen of each state source's states. Reassembling
-    /// removes the state alerts that told it, and this with them.
-    #[serde(default, skip_serializing_if = "SeenStates::is_empty")]
-    seen_states: SeenStates,
 }
 
 impl Default for Context {
@@ -219,18 +213,7 @@ impl Context {
             items: Vec::new(),
             next_seq: 0,
             prefix_sent: false,
-            seen_states: SeenStates::default(),
         }
-    }
-
-    /// What the model has seen of each state source's states.
-    pub(crate) const fn seen_states(&self) -> &SeenStates {
-        &self.seen_states
-    }
-
-    /// Records what the model has seen of a state source's states.
-    pub(crate) fn set_seen_states(&mut self, id: &str, seen: serde_json::Value) {
-        self.seen_states.set(id, seen);
     }
 
     // ── System blocks (stable, cacheable prefix) ──────────────────────
@@ -366,13 +349,6 @@ impl Context {
         let alert = announce(&LiveChange::new(&change.before, &change.after));
         self.push_item(Message::system(alert.content()), ItemKind::Restated);
         Some(alert.len())
-    }
-
-    /// Appends a state alert: removed by the next reassembly whatever its
-    /// position, since the state source restates the current value after
-    /// it when that is not the normal one.
-    pub(crate) fn push_state_alert(&mut self, block: &Block) -> u64 {
-        self.push_item(Message::system(block.content()), ItemKind::Restated)
     }
 
     /// Returns the number of persistent system blocks, live source blocks
@@ -701,14 +677,12 @@ impl Context {
     /// Clears only the conversation, keeping system blocks and the handoff.
     pub fn clear_recent(&mut self) {
         self.items.clear();
-        self.seen_states.clear();
     }
 
     /// Clears all non-persistent context: the handoff and the conversation.
     pub fn clear_history(&mut self) {
         self.handoff = None;
         self.items.clear();
-        self.seen_states.clear();
     }
 
     /// Clears everything, including persistent system blocks.
@@ -733,7 +707,6 @@ impl Context {
             handoff: self.handoff.clone(),
             items: self.items.clone(),
             next_seq: self.next_seq,
-            seen_states: self.seen_states.clone(),
         }
     }
 
@@ -744,7 +717,6 @@ impl Context {
             .next_seq
             .max(checkpoint.items.last().map_or(0, |item| item.seq + 1));
         self.items = checkpoint.items;
-        self.seen_states = checkpoint.seen_states;
     }
 
     /// Restores runtime-managed state from another serialized context while
@@ -928,8 +900,6 @@ impl Context {
     /// only once it was delivered.
     pub fn reassemble_below(&mut self, fork_point: u64) -> ReassemblyReport {
         let mut report = ReassemblyReport::default();
-        // Every state alert goes below, and what the model saw with them.
-        self.seen_states.clear();
 
         for (applied, freed) in [
             self.instructions.apply_staged(),
@@ -1142,8 +1112,6 @@ pub struct ContextCheckpoint {
     items: Vec<ContextItem>,
     #[serde(default)]
     next_seq: u64,
-    #[serde(default, skip_serializing_if = "SeenStates::is_empty")]
-    seen_states: SeenStates,
 }
 
 impl ContextCheckpoint {
@@ -1155,7 +1123,6 @@ impl ContextCheckpoint {
             handoff,
             items,
             next_seq,
-            seen_states: SeenStates::default(),
         }
     }
 
