@@ -202,7 +202,7 @@ async fn generate_image(generator: impl ImageGenerator) -> aither::Result<Vec<u8
 |-------|-------------|
 | `aither` | Entry crate re-exporting everything from `aither-core` + derive macros |
 | `aither-core` | `#![no_std]` traits (`LanguageModel`, `Event`, `LLMRequest`, `Tool`, embedders, moderation, …) |
-| `aither-agent` | Agent loop, `TerminalAgentBuilder`, context compaction, subagents, hooks, and event streaming |
+| `aither-agent` | Agent loop, context compaction, subagent runs, hooks, approvals, and event streaming |
 | `aither-sandbox` | Sandboxed terminal tool execution, IPC CLI command registry, and container/SSH routing |
 | `aither-cloud` | Unified multi-provider router across Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, etc. |
 | `aither-claude` | Native Anthropic Claude provider bindings with prompt caching and extended thinking |

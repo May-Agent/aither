@@ -1,8 +1,7 @@
 //! Model groups with budget tracking and automatic fallback.
 //!
-//! This module provides a tiered model system where models are organized by
-//! capability (advanced, balanced, fast) with automatic fallback when budgets
-//! are exhausted.
+//! A [`ModelGroup`] is a language model made of an ordered list of budgeted
+//! models: when one exhausts its budget, the next serves the request.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -255,99 +254,6 @@ impl<M> ModelGroup<M> {
             model.reset_all();
         }
         self.current.store(0, Ordering::Release);
-    }
-}
-
-/// Model tier classification for organizing models.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    Hash,
-    schemars::JsonSchema,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    /// High-capability models (e.g., GPT-4, Claude Opus)
-    #[default]
-    Advanced,
-    /// Balanced capability/cost models (e.g., GPT-4o, Claude Sonnet)
-    Balanced,
-    /// Fast/cheap models (e.g., GPT-4o-mini, Claude Haiku)
-    Fast,
-}
-
-/// Collection of model groups organized by tier.
-#[derive(Debug)]
-pub struct TieredModels<M> {
-    /// Advanced tier models.
-    pub advanced: Option<ModelGroup<M>>,
-    /// Balanced tier models.
-    pub balanced: Option<ModelGroup<M>>,
-    /// Fast tier models.
-    pub fast: Option<ModelGroup<M>>,
-}
-
-impl<M> Default for TieredModels<M> {
-    fn default() -> Self {
-        Self {
-            advanced: None,
-            balanced: None,
-            fast: None,
-        }
-    }
-}
-
-impl<M> TieredModels<M> {
-    /// Creates empty tiered models.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Sets the advanced tier models.
-    #[must_use]
-    pub fn with_advanced(mut self, group: ModelGroup<M>) -> Self {
-        self.advanced = Some(group);
-        self
-    }
-
-    /// Sets the balanced tier models.
-    #[must_use]
-    pub fn with_balanced(mut self, group: ModelGroup<M>) -> Self {
-        self.balanced = Some(group);
-        self
-    }
-
-    /// Sets the fast tier models.
-    #[must_use]
-    pub fn with_fast(mut self, group: ModelGroup<M>) -> Self {
-        self.fast = Some(group);
-        self
-    }
-
-    /// Gets the model group for a specific tier.
-    #[must_use]
-    pub const fn get(&self, tier: ModelTier) -> Option<&ModelGroup<M>> {
-        match tier {
-            ModelTier::Advanced => self.advanced.as_ref(),
-            ModelTier::Balanced => self.balanced.as_ref(),
-            ModelTier::Fast => self.fast.as_ref(),
-        }
-    }
-
-    /// Gets a mutable reference to the model group for a specific tier.
-    pub const fn get_mut(&mut self, tier: ModelTier) -> Option<&mut ModelGroup<M>> {
-        match tier {
-            ModelTier::Advanced => self.advanced.as_mut(),
-            ModelTier::Balanced => self.balanced.as_mut(),
-            ModelTier::Fast => self.fast.as_mut(),
-        }
     }
 }
 

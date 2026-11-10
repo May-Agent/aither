@@ -3,8 +3,7 @@
 //! All registered tools are always loaded into the LLM context.
 
 use aither_core::llm::tool::{
-    IntoToolResult, RegisterError, Tool, ToolContext, ToolDefinition, ToolResult,
-    Tools as CoreTools,
+    RegisterError, Tool, ToolContext, ToolDefinition, ToolResult, Tools as CoreTools,
 };
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
@@ -57,106 +56,6 @@ impl AgentTools {
     /// read.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) -> Result<(), RegisterError> {
         self.eager.register(tool)
-    }
-
-    /// Registers a dynamic terminal tool (type-erased).
-    ///
-    /// This is used for child terminal tools in subagents where the concrete type
-    /// is not known at compile time.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tool cannot be registered: another tool already uses
-    /// its name, or it carries no description for the model to read. Both
-    /// are mistakes in the calling program.
-    pub fn register_dyn_terminal(&mut self, dyn_tool: aither_sandbox::DynTerminalTool) {
-        use futures_core::Future;
-        use std::pin::Pin;
-
-        for entry in dyn_tool.into_entries() {
-            let handler = entry.handler;
-            self.eager.register_dyn(
-                entry.definition,
-                move |args: &str, cx: ToolContext| -> Pin<
-                    Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>,
-                > {
-                let handler = handler.clone();
-                let args = args.to_string();
-                Box::pin(async move {
-                    handler(&args, cx).await.into_tool_result()
-                })
-                },
-            )
-            .expect("dynamic terminal tool registration must succeed: duplicate name or missing description");
-        }
-    }
-
-    /// The tools of a fork: `definitions` exactly as the main agent's request
-    /// carried them, run by the entries and terminal controls of `terminal`
-    /// of the same name, so a control acts on the fork's own jobs. A
-    /// definition `terminal` has no entry for belongs to the main agent and
-    /// refuses when called. The native `compact` definition is the exception:
-    /// it runs the real tool over `compact`, the fork's own signal, so a call
-    /// compacts the fork.
-    pub(crate) fn forked(
-        definitions: &[ToolDefinition],
-        terminal: aither_sandbox::DynTerminalTool,
-        compact: Option<&std::sync::Arc<crate::compact_tool::CompactSignal>>,
-        notices: &crate::AnyNotices,
-    ) -> Self {
-        use futures_core::Future;
-        use std::pin::Pin;
-
-        let controls = terminal.controls();
-        let mut handlers: std::collections::HashMap<_, _> = terminal
-            .into_entries()
-            .into_iter()
-            .chain(controls)
-            .map(|entry| (entry.definition.name().to_string(), entry.handler))
-            .collect();
-        let mut tools = Self::new();
-        for definition in definitions {
-            let name = definition.name().to_string();
-            let handler = handlers.remove(&name);
-            let compact = compact
-                .filter(|_| name == crate::compact_tool::COMPACT_TOOL_NAME)
-                .map(|signal| {
-                    crate::compact_tool::CompactTool::new(
-                        std::sync::Arc::clone(signal),
-                        notices.clone(),
-                    )
-                });
-            let notices = notices.clone();
-            tools
-                .eager
-                .register_dyn(
-                    definition.clone(),
-                    move |args: &str,
-                          cx: ToolContext|
-                          -> Pin<
-                        Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>,
-                    > {
-                        if let Some(tool) = compact.clone() {
-                            let args = args.to_string();
-                            return Box::pin(async move {
-                                let args = serde_json::from_str(&args).map_err(|error| {
-                                    anyhow::anyhow!("Invalid arguments: {error}")
-                                })?;
-                                Tool::call(&tool, args, cx).await?.into_tool_result()
-                            });
-                        }
-                        let Some(handler) = handler.clone() else {
-                            let refusal =
-                                notices.fork_tool_refusal(&crate::ForkToolRefusal { tool: &name });
-                            return Box::pin(async move { Err(anyhow::anyhow!(refusal)) });
-                        };
-                        let args = args.to_string();
-                        Box::pin(async move { handler(&args, cx).await.into_tool_result() })
-                    },
-                )
-                .expect("a definition from a request registers: names are unique and described");
-        }
-        tools
     }
 
     /// Returns definitions of all registered tools.

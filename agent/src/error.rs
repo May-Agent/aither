@@ -1,11 +1,13 @@
 //! Agent error types.
 
 use core::fmt;
+use std::borrow::Cow;
 
 use aither_core::llm::{Classify, Failure};
 
 /// Errors that can occur during agent execution.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AgentError {
     /// LLM returned an error.
     Llm {
@@ -34,7 +36,7 @@ pub enum AgentError {
     /// A hook rejected the operation.
     HookRejected {
         /// Name of the hook that rejected.
-        hook: &'static str,
+        hook: Cow<'static, str>,
         /// Reason for rejection.
         reason: String,
     },
@@ -47,6 +49,25 @@ pub enum AgentError {
 
     /// Configuration error.
     Config(String),
+
+    /// A tool call needed an approval and none could be had: the agent has
+    /// no approver, the approver failed, or the run was cancelled while
+    /// waiting.
+    Approval(std::sync::Arc<aither_core::llm::tool::ApprovalError>),
+
+    /// The run was cancelled.
+    ///
+    /// A cancelled [`Run`](crate::Run) ends with
+    /// [`RunOutcome::Cancelled`](crate::RunOutcome::Cancelled) and `drive`
+    /// returns normally; this is what [`Agent::query`](crate::Agent::query),
+    /// which returns a reply, reports.
+    Cancelled,
+
+    /// The run paused for a reason that needs the embedder; see
+    /// [`RunPause`](crate::RunPause).
+    /// [`Agent::query`](crate::Agent::query) reports it, since it has no
+    /// reply to return.
+    Paused(crate::RunPause),
 }
 
 impl fmt::Display for AgentError {
@@ -66,6 +87,9 @@ impl fmt::Display for AgentError {
                 write!(f, "tool '{name}' not found")
             }
             Self::Config(msg) => write!(f, "configuration error: {msg}"),
+            Self::Approval(error) => write!(f, "{error}"),
+            Self::Cancelled => f.write_str("the run was cancelled"),
+            Self::Paused(pause) => write!(f, "the run paused: {pause:?}"),
         }
     }
 }
@@ -171,5 +195,123 @@ mod tests {
             AgentError::llm_local("x").failure().map(|f| f.kind),
             Some(FailureKind::Permanent)
         );
+    }
+}
+
+/// The serialized form of an [`AgentError`].
+///
+/// An approval error holds a boxed error that has no wire form, so it travels
+/// as its message and returns as an error carrying that message.
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+enum AgentErrorRepr {
+    Llm {
+        message: String,
+        failure: Failure,
+    },
+    ToolExecution {
+        name: String,
+        error: String,
+    },
+    MaxIterations {
+        limit: usize,
+    },
+    HookRejected {
+        hook: String,
+        reason: String,
+    },
+    ToolNotFound {
+        name: String,
+    },
+    Config(String),
+    ApprovalNoApprover {
+        kind: aither_core::llm::tool::ApprovalKind,
+    },
+    ApprovalFailed {
+        kind: aither_core::llm::tool::ApprovalKind,
+        message: String,
+    },
+    ApprovalCancelled,
+    Cancelled,
+    Paused(crate::RunPause),
+}
+
+#[cfg(feature = "serde")]
+impl From<&AgentError> for AgentErrorRepr {
+    fn from(error: &AgentError) -> Self {
+        use aither_core::llm::tool::ApprovalError;
+        match error {
+            AgentError::Llm { message, failure } => Self::Llm {
+                message: message.clone(),
+                failure: *failure,
+            },
+            AgentError::ToolExecution { name, error } => Self::ToolExecution {
+                name: name.clone(),
+                error: error.clone(),
+            },
+            AgentError::MaxIterations { limit } => Self::MaxIterations { limit: *limit },
+            AgentError::HookRejected { hook, reason } => Self::HookRejected {
+                hook: hook.to_string(),
+                reason: reason.clone(),
+            },
+            AgentError::ToolNotFound { name } => Self::ToolNotFound { name: name.clone() },
+            AgentError::Config(message) => Self::Config(message.clone()),
+            AgentError::Approval(approval) => match &**approval {
+                ApprovalError::NoApprover { kind } => {
+                    Self::ApprovalNoApprover { kind: kind.clone() }
+                }
+                ApprovalError::Failed { kind, failure } => Self::ApprovalFailed {
+                    kind: kind.clone(),
+                    message: std::error::Error::source(failure)
+                        .map_or_else(|| failure.to_string(), ToString::to_string),
+                },
+                ApprovalError::Cancelled => Self::ApprovalCancelled,
+            },
+            AgentError::Cancelled => Self::Cancelled,
+            AgentError::Paused(pause) => Self::Paused(*pause),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<AgentErrorRepr> for AgentError {
+    fn from(repr: AgentErrorRepr) -> Self {
+        use aither_core::llm::tool::{ApprovalError, ApproverFailure};
+        let approval = |error| Self::Approval(std::sync::Arc::new(error));
+        match repr {
+            AgentErrorRepr::Llm { message, failure } => Self::Llm { message, failure },
+            AgentErrorRepr::ToolExecution { name, error } => Self::ToolExecution { name, error },
+            AgentErrorRepr::MaxIterations { limit } => Self::MaxIterations { limit },
+            AgentErrorRepr::HookRejected { hook, reason } => Self::HookRejected {
+                hook: hook.into(),
+                reason,
+            },
+            AgentErrorRepr::ToolNotFound { name } => Self::ToolNotFound { name },
+            AgentErrorRepr::Config(message) => Self::Config(message),
+            AgentErrorRepr::ApprovalNoApprover { kind } => {
+                approval(ApprovalError::NoApprover { kind })
+            }
+            AgentErrorRepr::ApprovalFailed { kind, message } => approval(ApprovalError::Failed {
+                kind,
+                failure: ApproverFailure::new(std::io::Error::other(message)),
+            }),
+            AgentErrorRepr::ApprovalCancelled => approval(ApprovalError::Cancelled),
+            AgentErrorRepr::Cancelled => Self::Cancelled,
+            AgentErrorRepr::Paused(pause) => Self::Paused(pause),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for AgentError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        AgentErrorRepr::from(self).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for AgentError {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        AgentErrorRepr::deserialize(deserializer).map(Self::from)
     }
 }

@@ -1,7 +1,0 @@
-{% match outcome %}{% when SubagentReport::Cancelled %}Subagent '{{ subagent }}' was cancelled by the user.{% when SubagentReport::Completed { tier, model, result, id, cache_bound, alert } %}Subagent '{{ subagent }}' completed{% if let Some(model) = model %} ({% if let Some(tier) = tier %}{{ tier }} tier, {% endif %}model: {{ model }}){% endif %}.
-
-{{ result }}
-
-Continue this subagent with `subagent resume --id {{ id }}`{% if cache_bound %} while its prompt cache is still warm{% endif %}.{% if let Some(alert) = alert %}
-
-{{ alert }}{% endif %}{% endmatch %}{% include "subagent_commits.txt" %}{% include "subagent_working_copies.txt" %}

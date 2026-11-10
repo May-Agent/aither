@@ -386,19 +386,47 @@ impl Handoff {
     }
 }
 
+/// Finds the files a tool result names, for the handoff's file index.
+///
+/// What counts as a file the model may want restored after a compaction is
+/// the embedder's decision: aither knows nothing of the paths its tools
+/// print. An agent built without one indexes nothing.
+pub trait FileReferences: Send + Sync + 'static {
+    /// The files `output`, one tool result, names: paths or URLs the
+    /// restoration can read back.
+    fn files(&self, output: &str) -> Vec<String>;
+}
+
+/// A shared [`FileReferences`], carried by the agent and its compactions.
+#[derive(Clone)]
+pub struct AnyFileReferences(std::sync::Arc<dyn FileReferences>);
+
+impl AnyFileReferences {
+    /// Shares `references`.
+    #[must_use]
+    pub fn new(references: impl FileReferences) -> Self {
+        Self(std::sync::Arc::new(references))
+    }
+}
+
+impl std::fmt::Debug for AnyFileReferences {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AnyFileReferences").finish()
+    }
+}
+
 /// Builds the mechanical file index for a handoff from conversation messages.
 ///
-/// Scans tool results for `outputs/` URLs and `artifacts/` paths and pairs
-/// each with the description of the tool call that produced it. `previous` is
-/// the file index of the handoff being replaced: its entries are kept, so a
-/// file indexed by an earlier compaction stays indexed. Later mentions of the
-/// same path win. `outputs_dir` is the session's outputs directory, whose
-/// absolute paths saved-output notices print.
+/// Asks `references` for the files each tool result names and pairs each with
+/// the description of the tool call that produced it. `previous` is the file
+/// index of the handoff being replaced: its entries are kept, so a file
+/// indexed by an earlier compaction stays indexed. Later mentions of the same
+/// path win.
 #[must_use]
 pub fn build_file_index(
     previous: &[String],
     messages: &[Message],
-    outputs_dir: Option<&std::path::Path>,
+    references: Option<&AnyFileReferences>,
 ) -> Vec<String> {
     use std::collections::HashMap;
 
@@ -433,16 +461,8 @@ pub fn build_file_index(
         let description = call_description
             .get(tool_call_id.as_str())
             .map(|description| (*description).to_string());
-        for url in crate::output_urls::extract_referenced_urls(content, outputs_dir) {
-            index.insert(url, description.clone());
-        }
-        for word in content.split_whitespace() {
-            let word = word.trim_matches(|c: char| {
-                c == '"' || c == '\'' || c == '`' || c == ',' || c == ')' || c == ']' || c == ';'
-            });
-            if word.starts_with("artifacts/") && word.len() > "artifacts/".len() {
-                index.insert(word.to_string(), description.clone());
-            }
+        for file in references.iter().flat_map(|found| found.0.files(content)) {
+            index.insert(file, description.clone());
         }
     }
 
@@ -461,8 +481,9 @@ pub struct CompactionFork<D> {
     fork_point: u64,
     /// The file index of the handoff this compaction replaces.
     previous_file_index: Vec<String>,
-    /// The session's outputs directory, for the file index.
-    outputs_dir: Option<std::path::PathBuf>,
+    /// Finds the files the conversation's tool results name, for the file
+    /// index.
+    references: Option<AnyFileReferences>,
     /// The attachment catalog the instruction renders, carried to the
     /// completed compaction so apply resolves the handoff's names against
     /// exactly what the model saw.
@@ -530,7 +551,7 @@ impl<D: HandoffSchema> CompactionFork<D> {
         Ok(Self {
             fork_point,
             previous_file_index: previous_file_index.to_vec(),
-            outputs_dir: None,
+            references: None,
             attachment_catalog: attachments.to_vec(),
             request: LLMRequest::new(messages)
                 .with_parameters(request.parameters().clone())
@@ -539,11 +560,11 @@ impl<D: HandoffSchema> CompactionFork<D> {
         })
     }
 
-    /// Sets the session's outputs directory, so the file index also finds
-    /// saved outputs the conversation names by absolute path.
+    /// Sets how the file index finds the files the conversation's tool
+    /// results name.
     #[must_use]
-    pub fn with_outputs_dir(mut self, outputs_dir: Option<std::path::PathBuf>) -> Self {
-        self.outputs_dir = outputs_dir;
+    pub fn with_file_references(mut self, references: Option<AnyFileReferences>) -> Self {
+        self.references = references;
         self
     }
 
@@ -580,14 +601,14 @@ impl<D: HandoffSchema> CompactionFork<D> {
             fork_point,
             request,
             previous_file_index,
-            outputs_dir,
+            references,
             attachment_catalog,
             ..
         } = self;
         let file_index = build_file_index(
             &previous_file_index,
             request.messages(),
-            outputs_dir.as_deref(),
+            references.as_ref(),
         );
         let reason = match model.generate::<D>(request.clone()).await {
             Ok(document) => match document.validate() {
@@ -772,6 +793,23 @@ mod tests {
     use super::*;
     use aither_core::llm::ToolCall;
 
+    /// Names every word that is a path under `outputs/` or `artifacts/`.
+    struct UnderDirectories;
+
+    impl FileReferences for UnderDirectories {
+        fn files(&self, output: &str) -> Vec<String> {
+            output
+                .split_whitespace()
+                .filter(|word| word.starts_with("outputs/") || word.starts_with("artifacts/"))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn references() -> AnyFileReferences {
+        AnyFileReferences::new(UnderDirectories)
+    }
+
     #[test]
     fn build_file_index_pairs_outputs_with_call_descriptions() {
         let messages = vec![
@@ -801,7 +839,7 @@ mod tests {
             Message::tool("call_2", "wrote artifacts/slides.md"),
         ];
 
-        let index = build_file_index(&[], &messages, None);
+        let index = build_file_index(&[], &messages, Some(&references()));
         assert_eq!(index.len(), 2);
         assert!(
             index[0].contains("outputs/river.txt")
@@ -809,32 +847,6 @@ mod tests {
             "index entry should pair path with description: {index:?}"
         );
         assert!(index[1].contains("artifacts/slides.md") && index[1].contains("Write deck"));
-    }
-
-    #[test]
-    fn build_file_index_finds_the_absolute_path_a_saved_output_notice_prints() {
-        let dir = std::path::Path::new("/work/session/outputs");
-        // Joined the way the sandbox names the file, so the separator is the
-        // platform's.
-        let path = dir.join("river.txt").display().to_string();
-        let path = path.as_str();
-        let messages = vec![
-            Message::assistant_with_tool_calls(
-                "",
-                vec![ToolCall::new(
-                    "call_1",
-                    "terminal",
-                    serde_json::json!({"description": "Run the suite"}),
-                )],
-            ),
-            Message::tool(
-                "call_1",
-                aither_sandbox::output_saved_text("head", path, 100, 5000),
-            ),
-        ];
-        let index = build_file_index(&[], &messages, Some(dir));
-        assert_eq!(index.len(), 1, "{index:?}");
-        assert!(index[0].contains(path) && index[0].contains("Run the suite"));
     }
 
     #[test]
@@ -860,7 +872,7 @@ mod tests {
             Message::tool("call_2", "updated artifacts/report.md"),
         ];
 
-        let index = build_file_index(&[], &messages, None);
+        let index = build_file_index(&[], &messages, Some(&references()));
         assert_eq!(index.len(), 1);
         assert!(index[0].contains("final revision"));
     }
@@ -885,7 +897,7 @@ mod tests {
         let file_index = build_file_index(
             context.handoff_file_index(),
             &context.build_request(&[]),
-            None,
+            Some(&references()),
         );
         context.apply_handoff(
             Handoff::with_file_index("task".to_string(), file_index.clone()),

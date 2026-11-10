@@ -1,1 +1,0 @@
-The permission reviewer {{ reviewer }} denied this request: {{ reason }}

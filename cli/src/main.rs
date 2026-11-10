@@ -2,15 +2,9 @@
 //!
 //! A REPL-style interface for testing agents with `OpenAI`, Claude, or Gemini.
 //!
-//! # Terminal-First Design
-//!
-//! The agent has a single `terminal` tool. All other capabilities are exposed as
-//! terminal commands that can be run within terminal sessions:
-//!
-//! - `websearch "query"` - Search the web
-//! - `webfetch "url"` - Fetch and read web pages
-//!
-//! Standard shell commands (ls, cat, grep, find, etc.) work normally.
+//! The agent has `websearch`, `webfetch`, `filesystem` and `command` tools,
+//! plus the tools of any MCP server given. Every `command` call asks for the
+//! user's approval on the terminal first.
 //!
 //! # Usage
 //!
@@ -36,262 +30,26 @@
 
 mod hook;
 
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::sandbox::{
-    DomainApprover, DomainRequest, ToolRegistryBuilder, cli_to_json, schema_to_help,
-};
-use aither_agent::specialized::SubagentTool;
-use aither_agent::{
-    Agent, AgentEvent, AgentOptions, CompactionOutcome, Hook, TerminalAgentBuilder,
-};
+use aither_agent::{Agent, AgentEvent, CompactionOutcome, Hooks, RunOutcome};
 use aither_core::LanguageModel;
-use aither_core::llm::{Approval, ApprovalRequest, Approver, ApproverFailure, ToolResult};
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::enable_raw_mode;
 use executor_core::tokio::TokioGlobal;
 use tracing_subscriber::EnvFilter;
 
 mod provider;
 
-use crate::hook::DebugHook;
+use crate::hook::{CliHooks, RawModeGuard, TerminalApprover, print_event};
 use crate::provider::Provider;
 use aither_cloud::CloudProvider;
-
-/// Default whitelist of common domains that don't need explicit approval.
-const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
-    // Package registries
-    "registry.npmjs.org",
-    "registry.yarnpkg.com",
-    "pypi.org",
-    "files.pythonhosted.org",
-    "crates.io",
-    "static.crates.io",
-    "rubygems.org",
-    // CDNs
-    "cdn.jsdelivr.net",
-    "unpkg.com",
-    "cdnjs.cloudflare.com",
-    "esm.sh",
-    // Git hosts
-    "github.com",
-    "raw.githubusercontent.com",
-    "gitlab.com",
-    "bitbucket.org",
-    // Common APIs
-    "api.github.com",
-];
-
-/// Interactive approver that prompts the user for each script that crosses
-/// the sandbox boundary, unsandboxed or on a server. Scripts inside the
-/// sandbox are never put to it.
-#[derive(Debug, Default)]
-struct InteractiveApprover;
-
-impl Approver for InteractiveApprover {
-    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
-        // Display the full script, no truncation.
-        let display_script = request.subject().trim().replace('\n', "; ");
-        eprintln!(
-            "\n\x1b[33m⚠ Permission request: {}\x1b[0m",
-            request.reason().unwrap_or_else(|| request.kind().as_str())
-        );
-        eprintln!("\x1b[2mScript:\x1b[22m {display_script}");
-        eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
-        io::stderr().flush().ok();
-
-        // Read single char in raw mode
-        let approved = read_yes_no().unwrap_or(false);
-        eprintln!();
-
-        Ok(if approved {
-            Approval::Approved
-        } else {
-            Approval::Denied {
-                reason: "user declined".to_string(),
-            }
-        })
-    }
-}
-
-/// Approves the domains the network lists leave open by asking the user once
-/// per domain outside the default whitelist.
-#[derive(Debug, Clone, Default)]
-struct InteractiveDomains {
-    /// Cache of approved domains outside the default whitelist.
-    approved_domains: Arc<ArcSwap<HashSet<String>>>,
-}
-
-impl DomainApprover for InteractiveDomains {
-    fn approve(&self, request: &DomainRequest) -> impl std::future::Future<Output = bool> + Send {
-        std::future::ready(self.prompt_for_domain(&request.host))
-    }
-}
-
-impl InteractiveDomains {
-    /// Prompts once per new domain, remembering the answer.
-    fn prompt_for_domain(&self, domain: &str) -> bool {
-        if self.domain_is_allowed(domain) {
-            return true;
-        }
-
-        // Prompt user for new domain
-        eprintln!("\n\x1b[33m⚠ Network access: {domain}\x1b[0m");
-        eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
-        io::stderr().flush().ok();
-
-        let approved = read_yes_no().unwrap_or(false);
-        eprintln!();
-
-        if approved {
-            self.approve_domain(domain);
-        }
-        approved
-    }
-
-    /// Whether the default whitelist or an earlier approval allows `domain`.
-    fn domain_is_allowed(&self, domain: &str) -> bool {
-        DEFAULT_DOMAIN_WHITELIST.contains(&domain) || self.approved_domains.load().contains(domain)
-    }
-
-    /// Caches an approval for `domain`.
-    fn approve_domain(&self, domain: &str) {
-        self.approved_domains.rcu(|domains| {
-            let mut next = HashSet::clone(domains);
-            next.insert(domain.to_string());
-            next
-        });
-    }
-}
-
-/// Expand ~ to home directory in a path.
-fn expand_tilde(path: &std::path::Path) -> PathBuf {
-    if let Ok(stripped) = path.strip_prefix("~")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(stripped);
-    }
-    path.to_path_buf()
-}
-
-async fn path_exists(path: &std::path::Path) -> Result<bool> {
-    match tokio::fs::metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Read y/n response from stdin.
-fn read_yes_no() -> Result<bool> {
-    enable_raw_mode()?;
-    let _guard = RawModeGuard;
-
-    loop {
-        if event::poll(Duration::from_secs(30))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('y' | 'Y') => {
-                        eprint!("y");
-                        return Ok(true);
-                    }
-                    KeyCode::Char('n' | 'N') | KeyCode::Enter | KeyCode::Esc => {
-                        eprint!("n");
-                        return Ok(false);
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        } else {
-            // Timeout - default to no
-            eprint!("n (timeout)");
-            return Ok(false);
-        }
-    }
-}
-
-/// Register MCP tools as terminal IPC commands.
-///
-/// This makes MCP tools available as terminal commands (e.g., `resolve-library-id "tokio"`)
-/// instead of direct LLM tool calls.
-fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
-    let tools: Vec<_> = conn
-        .mcp_definitions()
-        .iter()
-        .map(|def| {
-            let name = def.name.clone();
-            let description = def.description.clone().unwrap_or_default();
-            let schema = def.input_schema.clone();
-            (name, description, schema)
-        })
-        .collect();
-
-    let conn = Arc::new(conn);
-
-    for (name, description, schema) in tools {
-        let conn = conn.clone();
-        let tool_name = name.clone();
-
-        // Build help text from schema
-        let help = if description.is_empty() {
-            schema_to_help(&schema)
-        } else {
-            format!("{description}\n\n{}", schema_to_help(&schema))
-        };
-
-        registry.configure_raw_handler(name, help, move |_call, args| {
-            let conn = conn.clone();
-            let tool_name = tool_name.clone();
-            let schema = schema.clone();
-            Box::pin(async move {
-                // Parse CLI args into JSON object
-                let arguments = match parse_cli_args_to_json(&schema, &args) {
-                    Ok(value) => value,
-                    Err(error) => return Err(error.to_string()),
-                };
-
-                // Call the MCP tool
-                match conn.call(&tool_name, arguments).await {
-                    Ok(result) => {
-                        // Extract text content from result
-                        let content = result
-                            .content
-                            .into_iter()
-                            .filter_map(|c| {
-                                if let aither_mcp::Content::Text(text_content) = c {
-                                    Some(text_content.text)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        Ok(ToolResult::text(content))
-                    }
-                    Err(error) => Err(error.to_string()),
-                }
-            })
-        });
-    }
-}
-
-/// Parse CLI-style arguments into a JSON object using the MCP schema.
-fn parse_cli_args_to_json(
-    schema: &serde_json::Value,
-    args: &[String],
-) -> anyhow::Result<serde_json::Value> {
-    cli_to_json(schema, args)
-}
 
 /// Interactive CLI for testing aither agents.
 #[derive(Parser, Debug)]
@@ -328,10 +86,6 @@ struct Args {
     /// Quiet mode. Only output the response (useful with --prompt for scripting).
     #[arg(short, long)]
     quiet: bool,
-
-    /// Path to skills directory. Skills are loaded from SKILL.md files in subdirectories.
-    #[arg(long)]
-    skills: Option<PathBuf>,
 
     /// Run as ACP server (for integration with Zed and other editors).
     #[arg(long)]
@@ -395,7 +149,7 @@ async fn main() -> Result<()> {
 
 /// Run as ACP server for editor integration.
 ///
-/// Each session the editor opens gets its own agent, sandboxed to the working
+/// Each session the editor opens gets its own agent, rooted at the working
 /// directory the editor supplied for that session.
 async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
     use aither_acp::AcpServer;
@@ -406,7 +160,7 @@ async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
         TokioGlobal,
         move |setup| {
             let cloud = cloud.clone();
-            async move { acp_session_agent(cloud, setup).await }
+            async move { Ok(acp_session_agent(cloud, setup)) }
         },
     );
     server.run().await?;
@@ -414,79 +168,35 @@ async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
 }
 
 /// Build the agent backing a single ACP session.
-async fn acp_session_agent(
+///
+/// It reads files and the web but runs no commands: an ACP session's agent
+/// has no hooks, so nothing would ask the editor's user before a command ran.
+fn acp_session_agent(
     cloud: CloudProvider,
     setup: aither_acp::SessionSetup,
-) -> std::result::Result<
-    Agent<CloudProvider, CloudProvider, CloudProvider>,
-    aither_acp::protocol::AcpError,
-> {
-    let to_acp = |err: anyhow::Error| aither_acp::protocol::AcpError::Transport(err.to_string());
-
-    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(&setup.cwd, TokioGlobal)
-        .await
-        .map_err(|err| to_acp(err.into()))?
-        .with_approver(InteractiveApprover)
-        .with_domain_approver(InteractiveDomains::default());
-
-    let agent = setup
+) -> Agent<CloudProvider> {
+    let builder = Agent::builder(cloud)
+        .tool(aither_agent::filesystem::FileSystemTool::read_only(
+            &setup.cwd,
+        ))
+        .tool(aither_agent::websearch::WebSearchTool::default())
+        .tool(aither_agent::webfetch::WebFetchTool::new());
+    setup
         .mcp
         .into_iter()
-        .fold(
-            TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
-                .tool(aither_agent::websearch::WebSearchTool::default())
-                .tool(aither_agent::webfetch::WebFetchTool::new())
-                .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud)),
-            TerminalAgentBuilder::mcp_connection,
-        )
-        .with_default_prompt()
-        .build();
-
-    Ok(agent)
+        .fold(builder, aither_agent::AgentBuilder::mcp)
+        .build()
 }
 
-async fn build_agent(
-    cloud: CloudProvider,
-    args: &Args,
-) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>>
-{
-    // Create terminal tool (heel names its working dir under system temp with
-    // four random words; the ids the model reads are leased words)
-    // Uses the interactive approver:
-    // - Sandboxed: always allow (no prompt)
-    // - Network (InteractiveDomains): ask once per domain, then remember
-    // - Unsafe or on a server: always ask for each script
-    let workdir_parent = std::env::temp_dir().join("aither");
-    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(&workdir_parent, TokioGlobal)
-        .await?
-        .with_approver(InteractiveApprover)
-        .with_domain_approver(InteractiveDomains::default());
-
-    // Create terminal-first agent builder
-    // All tools become IPC commands accessible via terminal
-    let mut builder = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
+async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudProvider, CliHooks>> {
+    let cwd = std::env::current_dir().context("failed to read the working directory")?;
+    let mut builder = Agent::builder(cloud)
+        .hooks(CliHooks)
+        .approver(TerminalApprover)
+        .tool(aither_agent::filesystem::FileSystemTool::new(&cwd))
+        .tool(aither_agent::command::CommandTool::new(&cwd))
         .tool(aither_agent::websearch::WebSearchTool::default())
-        .tool(aither_agent::webfetch::WebFetchTool::new())
-        .tool(aither_agent::sandbox::builtin::AskCommand::new(
-            cloud.clone(),
-        ));
-
-    // Load skills if path provided
-    if let Some(ref skills_path) = args.skills {
-        // Expand ~ to home directory
-        let expanded = expand_tilde(skills_path);
-        if path_exists(&expanded).await? {
-            builder = builder.with_skills(&expanded).await?;
-            if !args.quiet {
-                println!("Loaded skills from: {}", expanded.display());
-            }
-        } else if !args.quiet {
-            eprintln!(
-                "Warning: Skills directory not found: {}",
-                expanded.display()
-            );
-        }
-    }
+        .tool(aither_agent::webfetch::WebFetchTool::new());
 
     // Add Context7 MCP server by default (documentation lookup)
     if !args.no_context7 {
@@ -495,13 +205,7 @@ async fn build_agent(
                 if !args.quiet {
                     println!("Connected to Context7 MCP server");
                 }
-                // Collect MCP tool descriptions and register
-                for def in conn.mcp_definitions().iter() {
-                    let desc = def.description.clone().unwrap_or_default();
-                    let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
-                    builder = builder.tool_description(def.name.clone(), desc);
-                }
-                register_mcp_tools(conn, builder.tool_registry_mut());
+                builder = builder.mcp(conn);
             }
             Err(e) => {
                 if !args.quiet {
@@ -524,41 +228,60 @@ async fn build_agent(
             if !args.quiet {
                 println!("Connected to MCP server: {name}");
             }
-            for def in conn.mcp_definitions().iter() {
-                let desc = def.description.clone().unwrap_or_default();
-                let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
-                builder = builder.tool_description(def.name.clone(), desc);
-            }
-            register_mcp_tools(conn, builder.tool_registry_mut());
+            builder = builder.mcp(conn);
         }
     }
 
-    // aither defines no subagents: the CLI has the built-in routes and the
-    // working directory's `agents/`. Only the main agent gets the `subagent`
-    // command.
-    let subagent_tool = SubagentTool::new(cloud).with_base_dir(builder.sandbox_dir().to_string());
-    builder = builder.subagents(subagent_tool, SUBAGENT_DESCRIPTION);
+    if let Some(ref system) = args.system {
+        builder = builder.instruction(system);
+    }
 
-    // Add system prompt
-    let builder = if let Some(ref system) = args.system {
-        builder.system_prompt(system)
-    } else {
-        builder.with_default_prompt()
-    };
-
-    Ok(builder.hook(DebugHook).build())
+    Ok(builder.build())
 }
 
-/// What the `subagent` command is for, as the main agent reads it.
-const SUBAGENT_DESCRIPTION: &str = "Run a named subagent, fork your context, or continue a finished subagent; `subagent` alone lists the names. The brief is a path to a file you wrote, not inline text.";
+/// Runs `prompt` to its end, printing the run as it happens unless `quiet`,
+/// and returns the reply.
+async fn run_turn<M, H>(agent: &mut Agent<M, H>, prompt: &str, quiet: bool) -> Result<String>
+where
+    M: LanguageModel + 'static,
+    H: Hooks,
+{
+    if quiet {
+        return Ok(Box::pin(agent.query(prompt)).await?);
+    }
+    let flow = Box::pin(agent.run(prompt, []).drive(
+        None,
+        std::future::pending::<()>(),
+        |reply, timed| async move {
+            print_event(&timed);
+            let reply = match timed.event {
+                AgentEvent::RunEnded {
+                    outcome: RunOutcome::Completed { final_text },
+                    ..
+                } if timed.agent.is_main() => Some(final_text),
+                _ => reply,
+            };
+            ControlFlow::Continue(reply)
+        },
+    ))
+    .await?;
+    match flow {
+        ControlFlow::Continue(Some(reply)) => Ok(reply),
+        ControlFlow::Continue(None) | ControlFlow::Break(()) => {
+            anyhow::bail!("the run ended without a reply")
+        }
+    }
+}
 
 /// Run a single prompt and exit (headless mode).
 async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result<()> {
     let mut agent = Box::pin(build_agent(cloud, args)).await?;
 
-    match Box::pin(agent.query(prompt)).await {
+    match run_turn(&mut agent, prompt, args.quiet).await {
         Ok(response) => {
-            println!("{response}");
+            if args.quiet {
+                println!("{response}");
+            }
             Ok(())
         }
         Err(e) => {
@@ -602,7 +325,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
                         (),
                         std::future::pending(),
                         |(), timed| async move {
-                            if let AgentEvent::CompactionFinished { outcome } = timed.event {
+                            if let AgentEvent::CompactionEnded { outcome, .. } = timed.event {
                                 match outcome {
                                     CompactionOutcome::Applied(result) => println!(
                                         "\x1b[2mCompacted {} messages into summary, starting fresh session\x1b[22m",
@@ -611,7 +334,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
                                     CompactionOutcome::NothingToCompact => {
                                         println!("Nothing to compact (no conversation history).");
                                     }
-                                    CompactionOutcome::Failed(_) | CompactionOutcome::Discarded => {}
+                                    _ => {}
                                 }
                             }
                             ControlFlow::<std::convert::Infallible, _>::Continue(())
@@ -631,15 +354,10 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
             }
         }
 
-        // Query the agent
+        // Run the agent
         println!("\nAgent>");
-        match Box::pin(agent.query(input)).await {
-            Ok(response) => {
-                println!("{response}");
-            }
-            Err(e) => {
-                println!("\x1b[31mError: {e}\x1b[0m");
-            }
+        if let Err(e) = run_turn(&mut agent, input, false).await {
+            println!("\x1b[31mError: {e}\x1b[0m");
         }
         println!();
     }
@@ -648,12 +366,10 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn print_history<Advanced, Balanced, Fast, H>(agent: &Agent<Advanced, Balanced, Fast, H>)
+fn print_history<M, H>(agent: &Agent<M, H>)
 where
-    Advanced: LanguageModel + 'static,
-    Balanced: LanguageModel + 'static,
-    Fast: LanguageModel + 'static,
-    H: Hook,
+    M: LanguageModel + 'static,
+    H: Hooks,
 {
     let history = agent.history();
     if history.is_empty() {
@@ -668,11 +384,10 @@ where
     }
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
+fn truncate(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_index, _)) => format!("{}...", &s[..byte_index]),
+        None => s.to_string(),
     }
 }
 
@@ -713,13 +428,5 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
                 _ => {}
             }
         }
-    }
-}
-
-struct RawModeGuard;
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
     }
 }

@@ -136,6 +136,14 @@ impl<K> Slot<K> {
         }
     }
 
+    /// A slot named `name`, for a name known only at run time.
+    pub(crate) fn owned(name: String) -> Self {
+        Self {
+            name: Cow::Owned(name),
+            kind: PhantomData,
+        }
+    }
+
     /// The slot's name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -143,64 +151,20 @@ impl<K> Slot<K> {
     }
 }
 
+#[cfg(test)]
 impl InstructionSlot {
-    /// The base system prompt ([`AgentConfig::system_prompt`](crate::AgentConfig::system_prompt)).
-    pub const BASE_SYSTEM: Self = Self::new("base_system");
-    /// The persona overlay ([`AgentConfig::persona_prompt`](crate::AgentConfig::persona_prompt)).
-    pub const PERSONA: Self = Self::new("persona");
-    /// The catalog of commands prepared for the terminal.
-    pub const PREPARED_TOOLS: Self = Self::new("prepared_tools");
-    /// The shell runtime the terminal executes on.
-    pub const SHELL_RUNTIME: Self = Self::new("shell_runtime");
-    /// How a coding agent discovers repository guidance.
-    pub const WORKSPACE_FACTS: Self = Self::new("workspace_facts");
-    /// The knowledge cutoff and how to check the current time.
-    pub const KNOWLEDGE_AND_TIME: Self = Self::new("knowledge_and_time");
-    /// The filesystem permission model.
-    pub const PERMISSIONS: Self = Self::new("permissions");
-    /// The table of the CLI commands `terminal` runs, which a terminal agent
-    /// keeps current as live content (see
-    /// [`Context::update_live`](crate::Context::update_live)).
-    pub const COMMANDS: Self = Self::new("commands");
-    /// The communication and working languages, present only while a
-    /// communication language is enforced.
-    #[cfg(feature = "languages")]
-    pub const LANGUAGES: Self = Self::new("languages");
-
-    /// Every built-in instruction slot, in the default layout's order.
-    #[cfg(not(feature = "languages"))]
-    pub const BUILTIN: [Self; 8] = [
-        Self::BASE_SYSTEM,
-        Self::PERSONA,
-        Self::PREPARED_TOOLS,
-        Self::SHELL_RUNTIME,
-        Self::WORKSPACE_FACTS,
-        Self::KNOWLEDGE_AND_TIME,
-        Self::PERMISSIONS,
-        Self::COMMANDS,
-    ];
-
-    /// Every built-in instruction slot, in the default layout's order.
-    #[cfg(feature = "languages")]
-    pub const BUILTIN: [Self; 9] = [
-        Self::BASE_SYSTEM,
-        Self::PERSONA,
-        Self::PREPARED_TOOLS,
-        Self::SHELL_RUNTIME,
-        Self::WORKSPACE_FACTS,
-        Self::KNOWLEDGE_AND_TIME,
-        Self::PERMISSIONS,
-        Self::COMMANDS,
-        Self::LANGUAGES,
-    ];
+    pub(crate) const BASE_SYSTEM: Self = Self::new("base_system");
+    pub(crate) const PERSONA: Self = Self::new("persona");
+    pub(crate) const PERMISSIONS: Self = Self::new("permissions");
 }
 
 /// The order the host gives the system prompt's blocks.
 ///
-/// Every block the prompt holds, the built-in ones included, has a slot here;
-/// inserting a block whose slot is not laid out is a mistake in the host and
-/// panics. Instructions render first in their listed order, then the
-/// external-content notice and the external blocks in theirs.
+/// Every block the prompt holds has a slot here; inserting a block whose slot
+/// is not laid out is a mistake in the host and panics. aither supplies no
+/// block of its own: the prompt holds what the embedder fills. Instructions
+/// render first in their listed order, then the external-content notice and
+/// the external blocks in theirs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemLayout {
     instructions: Vec<InstructionSlot>,
@@ -244,9 +208,10 @@ impl SystemLayout {
 }
 
 impl Default for SystemLayout {
-    /// The built-in instruction slots and no external content.
+    /// No slots: the system prompt holds only the blocks the embedder places
+    /// and fills, in the order it places them.
     fn default() -> Self {
-        Self::new(InstructionSlot::BUILTIN, [])
+        Self::new([], [])
     }
 }
 
