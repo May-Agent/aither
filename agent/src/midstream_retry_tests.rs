@@ -15,7 +15,9 @@ use futures_core::Stream;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::{AgentBuilder, AgentError, AgentEvent, AgentOptions};
+use crate::{AgentBuilder, AgentError, AgentEvent, OutputKind, RequestOutcome, RunOutcome};
+
+type TestAgent = crate::Agent<BreakingLlm>;
 
 /// A provider failure of a chosen kind.
 #[derive(Debug, Clone, Copy)]
@@ -138,10 +140,7 @@ impl Tool for Probe {
 
 /// Runs `prompt` to its end, returning what it ended with and every event it
 /// emitted on the way.
-async fn run(
-    agent: &mut crate::Agent<BreakingLlm, BreakingLlm, BreakingLlm, ()>,
-    prompt: &str,
-) -> (Result<(), AgentError>, Vec<AgentEvent>) {
+async fn run(agent: &mut TestAgent, prompt: &str) -> (Result<(), AgentError>, Vec<AgentEvent>) {
     let mut events = Vec::new();
     let result = agent
         .run(prompt, std::iter::empty())
@@ -162,10 +161,14 @@ fn retries(events: &[AgentEvent]) -> Vec<(u32, u32, Duration)> {
     events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ResponseRetry {
-                retry,
-                max_retries,
-                delay,
+            AgentEvent::RequestEnded {
+                outcome:
+                    RequestOutcome::Retrying {
+                        retry,
+                        max_retries,
+                        delay,
+                        ..
+                    },
                 ..
             } => Some((*retry, *max_retries, *delay)),
             _ => None,
@@ -173,7 +176,17 @@ fn retries(events: &[AgentEvent]) -> Vec<(u32, u32, Duration)> {
         .collect()
 }
 
-fn assistants(agent: &crate::Agent<BreakingLlm, BreakingLlm, BreakingLlm, ()>) -> Vec<Message> {
+fn is_retry(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::RequestEnded {
+            outcome: RequestOutcome::Retrying { .. },
+            ..
+        }
+    )
+}
+
+fn assistants(agent: &TestAgent) -> Vec<Message> {
     agent
         .context()
         .recent()
@@ -205,10 +218,7 @@ async fn a_stream_that_breaks_mid_response_is_sent_again_and_only_the_replacemen
         ],
     );
     let probe = Probe::default();
-    let mut agent = AgentBuilder::new(llm.clone())
-        .agent_kind(crate::AgentKind::Chatbot)
-        .tool(probe.clone())
-        .build();
+    let mut agent = AgentBuilder::new(llm.clone()).tool(probe.clone()).build();
 
     let (result, events) = run(&mut agent, "answer").await;
 
@@ -238,15 +248,16 @@ async fn a_stream_that_breaks_mid_response_is_sent_again_and_only_the_replacemen
         "the broken stream's call is not in the conversation"
     );
     assert_eq!(retries(&events), [(1, 3, Duration::ZERO)]);
-    let retry_at = events
-        .iter()
-        .position(|event| matches!(event, AgentEvent::ResponseRetry { .. }))
-        .expect("a retry event");
+    let retry_at = events.iter().position(is_retry).expect("a retry event");
     let texts: Vec<_> = events
         .iter()
         .enumerate()
         .filter_map(|(at, event)| match event {
-            AgentEvent::Text(chunk) => Some((at, chunk.as_str())),
+            AgentEvent::BlockDelta {
+                kind: OutputKind::Text,
+                text,
+                ..
+            } => Some((at, text.as_str())),
             _ => None,
         })
         .collect();
@@ -260,7 +271,10 @@ async fn a_stream_that_breaks_mid_response_is_sent_again_and_only_the_replacemen
     );
     assert!(matches!(
         events.last(),
-        Some(AgentEvent::Complete { final_text, .. }) if final_text == "the whole answer"
+        Some(AgentEvent::RunEnded {
+            outcome: RunOutcome::Completed { final_text },
+            ..
+        }) if final_text == "the whole answer"
     ));
 }
 
@@ -270,9 +284,7 @@ async fn retries_stop_at_the_policy_limit() {
         immediate(2),
         (0..3).map(|_| vec![Ok(text("partial")), network_break()]),
     );
-    let mut agent = AgentBuilder::new(llm.clone())
-        .agent_kind(crate::AgentKind::Chatbot)
-        .build();
+    let mut agent = AgentBuilder::new(llm.clone()).build();
 
     let (result, events) = run(&mut agent, "answer").await;
 
@@ -295,9 +307,7 @@ async fn a_non_retryable_break_mid_response_ends_the_turn() {
             Err(StreamError(Failure::permanent())),
         ]],
     );
-    let mut agent = AgentBuilder::new(llm.clone())
-        .agent_kind(crate::AgentKind::Chatbot)
-        .build();
+    let mut agent = AgentBuilder::new(llm.clone()).build();
 
     let (result, events) = run(&mut agent, "answer").await;
 
@@ -311,9 +321,7 @@ async fn a_non_retryable_break_mid_response_ends_the_turn() {
 #[tokio::test]
 async fn a_failure_before_the_stream_opened_is_left_to_the_provider() {
     let llm = BreakingLlm::new(immediate(3), [vec![network_break()]]);
-    let mut agent = AgentBuilder::new(llm.clone())
-        .agent_kind(crate::AgentKind::Chatbot)
-        .build();
+    let mut agent = AgentBuilder::new(llm.clone()).build();
 
     let (result, events) = run(&mut agent, "answer").await;
 
@@ -343,9 +351,7 @@ async fn a_retry_waits_the_delay_the_upstream_requested() {
             vec![Ok(text("done"))],
         ],
     );
-    let mut agent = AgentBuilder::new(llm.clone())
-        .agent_kind(crate::AgentKind::Chatbot)
-        .build();
+    let mut agent = AgentBuilder::new(llm.clone()).build();
 
     let (result, events) = run(&mut agent, "answer").await;
 

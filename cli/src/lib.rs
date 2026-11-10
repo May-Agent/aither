@@ -8,7 +8,7 @@
 //! - Multi-provider support (`OpenAI`, Claude, Gemini)
 //! - Built-in filesystem and command tools
 //! - MCP server support via configuration file
-//! - Debug hook for logging tool calls
+//! - Terminal approval before the agent runs a command
 //!
 //! # Usage
 //!
@@ -28,5 +28,5 @@ mod hook;
 mod provider;
 
 pub use aither_cloud::{CloudError, CloudProvider};
-pub use hook::DebugHook;
+pub use hook::{COMMAND_TOOL, CliHooks, RawModeGuard, TerminalApprover, print_event};
 pub use provider::{Provider, auto_detect};

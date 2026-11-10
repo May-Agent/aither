@@ -1,2 +1,0 @@
-The {{ hook }} hook added context when {{ event }}:
-{{ context }}

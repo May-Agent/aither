@@ -1,1 +1,0 @@
-Compaction started in the background. Keep working: the summary replaces the older conversation at a later step, and nothing you do in the meantime is lost.

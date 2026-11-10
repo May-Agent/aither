@@ -13,8 +13,7 @@ use futures_core::Stream;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::specialized::{SubagentArgs, SubagentTool};
-use crate::{AgentBuilder, AgentOptions};
+use crate::{AgentBuilder, RunOutcome, SubagentRuns};
 
 #[derive(Debug)]
 struct NeverError;
@@ -71,7 +70,6 @@ impl LanguageModel for ScriptedLlm {
     }
 }
 
-/// Records which call reached it.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ProbeArgs {}
 
@@ -82,6 +80,10 @@ struct IdentityRecorder(Arc<Mutex<Vec<Option<CallIdentity>>>>);
 impl Tool for IdentityRecorder {
     fn name(&self) -> Cow<'static, str> {
         "probe".into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        "Records the identity of its caller.".into()
     }
 
     type Arguments = ProbeArgs;
@@ -108,10 +110,7 @@ async fn the_main_agent_dispatches_each_call_with_its_own_id() {
         vec![Event::Text("done".to_string())],
     ]);
     let recorder = IdentityRecorder::default();
-    let mut agent = AgentBuilder::new(llm)
-        .agent_kind(crate::AgentKind::Chatbot)
-        .tool(recorder.clone())
-        .build();
+    let mut agent = AgentBuilder::new(llm).tool(recorder.clone()).build();
 
     agent.query("probe twice").await.expect("main run");
 
@@ -143,37 +142,20 @@ async fn a_subagent_dispatches_its_calls_as_that_subagent_started_by_the_calling
         vec![Event::Text("done".to_string())],
     ]);
     let recorder = IdentityRecorder::default();
-    let child_recorder = recorder.clone();
-    let dir = tempfile::tempdir().expect("temp dir");
-    let worker = crate::SubagentDefinition::parse(
-        "name = \"worker\"\ndescription = \"worker for identity tests\"\ntier = \"fast\"\naccess = \"read_only\"\nprompt = '''\nProbe.\n'''\n",
-    )
-    .expect("parse definition");
-    let tool = SubagentTool::new(llm)
-        .with_definitions([worker])
-        .with_base_dir(dir.path())
-        .with_agent_setup("worker", move |builder| {
-            builder.tool(child_recorder.clone())
-        });
-    let prompt_file = dir.path().join("prompt.txt");
-    std::fs::write(&prompt_file, "probe once").expect("write prompt file");
     let parent = CallIdentity::new(ToolCallId::new("parent_call"), AgentIdentity::Main);
+    let runs = SubagentRuns::default();
+    let run = runs.start(&parent, "worker", "probe once");
+    let mut child = AgentBuilder::new(llm)
+        .identity(run.identity())
+        .tool(recorder.clone())
+        .build();
 
-    Tool::call(
-        &tool,
-        SubagentArgs {
-            name: "worker".to_string(),
-            prompt_file: prompt_file.to_string_lossy().into_owned(),
-            id: None,
-            agent: None,
-            worktrees: Vec::new(),
-            commit_worktrees: Vec::new(),
-        },
-        ToolContext::new().with_identity(parent.clone()),
-    )
-    .await
-    .expect("subagent run");
+    let outcome = run.run(&mut child, "probe once").await;
 
+    assert!(
+        matches!(outcome, RunOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
     let seen = recorder.0.lock().unwrap().clone();
     let [Some(identity)] = seen.as_slice() else {
         panic!("the subagent made one identified call, got {seen:?}");

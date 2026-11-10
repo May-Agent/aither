@@ -1,148 +1,146 @@
-//! Debug hook for CLI agent testing.
-//!
-//! Provides logging and human-friendly terminal output display.
+//! The CLI's decisions at the agent's control points, and its terminal
+//! rendering of a run.
+
+use std::io::{self, Write};
+use std::time::Duration;
 
 use aither_agent::{
-    Hook, PostToolAction, PreToolAction, StopContext, ToolResultContext, ToolUseContext,
+    AgentEvent, Hooks, OutputKind, RunOutcome, TimedEvent, ToolDecision, ToolInvocation,
 };
-use aither_core::llm::{CommandOutcome, ToolResult};
+use aither_core::llm::tool::{Approval, ApprovalKind, ApprovalRequest, Approver, ApproverFailure};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-/// A debug hook that logs tool calls with human-friendly terminal output.
+/// The tool whose every call the user approves first.
+pub const COMMAND_TOOL: &str = "command";
+
+/// Asks the user before the agent runs a command.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct DebugHook;
+pub struct CliHooks;
 
-impl Hook for DebugHook {
-    fn pre_tool_use(
+impl Hooks for CliHooks {
+    fn before_tool(
         &self,
-        ctx: &ToolUseContext<'_>,
-    ) -> impl std::future::Future<Output = PreToolAction> + Send {
-        // Terminal is the primary tool; show the command directly.
-        if ctx.tool_name == "terminal" {
-            if let Some((script, mode)) = parse_terminal_args(ctx.arguments) {
-                let mode_indicator = match mode.as_deref() {
-                    Some("unsafe") => "\x1b[31m⚠\x1b[0m ",
-                    Some("network") => "\x1b[33m⚡\x1b[0m ",
-                    _ => "",
-                };
-                // Show command with $ prefix like a terminal (no truncation)
-                let display_script = script.trim().replace('\n', "; ");
-                println!("\x1b[32m{mode_indicator}$\x1b[0m {display_script}");
-            }
+        call: &ToolInvocation<'_>,
+    ) -> impl std::future::Future<Output = ToolDecision> + Send {
+        std::future::ready(if call.name == COMMAND_TOOL {
+            ToolDecision::Ask(
+                ApprovalRequest::new(ApprovalKind::new("command"), call.arguments.to_string())
+                    .with_reason("the agent wants to run a command"),
+            )
         } else {
-            // Non-terminal tools (shouldn't happen in terminal-first architecture)
-            println!(
-                "\x1b[36m[tool]\x1b[0m {} \x1b[90m(turn {})\x1b[0m",
-                ctx.tool_name, ctx.turn
-            );
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ctx.arguments)
-                && let Ok(pretty) = serde_json::to_string_pretty(&parsed)
+            ToolDecision::Allow
+        })
+    }
+}
+
+/// Answers approval requests by asking on the terminal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TerminalApprover;
+
+impl Approver for TerminalApprover {
+    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+        eprintln!(
+            "\n\x1b[33m⚠ Approval needed ({}):\x1b[0m {}",
+            request.kind().as_str(),
+            request.subject()
+        );
+        if let Some(reason) = request.reason() {
+            eprintln!("\x1b[2m{reason}\x1b[22m");
+        }
+        eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
+        io::stderr().flush().ok();
+
+        let approved = tokio::task::spawn_blocking(read_yes_no)
+            .await
+            .map_err(ApproverFailure::new)?
+            .map_err(|error| ApproverFailure::new(std::io::Error::other(error.to_string())))?;
+        eprintln!();
+        Ok(if approved {
+            Approval::Approved
+        } else {
+            Approval::Denied {
+                reason: "the user declined".to_string(),
+            }
+        })
+    }
+}
+
+/// Reads a y/n answer from the terminal.
+fn read_yes_no() -> Result<bool> {
+    enable_raw_mode()?;
+    let _guard = RawModeGuard;
+
+    loop {
+        if event::poll(Duration::from_secs(30))? {
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
             {
-                for line in pretty.lines() {
-                    println!("  \x1b[90m{line}\x1b[0m");
+                match key.code {
+                    KeyCode::Char('y' | 'Y') => {
+                        eprint!("y");
+                        return Ok(true);
+                    }
+                    KeyCode::Char('n' | 'N') | KeyCode::Enter | KeyCode::Esc => {
+                        eprint!("n");
+                        return Ok(false);
+                    }
+                    _ => {}
                 }
-            }
-        }
-
-        // Permission is handled by TerminalTool's InteractivePermissionHandler
-        // No need to check here - would cause duplicate prompts
-        std::future::ready(PreToolAction::Allow)
-    }
-
-    fn post_tool_use(
-        &self,
-        ctx: &ToolResultContext<'_>,
-    ) -> impl std::future::Future<Output = PostToolAction> + Send {
-        let duration_ms = ctx.duration.as_millis();
-
-        if ctx.tool_name == "terminal" {
-            if let Some(err) = ctx.result.error_message() {
-                println!("\x1b[31m✗ Error:\x1b[0m {err} \x1b[90m({duration_ms}ms)\x1b[0m");
-            } else {
-                print_terminal_result(ctx.result, duration_ms);
             }
         } else {
-            // Non-terminal tools
-            if let Some(err) = ctx.result.error_message() {
-                println!(
-                    "\x1b[31m[error]\x1b[0m {} \x1b[90m({duration_ms}ms)\x1b[0m",
-                    ctx.tool_name
-                );
-                println!("  \x1b[31m{err}\x1b[0m");
+            eprint!("n (timeout)");
+            return Ok(false);
+        }
+    }
+}
+
+/// Restores the terminal's cooked mode when dropped.
+#[derive(Debug)]
+pub struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Prints one event of the main agent as a human-friendly line.
+pub fn print_event(timed: &TimedEvent) {
+    if !timed.agent.is_main() {
+        return;
+    }
+    match &timed.event {
+        AgentEvent::BlockDelta {
+            kind: OutputKind::Text,
+            text,
+            ..
+        } => {
+            print!("{text}");
+            io::stdout().flush().ok();
+        }
+        AgentEvent::ToolCallStarted {
+            name, arguments, ..
+        } => {
+            println!("\n\x1b[36m[tool]\x1b[0m {name} \x1b[90m{arguments}\x1b[0m");
+        }
+        AgentEvent::ToolCallEnded { result, .. } => {
+            if let Some(error) = result.error_message() {
+                println!("\x1b[31m✗ {error}\x1b[0m");
             } else {
-                let result = ctx.result.render_for_model();
-                let truncated = truncate_output(&result, 500);
-                println!(
-                    "\x1b[32m[ok]\x1b[0m {} \x1b[90m({duration_ms}ms)\x1b[0m",
-                    ctx.tool_name
-                );
-                for line in truncated.lines().take(10) {
+                let text = result.render_for_model();
+                let shown = truncate_output(&text, 500);
+                for line in shown.lines().take(10) {
                     println!("  \x1b[90m{line}\x1b[0m");
-                }
-                if truncated.lines().count() > 10 {
-                    println!(
-                        "  \x1b[90m... ({} more lines)\x1b[0m",
-                        truncated.lines().count() - 10
-                    );
                 }
             }
         }
-
-        std::future::ready(PostToolAction::Keep)
-    }
-
-    fn on_stop(
-        &self,
-        ctx: &StopContext<'_>,
-    ) -> impl std::future::Future<Output = Option<String>> + Send {
-        println!(
-            "\n\x1b[90m[completed in {} turn(s), reason: {:?}]\x1b[0m",
-            ctx.turns, ctx.reason
-        );
-        std::future::ready(None)
-    }
-}
-
-/// Parsed terminal arguments.
-fn parse_terminal_args(arguments: &str) -> Option<(String, Option<String>)> {
-    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    let script = parsed.get("script")?.as_str()?.to_string();
-    let mode = parsed
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    Some((script, mode))
-}
-
-/// Print a terminal tool result in human-friendly format, driven by its
-/// typed command outcome.
-fn print_terminal_result(result: &ToolResult, duration_ms: u128) {
-    match result.command().map(|command| &command.outcome) {
-        Some(CommandOutcome::Running { task_id, .. }) => {
-            println!("\x1b[33m⏳ Background task started:\x1b[0m {task_id}");
-            return;
-        }
-        Some(CommandOutcome::Exited { code }) if *code != 0 => {
-            print!("\x1b[31m✗ Exit code {code}:\x1b[0m ");
-        }
-        Some(CommandOutcome::Killed { task_id, .. }) => {
-            print!("\x1b[31m✗ Killed task {task_id}:\x1b[0m ");
-        }
-        _ => print!("\x1b[90m"),
-    }
-    println!("({duration_ms}ms)\x1b[0m");
-
-    let text = result.render_for_model();
-    let truncated = truncate_output(&text, 2000);
-    let lines: Vec<&str> = truncated.lines().collect();
-    let max_lines = 20;
-    for line in lines.iter().take(max_lines) {
-        println!("  {line}");
-    }
-    if lines.len() > max_lines {
-        println!(
-            "  \x1b[90m... ({} more lines)\x1b[0m",
-            lines.len() - max_lines
-        );
+        AgentEvent::RunEnded { outcome, .. } => match outcome {
+            RunOutcome::Completed { .. } => println!(),
+            other => println!("\n\x1b[90m[run ended: {other:?}]\x1b[0m"),
+        },
+        _ => {}
     }
 }
 
@@ -150,6 +148,6 @@ fn print_terminal_result(result: &ToolResult, duration_ms: u128) {
 fn truncate_output(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => format!("{}[...]", &s[..byte_idx]),
-        None => s.to_string(), // String is shorter than max_chars
+        None => s.to_string(),
     }
 }

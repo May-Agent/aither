@@ -10,6 +10,8 @@ use core::fmt::{self, Display};
 
 /// The id a model provider gave one tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct ToolCallId(String);
 
 impl ToolCallId {
@@ -37,6 +39,7 @@ impl Display for ToolCallId {
 /// The starting call's identity makes the subagent unique across nested
 /// subagents and ties it to the call that launched it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SubagentIdentity {
     name: String,
     started_by: Option<Box<CallIdentity>>,
@@ -68,6 +71,7 @@ impl SubagentIdentity {
 
 /// The agent making a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AgentIdentity {
     /// The main agent.
     Main,
@@ -77,6 +81,7 @@ pub enum AgentIdentity {
 
 /// What identifies one tool call: its id and the agent that made it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CallIdentity {
     call: ToolCallId,
     agent: AgentIdentity,
