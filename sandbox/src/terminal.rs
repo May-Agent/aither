@@ -72,7 +72,7 @@ use crate::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
     },
     interpreter::Interpreter,
-    job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
+    job_registry::{JobRegistry, JobStatus, job_registry_channel},
     limits::{LiveDuration, ShellLimits},
     output::{MediaResolution, OutputFormat, OutputStore, stored_path},
     output_policy::OutputPolicy,
@@ -96,6 +96,10 @@ use crate::{
         SubagentGrant, SubagentGrantError, SubagentSpaces, canonical as canonical_path,
     },
     wording::AnyShellWording,
+};
+use crate::events::{
+    EventSender, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
+    StdinWatchFailed, event_channel,
 };
 
 mod subagent_git;
@@ -555,46 +559,6 @@ impl TerminalLimits {
     }
 }
 
-/// A background job that crossed the long-running threshold.
-///
-/// Sent through the terminal's alert channel once per job; the agent turns
-/// it into a durable system alert.
-#[derive(Debug, Clone)]
-pub struct LongRunningJob {
-    /// Task ID of the job, a word leased from the terminal's id allocator.
-    pub task_id: String,
-    /// The script the job runs.
-    pub script: String,
-    /// How long the job had been running when the alert fired.
-    pub elapsed: Duration,
-}
-
-/// A background job whose stdin pipe has a reader waiting for input.
-///
-/// Sent once per blocking episode: the job is not alerted again until it has
-/// been fed through `terminal_input` and blocks anew.
-#[derive(Debug, Clone)]
-pub struct StdinBlockedJob {
-    /// Task ID of the job.
-    pub task_id: String,
-    /// The script the job runs.
-    pub script: String,
-}
-
-/// A background job whose stdin watch failed; carries the probe's error.
-///
-/// Sent once: after a failure the job can no longer report being blocked on
-/// stdin.
-#[derive(Debug, Clone)]
-pub struct StdinProbeFailedJob {
-    /// Task ID of the job.
-    pub task_id: String,
-    /// The script the job runs.
-    pub script: String,
-    /// Why the watch failed.
-    pub error: String,
-}
-
 /// Why the next foreground command does not start where the last one left
 /// the shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -640,27 +604,6 @@ impl DescendantsKilled {
     }
 }
 
-/// A system alert about a job, delivered through the terminal's alert
-/// channel.
-#[derive(Debug, Clone)]
-pub enum JobAlert {
-    /// A foreground command's shell exited while descendants were still
-    /// running, and they were killed.
-    DescendantsKilled(DescendantsKilled),
-    /// The job crossed the long-running threshold.
-    LongRunning(LongRunningJob),
-    /// The job is waiting for input on its stdin.
-    StdinBlocked(StdinBlockedJob),
-    /// Watching the job's stdin failed; no blocked-on-stdin alert can follow.
-    StdinProbeFailed(StdinProbeFailedJob),
-    /// A monitor collected new output lines from its watched job.
-    MonitorIncrement(crate::monitor::MonitorIncrement),
-    /// A monitor saw no new output for its stall window.
-    MonitorStalled(crate::monitor::MonitorStalled),
-    /// A monitor ended, reporting why.
-    MonitorEnded(crate::monitor::MonitorEnded),
-}
-
 /// A command that ran to completion.
 #[derive(Debug, Clone)]
 pub struct CompletedCommand {
@@ -688,22 +631,6 @@ impl From<CompletedCommand> for CommandResult {
             interruptions: command.interruptions,
         }
     }
-}
-
-/// A job `terminal` has just detached as a background task — started with
-/// `background: true` or promoted past the foreground window.
-///
-/// Sent through the terminal's started-task channel once per launched job;
-/// the agent turns it into a durable reminder and a `background_task_started`
-/// event.
-#[derive(Debug, Clone)]
-pub struct StartedBackgroundTask {
-    /// Task ID of the job, a word leased from the terminal's id allocator.
-    pub task_id: String,
-    /// First lines of the redirected output; empty when nothing was written yet.
-    pub output_preview: String,
-    /// File receiving the full redirected output.
-    pub output_file: StoredFile,
 }
 
 #[derive(Clone)]
@@ -738,266 +665,6 @@ impl BackgroundStartup {
         {
             let _ = self.tx.send(Err(error.to_string())).await;
         }
-    }
-}
-
-/// A completed background task result.
-#[derive(Debug)]
-pub struct CompletedTask {
-    /// The task ID, a word leased from the terminal's id allocator.
-    pub task_id: String,
-    /// The original script that was executed.
-    pub script: String,
-    /// The result of execution.
-    pub result: Result<CompletedCommand, TerminalError>,
-    /// Why the job was killed — its `timeout` bound, `terminal_kill` or a
-    /// memory runaway — or `None` when it exited on its own.
-    pub kill: Option<crate::KillCause>,
-    /// Set when the kill was the `timeout` bound passing.
-    pub timeout_kill: Option<TimeoutKill>,
-    /// Keeps the job in its registry, and its task id leased, until the agent
-    /// takes the completion by dropping it; `None` for a command the registry
-    /// never registered and for one whose call returned its result.
-    pub pending: Option<PendingCompletion>,
-}
-
-/// Receiver for completed background tasks.
-///
-/// This can be cloned and used independently of the `TerminalTool` to poll for
-/// completed background tasks. Multiple receivers share the same channel,
-/// so completed tasks are distributed among receivers.
-#[derive(Clone)]
-pub struct BackgroundTaskReceiver {
-    rx: Receiver<CompletedTask>,
-    alert_rx: Receiver<JobAlert>,
-    started_rx: Receiver<StartedBackgroundTask>,
-    running_tasks: Arc<AtomicUsize>,
-}
-
-/// Sender half of a [`BackgroundTaskReceiver`] channel.
-///
-/// A `TerminalTool` owns the sender side internally; the exposed pair lets
-/// tests and embedders drive a receiver without a live terminal backend:
-/// `task_started`/`task_finished` move the running counter the receiver's
-/// `has_running` reads, and the `send_*` methods deliver the same payloads
-/// spawned executions produce.
-#[derive(Clone, Debug)]
-pub struct BackgroundTaskSender {
-    completed_tx: Sender<CompletedTask>,
-    alert_tx: Sender<JobAlert>,
-    started_tx: Sender<StartedBackgroundTask>,
-    running_tasks: Arc<AtomicUsize>,
-}
-
-impl BackgroundTaskSender {
-    /// Records a task start: `has_running` on the paired receiver turns true.
-    pub fn task_started(&self) {
-        self.running_tasks.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Records a task end: decrements the running counter.
-    ///
-    /// # Panics
-    ///
-    /// Panics when more tasks are finished than were started — the counter
-    /// can never go negative, so a mismatched pair is a bug in the driver.
-    pub fn task_finished(&self) {
-        let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
-        assert!(
-            previous > 0,
-            "task_finished without a matching task_started"
-        );
-    }
-
-    /// Delivers a completed-task event to the receiver.
-    pub async fn send_completed(&self, task: CompletedTask) {
-        let _ = self.completed_tx.send(task).await;
-    }
-
-    /// Delivers a job alert to the receiver.
-    pub async fn send_alert(&self, alert: JobAlert) {
-        let _ = self.alert_tx.send(alert).await;
-    }
-
-    /// Delivers a background-task-started event to the receiver.
-    pub async fn send_started(&self, task: StartedBackgroundTask) {
-        let _ = self.started_tx.send(task).await;
-    }
-}
-
-/// Creates a standalone [`BackgroundTaskSender`]/[`BackgroundTaskReceiver`]
-/// pair disconnected from any `TerminalTool`, mirroring
-/// [`job_registry_channel`](crate::job_registry_channel).
-#[must_use]
-pub fn background_task_channel() -> (BackgroundTaskSender, BackgroundTaskReceiver) {
-    let (completed_tx, rx) = async_channel::unbounded();
-    let (alert_tx, alert_rx) = async_channel::unbounded();
-    let (started_tx, started_rx) = async_channel::unbounded();
-    let running_tasks = Arc::new(AtomicUsize::new(0));
-    (
-        BackgroundTaskSender {
-            completed_tx,
-            alert_tx,
-            started_tx,
-            running_tasks: running_tasks.clone(),
-        },
-        BackgroundTaskReceiver {
-            rx,
-            alert_rx,
-            started_rx,
-            running_tasks,
-        },
-    )
-}
-
-impl BackgroundTaskReceiver {
-    /// Takes all completed background tasks without blocking.
-    ///
-    /// Returns an empty vector if no tasks have completed.
-    #[must_use]
-    pub fn take_completed(&self) -> Vec<CompletedTask> {
-        let mut completed = Vec::new();
-        while let Ok(task) = self.rx.try_recv() {
-            completed.push(task);
-        }
-        completed
-    }
-
-    /// Takes all pending job alerts without blocking.
-    ///
-    /// A job produces at most one [`JobAlert::LongRunning`], and one
-    /// [`JobAlert::StdinBlocked`] per blocking episode.
-    #[must_use]
-    pub fn take_job_alerts(&self) -> Vec<JobAlert> {
-        let mut alerts = Vec::new();
-        while let Ok(alert) = self.alert_rx.try_recv() {
-            alerts.push(alert);
-        }
-        alerts
-    }
-
-    /// Takes all freshly started background tasks without blocking.
-    ///
-    /// Each entry names a job `terminal` has just detached; a job produces
-    /// exactly one.
-    #[must_use]
-    pub fn take_started(&self) -> Vec<StartedBackgroundTask> {
-        let mut started = Vec::new();
-        while let Ok(task) = self.started_rx.try_recv() {
-            started.push(task);
-        }
-        started
-    }
-
-    /// Checks if there are any completed tasks waiting.
-    #[must_use]
-    pub fn has_completed(&self) -> bool {
-        !self.rx.is_empty()
-    }
-
-    /// Checks if there are any background tasks still running.
-    ///
-    /// This works by checking the sender count - `TerminalTool` holds one sender,
-    /// and each running background task holds a cloned sender.
-    #[must_use]
-    pub fn has_running(&self) -> bool {
-        self.running_tasks.load(Ordering::Acquire) > 0
-    }
-
-    /// Waits for the next completed task.
-    ///
-    /// Returns `None` if the channel is closed (all senders dropped).
-    pub async fn recv(&self) -> Option<CompletedTask> {
-        self.rx.recv().await.ok()
-    }
-
-    /// Waits for a completed task with a timeout.
-    ///
-    /// Returns `None` if no task completes within the timeout or if the channel is closed.
-    pub async fn recv_timeout(&self, duration: std::time::Duration) -> Option<CompletedTask> {
-        futures_lite::future::or(async { self.rx.recv().await.ok() }, async {
-            futures_lite::future::yield_now().await;
-            async_io::Timer::after(duration).await;
-            None
-        })
-        .await
-    }
-
-    /// Waits for the next completed task or job alert.
-    ///
-    /// Cancel-safe: an event is taken only when this future completes, so a
-    /// caller racing it against other work loses nothing. A closed channel
-    /// never ends the wait.
-    pub async fn recv_event(&self) -> BackgroundTaskEvent {
-        futures_lite::future::or(
-            async {
-                match self.rx.recv().await {
-                    Ok(task) => BackgroundTaskEvent::Completed(Box::new(task)),
-                    Err(_) => std::future::pending().await,
-                }
-            },
-            async {
-                match self.alert_rx.recv().await {
-                    Ok(alert) => BackgroundTaskEvent::Alert(alert),
-                    Err(_) => std::future::pending().await,
-                }
-            },
-        )
-        .await
-    }
-
-    /// Waits for the next completed task or job alert, bounded by `duration`.
-    ///
-    /// Returns `None` when nothing arrives in time; a closed channel never
-    /// ends the wait early.
-    pub async fn recv_event_timeout(
-        &self,
-        duration: std::time::Duration,
-    ) -> Option<BackgroundTaskEvent> {
-        futures_lite::future::or(
-            async {
-                match self.rx.recv().await {
-                    Ok(task) => Some(BackgroundTaskEvent::Completed(Box::new(task))),
-                    // A closed channel never yields again; only the timer
-                    // may end the wait, or callers would spin.
-                    Err(_) => std::future::pending().await,
-                }
-            },
-            futures_lite::future::or(
-                async {
-                    match self.alert_rx.recv().await {
-                        Ok(alert) => Some(BackgroundTaskEvent::Alert(alert)),
-                        Err(_) => std::future::pending().await,
-                    }
-                },
-                async {
-                    futures_lite::future::yield_now().await;
-                    async_io::Timer::after(duration).await;
-                    None
-                },
-            ),
-        )
-        .await
-    }
-}
-
-/// What ended a [`BackgroundTaskReceiver::recv_event_timeout`] wait.
-#[derive(Debug)]
-pub enum BackgroundTaskEvent {
-    /// A background task completed; boxed to keep the enum small.
-    Completed(Box<CompletedTask>),
-    /// A job alert arrived.
-    Alert(JobAlert),
-}
-
-impl std::fmt::Debug for BackgroundTaskReceiver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BackgroundTaskReceiver")
-            .field("pending", &self.rx.len())
-            .field("pending_alerts", &self.alert_rx.len())
-            .field("pending_started", &self.started_rx.len())
-            .field("running_tasks", &self.running_tasks.load(Ordering::Acquire))
-            .finish()
     }
 }
 
@@ -1501,18 +1168,11 @@ pub struct TerminalTool<E, State = Unconfigured> {
     ids: AnyIdAllocator,
     output_store: OutputStore,
     job_registry: JobRegistry,
-    /// Channel for receiving completed background tasks.
-    completed_rx: Receiver<CompletedTask>,
-    /// Channel for sending completed background tasks (cloned for each background task).
-    completed_tx: Sender<CompletedTask>,
-    /// Channel for receiving long-running job alerts.
-    alert_rx: Receiver<JobAlert>,
-    /// Channel for sending long-running job alerts (cloned for each watchdog).
-    alert_tx: Sender<JobAlert>,
-    /// Channel for receiving freshly started background tasks.
-    started_rx: Receiver<StartedBackgroundTask>,
-    /// Channel for announcing freshly started background tasks.
-    started_tx: Sender<StartedBackgroundTask>,
+    /// Where the facts about this shell's jobs are raised (cloned for each
+    /// task that reports one).
+    events_tx: EventSender,
+    /// Where they are read.
+    events_rx: ShellEvents,
     /// Time bounds applied to spawned executions.
     limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
@@ -1557,12 +1217,8 @@ impl<E: Clone, State: Clone> Clone for TerminalTool<E, State> {
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
             job_registry: self.job_registry.clone(),
-            completed_rx: self.completed_rx.clone(),
-            completed_tx: self.completed_tx.clone(),
-            alert_rx: self.alert_rx.clone(),
-            alert_tx: self.alert_tx.clone(),
-            started_rx: self.started_rx.clone(),
-            started_tx: self.started_tx.clone(),
+            events_tx: self.events_tx.clone(),
+            events_rx: self.events_rx.clone(),
             limits: self.limits.clone(),
             running_tasks: self.running_tasks.clone(),
             grants: self.grants.clone(),
@@ -1727,9 +1383,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             .detach();
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
-        let (completed_tx, completed_rx) = async_channel::unbounded();
-        let (alert_tx, alert_rx) = async_channel::unbounded();
-        let (started_tx, started_rx) = async_channel::unbounded();
+        let (events_tx, events_rx) = event_channel();
         let running_tasks = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
@@ -1740,12 +1394,8 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             ids,
             output_store,
             job_registry,
-            completed_rx,
-            completed_tx,
-            alert_rx,
-            alert_tx,
-            started_rx,
-            started_tx,
+            events_tx,
+            events_rx,
             limits: TerminalLimits::new(limits),
             running_tasks,
             grants: Grants::new(),
@@ -1804,9 +1454,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             .detach();
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
-        let (completed_tx, completed_rx) = async_channel::unbounded();
-        let (alert_tx, alert_rx) = async_channel::unbounded();
-        let (started_tx, started_rx) = async_channel::unbounded();
+        let (events_tx, events_rx) = event_channel();
         let running_tasks = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
@@ -1817,12 +1465,8 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             ids,
             output_store,
             job_registry,
-            completed_rx,
-            completed_tx,
-            alert_rx,
-            alert_tx,
-            started_rx,
-            started_tx,
+            events_tx,
+            events_rx,
             limits: TerminalLimits::new(limits),
             running_tasks,
             grants: Grants::new(),
@@ -1852,12 +1496,8 @@ impl<E, State> TerminalTool<E, State> {
             ids: self.ids,
             output_store: self.output_store,
             job_registry: self.job_registry,
-            completed_rx: self.completed_rx,
-            completed_tx: self.completed_tx,
-            alert_rx: self.alert_rx,
-            alert_tx: self.alert_tx,
-            started_rx: self.started_rx,
-            started_tx: self.started_tx,
+            events_tx: self.events_tx,
+            events_rx: self.events_rx,
             limits: self.limits,
             running_tasks: self.running_tasks,
             grants: self.grants,
@@ -2317,11 +1957,10 @@ where
         self.job_registry.clone()
     }
 
-    /// Returns a receiver for completed background tasks.
-    /// Sender on the job-alert channel a watch task reports through;
-    /// `monitor` clones it for every pump it spawns.
-    pub(crate) fn job_alert_sender(&self) -> Sender<JobAlert> {
-        self.alert_tx.clone()
+    /// What a watch task reports through; `monitor` clones it for every pump
+    /// it spawns.
+    pub(crate) fn event_sender(&self) -> EventSender {
+        self.events_tx.clone()
     }
 
     /// The executor backing this terminal, for spawning watch tasks.
@@ -2337,33 +1976,16 @@ where
     }
 
     ///
-    /// The returned `BackgroundTaskReceiver` can be used independently of the `TerminalTool`
-    /// to poll for completed background tasks. This is useful for integrating with
-    /// the Agent's main loop.
-    pub fn background_receiver(&self) -> BackgroundTaskReceiver {
-        BackgroundTaskReceiver {
-            rx: self.completed_rx.clone(),
-            alert_rx: self.alert_rx.clone(),
-            started_rx: self.started_rx.clone(),
-            running_tasks: self.running_tasks.clone(),
-        }
+    /// The facts about this terminal's jobs. Every handle shares the queues,
+    /// so an event reaches one reader.
+    pub fn events(&self) -> ShellEvents {
+        self.events_rx.clone()
     }
 
-    /// Takes all completed background tasks without blocking.
-    ///
-    /// Returns an empty vector if no tasks have completed.
-    /// The agent should call this after each turn to check for completed background tasks.
-    pub fn take_completed(&self) -> Vec<CompletedTask> {
-        let mut completed = Vec::new();
-        while let Ok(task) = self.completed_rx.try_recv() {
-            completed.push(task);
-        }
-        completed
-    }
-
-    /// Checks if there are any pending background tasks.
-    pub fn has_pending_tasks(&self) -> bool {
-        !self.completed_rx.is_empty() || self.running_tasks.load(Ordering::Acquire) > 0
+    /// The events as tests read them.
+    #[cfg(test)]
+    pub(crate) fn background_receiver(&self) -> ShellEvents {
+        self.events()
     }
 }
 
@@ -2529,9 +2151,7 @@ where
             None => None,
         };
 
-        let (completed_tx, completed_rx) = async_channel::unbounded();
-        let (alert_tx, alert_rx) = async_channel::unbounded();
-        let (started_tx, started_rx) = async_channel::unbounded();
+        let (events_tx, events_rx) = event_channel();
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (job_registry, job_registry_service) =
             job_registry_channel(self.output_store.policy().clone());
@@ -2578,12 +2198,8 @@ where
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
             job_registry,
-            completed_rx,
-            completed_tx,
-            alert_rx,
-            alert_tx,
-            started_rx,
-            started_tx,
+            events_tx,
+            events_rx,
             limits: self.limits.clone(),
             running_tasks,
             grants,
@@ -2722,7 +2338,7 @@ where
     pub fn to_dyn(self) -> crate::command::DynTerminalTool {
         use crate::command::DynTerminalTool;
 
-        let background_receiver = self.background_receiver();
+        let events = self.events();
         let kept_receiver = self.kept_receiver();
         let job_registry = self.job_registry();
         let working_dir = self.working_dir().clone();
@@ -2741,7 +2357,7 @@ where
 
         DynTerminalTool {
             entries,
-            background_receiver,
+            events,
             kept_receiver,
             job_registry,
             working_dir,
@@ -2878,7 +2494,7 @@ where
         // on it promotes to a background task the model can feed through
         // `terminal_input`, and a blocked episode raises an alert.
         let stdin_alerts = Some(StdinAlerts {
-            tx: self.alert_tx.clone(),
+            tx: self.events_tx.clone(),
             task_id: task_id.to_string(),
             script: script.clone(),
         });
@@ -2889,12 +2505,12 @@ where
             JobLifetime::Background
         } else {
             JobLifetime::Foreground {
-                alerts: self.alert_tx.clone(),
+                alerts: self.events_tx.clone(),
             }
         };
         let background_startup = BackgroundStartup::new(startup_tx);
         let running_tasks = self.running_tasks.clone();
-        let completed_tx = self.completed_tx.clone();
+        let completed_tx = self.events_tx.clone();
         let outages = self.outages.clone();
         outages.begin(&task_id);
 
@@ -3001,7 +2617,7 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
                 &prepared.outputs,
                 &prepared.task_id,
                 prepared.max_lines,
-                &self.started_tx,
+                &self.events_tx,
             )
             .await;
         }
@@ -3045,7 +2661,7 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
                     &prepared.outputs,
                     &prepared.task_id,
                     prepared.max_lines,
-                    &self.started_tx,
+                    &self.events_tx,
                 )
                 .await
             }
@@ -3782,11 +3398,11 @@ where
         watch
     }
 
-    /// Emits one [`LongRunningJob`] when the job crosses the configured
+    /// Raises one [`LongRunning`] when the job crosses the configured
     /// long-running threshold.
     fn spawn_long_job_alert(&self, task_id: &IdLease) {
         let job_registry = self.job_registry.clone();
-        let alert_tx = self.alert_tx.clone();
+        let alert_tx = self.events_tx.clone();
         // Weak for the same reason as the watchdog's.
         let task_id = task_id.downgrade();
         let alert_after = self.limits.long_job_alert.get();
@@ -3800,10 +3416,10 @@ where
                     && matches!(job.status, JobStatus::Running)
                 {
                     let _ = alert_tx
-                        .send(JobAlert::LongRunning(LongRunningJob {
+                        .send(ShellEvent::LongRunning(LongRunning {
                             task_id: task_id.to_string(),
                             script: job.script,
-                            elapsed: job.started_at.elapsed(),
+                            after: job.started_at.elapsed(),
                         }))
                         .await;
                 }
@@ -3940,16 +3556,16 @@ async fn background_terminal_result(
     outputs: &OutputStore,
     task_id: &str,
     max_lines: usize,
-    started_tx: &Sender<StartedBackgroundTask>,
+    started_tx: &EventSender,
 ) -> aither_core::Result<ToolResult> {
     let redirect =
         start_background_output_redirect(job_registry, outputs, task_id, max_lines).await?;
     let _ = started_tx
-        .send(StartedBackgroundTask {
+        .send(ShellEvent::JobStarted(JobStarted {
             task_id: task_id.to_string(),
             output_preview: redirect.preview.clone(),
             output_file: redirect.file.clone(),
-        })
+        }))
         .await;
     let stdout = if redirect.truncated {
         CommandStream::Stored {
@@ -4241,7 +3857,7 @@ struct SpawnedTerminalTask<E> {
     result_tx: Sender<Result<CompletedCommand, String>>,
     /// Whether the call took the result: see [`SpawnedTerminal::took_result`].
     taken: Receiver<Sender<()>>,
-    completed_tx: Sender<CompletedTask>,
+    completed_tx: EventSender,
     running_tasks: Arc<AtomicUsize>,
     env_source: Option<Arc<dyn EnvSource>>,
     network: NetworkSettings,
@@ -4400,14 +4016,14 @@ where
     // tasks it saw promoted or detached (`take_started`), so a plain
     // foreground result is not delivered twice.
     let _ = completed_tx
-        .send(CompletedTask {
+        .send(ShellEvent::JobEnded(Box::new(JobEnded {
             task_id: task_id.to_string(),
             script,
             result,
             kill,
             timeout_kill: timeout_watch.kill().filter(|_| kill.is_some()),
             pending,
-        })
+        })))
         .await;
     running_tasks.fetch_sub(1, Ordering::AcqRel);
     // The flow's own hold on the word ends before the call returns.
@@ -5126,7 +4742,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
 #[derive(Clone)]
 enum JobLifetime {
     /// None: the survivors are killed and reported on `alerts`.
-    Foreground { alerts: Sender<JobAlert> },
+    Foreground { alerts: EventSender },
     /// All of them: the job runs until its whole tree has exited.
     Background,
 }
@@ -5136,7 +4752,7 @@ enum JobLifetime {
 /// Its presence is what makes a command a background job: a command without
 /// one reads EOF from a null stdin.
 struct StdinAlerts {
-    tx: Sender<JobAlert>,
+    tx: EventSender,
     task_id: String,
     script: String,
 }
@@ -5146,7 +4762,7 @@ impl StdinAlerts {
         debug!(task_id = %self.task_id, "background job is blocked on stdin");
         let _ = self
             .tx
-            .send(JobAlert::StdinBlocked(StdinBlockedJob {
+            .send(ShellEvent::StdinBlocked(StdinBlocked {
                 task_id: self.task_id.clone(),
                 script: self.script.clone(),
             }))
@@ -5159,7 +4775,7 @@ impl StdinAlerts {
         warn!(task_id = %self.task_id, error = %error, "stdin watch failed");
         let _ = self
             .tx
-            .send(JobAlert::StdinProbeFailed(StdinProbeFailedJob {
+            .send(ShellEvent::StdinWatchFailed(StdinWatchFailed {
                 task_id: self.task_id.clone(),
                 script: self.script.clone(),
                 error,
@@ -5303,7 +4919,9 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
             );
             if let JobLifetime::Foreground { alerts } = &lifetime {
                 let _ = alerts
-                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
+                        killed,
+                    )))
                     .await;
             }
         }
@@ -5437,7 +5055,7 @@ impl LocalChild {
 /// after its top-level shell exited.
 ///
 /// A foreground command's surviving descendants are killed and reported in one
-/// [`JobAlert::DescendantsKilled`]; a background job stays running until every
+/// [`ShellEvent::DescendantsKilled`]; a background job stays running until every
 /// descendant has exited, which its timeout, `terminal_kill` and the registry's
 /// kills end by killing the tree.
 async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), TerminalError> {
@@ -5453,7 +5071,9 @@ async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), T
                     "killed descendants of a finished foreground command"
                 );
                 let _ = alerts
-                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
+                        killed,
+                    )))
                     .await;
             }
             Ok(())
@@ -5683,7 +5303,9 @@ async fn record_container_exec_outcome(
                     "killed processes of a finished foreground container command"
                 );
                 let _ = alerts
-                    .send(JobAlert::DescendantsKilled(DescendantsKilled::new(killed)))
+                    .send(ShellEvent::DescendantsKilled(DescendantsKilled::new(
+                        killed,
+                    )))
                     .await;
             }
             if !output.stdout.is_empty() {
@@ -7144,7 +6766,7 @@ mod tests {
         result.render_for_model()
     }
 
-    fn started_task_id(receiver: &BackgroundTaskReceiver) -> String {
+    fn started_task_id(receiver: &ShellEvents) -> String {
         let started = receiver.take_started();
         assert_eq!(started.len(), 1, "expected one started-task event");
         started[0].task_id.clone()
@@ -7323,9 +6945,9 @@ mod tests {
     }
 
     async fn wait_for_completed_task(
-        receiver: &BackgroundTaskReceiver,
+        receiver: &ShellEvents,
         task_id: &str,
-    ) -> CompletedTask {
+    ) -> JobEnded {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(task) = receiver
@@ -8100,7 +7722,7 @@ mod tests {
         assert_eq!(ids.leased(), ["alfa", "bravo"]);
         assert_eq!(started.task_id, "alfa");
         assert_eq!(started.output_file.url, "outputs/bravo.txt");
-        receiver.recv().await.expect("the job completes");
+        receiver.recv_completed().await.expect("the job completes");
 
         let child = terminal
             .subagent_without_grant()
@@ -8219,7 +7841,7 @@ mod tests {
         assert_eq!(started.task_id, "river");
         assert_eq!(started.output_file.url, "outputs/stone.txt");
 
-        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv_completed())
             .await
             .expect("the job should deliver its completion")
             .expect("the completion channel stays open");
@@ -8468,7 +8090,7 @@ mod tests {
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
-                alerts: async_channel::unbounded().0,
+                alerts: event_channel().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
             network: NetworkSettings::default(),
@@ -8575,7 +8197,7 @@ mod tests {
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
-                alerts: async_channel::unbounded().0,
+                alerts: event_channel().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
             network: NetworkSettings::default(),
@@ -8702,7 +8324,7 @@ mod tests {
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
-                alerts: async_channel::unbounded().0,
+                alerts: event_channel().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
             network: NetworkSettings::default(),
@@ -9212,7 +8834,7 @@ mod tests {
 
         // The agent's receiver is the gate: the completion it receives is
         // held, not yet taken, while the host reads the registry.
-        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+        let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv_completed())
             .await
             .expect("the job should deliver its completion")
             .expect("the completion channel stays open");
@@ -9614,7 +9236,7 @@ mod tests {
 
     /// Collects the alerts that arrive within `window`.
     #[cfg(unix)]
-    async fn alerts_within(receiver: &BackgroundTaskReceiver, window: Duration) -> Vec<JobAlert> {
+    async fn alerts_within(receiver: &ShellEvents, window: Duration) -> Vec<ShellEvent> {
         let deadline = std::time::Instant::now() + window;
         let mut alerts = Vec::new();
         while std::time::Instant::now() < deadline {
@@ -9692,7 +9314,7 @@ mod tests {
             crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let (alert_tx, _alert_rx) = async_channel::unbounded();
+        let (alert_tx, _alert_rx) = event_channel();
         let (_pid, output) = execute_container_background(ContainerBackgroundExecution {
             executor: executor_core::tokio::TokioGlobal,
             env_source: &None,
@@ -9854,7 +9476,7 @@ mod tests {
         .expect("the relay reports ready");
         let fifo_path = job_fifo.path().clone();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let (alert_tx, _alert_rx) = async_channel::unbounded();
+        let (alert_tx, _alert_rx) = event_channel();
         execute_container_background(ContainerBackgroundExecution {
             executor: executor_core::tokio::TokioGlobal,
             env_source: &None,
@@ -9911,7 +9533,7 @@ mod tests {
         assert!(
             matches!(
                 alerts.as_slice(),
-                [JobAlert::StdinBlocked(job)] if job.task_id == task_id
+                [ShellEvent::StdinBlocked(job)] if job.task_id == task_id
             ),
             "a blocked reader must yield exactly one stdin alert: {alerts:?}"
         );
@@ -10326,7 +9948,7 @@ mod tests {
         .await;
         let alerts = receiver.take_job_alerts();
         match alerts.as_slice() {
-            [JobAlert::DescendantsKilled(killed)] => {
+            [ShellEvent::DescendantsKilled(killed)] => {
                 assert_eq!(killed.omitted, 0);
                 // The name is read after the freeze, once the child exec'd.
                 assert_eq!(
@@ -10842,7 +10464,7 @@ mod tests {
         };
         assert_eq!(alerts.len(), 1);
         assert!(
-            matches!(&alerts[0], JobAlert::LongRunning(job) if job.task_id == task_id),
+            matches!(&alerts[0], ShellEvent::LongRunning(job) if job.task_id == task_id),
             "expected the long-running alert for the job: {alerts:?}"
         );
         assert!(
@@ -14774,19 +14396,19 @@ mod tests {
 
     /// Job alerts the monitor produces until `ended` or `duration` passes.
     async fn monitor_alerts(
-        receiver: &BackgroundTaskReceiver,
+        receiver: &ShellEvents,
         duration: Duration,
-    ) -> Vec<JobAlert> {
+    ) -> Vec<ShellEvent> {
         let deadline = std::time::Instant::now() + duration;
         let mut alerts = Vec::new();
         while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-            let Some(event) = receiver.recv_event_timeout(remaining).await else {
+            let Some(alert) = receiver.recv_timeout(remaining).await else {
                 break;
             };
-            let BackgroundTaskEvent::Alert(alert) = event else {
+            if matches!(alert, ShellEvent::JobEnded(_) | ShellEvent::JobStarted(_)) {
                 continue;
-            };
-            let ended = matches!(alert, JobAlert::MonitorEnded(_));
+            }
+            let ended = matches!(alert, ShellEvent::MonitorEnded(_));
             alerts.push(alert);
             if ended {
                 break;
@@ -14834,7 +14456,7 @@ mod tests {
         let increments: Vec<&[String]> = alerts
             .iter()
             .filter_map(|alert| match alert {
-                JobAlert::MonitorIncrement(increment) => Some(increment.lines.as_slice()),
+                ShellEvent::MonitorIncrement(increment) => Some(increment.lines.as_slice()),
                 _ => None,
             })
             .collect();
@@ -14849,7 +14471,7 @@ mod tests {
         assert!(
             alerts.iter().any(|alert| matches!(
                 alert,
-                JobAlert::MonitorEnded(ended)
+                ShellEvent::MonitorEnded(ended)
                     if matches!(ended.end, MonitorEnd::Exited { exit_code: 0 })
             )),
             "the monitor reports the command's exit: {alerts:?}"
@@ -14883,7 +14505,7 @@ mod tests {
         let lines: Vec<&String> = alerts
             .iter()
             .filter_map(|alert| match alert {
-                JobAlert::MonitorIncrement(increment) => Some(&increment.lines),
+                ShellEvent::MonitorIncrement(increment) => Some(&increment.lines),
                 _ => None,
             })
             .flatten()
@@ -14899,7 +14521,7 @@ mod tests {
         assert!(
             alerts.iter().any(|alert| matches!(
                 alert,
-                JobAlert::MonitorEnded(ended)
+                ShellEvent::MonitorEnded(ended)
                     if matches!(&ended.end, MonitorEnd::StopMatched { line } if line == "keep two")
             )),
             "the first stop_on match ends the monitor: {alerts:?}"
@@ -14932,7 +14554,7 @@ mod tests {
         assert!(
             alerts.iter().any(|alert| matches!(
                 alert,
-                JobAlert::MonitorEnded(ended) if matches!(ended.end, MonitorEnd::TimedOut)
+                ShellEvent::MonitorEnded(ended) if matches!(ended.end, MonitorEnd::TimedOut)
             )),
             "the deadline kills the run and reports a timeout: {alerts:?}"
         );
@@ -14960,7 +14582,7 @@ mod tests {
         let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
         let stalls = alerts
             .iter()
-            .filter(|alert| matches!(alert, JobAlert::MonitorStalled(_)))
+            .filter(|alert| matches!(alert, ShellEvent::MonitorStalled(_)))
             .count();
         assert_eq!(stalls, 1, "a stall is reported once: {alerts:?}");
     }
@@ -15026,7 +14648,7 @@ mod tests {
         let lines: Vec<&String> = alerts
             .iter()
             .filter_map(|alert| match alert {
-                JobAlert::MonitorIncrement(increment) => Some(&increment.lines),
+                ShellEvent::MonitorIncrement(increment) => Some(&increment.lines),
                 _ => None,
             })
             .flatten()

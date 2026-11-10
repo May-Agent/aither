@@ -4,8 +4,8 @@
 //! Following a running command or a growing log used to mean polling: sleep,
 //! read, sleep, read. `monitor` runs the source as an ordinary background
 //! job — same sandbox, same PID-only kills, `terminal_kill` reaches it — and
-//! a pump feeds its new output to the agent through [`JobAlert`], which
-//! merges increments into the next turn boundary and wakes an idle agent.
+//! a pump raises its new output as [`ShellEvent::MonitorIncrement`] facts,
+//! which the embedder merges into its agent's next turn boundary.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -22,7 +22,8 @@ use crate::limits::LiveDuration;
 use crate::wording::{MonitorStarted, Refused};
 use crate::output::MediaResolution;
 use crate::policy::SandboxMode;
-use crate::terminal::{Configured, JobAlert, ShellArgs, TerminalTool};
+use crate::events::{EventSender, ShellEvent};
+use crate::terminal::{Configured, ShellArgs, TerminalTool};
 
 /// What an embedder decides about monitoring: the tool's name and description
 /// and the bounds of a watch. The bounds are live, so changing one reaches
@@ -179,7 +180,7 @@ struct Watch {
     /// completion the agent took first still leaves the pump its status.
     held: Option<crate::job_registry::JobWatch>,
     registry: JobRegistry,
-    alerts: async_channel::Sender<JobAlert>,
+    alerts: EventSender,
     interval: Duration,
     deadline: Instant,
     stall: Option<Duration>,
@@ -189,7 +190,7 @@ struct Watch {
 }
 
 /// The native `monitor` tool: starts the watched source as a background job
-/// and a pump that delivers its increments through [`JobAlert`].
+/// and a pump that raises its increments as [`ShellEvent`]s.
 pub struct MonitorTool<E> {
     terminal: TerminalTool<E, Configured>,
     settings: MonitorSettings,
@@ -374,7 +375,7 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
             held: registry.watch(&task_id).await,
             task_id: task_id.clone(),
             registry,
-            alerts: self.terminal.job_alert_sender(),
+            alerts: self.terminal.event_sender(),
             interval: Duration::from_secs(interval_secs),
             deadline: Instant::now() + Duration::from_secs(args.timeout_secs),
             stall: args.stall_secs.map(Duration::from_secs),
@@ -402,7 +403,7 @@ fn drain_lines(buffer: &mut Vec<u8>) -> Vec<String> {
         .collect()
 }
 
-async fn send(alerts: &async_channel::Sender<JobAlert>, alert: JobAlert) {
+async fn send(alerts: &EventSender, alert: ShellEvent) {
     let _ = alerts.send(alert).await;
 }
 
@@ -449,7 +450,7 @@ async fn watch_task(watch: Watch) {
                     last_output = now;
                     send(
                         &alerts,
-                        JobAlert::MonitorIncrement(MonitorIncrement {
+                        ShellEvent::MonitorIncrement(MonitorIncrement {
                             task_id: task_id.clone(),
                             lines,
                         }),
@@ -484,7 +485,7 @@ async fn watch_task(watch: Watch) {
         if let Some(end) = end {
             send(
                 &alerts,
-                JobAlert::MonitorEnded(MonitorEnded { task_id, end }),
+                ShellEvent::MonitorEnded(MonitorEnded { task_id, end }),
             )
             .await;
             return;
@@ -493,7 +494,7 @@ async fn watch_task(watch: Watch) {
             stalled = true;
             send(
                 &alerts,
-                JobAlert::MonitorStalled(MonitorStalled {
+                ShellEvent::MonitorStalled(MonitorStalled {
                     task_id: task_id.clone(),
                     stall_secs: stall.map_or(0, |s| s.as_secs()),
                 }),

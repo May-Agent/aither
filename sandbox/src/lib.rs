@@ -60,6 +60,7 @@ mod command_set;
 mod container;
 #[cfg(all(unix, feature = "jobserver"))]
 mod container_jobserver;
+mod events;
 mod foreground_wait;
 mod heel_binary;
 mod interpreter;
@@ -136,6 +137,9 @@ pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
 };
+pub use events::{
+    JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked, StdinWatchFailed,
+};
 pub use foreground_wait::ForegroundWait;
 /// Re-export of heel's rolling network audit log for terminal-tool configuration.
 pub use heel::NetworkAuditLog;
@@ -196,12 +200,10 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
-    CompletedTask, Configured, DescendantsKilled, DirectoryResetReason, JobAlert, LongRunningJob,
-    ShellArgs, StartedBackgroundTask, StdinBlockedJob, StdinProbeFailedJob, TerminalBinding,
-    TerminalError, TerminalRunError, TerminalRunner, TerminalScript, TerminalTool,
-    TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
-    background_task_channel, open_network_audit_log,
+    CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, ShellArgs,
+    TerminalBinding, TerminalError, TerminalRunError, TerminalRunner, TerminalScript,
+    TerminalTool, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
+    open_network_audit_log,
 };
 pub use tool_distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,

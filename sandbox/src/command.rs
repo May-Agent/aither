@@ -820,7 +820,7 @@ impl std::fmt::Debug for DynTerminalToolEntry {
 /// A type-erased terminal capability bundle for child agents.
 pub struct DynTerminalTool {
     pub(crate) entries: Vec<DynTerminalToolEntry>,
-    pub(crate) background_receiver: crate::terminal::BackgroundTaskReceiver,
+    pub(crate) events: crate::ShellEvents,
     pub(crate) kept_receiver: KeptExchangeReceiver,
     pub(crate) job_registry: crate::job_registry::JobRegistry,
     pub(crate) working_dir: PathBuf,
@@ -836,10 +836,10 @@ pub struct DynTerminalTool {
 }
 
 impl DynTerminalTool {
-    /// Returns the receiver for background terminal completions.
+    /// Returns the facts about the terminal's jobs.
     #[must_use]
-    pub fn background_receiver(&self) -> crate::terminal::BackgroundTaskReceiver {
-        self.background_receiver.clone()
+    pub fn events(&self) -> crate::ShellEvents {
+        self.events.clone()
     }
 
     /// Returns the receiver for the terminal calls whose kept commands
