@@ -1216,7 +1216,16 @@ impl PreparedTools<PathBuf> {
             .map(|path| {
                 let bin_dir = &bin_dir;
                 async move {
-                    let canonical = async_fs::canonicalize(path).await?;
+                    // A grant that no longer exists cannot contain the tool directory.
+                    let canonical = match async_fs::canonicalize(&path).await {
+                        Ok(canonical) => canonical,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(());
+                        }
+                        Err(source) => {
+                            return Err(ToolRuntimeError::GrantPath { path, source });
+                        }
+                    };
                     if bin_dir.starts_with(&canonical) || canonical.starts_with(bin_dir) {
                         return Err(ToolRuntimeError::WritableToolDirectory(canonical));
                     }
@@ -1515,6 +1524,14 @@ pub enum ToolRuntimeError {
     /// Agent write permissions would expose managed executable contents.
     #[error("managed tool directory overlaps a writable sandbox path: {0}")]
     WritableToolDirectory(PathBuf),
+    /// A writable grant could not be resolved.
+    #[error("cannot resolve writable path {}: {source}", path.display())]
+    GrantPath {
+        /// The grant that failed to resolve.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        source: std::io::Error,
+    },
     /// No artifact set supports the probed platform.
     #[error("unsupported tool target: {os}/{arch}")]
     UnsupportedTarget {
