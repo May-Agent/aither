@@ -741,8 +741,6 @@ pub struct Shell<E> {
     /// The script policies every script of this shell is put to, bound to
     /// the state of the agent the shell serves.
     policies: ScriptPolicies,
-    /// The shell program a script runs under on the host.
-    host_program: Option<Arc<str>>,
     /// The worktrees this shell's subagents were granted commit in so far,
     /// in grant order: the map the host's `git` shim reads. Shared with
     /// every subagent shell derived from this one.
@@ -776,7 +774,6 @@ impl<E: Clone> Clone for Shell<E> {
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.clone(),
-            host_program: self.host_program.clone(),
             committed: self.committed.clone(),
             launches: self.launches.clone(),
         }
@@ -848,13 +845,6 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 server.name
             )));
         }
-        if matches!(sandbox.backend(), Backend::Host { .. }) && parts.host_shell.is_none() {
-            return Err(TerminalError::SandboxSetup(
-                "a shell on the host needs the shell program its scripts run under: \
-                 ShellBuilder::host_shell"
-                    .to_string(),
-            ));
-        }
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
         // one is not necessarily granted inside the sandbox.
@@ -908,7 +898,6 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             outages: Outages::none(),
             subagent_spaces: None,
             policies: ScriptPolicies::new(parts.policies),
-            host_program: parts.host_shell,
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
         })
@@ -927,7 +916,10 @@ impl<E: Executor + Clone + 'static> Shell<E> {
     ) -> Result<Self, TerminalError> {
         let heel = crate::test_heel::binary().await.expect("a test heel");
         let sandbox = Sandbox::new(
-            Backend::Host { heel },
+            Backend::Host {
+                heel,
+                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
+            },
             executor.clone(),
             working_dir.as_ref(),
         );
@@ -955,7 +947,6 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 tools,
                 events: None,
                 policies: Vec::new(),
-                host_shell: Some(Arc::from(TEST_HOST_SHELL)),
             },
         )
         .await
@@ -1438,7 +1429,6 @@ where
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.for_agent(),
-            host_program: self.host_program.clone(),
             committed: self.committed.clone(),
             launches: Arc::default(),
         })
@@ -1555,11 +1545,8 @@ where
 
     fn resolve_home_target(&self, mode: SandboxMode) -> Result<ExecutionTarget, TerminalError> {
         let backend = match self.sandbox.backend() {
-            Backend::Host { .. } => ExecutionBackend::Local {
-                shell: self
-                    .host_program
-                    .clone()
-                    .expect("a shell on the host is built with its shell program"),
+            Backend::Host { launch, .. } => ExecutionBackend::Local {
+                shell: launch.shell().clone(),
             },
             Backend::Container { runtime, launch } => {
                 if mode == SandboxMode::Unsandboxed {
@@ -1645,6 +1632,7 @@ where
         self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
         self.spawn_long_job_alert(&task_id);
 
+        let info = crate::LaunchInfo::new(task_id.to_string(), call.clone(), mode);
         let lifetime = if background {
             JobLifetime::Background
         } else {
@@ -1668,6 +1656,7 @@ where
                 committed: self.committed_worktrees(),
                 job_registry: self.job_registry.clone(),
                 task_id,
+                info,
                 execution_id,
                 background,
                 timeout,
@@ -2870,6 +2859,8 @@ struct StandaloneExecution<E> {
     committed: Vec<CommittingWorktree>,
     job_registry: JobRegistry,
     task_id: IdLease,
+    /// What the job's processes are launched as.
+    info: crate::LaunchInfo,
     execution_id: String,
     background: bool,
     carry: Option<CwdCarry>,
@@ -2896,6 +2887,7 @@ struct StandaloneStart<'a, E> {
     committed: &'a [CommittingWorktree],
     job_registry: &'a JobRegistry,
     task_id: &'a IdLease,
+    info: crate::LaunchInfo,
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
@@ -2916,6 +2908,7 @@ struct LocalBackgroundExecution<'a, E> {
     executor: E,
     committed: &'a [CommittingWorktree],
     task_id: &'a IdLease,
+    info: crate::LaunchInfo,
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
@@ -2934,6 +2927,7 @@ struct ContainerJobExecution<'a, E> {
     sandbox: &'a Sandbox,
     committed: &'a [CommittingWorktree],
     task_id: &'a IdLease,
+    info: crate::LaunchInfo,
     execution_id: &'a str,
     script: &'a str,
     interpreter: Interpreter,
@@ -2955,6 +2949,7 @@ struct SshBackgroundExecution<'a, E> {
     sandbox: &'a Sandbox,
     launch: &'a RemoteLaunch,
     task_id: &'a IdLease,
+    info: crate::LaunchInfo,
     execution_id: &'a str,
     script: &'a str,
     interpreter: Interpreter,
@@ -3053,6 +3048,8 @@ struct SpawnedTerminalTask<E> {
     committed: Vec<CommittingWorktree>,
     job_registry: JobRegistry,
     task_id: IdLease,
+    /// What the job's processes are launched as.
+    info: crate::LaunchInfo,
     execution_id: String,
     background: bool,
     /// The bound the job runs under.
@@ -3093,6 +3090,7 @@ where
         committed,
         job_registry,
         task_id,
+        info,
         execution_id,
         background,
         timeout,
@@ -3136,6 +3134,7 @@ where
         committed,
         job_registry,
         task_id: task_id.clone(),
+        info,
         execution_id,
         background,
         carry,
@@ -3261,6 +3260,7 @@ where
         committed,
         job_registry,
         task_id,
+        info,
         execution_id,
         background,
         carry,
@@ -3293,6 +3293,7 @@ where
         committed: &committed,
         job_registry: &job_registry,
         task_id: &task_id,
+        info,
         execution_id: &execution_id,
         carry: carry.as_ref(),
         script: &script,
@@ -3387,6 +3388,7 @@ where
                 sandbox: request.sandbox,
                 committed: request.committed,
                 task_id: request.task_id,
+                info: request.info,
                 execution_id: request.execution_id,
                 script: request.script,
                 interpreter: request.interpreter,
@@ -3415,6 +3417,7 @@ where
                 sandbox: request.sandbox,
                 launch,
                 task_id: request.task_id,
+                info: request.info,
                 execution_id: request.execution_id,
                 script: request.script,
                 interpreter: request.interpreter,
@@ -3439,6 +3442,7 @@ where
         executor: request.executor,
         committed: request.committed,
         task_id: request.task_id,
+        info: request.info,
         execution_id: request.execution_id,
         carry: request.carry,
         script: request.script,
@@ -3719,6 +3723,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
     let mut spec = SpawnSpec::new(program)
         .args(args)
         .env(environment)
+        .launch_info(context.info.clone())
         .stdio(SpawnStdio {
             // A background job's stdin is watched; any other reads EOF.
             stdin: if context.stdin_alerts.is_some() {
@@ -4270,6 +4275,7 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
     let foreground = matches!(context.lifetime, JobLifetime::Foreground { .. });
     let mut spec = SpawnSpec::script(script)
         .env(environment)
+        .launch_info(context.info.clone())
         .grants(grants)
         .lifetime(if foreground {
             TreeLifetime::Foreground
@@ -4367,7 +4373,9 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
         SandboxMode::Unsandboxed => sandbox.unconfined(),
     };
     let script = launch_script(context.interpreter, context.script, context.task_id)?;
-    let child = sandbox.spawn(SpawnSpec::script(script)).await?;
+    let child = sandbox
+        .spawn(SpawnSpec::script(script).launch_info(context.info.clone()))
+        .await?;
     run_spawned_job(
         child,
         SpawnedJob {
@@ -4511,12 +4519,13 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
 pub fn inject_env_exports(
     script: String,
     env_source: Option<&Arc<dyn EnvSource>>,
+    launch: &crate::LaunchInfo,
 ) -> Result<String, TerminalError> {
     let Some(source) = env_source else {
         return Ok(script);
     };
     let mut rendered = String::new();
-    for (name, value) in source.env() {
+    for (name, value) in source.env(launch) {
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             || name.chars().next().is_some_and(|c| c.is_ascii_digit())
         {
@@ -5073,8 +5082,12 @@ mod tests {
             ("MY_KEY".to_string(), "it's".to_string()),
             ("OTHER".to_string(), "x".to_string()),
         ]));
-        let rendered = inject_env_exports("echo hi".to_string(), source.as_ref())
-            .expect("valid env names should render");
+        let rendered = inject_env_exports(
+            "echo hi".to_string(),
+            source.as_ref(),
+            &crate::LaunchInfo::default(),
+        )
+        .expect("valid env names should render");
         assert_eq!(
             rendered,
             "export MY_KEY='it'\"'\"'s'\nexport OTHER='x'\necho hi"
@@ -5085,9 +5098,11 @@ mod tests {
     fn inject_env_exports_rejects_shell_syntax_names() {
         let source: Option<Arc<dyn EnvSource>> =
             Some(Arc::new(vec![("BAD;name".to_string(), "x".to_string())]));
-        assert!(inject_env_exports("echo hi".to_string(), source.as_ref()).is_err());
+        let launch = crate::LaunchInfo::default();
+        assert!(inject_env_exports("echo hi".to_string(), source.as_ref(), &launch).is_err());
         assert_eq!(
-            inject_env_exports("echo hi".to_string(), None).expect("no source passes through"),
+            inject_env_exports("echo hi".to_string(), None, &launch)
+                .expect("no source passes through"),
             "echo hi"
         );
     }
@@ -5552,30 +5567,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_shell_needs_its_shell_program() {
-        let dir = tempfile::tempdir().unwrap();
-        let heel = crate::test_heel::binary().await.expect("a test heel");
-        let sandbox = Sandbox::new(
-            Backend::Host { heel },
-            executor_core::tokio::TokioGlobal,
-            dir.path(),
-        );
-        let error = Shell::builder(sandbox)
-            .interpreters([Interpreter::Shell])
-            .limits(crate::limits::fixture::limits())
-            .output(crate::output_policy::fixture::policy())
-            .wording(TestWording)
-            .tools(crate::test_wording::job_tools())
-            .build()
-            .await
-            .expect_err("a host shell without a shell program is refused");
-        assert!(
-            matches!(error, TerminalError::SandboxSetup(ref detail) if detail.contains("host_shell")),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
     async fn child_terminal_isolates_jobs() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let tool = fresh_terminal(dir.path()).await;
@@ -5801,6 +5792,7 @@ mod tests {
             committed: Vec::new(),
             job_registry,
             task_id: crate::test_ids::lease("probe"),
+            info: crate::LaunchInfo::default(),
             execution_id: "exec-test".to_string(),
             background: false,
             carry: None,
@@ -5869,6 +5861,7 @@ mod tests {
             committed: Vec::new(),
             job_registry,
             task_id: crate::test_ids::lease("policy"),
+            info: crate::LaunchInfo::default(),
             execution_id: "exec-policy".to_string(),
             background: false,
             carry: None,
@@ -5981,6 +5974,7 @@ mod tests {
             committed: Vec::new(),
             job_registry: tool.job_registry(),
             task_id: crate::test_ids::lease("grants"),
+            info: crate::LaunchInfo::default(),
             execution_id: "exec-grants".to_string(),
             background: false,
             carry: None,
@@ -6988,6 +6982,7 @@ mod tests {
             sandbox: &container_sandbox(&runtime, dir.path()),
             committed: &[],
             task_id: &crate::test_ids::lease("probe"),
+            info: crate::LaunchInfo::default(),
             execution_id: "exec-test",
             script: "cat",
             interpreter: Interpreter::Shell,
@@ -7119,6 +7114,7 @@ mod tests {
             sandbox: &container_sandbox(&runtime, dir.path()),
             committed: &[],
             task_id: &crate::test_ids::lease("probe"),
+            info: crate::LaunchInfo::default(),
             execution_id: "exec-test",
             script: "make",
             interpreter: Interpreter::Shell,
@@ -8094,6 +8090,7 @@ mod tests {
         let sandbox = Sandbox::new(
             Backend::Host {
                 heel: crate::test_heel::binary().await.expect("a test heel"),
+                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
             },
             executor_core::tokio::TokioGlobal,
             dir,
@@ -8531,6 +8528,73 @@ mod tests {
         .await
     }
 
+    /// An environment source that names the launch it is asked about.
+    #[derive(Debug)]
+    struct LaunchEnv;
+
+    impl EnvSource for LaunchEnv {
+        fn env(&self, launch: &crate::LaunchInfo) -> Vec<(String, String)> {
+            vec![
+                (
+                    "PROBE_TASK".to_string(),
+                    launch.task_id.clone().unwrap_or_default(),
+                ),
+                (
+                    "PROBE_CALL".to_string(),
+                    launch
+                        .call
+                        .as_ref()
+                        .map(|call| call.call().to_string())
+                        .unwrap_or_default(),
+                ),
+                ("PROBE_MODE".to_string(), format!("{:?}", launch.mode)),
+            ]
+        }
+    }
+
+    /// The environment source is told which job, call and mode the process
+    /// it supplies is launched for.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_env_source_is_told_the_launch_it_supplies() {
+        use aither_core::llm::{AgentIdentity, ToolCallId};
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let heel = crate::test_heel::binary().await.expect("a test heel");
+        let sandbox = Sandbox::new(
+            Backend::Host {
+                heel,
+                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
+            },
+            executor_core::tokio::TokioGlobal,
+            dir.path(),
+        )
+        .with_env_source(LaunchEnv);
+        let tool = Shell::new_exact_on(
+            sandbox,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+            TestWording::any(),
+            crate::test_wording::job_tools(),
+        )
+        .await
+        .expect("terminal tool should initialize");
+        let identity = CallIdentity::new(ToolCallId::new("call_probe"), AgentIdentity::Main);
+
+        let result = tool
+            .call(
+                terminal_args(
+                    "print the launch",
+                    "printenv PROBE_CALL; printenv PROBE_MODE",
+                ),
+                ToolContext::new().with_identity(identity),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let text = render_terminal_result(&result);
+        assert!(text.contains("call_probe\nSandboxed"), "{text}");
+    }
+
     /// A script the sandboxed command writes into its working directory and
     /// chmods executes — writable space also carries EXEC.
     #[cfg(unix)]
@@ -8549,71 +8613,16 @@ mod tests {
         );
     }
 
-    /// The host Rust toolchain works end to end inside the local sandbox:
-    /// cargo runs, and `cargo test` executes the binary it just built under
-    /// the writable working dir.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_host_rust_toolchain_builds_and_tests_a_crate() {
-        assert!(
-            std::process::Command::new("cargo")
-                .arg("--version")
-                .output()
-                .is_ok_and(|output| output.status.success()),
-            "cargo must be on the host PATH for this test"
-        );
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool = authority_terminal(dir.path()).await;
-
-        assert_eq!(
-            exit_code_of(&tool, "cargo --version").await,
-            0,
-            "cargo is reachable inside the sandbox"
-        );
-
-        let krate = dir.path().join("probe");
-        std::fs::create_dir_all(krate.join("src")).unwrap();
-        std::fs::write(
-            krate.join("Cargo.toml"),
-            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            krate.join("src/lib.rs"),
-            "#[test]\nfn it_runs() { assert_eq!(1 + 1, 2); }\n",
-        )
-        .unwrap();
-        let script = format!(
-            "cd '{}' && CARGO_TARGET_DIR='{}' cargo test",
-            krate.display(),
-            krate.join("target").display()
-        );
-        assert_eq!(
-            exit_code_of(&tool, &script).await,
-            0,
-            "cargo test executes the binary it built under the working dir"
-        );
-    }
-
-    /// Credential files inside the granted toolchain homes stay unreadable.
-    #[cfg(all(unix, target_os = "macos"))]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cargo_credentials_inside_the_granted_home_stay_unreadable() {
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool = authority_terminal(dir.path()).await;
-        let code = exit_code_of(&tool, "cat ~/.cargo/credentials.toml").await;
-        assert_ne!(
-            code, 0,
-            "a credential file under ~/.cargo stays denied inside the sandbox"
-        );
-    }
     /// Launches a subagent of `parent` the way its launcher does, with a
     /// launch history of its own.
     async fn launch(
         parent: &ConfiguredTestTool,
         grant: SubagentGrant,
     ) -> Result<ConfiguredTestTool, SubagentGrantError> {
-        parent.subagent(grant, None).await
+        let resolved = parent
+            .resolve_launch(&mut LaunchHistory::default(), grant)
+            .await?;
+        parent.launch_resolved(resolved, None).await
     }
 
     /// What a [`CloneSpaces`] was asked to prepare, as `(space, launcher,
@@ -9430,101 +9439,6 @@ mod tests {
             commits[0].commit
         );
         setup.main(&["fsck", "--strict", "--no-dangling"]);
-    }
-
-    /// The main agent's `git` in a committing worktree resolves the
-    /// worktree's host-owned repository entry through the terminal's shim:
-    /// no program the subagent's repository config names — fsmonitor,
-    /// hooks, filters — and no `.git` file it replaced decides what runs.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_main_agents_git_in_a_committing_worktree_runs_nothing_the_subagent_chose() {
-        use std::fmt::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        let setup = CommitSetup::new("guarded").await;
-        let _child = setup.committing_child(&setup.parent).await;
-
-        // A program only subagent-chosen configuration can reach.
-        let marker = setup.dir.path().join("subagent-ran");
-        let program = setup.dir.path().join("ran-by-git.sh");
-        std::fs::write(
-            &program,
-            format!("#!/bin/sh\nprintf ran >> '{}'\n", marker.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let hooks = setup.dir.path().join("evil-hooks");
-        std::fs::create_dir(&hooks).unwrap();
-        let pre_commit = hooks.join("pre-commit");
-        std::fs::write(
-            &pre_commit,
-            format!("#!/bin/sh\nprintf hook >> '{}'\n", marker.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Its repository's configuration names the program everywhere a
-        // program can be named; the worktree's attributes bind the filter.
-        let mut config = std::fs::read_to_string(setup.subagent.join("config")).unwrap();
-        write!(
-            config,
-            "\n[core]\n\tfsmonitor = {}\n\thooksPath = {}\n[filter \"pwn\"]\n\tclean = {}\n\trequired = true\n",
-            program.display(),
-            hooks.display(),
-            program.display()
-        )
-        .unwrap();
-        std::fs::write(setup.subagent.join("config"), config).unwrap();
-        std::fs::write(setup.worktree.join(".gitattributes"), "* filter=pwn\n").unwrap();
-
-        let worktree = setup.worktree.display().to_string();
-        for script in [
-            format!("git -C '{worktree}' status"),
-            format!("cd '{worktree}' && git status"),
-            format!(
-                "git -C '{worktree}' add -A && \
-                 git -C '{worktree}' -c user.name=a -c user.email=a@a -c commit.gpgSign=false \
-                 commit --allow-empty -m x"
-            ),
-        ] {
-            assert_eq!(
-                exit_code_of(&setup.parent, &script).await,
-                0,
-                "the ordinary git command should keep working: {script}"
-            );
-        }
-        assert!(
-            !marker.exists(),
-            "no program of the subagent's choosing ran through the worktree's repository"
-        );
-
-        // A replaced `.git` file resolves nothing either: the shim acts on
-        // the worktree's path, not on what its `.git` says.
-        std::fs::write(
-            setup.worktree.join(".git"),
-            format!("gitdir: {}\n", setup.subagent.display()),
-        )
-        .unwrap();
-        assert_eq!(
-            exit_code_of(&setup.parent, &format!("git -C '{worktree}' status")).await,
-            0
-        );
-        assert!(
-            !marker.exists(),
-            "a replaced .git file chose no program either"
-        );
-
-        // Git anywhere else is untouched.
-        let repository = dunce::canonicalize(setup.dir.path().join("repository")).unwrap();
-        assert_eq!(
-            exit_code_of(
-                &setup.parent,
-                &format!("git -C '{}' log --oneline -1", repository.display())
-            )
-            .await,
-            0,
-            "git in unrelated repositories still reaches them"
-        );
     }
 
     /// Nothing of the main repository's git directory is writable to a

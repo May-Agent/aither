@@ -12,7 +12,9 @@ use heel::{
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
 use super::domain::DomainGate;
 use super::stdio::{read_chunks, write_chunks};
-use super::{Backend, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio};
+use super::{
+    Backend, LaunchInfo, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio,
+};
 #[cfg(target_os = "linux")]
 use crate::process_tree::JobProcess;
 use crate::process_tree::{JobMarker, JobTree};
@@ -102,7 +104,7 @@ struct Launch {
 impl Sandbox {
     fn heel_binary(&self) -> Result<&heel::HeelBinary, SpawnError> {
         match &self.inner.backend {
-            Backend::Host { heel } => Ok(heel),
+            Backend::Host { heel, .. } => Ok(heel),
             Backend::Container { .. } | Backend::Ssh { .. } => Err(SpawnError::Setup(
                 "a local spawn needs the host backend".into(),
             )),
@@ -119,10 +121,14 @@ impl Sandbox {
 
     /// The environment of a host spawn: the sandbox's own, its source's, then
     /// the spec's, each overriding the one before.
-    fn host_environment(&self, spec_env: Vec<(String, String)>) -> Vec<(String, String)> {
+    fn host_environment(
+        &self,
+        spec_env: Vec<(String, String)>,
+        info: &LaunchInfo,
+    ) -> Vec<(String, String)> {
         let mut env = self.inner.environment.clone();
         if let Some(source) = &self.inner.env_source {
-            env.extend(source.env());
+            env.extend(source.env(info));
         }
         env.extend(spec_env);
         env
@@ -241,6 +247,7 @@ impl Sandbox {
             grants: extra_grants,
             ipc,
             lifetime,
+            info,
         } = spec;
         // A process on the host is a program: only a container or a server
         // has a managed shell to run a script in.
@@ -261,7 +268,7 @@ impl Sandbox {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let marker = JobMarker::new();
-        let mut env = self.host_environment(env);
+        let mut env = self.host_environment(env, &info);
         env.push(marker.entry());
         let launch = Launch {
             program,

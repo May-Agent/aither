@@ -88,6 +88,11 @@ typed-path = "0.12.3"
 aither-connectivity = { workspace = true, optional = true }
 jiff = { version = "0.2.39", default-features = false, features = ["std"] }
 
+# The pinned `heel` of `test_heel`: downloaded and verified when `HEEL_BIN` is unset.
+zenwave = { workspace = true, optional = true, features = ["hyper-backend", "rustls"] }
+sha2 = { version = "0.11", optional = true }
+hex = { version = "0.4.3", optional = true }
+
 # Job memory footprints on Windows.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", default-features = false, features = [
@@ -102,9 +107,9 @@ windows-sys = { version = "0.61", default-features = false, features = [
 default = []
 # Expose `test_git`, git isolated from the host configuration, to dependents' tests.
 test-git = []
-# Expose `test_heel`, the `heel` binary a developer or CI provides, to
-# dependents' tests.
-test-heel = []
+# Expose `test_heel`, the `heel` binary tests run under (`HEEL_BIN`, else the
+# pinned release), to dependents' tests.
+test-heel = ["dep:zenwave", "dep:sha2", "dep:hex"]
 # Expose `test_ids`, id allocators for tests, to dependents' tests.
 test-ids = []
 # Expose `test_budgets`, time and output budgets for tests, to dependents' tests.
@@ -123,6 +128,8 @@ rmp-serde = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 flate2 = "1.1.10"
 hex = "0.4.3"
+sha2 = "0.11"
+zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 
 [lints]

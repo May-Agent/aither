@@ -25,7 +25,8 @@ async fn host_sandbox(working_dir: &Path) -> Sandbox {
     let heel = crate::test_heel::binary()
         .await
         .expect("a heel is available to the tests");
-    Sandbox::new(Backend::Host { heel }, TokioGlobal, working_dir)
+    let launch = crate::HostLaunch::new("/bin/bash");
+    Sandbox::new(Backend::Host { heel, launch }, TokioGlobal, working_dir)
 }
 
 /// The programs of a container whose image the embedder prepared.

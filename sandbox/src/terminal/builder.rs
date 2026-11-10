@@ -27,7 +27,6 @@ pub struct ShellParts {
     pub(crate) tools: ShellToolSettings,
     pub(crate) events: Option<ShellEvents>,
     pub(crate) policies: Vec<AnyScriptPolicy>,
-    pub(crate) host_shell: Option<Arc<str>>,
 }
 
 /// Builds a [`Shell`] on the [`Sandbox`] its scripts run in.
@@ -44,7 +43,6 @@ pub struct ShellBuilder<I, L, O, W, T> {
     tools: T,
     events: Option<ShellEvents>,
     policies: Vec<AnyScriptPolicy>,
-    host_shell: Option<Arc<str>>,
 }
 
 impl Shell<Arc<AnyExecutor>> {
@@ -64,7 +62,6 @@ impl Shell<Arc<AnyExecutor>> {
             tools: Missing,
             events: None,
             policies: Vec::new(),
-            host_shell: None,
         }
     }
 }
@@ -76,15 +73,6 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
     #[must_use]
     pub fn policy(mut self, policy: impl ScriptPolicy) -> Self {
         self.policies.push(AnyScriptPolicy::new(policy));
-        self
-    }
-
-    /// The shell program, a path on the host, that scripts run under when the
-    /// sandbox runs on the host. The embedder prepares it; a shell on a
-    /// container or a server runs the one its launch names.
-    #[must_use]
-    pub fn host_shell(mut self, program: impl Into<Arc<str>>) -> Self {
-        self.host_shell = Some(program.into());
         self
     }
 
@@ -113,7 +101,6 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
-            host_shell: self.host_shell,
         }
     }
 
@@ -129,7 +116,6 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
-            host_shell: self.host_shell,
         }
     }
 
@@ -145,7 +131,6 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
-            host_shell: self.host_shell,
         }
     }
 
@@ -164,7 +149,6 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: self.tools,
             events: self.events,
             policies: self.policies,
-            host_shell: self.host_shell,
         }
     }
 
@@ -184,7 +168,6 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             tools: Given(tools),
             events: self.events,
             policies: self.policies,
-            host_shell: self.host_shell,
         }
     }
 }
@@ -203,8 +186,7 @@ impl
     /// # Errors
     /// Returns an error when the working directory or the output store cannot
     /// be created, when the sandbox runs its processes on an SSH server (a
-    /// server is a location a script names, not a shell's home), or when it
-    /// runs on the host and no [`host_shell`](Self::host_shell) was given.
+    /// server is a location a script names, not a shell's home).
     pub async fn build(self) -> Result<Shell<Arc<AnyExecutor>>, TerminalError> {
         let Self {
             sandbox,
@@ -215,7 +197,6 @@ impl
             tools: Given(tools),
             events,
             policies,
-            host_shell,
         } = self;
         let executor = sandbox.executor();
         Shell::from_parts(
@@ -229,7 +210,6 @@ impl
                 tools,
                 events,
                 policies,
-                host_shell,
             },
         )
         .await
@@ -251,13 +231,15 @@ mod tests {
     ) -> Shell<Arc<AnyExecutor>> {
         let heel = crate::test_heel::binary().await.expect("a heel for tests");
         let sandbox = Sandbox::new(
-            Backend::Host { heel },
+            Backend::Host {
+                heel,
+                launch: crate::HostLaunch::new("/bin/bash"),
+            },
             executor_core::tokio::TokioGlobal,
             directory,
         )
         .with_grants(grants);
         Shell::builder(sandbox)
-            .host_shell("/bin/bash")
             .interpreters(interpreters.iter().copied())
             .limits(test_budgets::limits())
             .output(test_budgets::output_policy())

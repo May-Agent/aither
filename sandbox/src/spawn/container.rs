@@ -10,7 +10,8 @@ use super::ContainerLaunch;
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
 use super::container_ipc::ContainerIpc;
 use super::{
-    EnvSource, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, TreeLifetime,
+    EnvSource, LaunchInfo, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec,
+    TreeLifetime,
 };
 use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
 use crate::terminal::{
@@ -88,12 +89,13 @@ impl Sandbox {
         launch: &ContainerLaunch,
         script: String,
         env: Vec<(String, String)>,
+        info: &LaunchInfo,
     ) -> Result<String, SpawnError> {
         let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
-        let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| failed(&e))?;
-        let script =
-            inject_env_exports(script, self.inner.env_source.as_ref()).map_err(|e| failed(&e))?;
+        let script = inject_env_exports(script, Some(&spec_env), info).map_err(|e| failed(&e))?;
+        let script = inject_env_exports(script, self.inner.env_source.as_ref(), info)
+            .map_err(|e| failed(&e))?;
         let script = launch.wrap_script(&script).map_err(|e| failed(&e))?;
         launch.shell_command(&script).map_err(|e| failed(&e))
     }
@@ -112,9 +114,18 @@ impl Sandbox {
             grants,
             ipc,
             lifetime,
+            info,
         } = spec;
-        let (script, working_dir, ipc) =
-            self.exec_command(runtime, launch, command, env, cwd.as_deref(), grants, ipc)?;
+        let (script, working_dir, ipc) = self.exec_command(
+            runtime,
+            launch,
+            command,
+            env,
+            cwd.as_deref(),
+            grants,
+            ipc,
+            &info,
+        )?;
 
         let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
         let (stdin_tx, stdin_rx) = async_channel::unbounded::<Vec<u8>>();
@@ -203,6 +214,7 @@ impl Sandbox {
         cwd: Option<&std::path::Path>,
         grants: Vec<SpawnGrant>,
         ipc: Option<heel::IpcRouter>,
+        info: &LaunchInfo,
     ) -> Result<(String, ContainerPath, Option<ContainerIpc>), SpawnError> {
         let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let working_dir = match cwd {
@@ -232,7 +244,7 @@ impl Sandbox {
                 shell_words::join(std::iter::once(&program).chain(&args))
             }
         };
-        let script = self.exec_script(launch, script, env)?;
+        let script = self.exec_script(launch, script, env, info)?;
         // A confined process runs in a sandbox rooted at the sandbox's own
         // directory; the directory it was asked to start in is entered inside.
         let script = match (&confinement, cwd.is_some()) {

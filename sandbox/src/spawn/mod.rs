@@ -44,10 +44,10 @@ pub use child::{ChildExit, Descendants, SandboxedChild};
 pub use domain::{
     AnyDomainApprover, ApproveAllDomains, DenyAllDomains, DomainApprover, DomainRequest,
 };
-pub use env::EnvSource;
+pub use env::{EnvSource, LaunchInfo};
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
 pub use host::{LocalSpawn, TreeLifetime, resolved};
-pub use launch::{ContainerLaunch, RemoteLaunch, shell_arguments};
+pub use launch::{ContainerLaunch, HostLaunch, RemoteLaunch, shell_arguments};
 pub use route::{HostRoute, HostRouteError};
 
 use crate::network_policy::CompiledNetworkPolicy;
@@ -156,6 +156,8 @@ pub struct SpawnSpec {
     pub(crate) ipc: Option<heel::IpcRouter>,
     /// Whether the backend ends the processes the top-level one leaves.
     pub(crate) lifetime: TreeLifetime,
+    /// What the launch is, for the sandbox's [`EnvSource`] to read.
+    pub(crate) info: LaunchInfo,
 }
 
 impl std::fmt::Debug for SpawnSpec {
@@ -197,7 +199,16 @@ impl SpawnSpec {
             grants: Vec::new(),
             ipc: None,
             lifetime: TreeLifetime::Background,
+            info: LaunchInfo::default(),
         }
+    }
+
+    /// Says what this launch is, for the sandbox's [`EnvSource`] to read:
+    /// the job, the call and the mode it runs in.
+    #[must_use]
+    pub fn launch_info(mut self, info: LaunchInfo) -> Self {
+        self.info = info;
+        self
     }
 
     /// Appends arguments.
@@ -464,7 +475,7 @@ impl Sandbox {
     /// The `heel` binary of a sandbox on the host.
     pub(crate) fn host_heel(&self) -> Option<&heel::HeelBinary> {
         match &self.inner.backend {
-            Backend::Host { heel } => Some(heel),
+            Backend::Host { heel, .. } => Some(heel),
             Backend::Container { .. } | Backend::Ssh { .. } => None,
         }
     }

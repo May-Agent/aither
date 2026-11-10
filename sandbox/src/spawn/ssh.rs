@@ -139,6 +139,7 @@ impl Sandbox {
             grants,
             ipc,
             lifetime: _,
+            info,
         } = spec;
         // A grant is a path on one machine and a router is served by this
         // one: nothing of either reaches a server.
@@ -182,7 +183,7 @@ impl Sandbox {
             }
         };
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
-        let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| failed(&e))?;
+        let script = inject_env_exports(script, Some(&spec_env), &info).map_err(|e| failed(&e))?;
         let remote = remote_command(launch, heel, &script).map_err(|e| failed(&e))?;
         let pidfile = shell_words::quote(&format!(
             "/tmp/aither-spawn-{}.pgid",

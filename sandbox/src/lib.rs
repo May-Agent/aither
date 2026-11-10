@@ -18,7 +18,7 @@
 //! ```rust,ignore
 //! use aither_sandbox::{Backend, Sandbox, Shell};
 //!
-//! let sandbox = Sandbox::new(Backend::Host { heel }, executor, working_dir);
+//! let sandbox = Sandbox::new(Backend::Host { heel, launch }, executor, working_dir);
 //! let shell = Shell::builder(sandbox)
 //!     .interpreters(interpreters)
 //!     .limits(limits)
@@ -153,8 +153,8 @@ pub use shell_syntax::{
 pub use spawn::{
     AnyDomainApprover, ApproveAllDomains, Backend, ChildExit, ContainerLaunch, DenyAllDomains,
     Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess, GrantSnapshot, Grants,
-    HostRoute, HostRouteError, Pipe, RemoteLaunch, Sandbox, SandboxedChild, SpawnCommand,
-    SpawnError, SpawnGrant, SpawnSpec, Stdio, TreeLifetime,
+    HostLaunch, HostRoute, HostRouteError, LaunchInfo, Pipe, RemoteLaunch, Sandbox, SandboxedChild,
+    SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio, TreeLifetime,
 };
 pub use ssh::{PreparedSsh, SshPlatform, SshProbeError, SshServer, SshServerError, probe_ssh_os};
 pub use stdin_watch::StdinWatchSignal;
