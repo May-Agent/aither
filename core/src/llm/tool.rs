@@ -236,7 +236,7 @@ pub use command::{
     render_interruptions,
 };
 pub use context::{Progress, ProgressError, ProgressSink, ToolContext};
-pub use identity::{AgentIdentity, CallIdentity, SubagentIdentity, ToolCallId};
+pub use identity::{AgentIdentity, AgentPath, CallIdentity, SubagentIdentity, ToolCallId};
 
 /// Final structured result from a tool execution.
 ///

@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use aither_core::llm::{CallIdentity, StoredFile};
+use aither_core::llm::{AgentPath, CallIdentity, StoredFile};
 use async_channel::{Receiver, Sender};
 use futures_lite::future::or;
 
@@ -24,12 +24,19 @@ use crate::terminal::{CompletedCommand, TerminalError, TimeoutKill};
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct JobStarted {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) output_preview: String,
     pub(crate) output_file: StoredFile,
 }
 
 impl JobStarted {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task ID of the job, a word leased from the shell's id allocator.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -56,6 +63,7 @@ impl JobStarted {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct JobEnded {
+    pub(crate) agent: AgentPath,
     pub(crate) info: crate::JobInfo,
     pub(crate) result: Result<CompletedCommand, TerminalError>,
     pub(crate) timeout_kill: Option<TimeoutKill>,
@@ -63,6 +71,12 @@ pub struct JobEnded {
 }
 
 impl JobEnded {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// The job as it ended: its task id (a word leased from the shell's id
     /// allocator), script, status with the cause of a kill, and the path of
     /// its stored output.
@@ -107,12 +121,19 @@ impl JobEnded {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct LongRunning {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) script: String,
     pub(crate) after: Duration,
 }
 
 impl LongRunning {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task ID of the job.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -137,11 +158,18 @@ impl LongRunning {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct StdinBlocked {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) script: String,
 }
 
 impl StdinBlocked {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task ID of the job.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -160,12 +188,19 @@ impl StdinBlocked {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct StdinWatchFailed {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) script: String,
     pub(crate) error: String,
 }
 
 impl StdinWatchFailed {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task ID of the job.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -192,12 +227,19 @@ impl StdinWatchFailed {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DescendantsKilled {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) call: Option<CallIdentity>,
     pub(crate) processes: Vec<JobProcess>,
 }
 
 impl DescendantsKilled {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task ID of the command.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -242,20 +284,46 @@ pub enum ShellEvent {
     MonitorEnded(MonitorEnded),
 }
 
+impl ShellEvent {
+    /// The agent whose shell raised the event: the root path for the main
+    /// shell, the subagent's path for a subagent's shell.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        match self {
+            Self::JobStarted(event) => event.agent(),
+            Self::JobEnded(event) => event.agent(),
+            Self::LongRunning(event) => event.agent(),
+            Self::StdinBlocked(event) => event.agent(),
+            Self::StdinWatchFailed(event) => event.agent(),
+            Self::DescendantsKilled(event) => event.agent(),
+            Self::MonitorIncrement(event) => event.agent(),
+            Self::MonitorStalled(event) => event.agent(),
+            Self::MonitorEnded(event) => event.agent(),
+        }
+    }
+}
+
 /// The raising half of a shell's events, cloned into every task that reports
 /// a fact.
 ///
 /// Events of different kinds queue apart, so a reader of one kind never waits
 /// behind another; [`ShellEvents`] reads them back in the order a job lives
-/// them: started, then the facts about it, then its end.
+/// them: started, then the facts about it, then its end. It knows the agent
+/// whose shell raises through it, which every event it builds names.
 #[derive(Clone, Debug)]
 pub struct EventSender {
+    agent: AgentPath,
     started: Sender<ShellEvent>,
     facts: Sender<ShellEvent>,
     ended: Sender<ShellEvent>,
 }
 
 impl EventSender {
+    /// The agent whose shell this raises for.
+    pub(crate) const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Raises `event`.
     ///
     /// # Errors
@@ -264,7 +332,7 @@ impl EventSender {
     pub(crate) async fn send(
         &self,
         event: ShellEvent,
-    ) -> Result<(), async_channel::SendError<ShellEvent>> {
+    ) -> Result<(), Box<async_channel::SendError<ShellEvent>>> {
         match event {
             ShellEvent::JobStarted(_) => self.started.send(event).await,
             ShellEvent::JobEnded(_) => self.ended.send(event).await,
@@ -276,6 +344,7 @@ impl EventSender {
             | ShellEvent::MonitorStalled(_)
             | ShellEvent::MonitorEnded(_) => self.facts.send(event).await,
         }
+        .map_err(Box::new)
     }
 }
 
@@ -328,9 +397,10 @@ impl ShellEvents {
         }
     }
 
-    /// A raising half of these queues.
-    pub(crate) fn sender(&self) -> EventSender {
+    /// A raising half of these queues, for the shell of `agent`.
+    pub(crate) fn sender(&self, agent: AgentPath) -> EventSender {
         EventSender {
+            agent,
             started: self.started.tx.clone(),
             facts: self.facts.tx.clone(),
             ended: self.ended.tx.clone(),
@@ -432,6 +502,7 @@ mod tests {
 
     fn stalled(task_id: &str) -> ShellEvent {
         ShellEvent::MonitorStalled(MonitorStalled {
+            agent: AgentPath::main(),
             task_id: task_id.to_string(),
             stall_secs: 1,
         })
@@ -448,7 +519,11 @@ mod tests {
                 .await
                 .is_none()
         );
-        events.sender().send(stalled("late")).await.unwrap();
+        events
+            .sender(AgentPath::main())
+            .send(stalled("late"))
+            .await
+            .unwrap();
         let ShellEvent::MonitorStalled(event) = reader.recv().await else {
             panic!("the raised event is the one read");
         };
@@ -458,7 +533,10 @@ mod tests {
     #[tokio::test]
     async fn senders_of_one_handle_reach_every_reader_of_it_once() {
         let events = ShellEvents::new();
-        let (first, second) = (events.sender(), events.sender());
+        let (first, second) = (
+            events.sender(AgentPath::main()),
+            events.sender(AgentPath::main()),
+        );
         first.send(stalled("one")).await.unwrap();
         second.send(stalled("two")).await.unwrap();
         let reader = events.clone();

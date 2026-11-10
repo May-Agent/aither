@@ -37,7 +37,7 @@ use crate::spawn::container_ipc::ExecSetup;
 use aither_core::llm::tool::{
     AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
 };
-use aither_core::llm::{CallIdentity, ToolContext};
+use aither_core::llm::{AgentPath, CallIdentity, ToolContext};
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
     ToolResult,
@@ -598,9 +598,54 @@ impl ShellRunError {
     }
 }
 
+/// Kills the running jobs of a registry when dropped.
+///
+/// `Drop` cannot await, so the kill runs as a task the terminal's executor
+/// spawns.
+struct KillJobsOnDrop {
+    registry: JobRegistry,
+    /// Spawns the kill of the registry's jobs on the terminal's executor.
+    spawn_kill: Box<dyn Fn(JobRegistry) + Send + Sync>,
+}
+
+impl KillJobsOnDrop {
+    fn new<E>(registry: JobRegistry, executor: E) -> Self
+    where
+        E: Executor + 'static,
+    {
+        Self {
+            registry,
+            spawn_kill: Box::new(move |registry| {
+                executor
+                    .spawn(async move {
+                        registry.kill_running().await;
+                    })
+                    .detach();
+            }),
+        }
+    }
+}
+
+impl Drop for KillJobsOnDrop {
+    fn drop(&mut self) {
+        (self.spawn_kill)(self.registry.clone());
+    }
+}
+
+impl std::fmt::Debug for KillJobsOnDrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KillJobsOnDrop").finish_non_exhaustive()
+    }
+}
+
 /// What a subagent's terminal holds that the main agent's does not.
 #[derive(Clone, Debug)]
 struct SubagentAuthority {
+    /// Kills the subagent's running jobs when the last handle of its terminal
+    /// goes. Only a subagent's terminal holds one: the main agent's jobs
+    /// outlive its terminal, so an embedder can rebuild it with its
+    /// background commands still running.
+    _jobs: Arc<KillJobsOnDrop>,
     /// Keeps the word naming its space leased while the terminal lives.
     _space_name: IdLease,
     /// The worktrees it may commit in, with their git data; it hands on no
@@ -874,7 +919,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             .detach();
 
         let events_rx = parts.events.unwrap_or_default();
-        let events_tx = events_rx.sender();
+        let events_tx = events_rx.sender(AgentPath::main());
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let sandbox = sandbox
             .with_working_dir(working_dir_path.clone())
@@ -977,7 +1022,7 @@ where
 
     /// A subagent terminal with an empty grant.
     async fn subagent_without_grant(&self) -> Result<Self, SubagentGrantError> {
-        self.subagent(SubagentGrant::new(), None).await
+        self.subagent(SubagentGrant::new(), None, "worker").await
     }
 }
 
@@ -1210,6 +1255,12 @@ where
     /// shell shares this shell's approver, output store, events and
     /// policies' definitions, with state of its own, and its own jobs.
     ///
+    /// `name` is the subagent's name beneath this shell's agent: every event
+    /// its shell raises carries that [`AgentPath`], where the main shell's
+    /// carry [`AgentPath::main`]. The subagent's running jobs are killed when
+    /// the last handle of its shell is dropped, which a main shell never
+    /// does.
+    ///
     /// # Errors
     /// Returns an error when `grant` names a path this shell cannot write or
     /// a commit it cannot grant, when a container shell has no workspace
@@ -1218,12 +1269,13 @@ where
         &self,
         grant: SubagentGrant,
         caller: Option<&Path>,
+        name: impl Into<String>,
     ) -> Result<Self, SubagentGrantError> {
         let resolved = {
             let mut history = self.launches.lock().await;
             self.resolve_launch(&mut history, grant).await?
         };
-        self.launch_resolved(resolved, caller).await
+        self.launch_resolved(resolved, caller, name.into()).await
     }
 
     /// Resolves the grant of a subagent this terminal launches: it never
@@ -1304,6 +1356,7 @@ where
             granted,
         }: ResolvedLaunch,
         caller: Option<&Path>,
+        name: String,
     ) -> Result<Self, SubagentGrantError> {
         async_fs::create_dir_all(&spaces_root)
             .await
@@ -1364,9 +1417,11 @@ where
             None => None,
         };
 
-        // The subagent's jobs raise their facts on the parent's handle.
+        // The subagent's jobs raise their facts on the parent's handle, as
+        // the agent named beneath this shell's.
+        let agent = self.events_tx.agent().child(name);
         let events_rx = self.events_rx.clone();
-        let events_tx = events_rx.sender();
+        let events_tx = events_rx.sender(agent);
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (job_registry, job_registry_service) =
             job_registry_channel(self.output_store.policy().clone());
@@ -1382,6 +1437,10 @@ where
             })
             .with_working_dir(space.clone())
             .with_scanner(job_registry.scanner());
+        let jobs = Arc::new(KillJobsOnDrop::new(
+            job_registry.clone(),
+            self.executor.clone(),
+        ));
         let readable_paths = sandbox.grants().snapshot().readable.clone();
         let git = match (&container, mount, self.sandbox.backend()) {
             (Some(confinement), Some(mount), Backend::Container { runtime, launch }) => {
@@ -1424,6 +1483,7 @@ where
             running_tasks,
             sandbox,
             subagent: Some(SubagentAuthority {
+                _jobs: jobs,
                 _space_name: space_name,
                 committing: granted.committing,
                 git,
@@ -2649,6 +2709,7 @@ where
                 {
                     let _ = alert_tx
                         .send(ShellEvent::LongRunning(LongRunning {
+                            agent: alert_tx.agent().clone(),
                             task_id: task_id.to_string(),
                             script: job.script,
                             after: job.started_at.elapsed(),
@@ -2808,6 +2869,7 @@ async fn detach_job(
         start_background_output_redirect(job_registry, outputs, task_id, max_lines).await?;
     let _ = started_tx
         .send(ShellEvent::JobStarted(JobStarted {
+            agent: started_tx.agent().clone(),
             task_id: task_id.to_string(),
             output_preview: redirect.preview.clone(),
             output_file: redirect.file.clone(),
@@ -3256,6 +3318,7 @@ where
         };
         let _ = completed_tx
             .send(ShellEvent::JobEnded(Box::new(JobEnded {
+                agent: completed_tx.agent().clone(),
                 info,
                 result,
                 timeout_kill,
@@ -3841,6 +3904,7 @@ impl JobLifetime {
         };
         let _ = alerts
             .send(ShellEvent::DescendantsKilled(DescendantsKilled {
+                agent: alerts.agent().clone(),
                 task_id: task_id.clone(),
                 call: call.clone(),
                 processes: killed,
@@ -3877,6 +3941,7 @@ impl StdinAlerts {
         let _ = self
             .tx
             .send(ShellEvent::StdinBlocked(StdinBlocked {
+                agent: self.tx.agent().clone(),
                 task_id: self.task_id.clone(),
                 script: self.script.clone(),
             }))
@@ -3890,6 +3955,7 @@ impl StdinAlerts {
         let _ = self
             .tx
             .send(ShellEvent::StdinWatchFailed(StdinWatchFailed {
+                agent: self.tx.agent().clone(),
                 task_id: self.task_id.clone(),
                 script: self.script.clone(),
                 error,
@@ -5628,6 +5694,116 @@ mod tests {
         assert_eq!(tool.job_registry().list().await.len(), 1);
     }
 
+    /// A subagent's events name its path and the main shell's the root, on
+    /// the one handle the two share.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn events_name_the_agent_whose_shell_raised_them() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = fresh_terminal(dir.path()).await;
+        let events = tool.background_receiver();
+        let child = tool
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        let grandchild = child
+            .subagent(SubagentGrant::new(), None, "reviewer")
+            .await
+            .expect("an empty grant is always given");
+
+        for shell in [&tool, &child, &grandchild] {
+            shell
+                .run_background(background_args("a job", "sleep 60"))
+                .await
+                .expect("the job starts");
+        }
+        let started = events.take_started();
+        let paths: Vec<_> = started.iter().map(|event| event.agent().clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                AgentPath::main(),
+                AgentPath::main().child("worker"),
+                AgentPath::main().child("worker").child("reviewer"),
+            ]
+        );
+
+        for shell in [&tool, &child, &grandchild] {
+            shell.jobs().kill_all().await;
+        }
+        let mut ended: Vec<_> = Vec::new();
+        for _ in 0..3 {
+            ended.push(ShellEvent::JobEnded(Box::new(
+                events.recv_completed().await,
+            )));
+        }
+        let mut paths: Vec<_> = ended
+            .iter()
+            .map(|event| event.agent().to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["main", "worker", "worker/reviewer"]);
+    }
+
+    /// The last handle of a subagent's shell going kills its running jobs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_last_handle_of_a_subagent_shell_ends_its_job() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = fresh_terminal(dir.path()).await;
+        let child = tool
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        let job = child
+            .run_background(background_args("a job", "sleep 60"))
+            .await
+            .expect("the job starts");
+
+        // A clone keeps the jobs: only the last handle's drop kills them.
+        let clone = child.clone();
+        drop(child);
+        async_io::Timer::after(Duration::from_millis(300)).await;
+        assert!(matches!(job.info().await.status, crate::JobStatus::Running));
+        drop(clone);
+
+        let result = tokio::time::timeout(Duration::from_secs(30), job.wait())
+            .await
+            .expect("the job ends once its shell is gone")
+            .expect("the job reports its end");
+        assert!(
+            !matches!(result.outcome, crate::RunOutcome::Exited { code: 0 }),
+            "the job was killed, not run to its end: {result:?}"
+        );
+    }
+
+    /// A main shell's jobs outlive its handles, so an embedder can rebuild it
+    /// with its background commands running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_main_shell_leaves_its_job_running() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = fresh_terminal(dir.path()).await;
+        let events = tool.background_receiver();
+        let jobs = tool.jobs();
+        tool.run_background(background_args("a job", "sleep 60"))
+            .await
+            .expect("the job starts");
+        let task_id = started_task_id(&events);
+        drop(tool);
+
+        async_io::Timer::after(Duration::from_millis(500)).await;
+        let listed = jobs.list().await;
+        assert!(
+            matches!(
+                listed.as_slice(),
+                [job] if job.task_id == task_id && matches!(job.status, crate::JobStatus::Running)
+            ),
+            "the job keeps running: {listed:?}"
+        );
+        jobs.kill_all().await;
+    }
+
     /// Background terminal arguments for `script`.
     #[cfg(unix)]
     fn background_args(description: &str, script: &str) -> ShellArgs {
@@ -5844,7 +6020,7 @@ mod tests {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
             stdin_alerts: None,
-            lifetime: foreground_lifetime(ShellEvents::new().sender()),
+            lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -5914,7 +6090,7 @@ mod tests {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
             stdin_alerts: None,
-            lifetime: foreground_lifetime(ShellEvents::new().sender()),
+            lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -6028,7 +6204,7 @@ mod tests {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
             stdin_alerts: None,
-            lifetime: foreground_lifetime(ShellEvents::new().sender()),
+            lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -7018,7 +7194,7 @@ mod tests {
             crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let alert_tx = ShellEvents::new().sender();
+        let alert_tx = ShellEvents::new().sender(AgentPath::main());
         let (_pid, output) = execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
@@ -7111,7 +7287,7 @@ mod tests {
         let erased = crate::AnyIpcProvider::new(provider.clone());
         let info = crate::LaunchInfo::new("probe", None, SandboxMode::Sandboxed);
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let alert_tx = ShellEvents::new().sender();
+        let alert_tx = ShellEvents::new().sender(AgentPath::main());
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
@@ -7245,7 +7421,7 @@ mod tests {
         .expect("the relay reports ready");
         let fifo_path = job_fifo.path().clone();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let alert_tx = ShellEvents::new().sender();
+        let alert_tx = ShellEvents::new().sender(AgentPath::main());
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
@@ -8831,7 +9007,9 @@ mod tests {
         let resolved = parent
             .resolve_launch(&mut LaunchHistory::default(), grant)
             .await?;
-        parent.launch_resolved(resolved, None).await
+        parent
+            .launch_resolved(resolved, None, "worker".to_owned())
+            .await
     }
 
     /// What a [`CloneSpaces`] was asked to prepare, as `(space, launcher,
@@ -8936,7 +9114,7 @@ mod tests {
         let (parent, seen) = spaced_terminal(dir.path(), Filling::Clone).await;
         let caller = dir.path().join("repo");
         let child = parent
-            .subagent(SubagentGrant::new(), Some(&caller))
+            .subagent(SubagentGrant::new(), Some(&caller), "worker")
             .await
             .expect("the space is prepared");
 
@@ -8983,7 +9161,7 @@ mod tests {
         ));
 
         let nested = child
-            .subagent(SubagentGrant::new(), None)
+            .subagent(SubagentGrant::new(), None, "worker")
             .await
             .expect("a nested space is prepared");
         let (nested_space, nested_launcher, nested_caller) = seen.try_recv().unwrap();

@@ -5,7 +5,8 @@
 //! behalf, can attribute what it did to the exact call and agent.
 
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt::{self, Display};
 
 /// The id a model provider gave one tool call.
@@ -104,5 +105,65 @@ impl CallIdentity {
     #[must_use]
     pub const fn agent(&self) -> &AgentIdentity {
         &self.agent
+    }
+}
+
+/// Where an agent stands in the tree of agents a run started: empty for the
+/// main agent, the subagent's name beneath its parent's path otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+pub struct AgentPath(Vec<String>);
+
+impl AgentPath {
+    /// The main agent.
+    #[must_use]
+    pub const fn main() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The path of the agent `identity` names, beneath the agent that
+    /// started it.
+    #[must_use]
+    pub fn of(identity: &AgentIdentity) -> Self {
+        match identity {
+            AgentIdentity::Main => Self::main(),
+            AgentIdentity::Subagent(subagent) => {
+                let mut path = subagent
+                    .started_by()
+                    .map_or_else(Self::main, |call| Self::of(call.agent()));
+                path.0.push(subagent.name().to_string());
+                path
+            }
+        }
+    }
+
+    /// The path of a child named `name` beneath this agent.
+    #[must_use]
+    pub fn child(&self, name: impl Into<String>) -> Self {
+        let mut path = self.clone();
+        path.0.push(name.into());
+        path
+    }
+
+    /// The names from the main agent down to this one.
+    #[must_use]
+    pub fn segments(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether this is the main agent.
+    #[must_use]
+    pub const fn is_main(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Display for AgentPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("main");
+        }
+        f.write_str(&self.0.join("/"))
     }
 }
