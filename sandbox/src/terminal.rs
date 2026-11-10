@@ -52,7 +52,7 @@ use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
 use heel::{
-    Access, CpuPriority, Grant, IoPriority, IpcRouter, NetworkAuditLog, ProcessPriority, WorkingDir,
+    Access, CpuPriority, Grant, IoPriority, IpcRouter, NetworkAuditLog, ProcessPriority,
 };
 /// On platforms without `heel supervise` a wait produces no report.
 #[cfg(not(target_os = "linux"))]
@@ -97,14 +97,17 @@ use crate::{
     },
     wording::AnyShellWording,
 };
-use crate::builtin::JobToolSettings;
+use crate::builtin::ShellToolSettings;
 use crate::jobs::Jobs;
 use crate::events::{
     EventSender, JobEnded, JobStarted, LongRunning, ShellEvent, ShellEvents, StdinBlocked,
     StdinWatchFailed, event_channel,
 };
 
+mod builder;
 mod subagent_git;
+
+pub use builder::{Given, Missing, ShellBuilder};
 
 pub fn erase_terminal_tool<T>(tool: T) -> crate::command::DynTerminalToolEntry
 where
@@ -1159,7 +1162,7 @@ pub struct Shell<E, State = Unconfigured> {
     /// `amber-forest-thunder-pearl/`) rather than a leased id.
     working_dir: PathBuf,
     /// Runtime registry for container and ssh execution metadata.
-    shell_sessions: ShellSessionRegistry,
+    sessions: ShellSessionRegistry,
     /// Approves what no call's context can: a script run with no tool call
     /// to ask through. Shared with the subagents' terminals.
     approver: Option<AnyApprover>,
@@ -1175,8 +1178,11 @@ pub struct Shell<E, State = Unconfigured> {
     events_tx: EventSender,
     /// Where they are read.
     events_rx: ShellEvents,
-    /// What the job control tools are named and described as.
-    job_tools: JobToolSettings,
+    /// What the shell tool and the job control tools are named and
+    /// described as.
+    job_tools: ShellToolSettings,
+    /// The interpreters a script may run under.
+    interpreters: Arc<[Interpreter]>,
     /// Time bounds applied to spawned executions.
     limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
@@ -1215,7 +1221,7 @@ impl<E: Clone, State: Clone> Clone for Shell<E, State> {
     fn clone(&self) -> Self {
         Self {
             working_dir: self.working_dir.clone(),
-            shell_sessions: self.shell_sessions.clone(),
+            sessions: self.sessions.clone(),
             approver: self.approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
@@ -1224,6 +1230,7 @@ impl<E: Clone, State: Clone> Clone for Shell<E, State> {
             events_tx: self.events_tx.clone(),
             events_rx: self.events_rx.clone(),
             job_tools: self.job_tools.clone(),
+            interpreters: self.interpreters.clone(),
             limits: self.limits.clone(),
             running_tasks: self.running_tasks.clone(),
             grants: self.grants.clone(),
@@ -1267,7 +1274,7 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
             sessions.prepared_tools.is_none(),
             "a prepared shell session registry is installed with adopt_prepared_tools"
         );
-        self.shell_sessions = sessions;
+        self.sessions = sessions;
         self
     }
 
@@ -1277,14 +1284,14 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
         mut self,
         availability: crate::shell_session::ShellRuntimeAvailability,
     ) -> Self {
-        self.shell_sessions = self.shell_sessions.with_availability(availability);
+        self.sessions = self.sessions.with_availability(availability);
         self
     }
 
     /// Adds container runtime metadata for container-backed terminal execution.
     #[must_use]
     pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
-        self.shell_sessions = self.shell_sessions.with_container_runtime(runtime);
+        self.sessions = self.sessions.with_container_runtime(runtime);
         self
     }
 
@@ -1339,103 +1346,21 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
         self
     }
 
-    /// Creates a new terminal tool with an executor.
+    /// Creates a shell with an executor, working in `working_dir` itself.
     ///
-    /// Creates a working directory under the specified parent directory, which
-    /// heel names with four random words (not a leased id). The executor is
-    /// used to spawn async tasks for the IPC server.
-    ///
-    /// # Errors
-    /// Returns an error when the working directory or output store cannot be created.
-    pub async fn new_in(
-        parent_dir: impl AsRef<std::path::Path>,
-        executor: E,
-        limits: ShellLimits,
-        output: OutputPolicy,
-        wording: AnyShellWording,
-        job_tools: JobToolSettings,
-    ) -> Result<Self, TerminalError> {
-        let parent_dir = parent_dir.as_ref();
-
-        // Ensure parent directory exists
-        async_fs::create_dir_all(parent_dir).await?;
-
-        // heel names the working directory with four random words; it is
-        // not a leased model-facing id.
-        let working_dir = WorkingDir::random_in(parent_dir).map_err(|e| {
-            TerminalError::SandboxSetup(format!("failed to create working dir: {e}"))
-        })?;
-        // Resolved once, as in `new_exact`.
-        let working_dir_path =
-            dunce::simplified(&async_fs::canonicalize(working_dir.path()).await?).to_path_buf();
-
-        info!(working_dir = %working_dir_path.display(), "created terminal tool working directory");
-
-        // Create outputs directory inside working dir
-        let ids = AnyIdAllocator::default();
-        let output_store = OutputStore::new(
-            working_dir_path.join("outputs"),
-            ids.clone(),
-            output,
-            wording,
-        )
-        .await?;
-
-        // Start job registry service
-        let (job_registry, job_registry_service) =
-            job_registry_channel(output_store.policy().clone());
-        executor
-            .spawn(async move { job_registry_service.serve().await })
-            .detach();
-
-        // Create channel for background task completion (unbounded to not block spawned tasks)
-        let (events_tx, events_rx) = event_channel();
-        let running_tasks = Arc::new(AtomicUsize::new(0));
-
-        Ok(Self {
-            working_dir: working_dir_path,
-            shell_sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
-            approver: None,
-            executor,
-            ids,
-            output_store,
-            job_registry,
-            events_tx,
-            events_rx,
-            job_tools,
-            limits: TerminalLimits::new(limits),
-            running_tasks,
-            grants: Grants::new(),
-            subagent: None,
-            carried_dir: Some(CarriedDir::default()),
-            env_source: None,
-            network: NetworkSettings::default(),
-            priority: ProcessPriority::default(),
-            #[cfg(all(unix, feature = "jobserver"))]
-            jobserver: None,
-            heel: SharedHeelBinary::default(),
-            outages: Outages::none(),
-            subagent_spaces: None,
-            registry: Unconfigured,
-        })
-    }
-
-    /// Creates a new terminal tool with an executor,
-    /// using the provided directory directly as the working directory.
-    ///
-    /// Unlike `new_in` which creates a random subdirectory, this method
-    /// uses the exact path provided. Use this when you want explicit control
-    /// over the working directory location.
+    /// Every interpreter is configured and the grants, environment and
+    /// network are empty; [`Shell::builder`] takes them from a
+    /// [`Sandbox`] instead.
     ///
     /// # Errors
     /// Returns an error when the working directory or output store cannot be created.
-    pub async fn new_exact(
+    pub(crate) async fn new_exact(
         working_dir: impl AsRef<std::path::Path>,
         executor: E,
         limits: ShellLimits,
         output: OutputPolicy,
         wording: AnyShellWording,
-        job_tools: JobToolSettings,
+        job_tools: ShellToolSettings,
     ) -> Result<Self, TerminalError> {
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
@@ -1467,7 +1392,7 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
 
         Ok(Self {
             working_dir: working_dir_path,
-            shell_sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
+            sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
             approver: None,
             executor,
             ids,
@@ -1476,6 +1401,7 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
             events_tx,
             events_rx,
             job_tools,
+            interpreters: Arc::new([Interpreter::Shell, Interpreter::Python]),
             limits: TerminalLimits::new(limits),
             running_tasks,
             grants: Grants::new(),
@@ -1499,7 +1425,7 @@ impl<E, State> Shell<E, State> {
     fn map_state<Next>(self, state: impl FnOnce(State) -> Next) -> Shell<E, Next> {
         Shell {
             working_dir: self.working_dir,
-            shell_sessions: self.shell_sessions,
+            sessions: self.sessions,
             approver: self.approver,
             executor: self.executor,
             ids: self.ids,
@@ -1508,6 +1434,7 @@ impl<E, State> Shell<E, State> {
             events_tx: self.events_tx,
             events_rx: self.events_rx,
             job_tools: self.job_tools,
+            interpreters: self.interpreters,
             limits: self.limits,
             running_tasks: self.running_tasks,
             grants: self.grants,
@@ -1795,10 +1722,10 @@ where
     /// machine. A remote execution environment is never a home environment.
     #[must_use]
     pub fn container_probe(&self) -> Option<crate::ContainerProbe> {
-        if self.shell_sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
+        if self.sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
             return None;
         }
-        self.shell_sessions
+        self.sessions
             .container_runtime()
             .map(ContainerShellRuntime::probe)
     }
@@ -1866,8 +1793,8 @@ where
     where
         State: Send,
     {
-        self.shell_sessions = self
-            .shell_sessions
+        self.sessions = self
+            .sessions
             .initialize_tools(distribution, cache_root)
             .await?;
         if let Some(tools) = self.local_home_tools()? {
@@ -1905,7 +1832,7 @@ where
         State: Send,
     {
         sessions.prepared_catalog()?;
-        self.shell_sessions = sessions;
+        self.sessions = sessions;
         if let Some(tools) = self.local_home_tools()? {
             tools.ensure_readonly(self.writable_grants().iter()).await?;
             if let Some(pinned) = tools.heel() {
@@ -1917,8 +1844,8 @@ where
 
     /// Prepared tools of the local home backend, when this terminal runs on it.
     fn local_home_tools(&self) -> Result<Option<&PreparedTools<PathBuf>>, ToolRuntimeError> {
-        match self.shell_sessions.resolve_local_backend() {
-            Ok(ShellBackend::Local) => self.shell_sessions.local_tools().map(Some),
+        match self.sessions.resolve_local_backend() {
+            Ok(ShellBackend::Local) => self.sessions.local_tools().map(Some),
             _ => Ok(None),
         }
     }
@@ -1935,7 +1862,7 @@ where
     /// Initialized session configuration shared with child terminals.
     #[must_use]
     pub const fn shell_sessions(&self) -> &ShellSessionRegistry {
-        &self.shell_sessions
+        &self.sessions
     }
 
     /// Operational context from successfully initialized environments.
@@ -1943,7 +1870,7 @@ where
     /// # Errors
     /// Fails when no tools are prepared or a backend configuration has changed.
     pub fn prepared_tools_context(&self) -> Result<String, ToolRuntimeError> {
-        self.shell_sessions.prepared_catalog()?.render()
+        self.sessions.prepared_catalog()?.render()
     }
 
     /// Returns the working directory path.
@@ -2192,7 +2119,7 @@ where
             (Some(confinement), Some(mount)) => {
                 SubagentGit::new(Arc::new(subagent_git::ContainerGit {
                     executor: self.executor.clone(),
-                    shell_sessions: self.shell_sessions.clone(),
+                    shell_sessions: self.sessions.clone(),
                     confinement: confinement.clone(),
                     mount,
                     priority: self.priority,
@@ -2224,7 +2151,7 @@ where
         );
         let launching = Shell {
             working_dir: space,
-            shell_sessions: self.shell_sessions.clone(),
+            sessions: self.sessions.clone(),
             approver: self.approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
@@ -2233,6 +2160,7 @@ where
             events_tx,
             events_rx,
             job_tools: self.job_tools.clone(),
+            interpreters: self.interpreters.clone(),
             limits: self.limits.clone(),
             running_tasks,
             grants,
@@ -2270,11 +2198,11 @@ where
     /// side canonical, spelling every path of a subagent's view inside the
     /// container. `None` outside a container.
     async fn container_mount(&self) -> Result<Option<MountRoot>, SubagentGrantError> {
-        if self.shell_sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
+        if self.sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
             return Ok(None);
         }
         let mount = self
-            .shell_sessions
+            .sessions
             .container_runtime()
             .and_then(ContainerShellRuntime::workspace_mount)
             .ok_or(SubagentGrantError::NoContainerMount)?;
@@ -2383,11 +2311,11 @@ where
         let wording = self.output_store.wording().clone();
         let output = self.output_store.policy().clone();
         let prepared_tools = self
-            .shell_sessions
+            .sessions
             .prepared_catalog()
             .expect("terminal tools must be initialized before exposing child capabilities")
             .clone();
-        let entries = vec![erase_terminal_tool(self)];
+        let entries = vec![erase_terminal_tool(self.tool())];
 
         DynTerminalTool {
             entries,
@@ -2426,7 +2354,7 @@ where
         let Some(name) = location.map(str::trim).filter(|name| !name.is_empty()) else {
             return Ok(None);
         };
-        self.shell_sessions
+        self.sessions
             .ssh_environments()
             .get(name)
             .map(Some)
@@ -2435,7 +2363,7 @@ where
 
     fn resolve_home_target(&self, mode: SandboxMode) -> Result<ExecutionTarget, TerminalError> {
         let backend = self
-            .shell_sessions
+            .sessions
             .resolve_local_backend()
             .map_err(TerminalError::InvalidTarget)?;
         if mode == SandboxMode::Unsandboxed && backend != ShellBackend::Local {
@@ -2445,15 +2373,15 @@ where
         }
         let backend = match backend {
             ShellBackend::Local => {
-                ExecutionBackend::Local(self.shell_sessions.local_tools()?.clone())
+                ExecutionBackend::Local(self.sessions.local_tools()?.clone())
             }
             ShellBackend::Container => ExecutionBackend::Container {
                 runtime: self
-                    .shell_sessions
+                    .sessions
                     .container_runtime()
                     .cloned()
                     .ok_or(ToolRuntimeError::MissingContainerRuntime)?,
-                tools: self.shell_sessions.container_tools()?.clone(),
+                tools: self.sessions.container_tools()?.clone(),
                 confinement: self
                     .subagent
                     .as_ref()
@@ -2470,7 +2398,7 @@ where
         environment: &SshEnvironment,
         mode: SandboxMode,
     ) -> Result<ExecutionTarget, TerminalError> {
-        let prepared = self.shell_sessions.ssh_tools(environment).await?;
+        let prepared = self.sessions.ssh_tools(environment).await?;
         let server = environment.server();
         let heel = match (mode, &prepared.heel) {
             (SandboxMode::Sandboxed, Some(heel)) => Some(heel.clone()),
@@ -2482,7 +2410,7 @@ where
         Ok(ExecutionTarget {
             mode,
             backend: ExecutionBackend::Ssh {
-                client: self.shell_sessions.ssh_environments().client().clone(),
+                client: self.sessions.ssh_environments().client().clone(),
                 server: server.clone(),
                 heel,
                 tools: prepared.tools.clone(),
@@ -2598,9 +2526,45 @@ where
     }
 }
 
-impl<E: Executor + Clone + 'static> Tool for Shell<E, Configured> {
+/// The model-facing tool of a [`Shell`]: the embedder's name and description
+/// over the shell's execution, with an argument schema that lists exactly the
+/// interpreters the shell was configured with.
+#[derive(Debug, Clone)]
+pub struct ShellTool<E> {
+    shell: Shell<E, Configured>,
+    identity: crate::builtin::ToolIdentity,
+}
+
+impl<E: Executor + Clone + 'static> Tool for ShellTool<E> {
     fn name(&self) -> Cow<'static, str> {
-        "terminal".into()
+        self.identity.name.clone()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        self.identity.description.clone()
+    }
+
+    fn arguments_schema(&self) -> schemars::Schema {
+        let mut schema = schemars::schema_for!(ShellArgs);
+        let interpreters = self
+            .shell
+            .interpreters
+            .iter()
+            .map(|interpreter| {
+                serde_json::to_value(interpreter).expect("an interpreter serializes as a name")
+            })
+            .collect::<Vec<_>>();
+        let definition = schema
+            .get_mut("$defs")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|definitions| definitions.get_mut("Interpreter"))
+            .expect("the schema of ShellArgs defines its interpreter");
+        *definition = serde_json::json!({
+            "description": "The interpreter a script runs under.",
+            "type": "string",
+            "enum": interpreters,
+        });
+        schema
     }
 
     type Arguments = ShellArgs;
@@ -2609,8 +2573,41 @@ impl<E: Executor + Clone + 'static> Tool for Shell<E, Configured> {
     async fn call(
         &self,
         arguments: Self::Arguments,
-        mut cx: ToolContext,
+        cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        self.shell.call(arguments, cx).await
+    }
+}
+
+impl<E: Executor + Clone + 'static> Shell<E, Configured> {
+    /// The model-facing tool of this shell, named and described as the
+    /// embedder's [`ShellToolSettings`] say.
+    #[must_use]
+    pub fn tool(&self) -> ShellTool<E> {
+        ShellTool {
+            shell: self.clone(),
+            identity: self.job_tools.shell.clone(),
+        }
+    }
+
+    /// Runs one `terminal` call: the script of `arguments` in its
+    /// interpreter, in the foreground window or detached.
+    ///
+    /// # Errors
+    /// Returns an error when the arguments are out of range, the interpreter
+    /// is not one the shell is configured with, a policy refuses the script
+    /// or the execution fails.
+    pub async fn call(
+        &self,
+        arguments: ShellArgs,
+        mut cx: ToolContext,
+    ) -> aither_core::Result<ToolResult> {
+        if !self.interpreters.contains(&arguments.interpreter) {
+            return Err(anyhow::anyhow!(
+                "the {:?} interpreter is not configured for this shell",
+                arguments.interpreter
+            ));
+        }
         let cap = self.limits.timeout_cap.get();
         let timeout = Duration::from_secs(arguments.timeout);
         if arguments.timeout == 0 || timeout > cap {
@@ -3025,9 +3022,9 @@ where
     /// `host`, or the terminal's own directory `own` when the script starts
     /// in neither a carried nor a named one, as the home backend names it.
     fn home_script_dir(&self, host: Option<PathBuf>, own: &Path) -> ScriptDir {
-        match self.shell_sessions.resolve_local_backend() {
+        match self.sessions.resolve_local_backend() {
             Ok(ShellBackend::Container) => container_script_dir(
-                self.shell_sessions
+                self.sessions
                     .container_runtime()
                     .and_then(|runtime| runtime.workspace_mount()),
                 host,
@@ -8137,7 +8134,7 @@ mod tests {
             script: "/bin/pwd".to_string(),
             interpreter: Interpreter::Shell,
             mode: SandboxMode::Sandboxed,
-            backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
+            backend: ExecutionBackend::Local(tool.sessions.local_tools().unwrap().clone()),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
                 alerts: event_channel().0,
@@ -9939,7 +9936,7 @@ mod tests {
     /// The directory the sandbox may execute programs from.
     #[cfg(unix)]
     fn exec_dir<E>(tool: &Shell<E, Configured>) -> PathBuf {
-        tool.shell_sessions
+        tool.sessions
             .local_tools()
             .expect("the terminal has local tools")
             .bin_dir()

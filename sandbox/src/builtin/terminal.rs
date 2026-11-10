@@ -23,9 +23,11 @@ pub struct ToolIdentity {
     pub description: Cow<'static, str>,
 }
 
-/// The identities of the three job control tools.
+/// The identities of the shell tool and of the three job control tools.
 #[derive(Debug, Clone)]
-pub struct JobToolSettings {
+pub struct ShellToolSettings {
+    /// The tool that runs a script.
+    pub shell: ToolIdentity,
     /// The tool that reads a job's output.
     pub read: ToolIdentity,
     /// The tool that writes to a job's stdin.

@@ -161,12 +161,13 @@ fn rendered(template: &impl Template) -> String {
 /// The names and descriptions the sandbox's tests give the job control
 /// tools.
 #[must_use]
-pub fn job_tools() -> crate::JobToolSettings {
+pub fn job_tools() -> crate::ShellToolSettings {
     let identity = |name: &'static str, description: &'static str| crate::ToolIdentity {
         name: name.into(),
         description: description.into(),
     };
-    crate::JobToolSettings {
+    crate::ShellToolSettings {
+        shell: identity("terminal", "Run a script."),
         read: identity("terminal_read", "Read a job's output."),
         input: identity("terminal_input", "Write to a job's stdin."),
         kill: identity("terminal_kill", "Kill a job."),

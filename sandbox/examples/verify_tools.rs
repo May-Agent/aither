@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    AnyShellWording, CommandBlocked, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
-    JobRead, JobToolSettings, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted,
+    Backend, CommandBlocked, HostProgram, Sandbox, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
+    JobRead, ShellToolSettings, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted,
     OmittedLines, OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain,
     ShellArgs, ShellLimits, ShellWording, StoredBinaryPart, Shell, ToolDistribution,
     ToolIdentity, ToolRegistryBuilder, ToolTarget,
@@ -101,6 +101,22 @@ fn identity(name: &'static str, description: &'static str) -> ToolIdentity {
     }
 }
 
+fn output_policy() -> OutputPolicy {
+    OutputPolicy::new(OutputLimits {
+        inline_bytes: 16_000,
+        preview_bytes: 16_000,
+        default_lines: 200,
+        ceiling_lines: 800,
+        read_bytes: 32 * 1024,
+        media: MediaBounds {
+            low: 512,
+            medium: 1024,
+            high: 2048,
+        },
+        job_preview_bytes: 50,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -126,34 +142,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1024 * 1024 * 1024,
         Duration::from_secs(120),
     );
-    let output = OutputPolicy::new(OutputLimits {
-        inline_bytes: 16_000,
-        preview_bytes: 16_000,
-        default_lines: 200,
-        ceiling_lines: 800,
-        read_bytes: 32 * 1024,
-        media: MediaBounds {
-            low: 512,
-            medium: 1024,
-            high: 2048,
+    let output = output_policy();
+    let cache = PathBuf::from(cache);
+    let heel = distribution
+        .prepare_host_program(HostProgram::Heel, &ToolTarget::native()?, &cache)
+        .await?;
+    let sandbox = Sandbox::new(
+        Backend::Host {
+            heel: heel::HeelBinary::verify(heel.path())?,
         },
-        job_preview_bytes: 50,
-    });
-    let terminal = Shell::new_exact(
-        PathBuf::from(workspace),
         executor_core::tokio::TokioGlobal,
-        limits,
-        output,
-        AnyShellWording::new(ExampleWording),
-        JobToolSettings {
+        PathBuf::from(workspace),
+    );
+    let terminal = Shell::builder(sandbox)
+        .limits(limits)
+        .output(output)
+        .wording(ExampleWording)
+        .tools(ShellToolSettings {
+            shell: identity("terminal", "Run a script."),
             read: identity("job_read", "Read a job's output."),
             input: identity("job_input", "Write to a job's stdin."),
             kill: identity("job_kill", "Kill a job."),
-        },
-    )
-    .await?
-    .initialize_tools(&distribution, &PathBuf::from(cache))
-    .await?;
+        })
+        .build()
+        .await?
+        .initialize_tools(&distribution, &cache)
+        .await?;
     let registry = ToolRegistryBuilder::new().build(terminal.output_store().clone());
     let terminal = terminal.with_registry(std::sync::Arc::new(registry));
     let arguments: ShellArgs = serde_json::from_value(serde_json::json!({
@@ -162,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "raw": true,
         "timeout": 120
     }))?;
-    let result = terminal.call(arguments, ToolContext::new()).await?;
+    let result = terminal.tool().call(arguments, ToolContext::new()).await?;
     let output = result.render_for_model();
     assert!(output.contains("baseline acceptance passed"), "{output}");
     // `uv --version` and `python3 --version` report the manifest's pins.

@@ -349,6 +349,41 @@ impl Sandbox {
         &self.inner.working_dir
     }
 
+    /// The executor the sandbox's tasks run on.
+    pub(crate) fn executor(&self) -> Arc<AnyExecutor> {
+        Arc::clone(&self.inner.executor)
+    }
+
+    /// Where the sandbox's processes run.
+    pub(crate) fn backend(&self) -> &Backend {
+        &self.inner.backend
+    }
+
+    /// The embedder's environment source.
+    pub(crate) fn env_source(&self) -> Option<Arc<dyn EnvSource>> {
+        self.inner.env_source.clone()
+    }
+
+    /// The network lists, their approver and the audit log.
+    pub(crate) fn network(
+        &self,
+    ) -> (
+        Option<CompiledNetworkPolicy>,
+        Option<AnyDomainApprover>,
+        Option<heel::NetworkAuditLog>,
+    ) {
+        (
+            self.inner.network.clone(),
+            self.inner.approver.clone(),
+            self.inner.audit.clone(),
+        )
+    }
+
+    /// The scheduling priority of the sandbox's processes.
+    pub(crate) fn priority(&self) -> heel::ProcessPriority {
+        self.inner.priority
+    }
+
     /// The same sandbox without confinement: a host spawn takes host access,
     /// ignoring the grants and denylists and the network lists.
     pub(crate) fn unconfined(&self) -> Self {

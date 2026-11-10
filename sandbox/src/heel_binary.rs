@@ -19,6 +19,11 @@ use crate::{HostProgramPath, ToolRuntimeError};
 pub struct SharedHeelBinary(Arc<OnceCell<HeelBinary>>);
 
 impl SharedHeelBinary {
+    /// A binary the embedder already verified.
+    pub(crate) fn provided(heel: HeelBinary) -> Self {
+        Self(Arc::new(OnceCell::from(heel)))
+    }
+
     /// Verifies the distribution's `heel` and shares it from now on.
     ///
     /// # Errors

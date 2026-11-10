@@ -6,7 +6,7 @@ mod terminal;
 pub use ask::{AskCommand, AskModelTier};
 pub use terminal::{
     JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
-    JobToolSettings, ToolIdentity,
+    ShellToolSettings, ToolIdentity,
 };
 
 use heel::IpcRouter;

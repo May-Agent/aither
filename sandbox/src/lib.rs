@@ -16,9 +16,15 @@
 //! // amber-forest-thunder-pearl/), not a leased id, with an outputs/
 //! // subdirectory and IPC command wrapper scripts; the ids the model reads are
 //! // leased from `with_id_allocator`'s allocator
-//! let tool = Shell::new_in(std::env::temp_dir(), executor).await?;
-//! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
-//! let tool = tool.with_registry(registry);
+//! let shell = Shell::builder(sandbox)
+//!     .limits(limits)
+//!     .output(output)
+//!     .wording(wording)
+//!     .tools(tools)
+//!     .build()
+//!     .await?;
+//! let registry = Arc::new(ToolRegistryBuilder::new().build(shell.output_store().clone()));
+//! let tool = shell.with_registry(registry);
 //!
 //! // Access the working directory path
 //! tracing::info!("Working dir: {}", tool.working_dir().display());
@@ -124,7 +130,7 @@ pub mod test_ids;
 pub use bollard_exec::BollardContainerExec;
 pub use builtin::{
     JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
-    JobToolSettings, ToolIdentity,
+    ShellToolSettings, ToolIdentity,
 };
 pub use command::{
     AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandCall, CommandEnvelope, CommandGate,
@@ -203,9 +209,9 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, ShellArgs,
-    TerminalBinding, TerminalError, TerminalRunError, TerminalRunner, TerminalScript,
-    Shell, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
+    CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, Given, Missing,
+    ShellArgs, ShellBuilder, ShellTool, TerminalBinding, TerminalError, TerminalRunError,
+    TerminalRunner, TerminalScript, Shell, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
     open_network_audit_log,
 };
 pub use tool_distribution::{

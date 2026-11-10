@@ -824,7 +824,7 @@ pub struct DynTerminalTool {
     pub(crate) kept_receiver: KeptExchangeReceiver,
     pub(crate) jobs: crate::Jobs,
     /// What the controls are named and described as.
-    pub(crate) job_tools: crate::builtin::JobToolSettings,
+    pub(crate) job_tools: crate::builtin::ShellToolSettings,
     pub(crate) working_dir: PathBuf,
     pub(crate) command_names: Vec<String>,
     pub(crate) prepared_tools: crate::ToolCatalog,
@@ -1568,7 +1568,7 @@ impl ToolRegistry {
     pub(crate) fn with_terminal_controls(
         mut self,
         jobs: crate::Jobs,
-        job_tools: &crate::builtin::JobToolSettings,
+        job_tools: &crate::builtin::ShellToolSettings,
         outputs: OutputStore,
     ) -> Self {
         let mut controls = ToolRegistryBuilder::new();
