@@ -134,6 +134,7 @@
 //! request fails rather than hanging.
 
 mod adapter;
+mod child;
 mod client;
 pub mod ext;
 mod macros;
@@ -144,6 +145,7 @@ mod session;
 pub mod vendor;
 
 pub use adapter::SessionUpdateMapper;
+pub use child::{AcpChildAgent, UpdateSink, UpdateSource};
 pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};
 pub use protocol::*;
 pub use server::{AcpServer, SessionSetup};

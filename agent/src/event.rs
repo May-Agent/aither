@@ -88,7 +88,10 @@ macro_rules! text_id {
         pub struct $name(String);
 
         impl $name {
-            pub(crate) fn new(id: impl Into<String>) -> Self {
+            /// Names an id, for an agent that lives outside this crate and
+            /// mints its own.
+            #[must_use]
+            pub fn new(id: impl Into<String>) -> Self {
                 Self(id.into())
             }
 
@@ -116,7 +119,10 @@ macro_rules! counter_id {
         pub struct $name($inner);
 
         impl $name {
-            pub(crate) const fn new(id: $inner) -> Self {
+            /// Names an id, for an agent that lives outside this crate and
+            /// mints its own.
+            #[must_use]
+            pub const fn new(id: $inner) -> Self {
                 Self(id)
             }
 
@@ -631,6 +637,96 @@ pub struct TimedEvent {
     pub agent: AgentPath,
     /// The event itself.
     pub event: AgentEvent,
+}
+
+impl TimedEvent {
+    /// An event emitted now by `agent`, for a [`ChildAgent`](crate::ChildAgent)
+    /// that lives outside this crate.
+    #[must_use]
+    pub fn now(agent: AgentPath, event: AgentEvent) -> Self {
+        Self {
+            at: Timestamp::now(),
+            agent,
+            event,
+        }
+    }
+}
+
+/// Constructors for the events an agent that lives outside this crate, such
+/// as an external session run as a [`ChildAgent`](crate::ChildAgent), can
+/// report.
+impl AgentEvent {
+    /// A run began.
+    #[must_use]
+    pub const fn run_started(run: RunId, agent: AgentPath) -> Self {
+        Self::RunStarted { run, agent }
+    }
+
+    /// A run ended.
+    #[must_use]
+    pub const fn run_ended(run: RunId, outcome: RunOutcome) -> Self {
+        Self::RunEnded { run, outcome }
+    }
+
+    /// A chunk of a block of a response.
+    #[must_use]
+    pub const fn block_delta(
+        request: RequestId,
+        block: BlockId,
+        kind: OutputKind,
+        text: String,
+    ) -> Self {
+        Self::BlockDelta {
+            request,
+            block,
+            kind,
+            text,
+        }
+    }
+
+    /// A block of a response is complete.
+    #[must_use]
+    pub const fn block_ended(request: RequestId, block: BlockId, kind: OutputKind) -> Self {
+        Self::BlockEnded {
+            request,
+            block,
+            kind,
+        }
+    }
+
+    /// A tool call was made.
+    #[must_use]
+    pub const fn tool_call_started(
+        call: ToolCallId,
+        name: String,
+        arguments: serde_json::Value,
+        origin: ToolOrigin,
+    ) -> Self {
+        Self::ToolCallStarted {
+            call,
+            name,
+            arguments,
+            origin,
+        }
+    }
+
+    /// The call's fate was settled.
+    #[must_use]
+    pub const fn tool_call_decided(call: ToolCallId, decision: ToolVerdict) -> Self {
+        Self::ToolCallDecided { call, decision }
+    }
+
+    /// A running tool reported progress.
+    #[must_use]
+    pub const fn tool_progress(call: ToolCallId, progress: Progress) -> Self {
+        Self::ToolProgress { call, progress }
+    }
+
+    /// A tool call ended.
+    #[must_use]
+    pub const fn tool_call_ended(call: ToolCallId, result: ToolResult) -> Self {
+        Self::ToolCallEnded { call, result }
+    }
 }
 
 impl AgentEvent {
