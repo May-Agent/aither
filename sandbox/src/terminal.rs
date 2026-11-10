@@ -4912,9 +4912,10 @@ mod tests {
 
     use super::*;
     use crate::GitDirAccess;
+    use crate::JobInputTool;
     use crate::ShellWording;
     #[cfg(unix)]
-    use crate::builtin::{JobInputArgs, JobInputTool};
+    use crate::builtin::JobInputArgs;
     use crate::output::empty_stream;
     use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
     use crate::test_wording::TestWording;

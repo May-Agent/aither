@@ -644,6 +644,7 @@ dependencies = [
  "anyhow",
  "async-net",
  "chromiumoxide",
+ "dom_query",
  "dom_smoothie",
  "futures-lite",
  "htmd",

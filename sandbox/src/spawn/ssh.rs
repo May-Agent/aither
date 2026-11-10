@@ -197,9 +197,13 @@ impl Sandbox {
         .render()
         .map_err(|e| failed(&e))?;
 
-        let mut command = self.inner.ssh_client.command(server, &remote);
+        let command = self.inner.ssh_client.command(server, &remote);
         #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let command = {
+            let mut command = command;
+            std::os::unix::process::CommandExt::process_group(&mut command, 0);
+            command
+        };
         // The pipes are set on the async command: converting a std command
         // resets them, and spawning would then inherit this process's stdio.
         let mut child = async_process::Command::from(command)
