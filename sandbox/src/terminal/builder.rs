@@ -368,17 +368,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let start = directory.path().canonicalize().unwrap();
         let shell = shell(&start, Grants::new(), &[Interpreter::Shell]).await;
+        // The `;` makes the script one the managed shell runs: a bare
+        // `probe` is a direct command, which Linux's supervisor refuses to
+        // start at all and macOS reports as an exit.
         let result = shell
             .run(crate::Script::new(
-                "probe",
+                "probe;",
                 &start,
                 std::time::Duration::from_secs(30),
             ))
             .await
             .expect("the script runs");
         assert!(
-            !matches!(result.outcome, crate::RunOutcome::Exited { code: 0 }),
-            "{result:?}"
+            matches!(result.outcome, crate::RunOutcome::Exited { code: 127 }),
+            "the shell finds no `probe`: {result:?}"
         );
     }
 
