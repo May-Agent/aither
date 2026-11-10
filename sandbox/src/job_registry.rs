@@ -245,6 +245,14 @@ impl std::fmt::Debug for JobWatch {
     }
 }
 
+impl JobWatch {
+    /// The job's task id lease, weakly: it neither keeps the word leased nor
+    /// the job registered.
+    pub(crate) fn lease(&self) -> WeakIdLease {
+        self.task_id.downgrade()
+    }
+}
+
 impl Drop for JobWatch {
     fn drop(&mut self) {
         let task_id = self.task_id.clone();
@@ -452,6 +460,14 @@ enum JobRequest {
         task_id: IdLease,
         chunk: Vec<u8>,
         reply: Sender<()>,
+    },
+    /// Appends `chunk` to the stdout of the running job leasing `task_id`,
+    /// replying whether it did: `false` when that job is not registered, no
+    /// longer runs or is another job under the same word.
+    AppendRunningTaskStdout {
+        task_id: IdLease,
+        chunk: Vec<u8>,
+        reply: Sender<bool>,
     },
     OweCompletion {
         task_id: String,
@@ -785,6 +801,30 @@ impl JobRegistry {
         })
         .await;
         Self::recv_reply(reply_rx).await;
+    }
+
+    /// Appends stdout bytes to the job `task_id` refers to, returning once
+    /// they are in its output; `false` when that job is not registered, has
+    /// ended or its word was released, in which case the bytes go nowhere. A
+    /// word leased again by a later job is never that job's.
+    pub(crate) async fn append_running_task_stdout(
+        &self,
+        task_id: &WeakIdLease,
+        chunk: Vec<u8>,
+    ) -> bool {
+        // The lease is held until the registry answers, so its word cannot
+        // name another job meanwhile.
+        let Some(task_id) = task_id.upgrade() else {
+            return false;
+        };
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::AppendRunningTaskStdout {
+            task_id,
+            chunk,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
     }
 
     /// Marks stdout stream closed.
@@ -1473,6 +1513,20 @@ async fn handle_job_request(
             } else if let Some(reply) = parked.park(&task_id, chunk, reply) {
                 let _ = reply.send(()).await;
             }
+        }
+        JobRequest::AppendRunningTaskStdout {
+            task_id,
+            chunk,
+            reply,
+        } => {
+            let running = find_pid_by_task_id(jobs, &task_id).filter(|pid| {
+                let job = &jobs[pid];
+                job.task_id.same_lease(&task_id) && matches!(job.info.status, JobStatus::Running)
+            });
+            if let Some(pid) = running {
+                append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
+            }
+            let _ = reply.send(running.is_some()).await;
         }
         JobRequest::List { reply } => {
             let items = jobs.values().map(|state| state.info.clone()).collect();

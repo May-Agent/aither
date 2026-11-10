@@ -114,7 +114,9 @@ pub use job_registry::{
     Delivery, JobDelta, JobInfo, JobPlace, JobRead, JobStatus, KillCause, OwedCompletion,
     PendingCompletion, UnchangedRead,
 };
-pub use jobs::{Job, JobWaitError, Jobs, RunOutcome, ScriptResult};
+pub use jobs::{
+    AppendOutcome, Job, JobOutputAppender, JobWaitError, Jobs, RunOutcome, ScriptResult,
+};
 #[cfg(all(unix, feature = "jobserver"))]
 pub use jobserver::{
     CommandFifo, JobBroker, JobBrokerService, JobPool, JobserverError, job_broker_channel,
