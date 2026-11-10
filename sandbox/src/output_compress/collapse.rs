@@ -1,5 +1,7 @@
 //! Blank-run collapsing stage.
 
+use askama::Template;
+
 /// A line counts as blank only when it has no characters at all.
 ///
 /// Lines made of spaces are left alone on purpose: in a unified diff every
@@ -10,27 +12,48 @@ const fn is_blank(line: &str) -> bool {
     line.is_empty()
 }
 
-/// Collapses every run of two or more blank lines into a single blank line.
+#[derive(Template)]
+#[template(path = "blank_lines_marker.txt", escape = "none")]
+struct BlankLinesMarker {
+    count: usize,
+}
+
+/// Replaces every run of two or more blank lines with one marker line that
+/// says how many blank lines it stands for.
 ///
 /// A lone blank line is always kept, so paragraphs, hunk separators and the
-/// blank context lines of a patch survive. Whether the text ends with a line
+/// blank context lines of a patch survive. The marker is one line of the
+/// returned text, and the returned text is what gets stored, so every line
+/// number downstream (previews, omitted ranges) counts the marker as one
+/// line and matches the stored file. Whether the text ends with a line
 /// terminator is preserved: lines keep the newline they arrived with, and
 /// none is added to a last line that had none.
 #[must_use]
 pub fn collapse_blank_runs(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_blank_run = false;
+    let mut run = 0_usize;
+    let flush = |out: &mut String, run: usize| match run {
+        0 => {}
+        1 => out.push('\n'),
+        count => {
+            out.push_str(
+                &BlankLinesMarker { count }
+                    .render()
+                    .expect("blank lines marker template must render"),
+            );
+            out.push('\n');
+        }
+    };
     for line in text.split_inclusive('\n') {
         if is_blank(line.strip_suffix('\n').unwrap_or(line)) {
-            if in_blank_run {
-                continue;
-            }
-            in_blank_run = true;
-        } else {
-            in_blank_run = false;
+            run += 1;
+            continue;
         }
+        flush(&mut out, run);
+        run = 0;
         out.push_str(line);
     }
+    flush(&mut out, run);
     out
 }
 
@@ -39,11 +62,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collapses_runs_to_one_blank_line() {
-        assert_eq!(
-            collapse_blank_runs("alpha\n\n\n\nbeta\n"),
-            "alpha\n\nbeta\n"
+    fn collapses_a_run_to_one_marker_naming_its_count() {
+        let collapsed = collapse_blank_runs("alpha\n\n\n\nbeta\n");
+        let lines: Vec<&str> = collapsed.lines().collect();
+        assert_eq!(lines.len(), 3, "{collapsed}");
+        assert_eq!(lines[0], "alpha");
+        assert!(
+            lines[1].starts_with("[... 3 blank lines collapsed"),
+            "{collapsed}"
         );
+        assert!(lines[1].contains("not part of it"), "{collapsed}");
+        assert_eq!(lines[2], "beta");
+    }
+
+    #[test]
+    fn a_run_of_two_is_marked_too() {
+        let collapsed = collapse_blank_runs("a\n\n\nb\n");
+        assert!(
+            collapsed.contains("[... 2 blank lines collapsed"),
+            "{collapsed}"
+        );
+    }
+
+    #[test]
+    fn line_numbers_after_a_run_count_the_marker_as_one_line() {
+        let collapsed = collapse_blank_runs("a\n\n\n\n\nb\nc\n");
+        let number = collapsed
+            .lines()
+            .position(|line| line == "c")
+            .expect("c present")
+            + 1;
+        assert_eq!(number, 4, "{collapsed}");
     }
 
     #[test]
@@ -59,7 +108,12 @@ mod tests {
 
     #[test]
     fn collapses_a_trailing_run() {
-        assert_eq!(collapse_blank_runs("alpha\n\n\n"), "alpha\n\n");
+        let collapsed = collapse_blank_runs("alpha\n\n\n");
+        assert!(
+            collapsed.starts_with("alpha\n[... 2 blank lines collapsed")
+                && collapsed.ends_with("...]\n"),
+            "{collapsed}"
+        );
     }
 
     #[test]
@@ -69,7 +123,7 @@ mod tests {
 
     #[test]
     fn keeps_a_missing_final_newline() {
-        assert_eq!(collapse_blank_runs("alpha\n\n\nbeta"), "alpha\n\nbeta");
+        assert!(!collapse_blank_runs("alpha\n\n\nbeta").ends_with('\n'));
         assert_eq!(collapse_blank_runs("abc"), "abc");
     }
 }

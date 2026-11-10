@@ -1,0 +1,1 @@
+[... {{ count }} blank lines collapsed into this marker; the file has {{ count }} empty lines here and this line is not part of it ...]
