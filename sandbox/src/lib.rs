@@ -68,7 +68,6 @@ mod container;
 mod container_jobserver;
 mod events;
 mod foreground_wait;
-mod heel_binary;
 mod interpreter;
 mod job_registry;
 mod jobs;
@@ -189,8 +188,7 @@ pub use process_tree::{
 };
 pub use shell_session::{
     AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerProbe, ContainerProbeError,
-    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellRuntimeAvailability,
-    ShellSessionRegistry,
+    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellSessionRegistry,
 };
 pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,

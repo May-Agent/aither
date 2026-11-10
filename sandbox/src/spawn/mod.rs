@@ -432,6 +432,44 @@ impl Sandbox {
         &self.inner.working_dir
     }
 
+    /// The same sandbox starting its processes in `working_dir`.
+    #[must_use]
+    pub fn with_working_dir(self, working_dir: impl Into<PathBuf>) -> Self {
+        self.edit(|inner| inner.working_dir = working_dir.into())
+    }
+
+    /// The same sandbox on `backend`: the grants, environment and network
+    /// policy are kept.
+    #[must_use]
+    pub fn with_backend(self, backend: Backend) -> Self {
+        self.edit(|inner| inner.backend = backend)
+    }
+
+    /// The sandbox with what a tool session adds for the programs it
+    /// prepared: grants that lead the embedder's fixed ones, environment the
+    /// embedder's own and its source's override, and the write denylist unless
+    /// the embedder gave one.
+    pub(crate) fn with_session(
+        self,
+        grants: Vec<heel::Grant>,
+        environment: Vec<(String, String)>,
+        write_denylist: heel::WriteDenylist,
+    ) -> Self {
+        self.edit(|inner| {
+            inner.fixed_grants.splice(0..0, grants);
+            inner.environment.splice(0..0, environment);
+            inner.write_denylist.get_or_insert(write_denylist);
+        })
+    }
+
+    /// The `heel` binary of a sandbox on the host.
+    pub(crate) fn host_heel(&self) -> Option<&heel::HeelBinary> {
+        match &self.inner.backend {
+            Backend::Host { heel } => Some(heel),
+            Backend::Container { .. } | Backend::Ssh { .. } => None,
+        }
+    }
+
     /// The executor the sandbox's tasks run on.
     pub(crate) fn executor(&self) -> Arc<AnyExecutor> {
         Arc::clone(&self.inner.executor)
@@ -440,26 +478,6 @@ impl Sandbox {
     /// Where the sandbox's processes run.
     pub(crate) fn backend(&self) -> &Backend {
         &self.inner.backend
-    }
-
-    /// The embedder's environment source.
-    pub(crate) fn env_source(&self) -> Option<Arc<dyn EnvSource>> {
-        self.inner.env_source.clone()
-    }
-
-    /// The network lists, their approver and the audit log.
-    pub(crate) fn network(
-        &self,
-    ) -> (
-        Option<CompiledNetworkPolicy>,
-        Option<AnyDomainApprover>,
-        Option<heel::NetworkAuditLog>,
-    ) {
-        (
-            self.inner.network.clone(),
-            self.inner.approver.clone(),
-            self.inner.audit.clone(),
-        )
     }
 
     /// The scheduling priority of the sandbox's processes.

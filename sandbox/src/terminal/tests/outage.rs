@@ -26,10 +26,6 @@ async fn terminal(
     .adopt_prepared_tools(shell_sessions)
     .await
     .expect("prepared tools should be adopted")
-    .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-        local: true,
-        container: false,
-    })
     .with_connectivity(connectivity);
     let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
     (cache, tool.with_registry(registry))

@@ -59,8 +59,8 @@ pub(super) struct LocalGit<E> {
     /// repository answers to.
     pub committing: Vec<CommittingWorktree>,
     pub priority: ProcessPriority,
-    /// The parent terminal's verified `heel` binary.
-    pub heel: crate::heel_binary::SharedHeelBinary,
+    /// The parent terminal's `heel` binary.
+    pub heel: heel::HeelBinary,
 }
 
 /// The host's own `git` as an absolute path, so a sandboxed git does not
@@ -209,13 +209,8 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                 )
                 .collect::<heel::Result<_>>()
                 .map_err(|error| ExportError::Launch(error.to_string()))?;
-        let heel_binary = self
-            .heel
-            .get()
-            .await
-            .map_err(|error| ExportError::Launch(error.to_string()))?;
         let config = SandboxConfig::builder()
-            .heel_binary(heel_binary)
+            .heel_binary(self.heel.clone())
             .network(DenyAll)
             .working_dir(canonical(&working_dir))
             .grants(grants)
@@ -343,6 +338,7 @@ impl<E: Executor + Clone + 'static> SandboxedGitImpl for LocalGit<E> {
 pub(super) struct ContainerGit<E> {
     pub executor: E,
     pub shell_sessions: ShellSessionRegistry,
+    pub runtime: crate::ContainerShellRuntime,
     pub confinement: ContainerConfinement,
     pub mount: MountRoot,
     pub priority: ProcessPriority,
@@ -350,11 +346,7 @@ pub(super) struct ContainerGit<E> {
 
 impl<E: Executor + Clone + 'static> ContainerGit<E> {
     async fn run_in_container(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
-        let runtime = self
-            .shell_sessions
-            .container_runtime()
-            .cloned()
-            .ok_or_else(|| ExportError::Launch("no container runtime".to_string()))?;
+        let runtime = self.runtime.clone();
         let tools = self
             .shell_sessions
             .container_tools()

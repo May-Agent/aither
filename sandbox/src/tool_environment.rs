@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::ContainerPath;
 use crate::shell_session::{ShellBackend, ShellSessionRegistry};
+use crate::spawn::Backend;
 use crate::ssh::{PreparedSsh, SshEnvironment};
 use crate::tool_distribution::ToolDistribution;
 use crate::tool_runtime::{
@@ -63,18 +64,14 @@ impl ShellSessionRegistry {
     ///
     /// # Errors
     /// Fails on unsupported platforms, missing artifacts, integrity failures
-    /// and a registry with no home backend.
+    /// and a `home` that is no home environment.
     pub async fn initialize_tools(
         mut self,
+        home: &Backend,
         distribution: &ToolDistribution,
         cache_root: &Path,
     ) -> Result<Self, ToolRuntimeError> {
-        let availability = self.availability();
-        let home = if availability.container {
-            let runtime = self
-                .container_runtime()
-                .cloned()
-                .ok_or(ToolRuntimeError::MissingContainerRuntime)?;
+        let home = if let Backend::Container { runtime, .. } = home {
             let transport = ContainerToolTransport::new(runtime.clone());
             let info = probe_tool_environment(&transport).await?;
             let tools = distribution
@@ -85,7 +82,7 @@ impl ShellSessionRegistry {
                 container_id: runtime.container_id().into(),
                 tools,
             }
-        } else if availability.local {
+        } else if matches!(home, Backend::Host { .. }) {
             let target = ToolTarget::native()?;
             ensure_command_line_tools(&LocalToolTransport, &target).await?;
             let artifacts = cache_root.join("artifacts");
@@ -101,7 +98,7 @@ impl ShellSessionRegistry {
             )
         } else {
             return Err(ToolRuntimeError::NotInitialized(
-                "no configured home environment".into(),
+                "an SSH server is no home environment".into(),
             ));
         };
         let catalog = home.catalog().clone();
@@ -116,33 +113,46 @@ impl ShellSessionRegistry {
         Ok(self)
     }
 
-    /// Prepared environments, provided they are exactly the configured home
-    /// backend.
-    ///
-    /// Preparation is bound to the home backend and the container it mounted
-    /// into; a registry whose home changed after preparation describes an
-    /// environment nobody prepared.
+    /// Prepared environments, once the registry was prepared.
     fn prepared_environments(&self) -> Result<&PreparedToolEnvironments, ToolRuntimeError> {
-        let prepared = self
-            .prepared_tools
+        self.prepared_tools
             .as_ref()
-            .ok_or_else(|| ToolRuntimeError::NotInitialized("execution environments".into()))?;
-        if Some(prepared.home.backend()) != self.resolve_local_backend().ok() {
+            .ok_or_else(|| ToolRuntimeError::NotInitialized("execution environments".into()))
+    }
+
+    /// Checks that the prepared tools are exactly the ones `home` runs
+    /// with: preparation is bound to the home backend and the container it
+    /// mounted into, so a registry prepared for another home describes an
+    /// environment nobody prepared.
+    ///
+    /// # Errors
+    /// Rejects an uninitialized registry, one prepared for another home
+    /// backend and one prepared in another container.
+    pub(crate) fn check_home(&self, home: &Backend) -> Result<(), ToolRuntimeError> {
+        let prepared = self.prepared_environments()?;
+        let backend = match home {
+            Backend::Host { .. } => ShellBackend::Local,
+            Backend::Container { .. } => ShellBackend::Container,
+            Backend::Ssh { .. } => {
+                return Err(ToolRuntimeError::EnvironmentChanged(
+                    PreparedEnvironment::HomeBackend,
+                ));
+            }
+        };
+        if prepared.home.backend() != backend {
             return Err(ToolRuntimeError::EnvironmentChanged(
                 PreparedEnvironment::HomeBackend,
             ));
         }
-        if let PreparedHome::Container { container_id, .. } = &prepared.home
-            && self
-                .container_runtime()
-                .map(crate::ContainerShellRuntime::container_id)
-                != Some(container_id.as_str())
+        if let (PreparedHome::Container { container_id, .. }, Backend::Container { runtime, .. }) =
+            (&prepared.home, home)
+            && runtime.container_id() != container_id.as_str()
         {
             return Err(ToolRuntimeError::EnvironmentChanged(
                 PreparedEnvironment::Container,
             ));
         }
-        Ok(prepared)
+        Ok(())
     }
 
     /// The prepared tools of a local home backend, as the host sees them.

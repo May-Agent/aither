@@ -13,13 +13,14 @@
 //! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
 
 use crate::foreground_wait::ForegroundWait;
-use crate::heel_binary::SharedHeelBinary;
 use crate::memory::{
     AnyContainerMemory, AnyFootprintReader, AnyFootprintRegistry, FootprintReader,
     FootprintRegistry, JobMemory, ProbedContainerMemory, ResponseWindow, SystemFootprints,
 };
-use crate::network_policy::CompiledNetworkPolicy;
 use crate::outage::Outages;
+use crate::spawn::Backend;
+#[cfg(test)]
+use crate::{AnyShellWording, OutputPolicy};
 use std::{
     borrow::Cow,
     io::Read,
@@ -76,15 +77,12 @@ use crate::{
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
     limits::{LiveDuration, ShellLimits},
     output::{MediaResolution, OutputFormat, OutputStore, stored_path},
-    output_policy::OutputPolicy,
     process_tree::{JobProcess, JobTree},
-    shell_session::{
-        ContainerShellRuntime, ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry,
-    },
+    shell_session::{ContainerShellRuntime, ShellSessionRegistry},
     spawn::stdio::{read_chunks, write_chunks},
     spawn::{
-        AnyDomainApprover, ContainerSetup, Descendants, DomainApprover, EnvSource, GrantSnapshot,
-        Grants, LocalSpawn, Pipe, Sandbox, SpawnSpec, Stdio as SpawnStdio, TreeLifetime,
+        ContainerSetup, Descendants, EnvSource, GrantSnapshot, Grants, LocalSpawn, Pipe, Sandbox,
+        SpawnSpec, Stdio as SpawnStdio, TreeLifetime,
     },
     ssh::{SshClient, SshEnvironment, SshServer},
     stdin_watch::{
@@ -95,7 +93,6 @@ use crate::{
         LaunchHistory, Launcher, PreparedSpace, ResolvedGrant, RunSpace, Spelling, SubagentGit,
         SubagentGrant, SubagentGrantError, SubagentSpaces, canonical as canonical_path,
     },
-    wording::AnyShellWording,
 };
 
 mod builder;
@@ -135,19 +132,10 @@ where
     }
 }
 
-/// What a terminal's sandboxed network connections are checked against: the
-/// lists, the approver for what they leave open, and the audit log.
-#[derive(Clone, Default)]
-struct NetworkSettings {
-    lists: Option<CompiledNetworkPolicy>,
-    approver: Option<AnyDomainApprover>,
-    audit: Option<NetworkAuditLog>,
-}
-
 /// Opens a daily-rotated network audit log under `dir`, creating the directory if needed.
 ///
 /// Keeps at most `max_files` rotated files. Attach the log with
-/// [`Shell::with_network_audit_log`] to record every sandboxed
+/// [`Sandbox::with_audit_log`] to record every sandboxed
 /// network policy decision.
 ///
 /// # Errors
@@ -1068,27 +1056,20 @@ pub struct Shell<E, State = Unconfigured> {
     limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
     running_tasks: Arc<AtomicUsize>,
-    /// Filesystem grants, shared by every clone; commands snapshot them at
-    /// launch.
-    grants: Grants,
+    /// The sandbox this shell's scripts run in: its grants, which every clone
+    /// shares and commands snapshot at launch, environment source, network
+    /// policy, priority, backend and `heel`. Each job runs in a copy of it
+    /// with what the job adds.
+    sandbox: Sandbox,
     /// Set on a subagent's terminal, never on the main agent's.
     subagent: Option<SubagentAuthority>,
     /// The working directory the next foreground command starts in; held on
     /// the main agent's terminal only, a subagent's commands always start in
     /// its own space.
     carried_dir: Option<CarriedDir>,
-    /// Extra environment variables resolved for each spawned execution.
-    env_source: Option<Arc<dyn EnvSource>>,
-    /// Rolling audit log recording every sandboxed network policy decision.
-    network: NetworkSettings,
-    /// Scheduling priority applied to every sandboxed execution.
-    priority: ProcessPriority,
     /// Shared jobserver token broker, when configured.
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
-    /// The verified `heel` binary every sandbox this tool creates carries,
-    /// shared by its clones and its subagents' tools.
-    heel: SharedHeelBinary,
     /// Records the outages commands run through.
     outages: Outages,
     /// Prepares the space of every subagent launched from this terminal and,
@@ -1114,15 +1095,11 @@ impl<E: Clone, State: Clone> Clone for Shell<E, State> {
             interpreters: self.interpreters.clone(),
             limits: self.limits.clone(),
             running_tasks: self.running_tasks.clone(),
-            grants: self.grants.clone(),
+            sandbox: self.sandbox.clone(),
             subagent: self.subagent.clone(),
             carried_dir: self.carried_dir.clone(),
-            env_source: self.env_source.clone(),
-            network: self.network.clone(),
-            priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
-            heel: self.heel.clone(),
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             registry: self.registry.clone(),
@@ -1159,47 +1136,6 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
         self
     }
 
-    /// Sets dynamic runtime availability for terminal execution.
-    #[must_use]
-    pub fn with_shell_runtime_availability(
-        mut self,
-        availability: crate::shell_session::ShellRuntimeAvailability,
-    ) -> Self {
-        self.sessions = self.sessions.with_availability(availability);
-        self
-    }
-
-    /// Adds container runtime metadata for container-backed terminal execution.
-    #[must_use]
-    pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
-        self.sessions = self.sessions.with_container_runtime(runtime);
-        self
-    }
-
-    /// Records every sandboxed network policy decision — allowed or denied —
-    /// into the given rolling audit log.
-    #[must_use]
-    pub fn with_network_audit_log(mut self, log: NetworkAuditLog) -> Self {
-        self.network.audit = Some(log);
-        self
-    }
-
-    /// Sets the network lists a sandboxed connection is checked against
-    /// first: a host they allow or deny is decided without the approver.
-    #[must_use]
-    pub fn with_network_policy(mut self, policy: CompiledNetworkPolicy) -> Self {
-        self.network.lists = Some(policy);
-        self
-    }
-
-    /// Decides the connections the network lists leave open. Without an
-    /// approver every such connection is denied.
-    #[must_use]
-    pub fn with_domain_approver(mut self, approver: impl DomainApprover + 'static) -> Self {
-        self.network.approver = Some(AnyDomainApprover::new(approver));
-        self
-    }
-
     /// Has `spaces` prepare the space of every subagent launched from this
     /// terminal and, at any depth, from theirs, before the subagent's
     /// terminal exists. A launch whose space cannot be prepared fails with
@@ -1227,36 +1163,38 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
         self
     }
 
-    /// Creates a shell with an executor, working in `working_dir` itself.
-    ///
-    /// Every interpreter is configured and the grants, environment and
-    /// network are empty; [`Shell::builder`] takes them from a
-    /// [`Sandbox`] instead.
+    /// Creates a shell whose scripts run in `sandbox`, working in its
+    /// working directory itself.
     ///
     /// # Errors
-    /// Returns an error when the working directory or output store cannot be created.
-    pub(crate) async fn new_exact(
-        working_dir: impl AsRef<std::path::Path>,
+    /// Returns an error when the working directory or output store cannot be
+    /// created, or when the sandbox runs its processes on an SSH server: a
+    /// server is a location a script names, not a shell's home.
+    pub(crate) async fn from_parts(
+        sandbox: Sandbox,
         executor: E,
-        limits: ShellLimits,
-        output: OutputPolicy,
-        wording: AnyShellWording,
-        job_tools: ShellToolSettings,
+        parts: builder::ShellParts,
     ) -> Result<Self, TerminalError> {
+        if let Backend::Ssh { server, .. } = sandbox.backend() {
+            return Err(TerminalError::SandboxSetup(format!(
+                "the sandbox runs on the SSH server {}: a server is a location, not a shell's home",
+                server.name
+            )));
+        }
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
         // one is not necessarily granted inside the sandbox.
-        async_fs::create_dir_all(working_dir.as_ref()).await?;
+        async_fs::create_dir_all(sandbox.working_dir()).await?;
         let working_dir_path =
-            dunce::simplified(&async_fs::canonicalize(working_dir.as_ref()).await?).to_path_buf();
+            dunce::simplified(&async_fs::canonicalize(sandbox.working_dir()).await?).to_path_buf();
 
         // Create outputs directory inside working dir
         let ids = AnyIdAllocator::default();
         let output_store = OutputStore::new(
             working_dir_path.join("outputs"),
             ids.clone(),
-            output,
-            wording,
+            parts.output,
+            parts.wording,
         )
         .await?;
 
@@ -1267,13 +1205,15 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
             .spawn(async move { job_registry_service.serve().await })
             .detach();
 
-        // Create channel for background task completion (unbounded to not block spawned tasks)
         let (events_tx, events_rx) = event_channel();
         let running_tasks = Arc::new(AtomicUsize::new(0));
+        let sandbox = sandbox
+            .with_working_dir(working_dir_path.clone())
+            .with_scanner(job_registry.scanner());
 
         Ok(Self {
             working_dir: working_dir_path,
-            sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
+            sessions: ShellSessionRegistry::default(),
             approver: None,
             executor,
             ids,
@@ -1281,23 +1221,63 @@ impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
             job_registry,
             events_tx,
             events_rx,
-            job_tools,
-            interpreters: Arc::new([Interpreter::Shell, Interpreter::Python]),
-            limits: TerminalLimits::new(limits),
+            job_tools: parts.tools,
+            interpreters: parts.interpreters.into(),
+            limits: TerminalLimits::new(parts.limits),
             running_tasks,
-            grants: Grants::new(),
+            sandbox,
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
-            env_source: None,
-            network: NetworkSettings::default(),
-            priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
-            heel: SharedHeelBinary::default(),
             outages: Outages::none(),
             subagent_spaces: None,
             registry: Unconfigured,
         })
+    }
+
+    /// A shell on the host in `working_dir` under the pinned `heel`, with
+    /// shell and Python configured and nothing granted.
+    #[cfg(test)]
+    pub(crate) async fn new_exact(
+        working_dir: impl AsRef<std::path::Path>,
+        executor: E,
+        limits: ShellLimits,
+        output: OutputPolicy,
+        wording: AnyShellWording,
+        tools: ShellToolSettings,
+    ) -> Result<Self, TerminalError> {
+        let heel = crate::test_heel::pinned().await.expect("the pinned heel");
+        let sandbox = Sandbox::new(
+            Backend::Host { heel },
+            executor.clone(),
+            working_dir.as_ref(),
+        );
+        Self::new_exact_on(sandbox, executor, limits, output, wording, tools).await
+    }
+
+    /// A shell running in `sandbox`, with shell and Python configured.
+    #[cfg(test)]
+    pub(crate) async fn new_exact_on(
+        sandbox: Sandbox,
+        executor: E,
+        limits: ShellLimits,
+        output: OutputPolicy,
+        wording: AnyShellWording,
+        tools: ShellToolSettings,
+    ) -> Result<Self, TerminalError> {
+        Self::from_parts(
+            sandbox,
+            executor,
+            builder::ShellParts {
+                interpreters: vec![Interpreter::Shell, Interpreter::Python],
+                limits,
+                output,
+                wording,
+                tools,
+            },
+        )
+        .await
     }
 }
 
@@ -1318,15 +1298,11 @@ impl<E, State> Shell<E, State> {
             interpreters: self.interpreters,
             limits: self.limits,
             running_tasks: self.running_tasks,
-            grants: self.grants,
+            sandbox: self.sandbox,
             subagent: self.subagent,
             carried_dir: self.carried_dir,
-            env_source: self.env_source,
-            network: self.network,
-            priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver,
-            heel: self.heel,
             outages: self.outages,
             subagent_spaces: self.subagent_spaces,
             registry: state(self.registry),
@@ -1396,81 +1372,6 @@ where
     E: Executor + Clone + 'static,
     State: Clone,
 {
-    /// Adds additional writable paths to the sandbox configuration.
-    ///
-    /// These paths will be writable in sandboxed and network modes.
-    #[must_use]
-    pub fn with_writable_paths(self, paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
-        for path in paths {
-            self.grants.add_writable(path.into());
-        }
-        self
-    }
-
-    /// Adds additional readable (but not writable) paths to the sandbox configuration.
-    ///
-    /// These paths will be readable in all sandbox modes, even in strict
-    /// filesystem mode where reads outside the sandbox are normally denied.
-    #[must_use]
-    pub fn with_readable_paths(self, paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
-        for path in paths {
-            self.grants.add_readable(path.into());
-        }
-        self
-    }
-
-    /// Denies sandboxed local commands reading these absolute paths and
-    /// everything beneath them, in addition to heel's credential table
-    /// (`~/.ssh`, `~/.config/gh`, keychains and other credential stores).
-    /// Every other path on the host is readable; writes stay limited to the
-    /// granted paths.
-    #[must_use]
-    pub fn with_read_denied_paths(
-        self,
-        paths: impl IntoIterator<Item = impl Into<PathBuf>>,
-    ) -> Self {
-        for path in paths {
-            self.grants.deny_read(path.into());
-        }
-        self
-    }
-
-    /// Injects extra environment variables into every command this tool
-    /// spawns in the home environment.
-    ///
-    /// The source is resolved per execution, so values it returns reflect
-    /// the moment each command launches. Injection applies to the local and
-    /// container backends; SSH targets are deliberately excluded so
-    /// host-side values (for example secrets) never reach remote machines.
-    /// Caller-provided names override the session's computed environment.
-    #[must_use]
-    pub fn with_env_source(mut self, source: impl EnvSource + 'static) -> Self {
-        self.env_source = Some(Arc::new(source));
-        self
-    }
-
-    /// Injects a fixed set of environment variables into every spawned
-    /// command; a convenience for [`Self::with_env_source`] over static pairs.
-    #[must_use]
-    pub fn with_envs(self, envs: impl IntoIterator<Item = (String, String)>) -> Self {
-        self.with_env_source(envs.into_iter().collect::<Vec<_>>())
-    }
-
-    /// Lowers the scheduling priority of the commands this tool runs.
-    ///
-    /// The priority is applied to every sandbox the tool creates — one-shot
-    /// commands, persistent shell sessions and background jobs — and is
-    /// inherited by everything they spawn. Container executions run the script
-    /// through the image's own `heel run`, so the image needs a `heel` binary
-    /// when a non-normal priority is configured. SSH executions are not
-    /// affected: the remote host runs its own `heel`, managed outside this
-    /// configuration.
-    #[must_use]
-    pub const fn with_process_priority(mut self, priority: ProcessPriority) -> Self {
-        self.priority = priority;
-        self
-    }
-
     /// Shares a jobserver token pool across every command this tool runs.
     ///
     /// `pool` is the host-provided shared pool (a `fifo:` jobserver). Each
@@ -1507,29 +1408,12 @@ where
         Ok(self)
     }
 
-    /// Sets how long a `terminal` call waits in the foreground before a
-    /// still-running command promotes to a background task. Defaults to
-    /// [`DEFAULT_FOREGROUND_WAIT`].
-    #[must_use]
-    pub fn with_foreground_wait(self, wait: Duration) -> Self {
-        self.limits.foreground_wait.set_normal(wait);
-        self
-    }
-
     /// A handle on the foreground window, shared with every terminal derived
     /// from this one: a longer window put in force through it applies to the
     /// next foreground wait of each of them.
     #[must_use]
     pub fn foreground_wait(&self) -> ForegroundWait {
         self.limits.foreground_wait.clone()
-    }
-
-    /// Sets how long the agent has to act on a final memory warning before
-    /// the job it names is killed. Defaults to [`DEFAULT_RESPONSE_WINDOW`].
-    #[must_use]
-    pub fn with_response_window(self, window: Duration) -> Self {
-        self.limits.response_window.set(window);
-        self
     }
 
     /// A handle on the response window, shared with every terminal derived
@@ -1585,50 +1469,19 @@ where
     /// machine. A remote execution environment is never a home environment.
     #[must_use]
     pub fn container_probe(&self) -> Option<crate::ContainerProbe> {
-        if self.sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
-            return None;
+        match self.sandbox.backend() {
+            Backend::Container { runtime, .. } => Some(runtime.probe()),
+            Backend::Host { .. } | Backend::Ssh { .. } => None,
         }
-        self.sessions
-            .container_runtime()
-            .map(ContainerShellRuntime::probe)
     }
 
-    /// Sets the largest `timeout` a command accepts.
-    /// Defaults to [`DEFAULT_TIMEOUT_CAP`].
-    #[must_use]
-    pub fn with_timeout_cap(self, cap: Duration) -> Self {
-        self.limits.timeout_cap.set(cap);
-        self
-    }
-
-    /// Sets the most bytes a subagent's sandbox may send the host while the
-    /// commits it made are imported into the main repository; a pack or answer
-    /// that exceeds it fails the import. `0` leaves the bytes unbounded.
-    /// Defaults to [`DEFAULT_SUBAGENT_IMPORT_LIMIT`]. Each piece of an import's
-    /// sandboxed work is bounded in time by the foreground limit.
-    ///
-    /// The setting can be changed while the terminal and the subagents it
-    /// launches run, through [`Self::subagent_import_budget`].
-    #[must_use]
-    pub fn with_subagent_import_limit(self, bytes: u64) -> Self {
-        self.limits.subagent_import.set(bytes);
-        self
-    }
-
-    /// A handle on the setting [`Self::with_subagent_import_limit`] sets,
-    /// shared with every subagent this terminal launches: a change through it
-    /// applies to the next import of each of them.
+    /// A handle on the most bytes a subagent's sandbox may send the host
+    /// while its commits are imported, shared with every subagent this
+    /// terminal launches: a change through it applies to the next import of
+    /// each of them.
     #[must_use]
     pub fn subagent_import_budget(&self) -> ImportBudget {
         self.limits.subagent_import.clone()
-    }
-
-    /// Sets how long a background job may run before it produces one system
-    /// alert naming it. Defaults to [`DEFAULT_LONG_JOB_ALERT_AFTER`].
-    #[must_use]
-    pub fn with_long_job_alert_after(self, after: Duration) -> Self {
-        self.limits.long_job_alert.set(after);
-        self
     }
 
     /// Records the sleep and offline intervals `connectivity` reports during
@@ -1658,17 +1511,15 @@ where
     {
         self.sessions = self
             .sessions
-            .initialize_tools(distribution, cache_root)
+            .initialize_tools(self.sandbox.backend(), distribution, cache_root)
             .await?;
         if let Some(tools) = self.local_home_tools()? {
             tools.ensure_readonly(self.writable_grants().iter()).await?;
-            if let Some(pinned) = tools.heel() {
-                self.heel.provide(pinned).await?;
+            if let Some(heel) = self.sandbox.host_heel() {
+                tools
+                    .verify_local_versions(self.executor.clone(), heel.clone())
+                    .await?;
             }
-            let heel = self.heel.get().await?;
-            tools
-                .verify_local_versions(self.executor.clone(), heel)
-                .await?;
         }
         Ok(self)
     }
@@ -1694,29 +1545,26 @@ where
     where
         State: Send,
     {
-        sessions.prepared_catalog()?;
+        sessions.check_home(self.sandbox.backend())?;
         self.sessions = sessions;
         if let Some(tools) = self.local_home_tools()? {
             tools.ensure_readonly(self.writable_grants().iter()).await?;
-            if let Some(pinned) = tools.heel() {
-                self.heel.provide(pinned).await?;
-            }
         }
         Ok(self)
     }
 
     /// Prepared tools of the local home backend, when this terminal runs on it.
     fn local_home_tools(&self) -> Result<Option<&PreparedTools<PathBuf>>, ToolRuntimeError> {
-        match self.sessions.resolve_local_backend() {
-            Ok(ShellBackend::Local) => self.sessions.local_tools().map(Some),
-            _ => Ok(None),
+        match self.sandbox.backend() {
+            Backend::Host { .. } => self.sessions.local_tools().map(Some),
+            Backend::Container { .. } | Backend::Ssh { .. } => Ok(None),
         }
     }
 
     /// The paths this terminal grants write access to, which must not expose
     /// the managed tools.
     fn writable_grants(&self) -> Vec<PathBuf> {
-        let grants = self.grants.snapshot();
+        let grants = self.sandbox.grants().snapshot();
         std::iter::once(self.working_dir.clone())
             .chain(grants.writable.iter().cloned())
             .collect()
@@ -1791,7 +1639,7 @@ where
     /// The shared runtime grant handle: adding a grant through it affects
     /// every command launched afterwards, on this terminal and its clones.
     pub fn grants(&self) -> Grants {
-        self.grants.clone()
+        self.sandbox.grants().clone()
     }
 
     ///
@@ -1848,7 +1696,7 @@ where
         // view is canonical.
         let working_dir = canonical_path(&self.working_dir).await?;
         let mut authority = vec![working_dir.clone()];
-        for path in &self.grants.snapshot().writable {
+        for path in &self.sandbox.grants().snapshot().writable {
             authority.push(canonical_path(path).await?);
         }
         let spaces_root = working_dir.join(SUBAGENT_SPACES_DIR);
@@ -1977,20 +1825,25 @@ where
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
-        let grants = self.grants.derived(GrantSnapshot {
-            readable: authority,
-            writable: granted.writable.clone(),
-            ..GrantSnapshot::default()
-        });
-        let readable_paths = grants.snapshot().readable.clone();
-        let git = match (&container, mount) {
-            (Some(confinement), Some(mount)) => {
+        let sandbox = self
+            .sandbox
+            .derived(GrantSnapshot {
+                readable: authority,
+                writable: granted.writable.clone(),
+                ..GrantSnapshot::default()
+            })
+            .with_working_dir(space.clone())
+            .with_scanner(job_registry.scanner());
+        let readable_paths = sandbox.grants().snapshot().readable.clone();
+        let git = match (&container, mount, self.sandbox.backend()) {
+            (Some(confinement), Some(mount), Backend::Container { runtime, .. }) => {
                 SubagentGit::new(Arc::new(subagent_git::ContainerGit {
                     executor: self.executor.clone(),
                     shell_sessions: self.sessions.clone(),
+                    runtime: runtime.clone(),
                     confinement: confinement.clone(),
                     mount,
-                    priority: self.priority,
+                    priority: self.sandbox.priority(),
                 }))
             }
             _ => SubagentGit::new(Arc::new(subagent_git::LocalGit {
@@ -1999,8 +1852,12 @@ where
                 writable: granted.writable,
                 readable: readable_paths,
                 committing: granted.committing.clone(),
-                priority: self.priority,
-                heel: self.heel.clone(),
+                priority: self.sandbox.priority(),
+                heel: self
+                    .sandbox
+                    .host_heel()
+                    .expect("a subagent outside a container runs on the host")
+                    .clone(),
             })),
         };
         let registry = Arc::new(
@@ -2031,7 +1888,7 @@ where
             interpreters: self.interpreters.clone(),
             limits: self.limits.clone(),
             running_tasks,
-            grants,
+            sandbox,
             subagent: Some(SubagentAuthority {
                 _space_name: space_name,
                 committing: granted.committing,
@@ -2039,12 +1896,8 @@ where
                 prepared,
             }),
             carried_dir: None,
-            env_source: self.env_source.clone(),
-            network: self.network.clone(),
-            priority: self.priority,
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: self.jobserver.clone(),
-            heel: self.heel.clone(),
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             registry: Launching { registry },
@@ -2065,13 +1918,11 @@ where
     /// side canonical, spelling every path of a subagent's view inside the
     /// container. `None` outside a container.
     async fn container_mount(&self) -> Result<Option<MountRoot>, SubagentGrantError> {
-        if self.sessions.resolve_local_backend() != Ok(ShellBackend::Container) {
+        let Backend::Container { runtime, .. } = self.sandbox.backend() else {
             return Ok(None);
-        }
-        let mount = self
-            .sessions
-            .container_runtime()
-            .and_then(ContainerShellRuntime::workspace_mount)
+        };
+        let mount = runtime
+            .workspace_mount()
             .ok_or(SubagentGrantError::NoContainerMount)?;
         // The mount is compared by real path, like everything it maps.
         Ok(Some(MountRoot::new(
@@ -2229,25 +2080,20 @@ where
     }
 
     fn resolve_home_target(&self, mode: SandboxMode) -> Result<ExecutionTarget, TerminalError> {
-        let backend = self
-            .sessions
-            .resolve_local_backend()
-            .map_err(TerminalError::InvalidTarget)?;
-        if mode == SandboxMode::Unsandboxed && backend != ShellBackend::Local {
-            return Err(TerminalError::InvalidTarget(
-                "unsafe mode is only available in heel local runtime".into(),
-            ));
-        }
-        let backend = match backend {
-            ShellBackend::Local => ExecutionBackend::Local(self.sessions.local_tools()?.clone()),
-            ShellBackend::Container => ExecutionBackend::Container {
-                runtime: self
-                    .sessions
-                    .container_runtime()
-                    .cloned()
-                    .ok_or(ToolRuntimeError::MissingContainerRuntime)?,
-                tools: self.sessions.container_tools()?.clone(),
-            },
+        let backend = match self.sandbox.backend() {
+            Backend::Host { .. } => ExecutionBackend::Local(self.sessions.local_tools()?.clone()),
+            Backend::Container { runtime, .. } => {
+                if mode == SandboxMode::Unsandboxed {
+                    return Err(TerminalError::InvalidTarget(
+                        "unsafe mode is only available in heel local runtime".into(),
+                    ));
+                }
+                ExecutionBackend::Container {
+                    runtime: runtime.clone(),
+                    tools: self.sessions.container_tools()?.clone(),
+                }
+            }
+            Backend::Ssh { .. } => unreachable!("a shell is never built on an SSH server"),
         };
         Ok(ExecutionTarget { mode, backend })
     }
@@ -2341,9 +2187,7 @@ where
         running_tasks.fetch_add(1, Ordering::AcqRel);
         self.executor
             .spawn(execute_terminal_task(SpawnedTerminalTask {
-                working_dir: self.working_dir.clone(),
-                grants: self.grants.clone(),
-                env_source: self.env_source.clone(),
+                sandbox: self.sandbox.clone(),
                 executor: self.executor.clone(),
                 registry,
                 job_registry: self.job_registry.clone(),
@@ -2369,11 +2213,8 @@ where
                 taken: taken_rx,
                 completed_tx,
                 running_tasks,
-                network: self.network.clone(),
-                priority: self.priority,
                 #[cfg(all(unix, feature = "jobserver"))]
                 jobserver: self.jobserver.clone(),
-                heel: self.heel.clone(),
                 outages,
             }))
             .detach();
@@ -2699,7 +2540,7 @@ impl<E: Executor + Clone + 'static> Shell<E, Configured> {
         let ctx = CarryContext {
             carried_dir: self.carried_dir.as_ref(),
             working_dir: &self.working_dir,
-            grants: self.grants.snapshot(),
+            grants: self.sandbox.grants().snapshot(),
         };
         settle_cwd(carry, take_cwd_report(carry).await, succeeded, &ctx).await
     }
@@ -2960,15 +2801,13 @@ where
     /// `host`, or the terminal's own directory `own` when the script starts
     /// in neither a carried nor a named one, as the home backend names it.
     fn home_script_dir(&self, host: Option<PathBuf>, own: &Path) -> ScriptDir {
-        match self.sessions.resolve_local_backend() {
-            Ok(ShellBackend::Container) => container_script_dir(
-                self.sessions
-                    .container_runtime()
-                    .and_then(|runtime| runtime.workspace_mount()),
-                host,
-                own,
-            ),
-            _ => ScriptDir::Host(host.unwrap_or_else(|| own.to_path_buf())),
+        match self.sandbox.backend() {
+            Backend::Container { runtime, .. } => {
+                container_script_dir(runtime.workspace_mount(), host, own)
+            }
+            Backend::Host { .. } | Backend::Ssh { .. } => {
+                ScriptDir::Host(host.unwrap_or_else(|| own.to_path_buf()))
+            }
         }
     }
 
@@ -3155,7 +2994,7 @@ where
                     tools
                         .ensure_readonly(
                             std::iter::once(&self.working_dir)
-                                .chain(self.grants.snapshot().writable.iter()),
+                                .chain(self.sandbox.grants().snapshot().writable.iter()),
                         )
                         .await
                         .map_err(TerminalError::from)?;
@@ -3582,9 +3421,9 @@ fn background_preview(preview: &str) -> String {
 }
 
 struct StandaloneExecution<E> {
-    working_dir: PathBuf,
-    grants: Grants,
-    env_source: Option<Arc<dyn EnvSource>>,
+    /// The shell's sandbox: its directory, live grants, environment source,
+    /// network policy, priority and home backend.
+    sandbox: Sandbox,
     executor: E,
     registry: Arc<ToolRegistry>,
     job_registry: JobRegistry,
@@ -3600,11 +3439,8 @@ struct StandaloneExecution<E> {
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: BackgroundStartup,
-    network: NetworkSettings,
-    priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
-    heel: SharedHeelBinary,
     expect: OutputFormat,
     resolution: MediaResolution,
     outputs: OutputStore,
@@ -3613,9 +3449,7 @@ struct StandaloneExecution<E> {
 }
 
 struct StandaloneStart<'a, E> {
-    working_dir: &'a Path,
-    grants: &'a Grants,
-    env_source: &'a Option<Arc<dyn EnvSource>>,
+    sandbox: &'a Sandbox,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
     job_registry: &'a JobRegistry,
@@ -3629,18 +3463,13 @@ struct StandaloneStart<'a, E> {
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
-    network: NetworkSettings,
-    priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: &'a Option<JobBroker>,
-    heel: &'a SharedHeelBinary,
 }
 
 struct LocalBackgroundExecution<'a, E> {
     prepared_tools: &'a PreparedTools<PathBuf>,
-    working_dir: &'a Path,
-    grants: &'a Grants,
-    env_source: &'a Option<Arc<dyn EnvSource>>,
+    sandbox: &'a Sandbox,
     executor: E,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a IdLease,
@@ -3653,18 +3482,13 @@ struct LocalBackgroundExecution<'a, E> {
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
-    priority: ProcessPriority,
-    network: NetworkSettings,
     #[cfg(all(unix, feature = "jobserver"))]
     job_fifo: Option<crate::jobserver::CommandFifo>,
-    heel: &'a SharedHeelBinary,
 }
 
 struct ContainerJobExecution<'a, E> {
     executor: E,
-    working_dir: &'a Path,
-    grants: &'a Grants,
-    env_source: &'a Option<Arc<dyn EnvSource>>,
+    sandbox: &'a Sandbox,
     registry: &'a Arc<ToolRegistry>,
     task_id: &'a IdLease,
     execution_id: &'a str,
@@ -3679,7 +3503,6 @@ struct ContainerJobExecution<'a, E> {
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
-    priority: ProcessPriority,
     /// The command's jobserver fifo inside the container, held until its
     /// exec has ended.
     #[cfg(all(unix, feature = "jobserver"))]
@@ -3688,7 +3511,7 @@ struct ContainerJobExecution<'a, E> {
 
 struct SshBackgroundExecution<'a, E> {
     executor: E,
-    working_dir: &'a Path,
+    sandbox: &'a Sandbox,
     prepared_tools: &'a PreparedTools<PathBuf>,
     task_id: &'a IdLease,
     execution_id: &'a str,
@@ -3779,8 +3602,7 @@ impl SpawnedTerminal {
 }
 
 struct SpawnedTerminalTask<E> {
-    working_dir: PathBuf,
-    grants: Grants,
+    sandbox: Sandbox,
     executor: E,
     registry: Arc<ToolRegistry>,
     job_registry: JobRegistry,
@@ -3808,12 +3630,8 @@ struct SpawnedTerminalTask<E> {
     taken: Receiver<Sender<()>>,
     completed_tx: EventSender,
     running_tasks: Arc<AtomicUsize>,
-    env_source: Option<Arc<dyn EnvSource>>,
-    network: NetworkSettings,
-    priority: ProcessPriority,
     #[cfg(all(unix, feature = "jobserver"))]
     jobserver: Option<JobBroker>,
-    heel: SharedHeelBinary,
     outages: Outages,
 }
 
@@ -3823,9 +3641,7 @@ where
     E: Executor + Clone + 'static,
 {
     let SpawnedTerminalTask {
-        working_dir,
-        grants,
-        env_source,
+        sandbox,
         executor,
         registry,
         job_registry,
@@ -3851,11 +3667,8 @@ where
         taken,
         completed_tx,
         running_tasks,
-        network,
-        priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
-        heel,
         outages,
     } = task;
     // Before the job registers, so the registry reports the bound it runs under.
@@ -3868,13 +3681,11 @@ where
         (
             DirSpelling::of(&backend),
             carried_dir.clone(),
-            working_dir.clone(),
+            sandbox.working_dir().to_path_buf(),
         )
     });
     let result = execute_script_standalone(StandaloneExecution {
-        working_dir,
-        grants,
-        env_source,
+        sandbox,
         executor,
         registry,
         job_registry,
@@ -3890,11 +3701,8 @@ where
         stdin_alerts,
         lifetime,
         background_startup,
-        network,
-        priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
-        heel,
         expect,
         resolution,
         outputs,
@@ -4002,9 +3810,7 @@ where
     E: Executor + Clone + 'static,
 {
     let StandaloneExecution {
-        working_dir,
-        grants,
-        env_source,
+        sandbox,
         executor,
         registry,
         job_registry,
@@ -4020,11 +3826,8 @@ where
         stdin_alerts,
         lifetime,
         background_startup,
-        network,
-        priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver,
-        heel,
         expect,
         resolution,
         outputs,
@@ -4039,9 +3842,7 @@ where
     );
     debug!(script = %script, "script content");
     let start_result = start_standalone_execution(StandaloneStart {
-        working_dir: &working_dir,
-        grants: &grants,
-        env_source: &env_source,
+        sandbox: &sandbox,
         executor,
         registry: &registry,
         job_registry: &job_registry,
@@ -4055,11 +3856,8 @@ where
         stdin_alerts,
         lifetime,
         background_startup: &background_startup,
-        network,
-        priority,
         #[cfg(all(unix, feature = "jobserver"))]
         jobserver: &jobserver,
-        heel: &heel,
     })
     .await;
     let (pid, output) = match start_result {
@@ -4097,8 +3895,8 @@ where
         Some(carry) => {
             let ctx = CarryContext {
                 carried_dir: carried_dir.as_ref(),
-                working_dir: &working_dir,
-                grants: grants.snapshot(),
+                working_dir: sandbox.working_dir(),
+                grants: sandbox.grants().snapshot(),
             };
             settle_cwd(carry, take_cwd_report(carry).await, exit_code == 0, &ctx).await
         }
@@ -4141,9 +3939,7 @@ where
             let ipc_commands = request.registry.registered_tool_names();
             return execute_container_job(ContainerJobExecution {
                 executor: request.executor,
-                working_dir: request.working_dir,
-                grants: request.grants,
-                env_source: request.env_source,
+                sandbox: request.sandbox,
                 registry: request.registry,
                 task_id: request.task_id,
                 execution_id: request.execution_id,
@@ -4158,7 +3954,6 @@ where
                 stdin_alerts: request.stdin_alerts,
                 lifetime: request.lifetime,
                 background_startup: request.background_startup,
-                priority: request.priority,
                 #[cfg(all(unix, feature = "jobserver"))]
                 job_fifo,
             })
@@ -4174,7 +3969,7 @@ where
             // machine, so its commands take no token and get no fifo.
             return execute_ssh_background(SshBackgroundExecution {
                 executor: request.executor,
-                working_dir: request.working_dir,
+                sandbox: request.sandbox,
                 prepared_tools: tools,
                 task_id: request.task_id,
                 execution_id: request.execution_id,
@@ -4197,9 +3992,7 @@ where
     };
     let local = LocalBackgroundExecution {
         prepared_tools,
-        working_dir: request.working_dir,
-        grants: request.grants,
-        env_source: request.env_source,
+        sandbox: request.sandbox,
         executor: request.executor,
         registry: request.registry,
         task_id: request.task_id,
@@ -4212,11 +4005,8 @@ where
         stdin_alerts: request.stdin_alerts,
         lifetime: request.lifetime,
         background_startup: request.background_startup,
-        priority: request.priority,
-        network: request.network,
         #[cfg(all(unix, feature = "jobserver"))]
         job_fifo,
-        heel: request.heel,
     };
     // Unsafe mode bypasses the proxy entirely, so its connections are not
     // audited at this layer.
@@ -5195,19 +4985,15 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
     additions: ContainerJobAdditions,
 ) -> Result<(u32, std::process::Output), TerminalError> {
     let runtime = context.container_runtime;
-    let mut sandbox = Sandbox::new(
-        crate::Backend::Container {
+    // The sandbox's grants, priority and environment source, on the container
+    // whose tools the home environment prepared.
+    let sandbox = context
+        .sandbox
+        .clone()
+        .with_backend(crate::Backend::Container {
             runtime: runtime.clone(),
             launch: context.prepared_tools.container_launch(),
-        },
-        context.executor.clone(),
-        context.working_dir,
-    )
-    .with_grants(context.grants.clone())
-    .with_priority(context.priority);
-    if let Some(source) = context.env_source {
-        sandbox = sandbox.with_env_source(source.clone());
-    }
+        });
 
     let carry = context.carry;
     let script = container_job_script(
@@ -5290,16 +5076,17 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
     context: SshBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
     let launch = context.prepared_tools.remote_launch()?;
-    let sandbox = Sandbox::new(
-        crate::Backend::Ssh {
+    // Only what the spec names travels to a server: the sandbox's own
+    // environment, source and grants never leave this machine.
+    let sandbox = context
+        .sandbox
+        .clone()
+        .with_backend(crate::Backend::Ssh {
             server: context.server.clone(),
             heel: context.heel.map(str::to_owned),
             launch,
-        },
-        context.executor.clone(),
-        context.working_dir,
-    )
-    .with_ssh_client(context.client.clone());
+        })
+        .with_ssh_client(context.client.clone());
     let sandbox = match context.mode {
         SandboxMode::Sandboxed => sandbox,
         SandboxMode::Unsandboxed => sandbox.unconfined(),
@@ -5537,12 +5324,7 @@ async fn local_sandbox<E: Executor + Clone + 'static>(
     context: &LocalBackgroundExecution<'_, E>,
 ) -> Result<(Sandbox, CommandAdditions), TerminalError> {
     write_git_shim(context.prepared_tools).await?;
-    let session = session_base(context.working_dir, context.prepared_tools).await?;
-    let heel = context
-        .heel
-        .get()
-        .await
-        .map_err(|e| TerminalError::SandboxSetup(e.to_string()))?;
+    let session = session_base(context.sandbox.working_dir(), context.prepared_tools).await?;
     let mut additions = CommandAdditions {
         environment: Vec::new(),
         grants: Vec::new(),
@@ -5559,29 +5341,11 @@ async fn local_sandbox<E: Executor + Clone + 'static>(
         Ok(path.display().to_string())
     })?;
 
-    let mut sandbox = Sandbox::new(
-        crate::Backend::Host { heel },
-        context.executor.clone(),
-        context.working_dir,
-    )
-    .with_grants(context.grants.clone())
-    .with_fixed_grants(session.grants)
-    .with_environment(session.environment)
-    .with_write_denylist(session.write_denylist)
-    .with_priority(context.priority)
-    .with_scanner(context.job_registry.scanner());
-    if let Some(source) = context.env_source {
-        sandbox = sandbox.with_env_source(source.clone());
-    }
-    if let Some(lists) = &context.network.lists {
-        sandbox = sandbox.with_network_policy(lists.clone());
-    }
-    if let Some(approver) = &context.network.approver {
-        sandbox = sandbox.with_domain_approver(approver.clone());
-    }
-    if let Some(log) = &context.network.audit {
-        sandbox = sandbox.with_audit_log(log.clone());
-    }
+    let sandbox = context.sandbox.clone().with_session(
+        session.grants,
+        session.environment,
+        session.write_denylist,
+    );
     Ok((sandbox, additions))
 }
 
@@ -6444,11 +6208,7 @@ mod tests {
             .prepare_local(cache.path())
             .await
             .unwrap();
-        let registry = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        })
-        .with_test_tools(tools);
+        let registry = ShellSessionRegistry::default().with_test_tools(tools);
         (cache, registry)
     }
 
@@ -6505,10 +6265,52 @@ mod tests {
 
     /// A local home, not yet prepared.
     fn local_registry() -> ShellSessionRegistry {
-        ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        })
+        ShellSessionRegistry::default()
+    }
+
+    /// A sandbox on `runtime` with `tools` prepared for its image, working in
+    /// `directory`.
+    fn container_sandbox(
+        runtime: &ContainerShellRuntime,
+        tools: &PreparedTools<ContainerPath>,
+        directory: &Path,
+    ) -> Sandbox {
+        Sandbox::new(
+            Backend::Container {
+                runtime: runtime.clone(),
+                launch: tools.container_launch(),
+            },
+            executor_core::tokio::TokioGlobal,
+            directory,
+        )
+    }
+
+    /// A terminal whose home is the container `container_id`, never reached.
+    async fn fresh_container_terminal(
+        dir: &Path,
+        container_id: &str,
+    ) -> Shell<executor_core::tokio::TokioGlobal> {
+        let launch =
+            crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools())
+                .container_launch();
+        let sandbox = Sandbox::new(
+            Backend::Container {
+                runtime: test_container_runtime(container_id),
+                launch,
+            },
+            executor_core::tokio::TokioGlobal,
+            dir,
+        );
+        Shell::new_exact_on(
+            sandbox,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+            TestWording::any(),
+            crate::test_wording::job_tools(),
+        )
+        .await
+        .expect("terminal tool should initialize")
     }
 
     async fn fresh_terminal(dir: &Path) -> Shell<executor_core::tokio::TokioGlobal> {
@@ -6688,12 +6490,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_container_home_still_gives_the_host_runnable_tools() {
-        let container = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: true,
-        })
-        .with_container_runtime(test_container_runtime("aither-host-tools"))
-        .with_test_container_tools(
+        let container = ShellSessionRegistry::default().with_test_container_tools(
             crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools()),
             "aither-host-tools".to_string(),
         );
@@ -6740,12 +6537,7 @@ mod tests {
             name: "staging".to_string(),
             target: "deploy@staging.internal".to_string(),
         };
-        let container = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: true,
-        })
-        .with_container_runtime(test_container_runtime("aither-tools-a"))
-        .with_test_container_tools(
+        let container = ShellSessionRegistry::default().with_test_container_tools(
             crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools()),
             "aither-tools-a".to_string(),
         );
@@ -6760,9 +6552,18 @@ mod tests {
                     .await
             }
         };
+        let adopt_in = |container_id: &'static str, sessions: ShellSessionRegistry| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                fresh_container_terminal(&dir, container_id)
+                    .await
+                    .adopt_prepared_tools(sessions)
+                    .await
+            }
+        };
 
         assert!(adopt(prepared.clone()).await.is_ok());
-        assert!(adopt(container.clone()).await.is_ok());
+        assert!(adopt_in("aither-tools-a", container.clone()).await.is_ok());
         assert!(matches!(
             adopt(local_registry()).await,
             Err(ToolRuntimeError::NotInitialized(_))
@@ -6773,17 +6574,19 @@ mod tests {
         assert!(prepared.remove_ssh_server("build").is_some());
         assert!(adopt(prepared.clone()).await.is_ok());
         assert!(matches!(
-            adopt(container.with_container_runtime(test_container_runtime("aither-tools-b"))).await,
+            adopt_in("aither-tools-b", container.clone()).await,
             Err(ToolRuntimeError::EnvironmentChanged(
                 crate::PreparedEnvironment::Container
             ))
         ));
         assert!(matches!(
-            adopt(prepared.with_availability(ShellRuntimeAvailability {
-                local: true,
-                container: true,
-            }))
-            .await,
+            adopt(container).await,
+            Err(ToolRuntimeError::EnvironmentChanged(
+                crate::PreparedEnvironment::HomeBackend
+            ))
+        ));
+        assert!(matches!(
+            adopt_in("aither-tools-a", prepared).await,
             Err(ToolRuntimeError::EnvironmentChanged(
                 crate::PreparedEnvironment::HomeBackend
             ))
@@ -6794,11 +6597,9 @@ mod tests {
     async fn adoption_rechecks_this_terminals_writable_paths() {
         let (cache, prepared) = prepared_test_registry().await;
         let dir = tempfile::tempdir().unwrap();
-        let exposed = fresh_terminal(dir.path())
-            .await
-            .with_writable_paths([cache.path()])
-            .adopt_prepared_tools(prepared)
-            .await;
+        let terminal = fresh_terminal(dir.path()).await;
+        terminal.grants().add_writable(cache.path());
+        let exposed = terminal.adopt_prepared_tools(prepared).await;
         assert!(matches!(
             exposed,
             Err(ToolRuntimeError::WritableToolDirectory(_))
@@ -7335,11 +7136,7 @@ mod tests {
         }
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let mut registry = ToolRegistryBuilder::new();
         for decision in decisions {
             registry.script_policy(Decide(decision));
@@ -7737,11 +7534,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let parent = tool.with_registry(registry);
         let child = parent
@@ -7774,11 +7567,7 @@ mod tests {
         .with_id_allocator(ids.allocator())
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let terminal = tool.with_registry(registry);
 
@@ -7855,11 +7644,7 @@ mod tests {
         .with_id_allocator(ids)
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
@@ -8141,9 +7926,7 @@ mod tests {
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
-            working_dir: tool.working_dir().clone(),
-            grants: Grants::new(),
-            env_source: None,
+            sandbox: tool.sandbox.clone(),
             executor: executor_core::tokio::TokioGlobal,
             registry,
             job_registry,
@@ -8161,11 +7944,8 @@ mod tests {
                 alerts: event_channel().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
-            network: NetworkSettings::default(),
-            priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
-            heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
@@ -8244,14 +8024,16 @@ mod tests {
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
-            working_dir,
-            grants: test_grants(
-                GitDirAccess::ReadWrite,
-                writable_paths,
-                readable_paths,
-                Vec::new(),
-            ),
-            env_source: None,
+            sandbox: tool
+                .sandbox
+                .clone()
+                .with_working_dir(working_dir)
+                .with_grants(test_grants(
+                    GitDirAccess::ReadWrite,
+                    writable_paths,
+                    readable_paths,
+                    Vec::new(),
+                )),
             executor: executor_core::tokio::TokioGlobal,
             registry,
             job_registry,
@@ -8269,11 +8051,8 @@ mod tests {
                 alerts: event_channel().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
-            network: NetworkSettings::default(),
-            priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
-            heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
@@ -8377,9 +8156,12 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
-            working_dir: tool.working_dir().clone(),
-            grants: test_grants(git_dir, writable_paths, readable_paths, read_denied_paths),
-            env_source: None,
+            sandbox: tool.sandbox.clone().with_grants(test_grants(
+                git_dir,
+                writable_paths,
+                readable_paths,
+                read_denied_paths,
+            )),
             executor: executor_core::tokio::TokioGlobal,
             registry,
             job_registry: tool.job_registry(),
@@ -8397,11 +8179,8 @@ mod tests {
                 alerts: event_channel().0,
             },
             background_startup: BackgroundStartup::new(startup_tx),
-            network: NetworkSettings::default(),
-            priority: ProcessPriority::default(),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
-            heel: SharedHeelBinary::default(),
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
@@ -8813,11 +8592,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
 
@@ -8878,11 +8653,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let receiver = tool.background_receiver();
@@ -8950,11 +8721,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let background_receiver = tool.background_receiver();
@@ -9026,11 +8793,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let events = tool.background_receiver();
@@ -9159,11 +8922,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let child_pid_path = dir.path().join("child.pid");
@@ -9523,9 +9282,7 @@ mod tests {
         let (alert_tx, _alert_rx) = event_channel();
         let (_pid, output) = execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
-            working_dir: dir.path(),
-            grants: &Grants::new(),
-            env_source: &None,
+            sandbox: &container_sandbox(&runtime, &container_tools, dir.path()),
             registry: &registry,
             task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
@@ -9543,7 +9300,6 @@ mod tests {
             }),
             lifetime: JobLifetime::Foreground { alerts: alert_tx },
             background_startup: &BackgroundStartup::new(startup_tx),
-            priority: ProcessPriority::default(),
             carry: None,
             #[cfg(all(unix, feature = "jobserver"))]
             job_fifo: None,
@@ -9662,9 +9418,7 @@ mod tests {
         let (alert_tx, _alert_rx) = event_channel();
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
-            working_dir: dir.path(),
-            grants: &Grants::new(),
-            env_source: &None,
+            sandbox: &container_sandbox(&runtime, &container_tools, dir.path()),
             registry: &registry,
             task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
@@ -9678,7 +9432,6 @@ mod tests {
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground { alerts: alert_tx },
             background_startup: &BackgroundStartup::new(startup_tx),
-            priority: ProcessPriority::default(),
             carry: None,
             job_fifo: Some(job_fifo),
         })
@@ -9836,10 +9589,10 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_foreground_wait(foreground_wait)
-        .with_timeout_cap(timeout_cap)
-        .with_long_job_alert_after(alert_after);
+        .expect("prepared tools should be adopted");
+        tool.limits.foreground_wait.set_normal(foreground_wait);
+        tool.limits.timeout_cap.set(timeout_cap);
+        tool.limits.long_job_alert.set(alert_after);
         (cache, tool)
     }
 
@@ -10683,8 +10436,16 @@ mod tests {
         Shell<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
+        let sandbox = Sandbox::new(
+            Backend::Host {
+                heel: crate::test_heel::pinned().await.expect("the pinned heel"),
+            },
+            executor_core::tokio::TokioGlobal,
             dir,
+        )
+        .with_priority(priority);
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact_on(
+            sandbox,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
@@ -10695,8 +10456,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_process_priority(priority);
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
@@ -11221,14 +10981,17 @@ mod tests {
         (container, image, tools_cache)
     }
 
-    /// The shell sessions of a terminal whose home is the acceptance
-    /// container, reaching the host IPC bridge through the docker gateway.
+    /// The sandbox and shell sessions of a terminal whose home is the
+    /// acceptance container, reaching the host IPC bridge through the docker
+    /// gateway.
     #[cfg(all(unix, aither_container_acceptance))]
     async fn acceptance_shell_sessions(
         container: &TestDockerContainer,
         image: &crate::tool_runtime::ImageTools,
         workspace: &Path,
-    ) -> ShellSessionRegistry {
+        directory: &Path,
+        configure: impl FnOnce(Sandbox) -> Sandbox,
+    ) -> (Sandbox, ShellSessionRegistry) {
         let client = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("docker client should connect"),
         );
@@ -11253,12 +11016,19 @@ mod tests {
         // entry names the container and its `/opt/aither/tools` bin dir, which
         // the wrapped script puts on `PATH` and heel must grant execute on.
         let container_tools = crate::tool_runtime::tests::container_tools(image);
-        ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: true,
-        })
-        .with_container_runtime(runtime)
-        .with_test_container_tools(container_tools, container.0.clone())
+        let sandbox = configure(Sandbox::new(
+            Backend::Container {
+                runtime,
+                launch: container_tools.container_launch(),
+            },
+            executor_core::tokio::TokioGlobal,
+            directory,
+        ));
+        (
+            sandbox,
+            ShellSessionRegistry::default()
+                .with_test_container_tools(container_tools, container.0.clone()),
+        )
     }
 
     /// The streamed exec of the real docker backend delivers a command's
@@ -11336,9 +11106,13 @@ mod tests {
     async fn container_subagent_is_confined_while_the_main_agent_is_not() {
         let (container, bundle, _tools_cache) = start_acceptance_container().await;
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let shell_sessions = acceptance_shell_sessions(&container, &bundle, dir.path()).await;
-        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
-            dir.path(),
+        let (sandbox, shell_sessions) =
+            acceptance_shell_sessions(&container, &bundle, dir.path(), dir.path(), |sandbox| {
+                sandbox
+            })
+            .await;
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact_on(
+            sandbox,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
@@ -11395,11 +11169,17 @@ mod tests {
     async fn container_command_runs_with_configured_nice_and_reaches_ipc() {
         let (container, bundle, _tools_cache) = start_acceptance_container().await;
 
-        let shell_sessions = acceptance_shell_sessions(&container, &bundle, Path::new("/")).await;
-
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
-            dir.path(),
+        let (sandbox, shell_sessions) =
+            acceptance_shell_sessions(&container, &bundle, Path::new("/"), dir.path(), |sandbox| {
+                sandbox.with_priority(ProcessPriority::new(
+                    CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
+                    IoPriority::Normal,
+                ))
+            })
+            .await;
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact_on(
+            sandbox,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
@@ -11410,11 +11190,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_process_priority(ProcessPriority::new(
-            CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
-            IoPriority::Normal,
-        ));
+        .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(ProbeEchoTool);
         let registry = Arc::new(builder.build(tool.output_store().clone()));
@@ -13547,8 +13323,8 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_readable_paths([read_only.path()]);
+        .expect("prepared tools should be adopted");
+        tool.grants().add_readable(read_only.path());
         let terminal = tool.with_registry(Arc::new(
             ToolRegistryBuilder::new().build(test_outputs(dir.path().join("outputs"))),
         ));
@@ -13896,14 +13672,18 @@ mod tests {
         };
         let container_tools =
             crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
-        let shell_sessions = ShellSessionRegistry::new(ShellRuntimeAvailability {
-            local: false,
-            container: true,
-        })
-        .with_container_runtime(runtime)
-        .with_test_container_tools(container_tools, "aither-test-confinement".to_string());
-        let tool = Shell::new_exact(
+        let sandbox = Sandbox::new(
+            Backend::Container {
+                runtime,
+                launch: container_tools.container_launch(),
+            },
+            executor_core::tokio::TokioGlobal,
             dir,
+        );
+        let shell_sessions = ShellSessionRegistry::default()
+            .with_test_container_tools(container_tools, "aither-test-confinement".to_string());
+        let tool = Shell::new_exact_on(
+            sandbox,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
             crate::output_policy::fixture::policy(),
@@ -14124,11 +13904,7 @@ mod tests {
         .expect("terminal tool should initialize")
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        .expect("prepared tools should be adopted");
         let mut registry = ToolRegistryBuilder::new();
         configure(&mut registry);
         let registry = Arc::new(registry.build(tool.output_store().clone()));

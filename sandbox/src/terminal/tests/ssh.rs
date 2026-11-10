@@ -197,6 +197,13 @@ impl Drop for Sshd {
     }
 }
 
+/// The host backend a shell's home is, under the pinned `heel`.
+async fn host_home() -> crate::Backend {
+    crate::Backend::Host {
+        heel: crate::test_heel::pinned().await.expect("the pinned heel"),
+    }
+}
+
 /// A terminal in `dir` over `registry` that asks `approver` for what needs
 /// approval.
 async fn terminal(dir: &Path, registry: ShellSessionRegistry, approver: &Approvals) -> Terminal {
@@ -291,7 +298,7 @@ async fn a_server_added_live_is_asked_prepared_lazily_and_runs_both_modes() {
     let cache = crate::tool_runtime::tests::unlocking_tempdir();
     let registry = local_registry()
         .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
+        .initialize_tools(&host_home().await, &distribution, cache.path())
         .await
         .expect("the home prepares without touching any server");
     let dir = tempfile::tempdir().unwrap();
@@ -388,7 +395,7 @@ async fn a_server_without_heel_gets_the_pinned_one_installed() {
     let cache = crate::tool_runtime::tests::unlocking_tempdir();
     let registry = local_registry()
         .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
+        .initialize_tools(&host_home().await, &distribution, cache.path())
         .await
         .expect("the home prepares without touching any server");
     let dir = tempfile::tempdir().unwrap();
@@ -633,7 +640,7 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
     let cache = crate::tool_runtime::tests::unlocking_tempdir();
     let registry = local_registry()
         .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
+        .initialize_tools(&host_home().await, &distribution, cache.path())
         .await
         .expect("the home prepares");
     let dir = tempfile::tempdir().unwrap();

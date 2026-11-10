@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use aither_core::llm::{Tool, ToolContext};
 use aither_sandbox::{
-    Backend, CommandBlocked, CommandKilled, FoldedLines, HostProgram, JobInputSent, JobKillAsked,
-    JobRead, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted, OmittedLines, OutputLimits,
-    OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain, Sandbox, Shell, ShellArgs,
-    ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution, ToolIdentity,
-    ToolRegistryBuilder, ToolTarget,
+    Backend, CommandBlocked, CommandKilled, FoldedLines, HostProgram, Interpreter, JobInputSent,
+    JobKillAsked, JobRead, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted, OmittedLines,
+    OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain, Sandbox, Shell,
+    ShellArgs, ShellLimits, ShellToolSettings, ShellWording, StoredBinaryPart, ToolDistribution,
+    ToolIdentity, ToolRegistryBuilder, ToolTarget,
 };
 
 /// The wording of this example's shell: aither ships none, and the example's
@@ -152,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(workspace),
     );
     let terminal = Shell::builder(sandbox)
+        .interpreters([Interpreter::Shell, Interpreter::Python])
         .limits(limits)
         .output(output)
         .wording(ExampleWording)

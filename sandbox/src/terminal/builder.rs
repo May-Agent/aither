@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use executor_core::AnyExecutor;
 
-use super::{Interpreter, NetworkSettings, Shell, ShellToolSettings, TerminalError, Unconfigured};
-use crate::heel_binary::SharedHeelBinary;
-use crate::{AnyShellWording, Backend, OutputPolicy, Sandbox, ShellLimits, ShellWording};
+use super::{Interpreter, Shell, ShellToolSettings, TerminalError, Unconfigured};
+use crate::{AnyShellWording, OutputPolicy, Sandbox, ShellLimits, ShellWording};
 
 /// A value the builder has not been given yet.
 #[derive(Debug, Clone, Copy)]
@@ -16,14 +15,23 @@ pub struct Missing;
 #[derive(Debug, Clone)]
 pub struct Given<T>(T);
 
+/// What a shell is built from besides its sandbox.
+pub(crate) struct ShellParts {
+    pub(crate) interpreters: Vec<Interpreter>,
+    pub(crate) limits: ShellLimits,
+    pub(crate) output: OutputPolicy,
+    pub(crate) wording: AnyShellWording,
+    pub(crate) tools: ShellToolSettings,
+}
+
 /// Builds a [`Shell`] on the [`Sandbox`] its scripts run in.
 ///
-/// The limits, the output policy, the wording and the tool identities have no
-/// defaults: [`build`](Self::build) exists once every one is given.
+/// The interpreters, limits, output policy, wording and tool identities have
+/// no defaults: [`build`](Self::build) exists once every one is given.
 #[derive(Debug)]
-pub struct ShellBuilder<L, O, W, T> {
+pub struct ShellBuilder<I, L, O, W, T> {
     sandbox: Sandbox,
-    interpreters: Vec<Interpreter>,
+    interpreters: I,
     limits: L,
     output: O,
     wording: W,
@@ -35,10 +43,10 @@ impl Shell<Arc<AnyExecutor>, Unconfigured> {
     /// live grants, environment source, network policy, priority and
     /// backend are the shell's.
     #[must_use]
-    pub fn builder(sandbox: Sandbox) -> ShellBuilder<Missing, Missing, Missing, Missing> {
+    pub fn builder(sandbox: Sandbox) -> ShellBuilder<Missing, Missing, Missing, Missing, Missing> {
         ShellBuilder {
             sandbox,
-            interpreters: vec![Interpreter::Shell, Interpreter::Python],
+            interpreters: Missing,
             limits: Missing,
             output: Missing,
             wording: Missing,
@@ -47,18 +55,27 @@ impl Shell<Arc<AnyExecutor>, Unconfigured> {
     }
 }
 
-impl<L, O, W, T> ShellBuilder<L, O, W, T> {
+impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
     /// The interpreters a script may run under, and the ones the model's
-    /// `interpreter` argument lists; shell and Python when not set.
+    /// `interpreter` argument lists.
     #[must_use]
-    pub fn interpreters(mut self, interpreters: impl IntoIterator<Item = Interpreter>) -> Self {
-        self.interpreters = interpreters.into_iter().collect();
-        self
+    pub fn interpreters(
+        self,
+        interpreters: impl IntoIterator<Item = Interpreter>,
+    ) -> ShellBuilder<Given<Vec<Interpreter>>, L, O, W, T> {
+        ShellBuilder {
+            sandbox: self.sandbox,
+            interpreters: Given(interpreters.into_iter().collect()),
+            limits: self.limits,
+            output: self.output,
+            wording: self.wording,
+            tools: self.tools,
+        }
     }
 
     /// The time bounds of every script.
     #[must_use]
-    pub fn limits(self, limits: ShellLimits) -> ShellBuilder<Given<ShellLimits>, O, W, T> {
+    pub fn limits(self, limits: ShellLimits) -> ShellBuilder<I, Given<ShellLimits>, O, W, T> {
         ShellBuilder {
             sandbox: self.sandbox,
             interpreters: self.interpreters,
@@ -71,7 +88,7 @@ impl<L, O, W, T> ShellBuilder<L, O, W, T> {
 
     /// The budgets of what a script's output returns inline.
     #[must_use]
-    pub fn output(self, output: OutputPolicy) -> ShellBuilder<L, Given<OutputPolicy>, W, T> {
+    pub fn output(self, output: OutputPolicy) -> ShellBuilder<I, L, Given<OutputPolicy>, W, T> {
         ShellBuilder {
             sandbox: self.sandbox,
             interpreters: self.interpreters,
@@ -87,7 +104,7 @@ impl<L, O, W, T> ShellBuilder<L, O, W, T> {
     pub fn wording(
         self,
         wording: impl ShellWording,
-    ) -> ShellBuilder<L, O, Given<AnyShellWording>, T> {
+    ) -> ShellBuilder<I, L, O, Given<AnyShellWording>, T> {
         ShellBuilder {
             sandbox: self.sandbox,
             interpreters: self.interpreters,
@@ -104,7 +121,7 @@ impl<L, O, W, T> ShellBuilder<L, O, W, T> {
     pub fn tools(
         self,
         tools: ShellToolSettings,
-    ) -> ShellBuilder<L, O, W, Given<ShellToolSettings>> {
+    ) -> ShellBuilder<I, L, O, W, Given<ShellToolSettings>> {
         ShellBuilder {
             sandbox: self.sandbox,
             interpreters: self.interpreters,
@@ -118,6 +135,7 @@ impl<L, O, W, T> ShellBuilder<L, O, W, T> {
 
 impl
     ShellBuilder<
+        Given<Vec<Interpreter>>,
         Given<ShellLimits>,
         Given<OutputPolicy>,
         Given<AnyShellWording>,
@@ -133,44 +151,25 @@ impl
     pub async fn build(self) -> Result<Shell<Arc<AnyExecutor>, Unconfigured>, TerminalError> {
         let Self {
             sandbox,
-            interpreters,
+            interpreters: Given(interpreters),
             limits: Given(limits),
             output: Given(output),
             wording: Given(wording),
             tools: Given(tools),
         } = self;
-        let mut shell = Shell::new_exact(
-            sandbox.working_dir(),
-            sandbox.executor(),
-            limits,
-            output,
-            wording,
-            tools,
+        let executor = sandbox.executor();
+        Shell::from_parts(
+            sandbox,
+            executor,
+            ShellParts {
+                interpreters,
+                limits,
+                output,
+                wording,
+                tools,
+            },
         )
-        .await?;
-        shell.interpreters = interpreters.into();
-        shell.grants = sandbox.grants().clone();
-        shell.env_source = sandbox.env_source();
-        let (lists, approver, audit) = sandbox.network();
-        shell.network = NetworkSettings {
-            lists,
-            approver,
-            audit,
-        };
-        shell.priority = sandbox.priority();
-        match sandbox.backend() {
-            Backend::Host { heel } => shell.heel = SharedHeelBinary::provided(heel.clone()),
-            Backend::Container { runtime, .. } => {
-                shell.sessions = shell.sessions.with_container_runtime(runtime.clone());
-            }
-            Backend::Ssh { server, .. } => {
-                return Err(TerminalError::SandboxSetup(format!(
-                    "the sandbox runs on the SSH server {}: a server is a location, not a shell's home",
-                    server.name
-                )));
-            }
-        }
-        Ok(shell)
+        .await
     }
 }
 
@@ -180,7 +179,7 @@ mod tests {
 
     use super::*;
     use crate::spawn::Grants;
-    use crate::{test_budgets, test_wording};
+    use crate::{Backend, test_budgets, test_wording};
 
     async fn shell(
         directory: &std::path::Path,
@@ -217,7 +216,7 @@ mod tests {
         let granted = directory.path().join("granted");
         grants.add_writable(&granted);
         assert_eq!(
-            shell.grants.snapshot().writable,
+            shell.sandbox.grants().snapshot().writable,
             grants.snapshot().writable,
             "the shell sees the grants the sandbox's handle changes"
         );
