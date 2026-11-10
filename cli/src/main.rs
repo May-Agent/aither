@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use aither_agent::sandbox::{
     ScriptLanguage, ToolRegistryBuilder, cli_to_json,
-    permission::{PermissionError, PermissionHandler, TerminalMode},
+    permission::{CommandLocation, PermissionError, PermissionHandler, TerminalMode},
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
@@ -118,6 +118,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true), // Always allow
@@ -126,6 +127,9 @@ impl PermissionHandler for InteractivePermissionHandler {
                 let mode_desc = mode.description();
                 let display_script = script.trim().replace('\n', "; ");
                 eprintln!("\n\x1b[33m⚠ Permission request: {mode_desc}\x1b[0m");
+                if let Some(server) = location.server() {
+                    eprintln!("\x1b[2mLocation:\x1b[22m SSH server {server}");
+                }
                 eprintln!("\x1b[2mScript ({language:?}):\x1b[22m {display_script}");
                 eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
                 io::stderr().flush().ok();
@@ -156,6 +160,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         _mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl std::future::Future<Output = bool> + Send {
         std::future::ready(true)
     }

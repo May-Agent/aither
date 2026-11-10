@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aither_core::{IdLease, WeakIdLease};
 use async_channel::{Receiver, Sender, WeakSender};
@@ -39,6 +39,19 @@ pub struct JobInfo {
     pub output_path: Option<PathBuf>,
     /// Where the job runs.
     pub place: JobPlace,
+    /// The bound the job was started under: it is killed once this long has
+    /// passed since it started. `None` when nothing bounds it.
+    pub timeout: Option<Duration>,
+}
+
+impl JobInfo {
+    /// How long until the job's `timeout` bound kills it, zero once passed;
+    /// `None` when nothing bounds it.
+    #[must_use]
+    pub fn remaining(&self) -> Option<Duration> {
+        self.timeout
+            .map(|timeout| timeout.saturating_sub(self.started_at.elapsed()))
+    }
 }
 
 /// Status of a background job.
@@ -351,6 +364,10 @@ enum StateCommand {
         process_tree: Option<JobTree>,
         place: JobPlace,
     },
+    Bound {
+        task_id: IdLease,
+        timeout: Duration,
+    },
     AttachTerminalInput {
         pid: u32,
         input_tx: TerminalInputSender,
@@ -659,6 +676,17 @@ impl JobRegistry {
             mode,
             output_path,
             process_tree,
+        })
+        .await;
+    }
+
+    /// Records that the job of task `task_id` runs under a `timeout` bound,
+    /// reported as [`JobInfo::timeout`]. Called before the job registers: it
+    /// is applied when it does.
+    pub async fn bound_by_timeout(&self, task_id: &IdLease, timeout: Duration) {
+        self.send_command(StateCommand::Bound {
+            task_id: task_id.clone(),
+            timeout,
         })
         .await;
     }
@@ -1116,6 +1144,8 @@ struct ParkedOutput {
     /// Forgotten jobs whose lease something still holds, such as a command
     /// that may still report progress.
     forgotten: Vec<WeakIdLease>,
+    /// `timeout` bounds of jobs not registered yet, by task id.
+    bounds: HashMap<String, (WeakIdLease, Duration)>,
 }
 
 /// The appends waiting for one job, in arrival order.
@@ -1171,6 +1201,27 @@ impl ParkedOutput {
             .unwrap_or_default()
     }
 
+    /// Holds the `timeout` bound of task `task_id`, whose job registers next.
+    fn bound(&mut self, task_id: &IdLease, timeout: Duration) {
+        self.prune();
+        self.bounds
+            .insert(task_id.to_string(), (task_id.downgrade(), timeout));
+    }
+
+    /// Takes the `timeout` bound held for task `task_id`, which is registering.
+    fn take_bound(&mut self, task_id: &IdLease) -> Option<Duration> {
+        self.prune();
+        self.bounds
+            .remove(task_id.as_str())
+            .map(|(lease, timeout)| {
+                assert!(
+                    lease.refers_to(task_id),
+                    "two live leases share the task id '{task_id}'"
+                );
+                timeout
+            })
+    }
+
     /// Records that the registry forgot the job of task `task_id`, so what is
     /// still sent to it is dropped instead of waiting for it.
     fn forgot(&mut self, task_id: &IdLease) {
@@ -1185,6 +1236,8 @@ impl ParkedOutput {
             .retain(|_, parked| parked.lease.upgrade().is_some());
         self.forgotten
             .retain(|forgotten| forgotten.upgrade().is_some());
+        self.bounds
+            .retain(|_, (lease, _)| lease.upgrade().is_some());
     }
 }
 
@@ -1239,6 +1292,7 @@ async fn handle_state_command(
                 parked.forgot(&replaced.task_id);
             }
             let waiting = parked.take(&task_id);
+            let timeout = parked.take_bound(&task_id);
             register_job(
                 jobs,
                 pid,
@@ -1249,6 +1303,7 @@ async fn handle_state_command(
                 mode,
                 output_path,
                 place,
+                timeout,
             );
             if let Some(job) = jobs.get_mut(&pid) {
                 job.process_tree = process_tree;
@@ -1258,6 +1313,7 @@ async fn handle_state_command(
                 let _ = reply.send(()).await;
             }
         }
+        StateCommand::Bound { task_id, timeout } => parked.bound(&task_id, timeout),
         StateCommand::AttachTerminalInput { pid, input_tx } => {
             // A job that already finished takes no input: the sender drops here.
             if let Some(job) = jobs
@@ -1489,8 +1545,10 @@ fn register_job(
     mode: TerminalMode,
     output_path: Option<PathBuf>,
     place: JobPlace,
+    timeout: Option<Duration>,
 ) {
     let info = JobInfo {
+        timeout,
         place,
         pid,
         task_id: task_id.to_string(),
@@ -2175,6 +2233,34 @@ mod tests {
         registry
     }
 
+    /// A bound recorded before the job registers is reported once it does; a
+    /// job nothing bounded reports none.
+    #[tokio::test]
+    async fn a_job_reports_the_timeout_it_runs_under() {
+        let (registry, service) = job_registry_channel();
+        tokio::spawn(service.serve());
+        let bounded = crate::test_ids::lease("bounded");
+        let free = crate::test_ids::lease("free");
+
+        registry
+            .bound_by_timeout(&bounded, Duration::from_secs(600))
+            .await;
+        registry
+            .register(1, &bounded, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+        registry
+            .register(2, &free, "exec", "run", TerminalMode::Sandboxed, None)
+            .await;
+
+        let info = registry.get(1).await.expect("job exists");
+        assert_eq!(info.timeout, Some(Duration::from_secs(600)));
+        let remaining = info.remaining().expect("the job is bounded");
+        assert!(remaining > Duration::from_secs(590), "{remaining:?}");
+        let info = registry.get(2).await.expect("job exists");
+        assert_eq!(info.timeout, None);
+        assert_eq!(info.remaining(), None);
+    }
+
     /// A job's task id stays leased while the registry keeps the job, past
     /// its end, and is released once the registry forgets it: when a job
     /// with the same pid replaces it, or with the registry.
@@ -2760,6 +2846,7 @@ mod tests {
             TerminalMode::Sandboxed,
             None,
             JobPlace::Host,
+            None,
         );
         jobs
     }
@@ -3032,6 +3119,7 @@ mod tests {
             TerminalMode::Sandboxed,
             None,
             JobPlace::Host,
+            None,
         );
         let _first = owe_completion(&mut jobs, 12, Ok(0), &weak).await;
         let _second = owe_completion(&mut jobs, 12, Ok(0), &weak).await;

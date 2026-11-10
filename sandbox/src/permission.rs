@@ -54,6 +54,43 @@ impl TerminalMode {
     }
 }
 
+/// Where a command runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandLocation<'a> {
+    /// The home environment.
+    Local,
+    /// A server of the registry's SSH set.
+    Ssh {
+        /// The server's name, as the command gave it as its `location`.
+        server: &'a str,
+    },
+}
+
+/// How far an answer of [`PermissionHandler::check_location`] reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationApproval {
+    /// Commands may not run on the server.
+    Refused,
+    /// The command that asked runs; the next command on the server asks
+    /// again.
+    Once,
+    /// Commands run on the server for as long as it stays in the registry,
+    /// a subagent's included.
+    Session,
+}
+
+impl<'a> CommandLocation<'a> {
+    /// The server's name, or `None` for the home environment.
+    #[must_use]
+    pub const fn server(self) -> Option<&'a str> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { server } => Some(server),
+        }
+    }
+}
+
 /// A request for a permission beyond the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -66,6 +103,8 @@ pub enum PermissionRequest<'a> {
         script: &'a str,
         /// The language the script is written in.
         language: ScriptLanguage,
+        /// Where the command runs.
+        location: CommandLocation<'a>,
     },
     /// A sandboxed command's connection to a network domain that is not
     /// already allowed.
@@ -79,9 +118,9 @@ pub enum PermissionRequest<'a> {
     /// all. Approving it lets the terminal connect and prepare the server:
     /// the managed tools in its cache directory and, when it has no `heel`,
     /// the distribution's pinned `heel` for its platform in
-    /// `~/.local/bin`. Once approved, the server's later commands, a
-    /// subagent's included, are not asked about again while it stays in the
-    /// registry; each still passes the admission its mode needs.
+    /// `~/.local/bin`. Once approved for the session, the server's later
+    /// commands, a subagent's included, are not asked about again while it
+    /// stays in the registry; each still passes the admission its mode needs.
     Location {
         /// The server the command names.
         server: &'a SshServer,
@@ -109,12 +148,13 @@ pub trait PermissionHandler: Send + Sync {
     ///
     /// For `Sandboxed` mode, this should always return `Ok(true)`.
     /// For `Unsafe` mode, this should prompt for each script, which is
-    /// source in `language`.
+    /// source in `language` and runs at `location`.
     fn check(
         &self,
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
 
     /// Returns whether `check` will suspend waiting for an external approval.
@@ -126,8 +166,9 @@ pub trait PermissionHandler: Send + Sync {
         mode: TerminalMode,
         script: &str,
         language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
-        let _ = (mode, script, language);
+        let _ = (mode, script, language, location);
         async { false }
     }
 
@@ -158,19 +199,21 @@ pub trait PermissionHandler: Send + Sync {
         None
     }
 
-    /// Whether commands may run on `server`, asked once by the first command
-    /// that names it, after [`review`](Self::review) passed the
-    /// [`PermissionRequest::Location`]. `role` says whether a subagent asks,
-    /// so the handler can put a subagent's request to its main agent.
+    /// Whether commands may run on `server` and how far the answer reaches,
+    /// asked by the first command that names it and again by every command
+    /// after a [`LocationApproval::Once`], after [`review`](Self::review)
+    /// passed the [`PermissionRequest::Location`]. `role` says whether a
+    /// subagent asks, so the handler can put a subagent's request to its
+    /// main agent.
     ///
-    /// Default implementation denies every server (fail-safe).
+    /// Default implementation refuses every server (fail-safe).
     fn check_location(
         &self,
         server: &SshServer,
         role: CommandRole,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+    ) -> impl Future<Output = Result<LocationApproval, PermissionError>> + Send {
         let _ = (server, role);
-        async { Ok(false) }
+        async { Ok(LocationApproval::Refused) }
     }
 
     /// Whether [`check_location`](Self::check_location) will suspend waiting
@@ -272,6 +315,7 @@ impl PermissionHandler for DenyUnsafe {
         mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true),
@@ -287,6 +331,7 @@ impl PermissionHandler for DenyUnsafe {
         _mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(false)
     }
@@ -302,6 +347,7 @@ impl PermissionHandler for NoopPermissionHandler {
         _mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(Ok(true))
     }
@@ -311,6 +357,7 @@ impl PermissionHandler for NoopPermissionHandler {
         _mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        _location: CommandLocation<'_>,
     ) -> impl Future<Output = bool> + Send {
         std::future::ready(false)
     }
@@ -323,8 +370,8 @@ impl PermissionHandler for NoopPermissionHandler {
         &self,
         _server: &SshServer,
         _role: CommandRole,
-    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
-        std::future::ready(Ok(true))
+    ) -> impl Future<Output = Result<LocationApproval, PermissionError>> + Send {
+        std::future::ready(Ok(LocationApproval::Session))
     }
 }
 
@@ -339,7 +386,12 @@ mod tests {
         // Sandboxed should be allowed
         assert!(
             handler
-                .check(TerminalMode::Sandboxed, "ls", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Sandboxed,
+                    "ls",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .unwrap()
         );
@@ -347,7 +399,12 @@ mod tests {
         // Unsafe should be denied
         assert!(
             handler
-                .check(TerminalMode::Unsafe, "rm -rf /", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Unsafe,
+                    "rm -rf /",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .is_err()
         );
@@ -359,13 +416,23 @@ mod tests {
 
         assert!(
             handler
-                .check(TerminalMode::Sandboxed, "ls", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Sandboxed,
+                    "ls",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .unwrap()
         );
         assert!(
             handler
-                .check(TerminalMode::Unsafe, "rm -rf /", ScriptLanguage::Shell)
+                .check(
+                    TerminalMode::Unsafe,
+                    "rm -rf /",
+                    ScriptLanguage::Shell,
+                    CommandLocation::Local,
+                )
                 .await
                 .unwrap()
         );
@@ -386,17 +453,19 @@ mod tests {
             name: "build".to_string(),
             target: "builder@build.internal".to_string(),
         };
-        assert!(
-            !DenyUnsafe
+        assert_eq!(
+            DenyUnsafe
                 .check_location(&server, CommandRole::Main)
                 .await
-                .unwrap()
+                .unwrap(),
+            LocationApproval::Refused
         );
-        assert!(
+        assert_eq!(
             NoopPermissionHandler
                 .check_location(&server, CommandRole::Subagent)
                 .await
-                .unwrap()
+                .unwrap(),
+            LocationApproval::Session
         );
     }
 
@@ -417,6 +486,24 @@ mod tests {
                 "server": { "name": "build", "target": "builder@build.internal" },
                 "role": "subagent",
             })
+        );
+    }
+
+    #[test]
+    fn a_command_request_names_where_it_runs() {
+        let request = |location| PermissionRequest::Command {
+            mode: TerminalMode::Unsafe,
+            script: "make",
+            language: ScriptLanguage::Shell,
+            location,
+        };
+        assert_eq!(
+            serde_json::to_value(request(CommandLocation::Local)).unwrap()["location"],
+            serde_json::json!({ "kind": "local" })
+        );
+        assert_eq!(
+            serde_json::to_value(request(CommandLocation::Ssh { server: "build" })).unwrap()["location"],
+            serde_json::json!({ "kind": "ssh", "server": "build" })
         );
     }
 

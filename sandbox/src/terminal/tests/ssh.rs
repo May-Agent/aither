@@ -5,6 +5,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
+use crate::permission::LocationApproval;
 use crate::ssh::SshClient;
 use crate::{CommandRole, SshPlatform, SshProbeError, SshServer};
 
@@ -15,13 +16,21 @@ use super::*;
 #[derive(Default)]
 struct LocationHandler {
     deny: AtomicBool,
+    /// Approve for one command only; otherwise for the session.
+    once: AtomicBool,
     asked: Mutex<Vec<(String, CommandRole)>>,
     unsafe_checks: AtomicUsize,
+    /// The server each `unsafe` command was located on; `None` is the home.
+    unsafe_locations: Mutex<Vec<Option<String>>>,
 }
 
 impl LocationHandler {
     fn asked(&self) -> Vec<(String, CommandRole)> {
         self.asked.lock().unwrap().clone()
+    }
+
+    fn unsafe_locations(&self) -> Vec<Option<String>> {
+        self.unsafe_locations.lock().unwrap().clone()
     }
 }
 
@@ -31,9 +40,14 @@ impl PermissionHandler for LocationHandler {
         mode: TerminalMode,
         _script: &str,
         _language: ScriptLanguage,
+        location: CommandLocation<'_>,
     ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
         if mode == TerminalMode::Unsafe {
             self.unsafe_checks.fetch_add(1, AtomicOrdering::SeqCst);
+            self.unsafe_locations
+                .lock()
+                .unwrap()
+                .push(location.server().map(str::to_string));
         }
         std::future::ready(Ok(true))
     }
@@ -42,9 +56,15 @@ impl PermissionHandler for LocationHandler {
         &self,
         server: &SshServer,
         role: CommandRole,
-    ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
+    ) -> impl std::future::Future<Output = Result<LocationApproval, PermissionError>> + Send {
         self.asked.lock().unwrap().push((server.name.clone(), role));
-        std::future::ready(Ok(!self.deny.load(AtomicOrdering::SeqCst)))
+        std::future::ready(Ok(if self.deny.load(AtomicOrdering::SeqCst) {
+            LocationApproval::Refused
+        } else if self.once.load(AtomicOrdering::SeqCst) {
+            LocationApproval::Once
+        } else {
+            LocationApproval::Session
+        }))
     }
 
     fn will_wait_for_location(
@@ -464,6 +484,43 @@ async fn a_denied_server_is_asked_again_and_never_prepared() {
     assert!(!environment.is_prepared());
 }
 
+/// A once-only approval is not kept, so every command asks; a session
+/// approval is asked for once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_once_only_approval_asks_again_and_a_session_approval_does_not() {
+    for (once, expected_asks) in [(true, 2), (false, 1)] {
+        let unreachable = tempfile::tempdir().unwrap();
+        let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
+        let tools = registry.local_tools().unwrap().clone();
+        let registry = registry.with_test_ssh(Sshd::server(), Some("/opt/heel".into()), tools);
+        let environment = registry.ssh_environments().get("fixture").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
+        terminal
+            .permission_handler
+            .once
+            .store(once, AtomicOrdering::SeqCst);
+        for _ in 0..2 {
+            // The connection is refused; only the questions put matter here.
+            let result = terminal
+                .call(
+                    args("true", TerminalExecutionMode::Default, "fixture"),
+                    ToolContext::new(),
+                )
+                .await;
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .is_none_or(|error| !error.to_string().contains("was not approved")),
+                "the command was approved: {result:?}"
+            );
+        }
+        assert_eq!(terminal.permission_handler.asked().len(), expected_asks);
+        assert_eq!(environment.is_approved(), !once);
+    }
+}
+
 /// A subagent's first command reaches the handler as the subagent's, and
 /// the approval holds for the main agent sharing the registry.
 #[tokio::test(flavor = "multi_thread")]
@@ -493,6 +550,36 @@ async fn a_subagent_asks_as_a_subagent_and_its_approval_is_shared() {
         [("fixture".to_string(), CommandRole::Subagent)]
     );
     assert_eq!(main.permission_handler.asked(), []);
+}
+
+/// An `unsafe` command reaches the handler with the server it is located
+/// on, or the home when it names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsafe_command_reaches_the_handler_with_its_location() {
+    let unreachable = tempfile::tempdir().unwrap();
+    let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
+    let tools = registry.local_tools().unwrap().clone();
+    let registry = registry.with_test_ssh(Sshd::server(), None, tools);
+    let dir = tempfile::tempdir().unwrap();
+    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
+    // The connection is refused; only the question put matters here.
+    let _ = terminal
+        .call(
+            args("true", TerminalExecutionMode::Unsafe, "fixture"),
+            ToolContext::new(),
+        )
+        .await;
+    terminal
+        .call(
+            args("true", TerminalExecutionMode::Unsafe, ""),
+            ToolContext::new(),
+        )
+        .await
+        .expect("an unsafe command runs at home");
+    assert_eq!(
+        terminal.permission_handler.unsafe_locations(),
+        [Some("fixture".to_string()), None]
+    );
 }
 
 /// A server without `heel` runs `unsafe` commands only.
