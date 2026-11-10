@@ -48,6 +48,7 @@ struct SshdConfig<'a> {
     authorized_keys: &'a str,
     pid_file: &'a str,
     home: &'a str,
+    login_shell: Option<&'a str>,
 }
 
 #[derive(Template)]
@@ -126,6 +127,16 @@ impl Sshd {
     }
 
     async fn start_with_heel(has_heel: bool) -> Self {
+        Self::start_with(has_heel, None).await
+    }
+
+    /// A server whose every command line is parsed by `login_shell`, a
+    /// program path, instead of the shell of this user's account.
+    async fn start_with_login_shell(login_shell: &str) -> Self {
+        Self::start_with(false, Some(login_shell)).await
+    }
+
+    async fn start_with(has_heel: bool, login_shell: Option<&str>) -> Self {
         let sshd = Path::new("/usr/sbin/sshd");
         assert!(
             sshd.is_file(),
@@ -150,6 +161,7 @@ impl Sshd {
             authorized_keys: text(&root.join("authorized_keys")),
             pid_file: text(&root.join("sshd.pid")),
             home: text(&home),
+            login_shell,
         }
         .render()
         .unwrap();
@@ -269,7 +281,7 @@ async fn the_probe_reports_the_servers_platform_without_preparing_it() {
         refusing_client(unreachable.path())
             .probe_os(&Sshd::server())
             .await,
-        Err(SshProbeError::Failed { .. })
+        Err(SshProbeError::Upload(_))
     ));
 }
 
@@ -540,7 +552,7 @@ async fn the_public_probe_reports_an_unreachable_server() {
     })
     .await
     .expect_err("nothing answers");
-    assert!(matches!(error, SshProbeError::Failed { .. }), "{error}");
+    assert!(matches!(error, SshProbeError::Upload(_)), "{error}");
 }
 
 /// The pool bounds this machine's jobs: a server's command runs outside it,
@@ -713,4 +725,87 @@ async fn a_script_spawned_on_a_server_runs_in_the_managed_shell() {
         crate::Descendants::Unobserved
     );
     assert!(child.take_stdin_blocked().is_none());
+}
+
+/// Text every quoting convention treats differently, in the scripts of the
+/// login-shell tests: spaces, both quotes, backslashes, `$`, command
+/// substitution, newlines and Chinese, Japanese and Korean.
+const AWKWARD: &str = "a b 'single' \"double\" \\back\\\\slash \\' $HOME ${x} $(id) `id` !! ;|&<>\n\
+    \tindented\n\n中文：你好，世界\n日本語：こんにちは、世界\n한국어: 안녕하세요, 세계";
+
+/// Runs a script that prints its own path, then [`AWKWARD`] from a quoted
+/// here-document, through a server whose login shell is `login_shell`: the
+/// text must arrive unchanged and the script's file must be gone.
+async fn assert_script_arrives_unchanged(login_shell: &str) {
+    let sshd = Sshd::start_with_login_shell(login_shell).await;
+    let script = format!("printf '%s\\n' \"$0\"\ncat <<'AITHER_END'\n{AWKWARD}\nAITHER_END\n");
+    let command = sshd.client.command(&Sshd::server(), &script).await.unwrap();
+    let output = async_process::Command::from(command)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{login_shell}: {stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (path, body) = stdout.split_once('\n').unwrap();
+    assert_eq!(body, format!("{AWKWARD}\n"), "{login_shell}");
+    assert!(
+        !Path::new(path).exists(),
+        "{login_shell}: the script deletes its own file {path}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reaches_sh_unchanged_under_a_posix_login_shell() {
+    assert_script_arrives_unchanged("/bin/sh").await;
+}
+
+/// Needs `fish` installed: skipped, loudly, where it is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reaches_sh_unchanged_under_a_fish_login_shell() {
+    let fish = [
+        "/opt/homebrew/bin/fish",
+        "/usr/local/bin/fish",
+        "/usr/bin/fish",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).is_file());
+    let Some(fish) = fish else {
+        eprintln!("SKIPPED: fish is not installed, so the fish login shell case did not run");
+        return;
+    };
+    assert_script_arrives_unchanged(fish).await;
+}
+
+/// The job's standard input is its own: the script travels another way.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_commands_stdin_is_free_for_the_scripts_input() {
+    let sshd = Sshd::start().await;
+    let command = sshd.client.command(&Sshd::server(), "cat").await.unwrap();
+    let mut child = async_process::Command::from(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    futures_lite::io::AsyncWriteExt::write_all(&mut stdin, "输入 'x'\n".as_bytes())
+        .await
+        .unwrap();
+    drop(stdin);
+    let output = child.output().await.unwrap();
+    assert_eq!(output.stdout, "输入 'x'\n".as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_that_cannot_be_uploaded_runs_nothing_and_says_why() {
+    let unreachable = tempfile::tempdir().unwrap();
+    let error = refusing_client(unreachable.path())
+        .command(&Sshd::server(), "echo ran")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::ssh::SshUploadError::Failed { .. }),
+        "{error}"
+    );
 }

@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use futures_lite::io::AsyncWriteExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +43,27 @@ pub enum SshServerError {
     Duplicate(String),
 }
 
+/// Why a script could not be written to a server, so that nothing ran.
+#[derive(Debug, thiserror::Error)]
+pub enum SshUploadError {
+    /// `ssh` could not be started or waited for.
+    #[error("could not start ssh: {0}")]
+    Spawn(std::io::Error),
+    /// The script could not be sent to `ssh`.
+    #[error("could not send the script to ssh: {0}")]
+    Write(std::io::Error),
+    /// The connection failed or the server could not store the script.
+    #[error("writing the script to `{target}` failed ({status}): {stderr}")]
+    Failed {
+        /// The SSH target written to.
+        target: String,
+        /// The exit status `ssh` returned.
+        status: std::process::ExitStatus,
+        /// What it wrote to its standard error.
+        stderr: String,
+    },
+}
+
 /// The operating system and architecture a server reports, as `uname -s`
 /// and `uname -m` print them (for example `Linux` and `x86_64`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -58,6 +80,9 @@ pub enum SshProbeError {
     /// `ssh` could not be started.
     #[error("could not start ssh: {0}")]
     Spawn(#[from] std::io::Error),
+    /// The probe script could not be written to the server.
+    #[error(transparent)]
+    Upload(#[from] SshUploadError),
     /// The connection or the remote command failed.
     #[error("the probe of `{target}` exited with {status}: {stderr}")]
     Failed {
@@ -102,22 +127,66 @@ impl SshClient {
         }
     }
 
-    /// `ssh` running `script` under `sh -c` on `server`.
-    pub(crate) fn command(&self, server: &SshServer, script: &str) -> std::process::Command {
+    /// `ssh` to `server` with `line` as the remote command line.
+    ///
+    /// The remote login shell parses `line` before anything else runs, and
+    /// shells disagree on quoting, so every line this client sends is made
+    /// only of letters, digits and `-`, `.`, `/`, `;`, `>` and spaces.
+    fn ssh(&self, server: &SshServer, line: &str) -> std::process::Command {
         let mut command = std::process::Command::new("ssh");
         command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
         if let Some(config) = &self.config {
             command.arg("-F").arg(config);
         }
-        command
-            .arg("--")
-            .arg(&server.target)
-            .arg(shell_words::join(["sh", "-c", script]));
+        command.arg("--").arg(&server.target).arg(line);
         command
     }
 
+    /// `ssh` running `script` under `sh` on `server`, with the command's
+    /// standard input free for the script's own input.
+    ///
+    /// The script never appears on the remote command line: one `ssh` writes
+    /// it to a private file on the server through its standard input, and the
+    /// command returned runs that file with `sh`, which reads it byte for
+    /// byte. The script deletes its own file as its first action.
+    ///
+    /// # Errors
+    ///
+    /// Fails, running nothing, when the script cannot be written to the
+    /// server.
+    pub(crate) async fn command(
+        &self,
+        server: &SshServer,
+        script: &str,
+    ) -> Result<std::process::Command, SshUploadError> {
+        let path = format!("/tmp/aither-{}.sh", uuid::Uuid::new_v4().simple());
+        let upload = |error: std::io::Error| SshUploadError::Spawn(error);
+        let mut child =
+            async_process::Command::from(self.ssh(server, &format!("umask 077; cat > {path}")))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(upload)?;
+        let mut stdin = child.stdin.take().expect("the upload's stdin is piped");
+        let body = format!("rm -f \"$0\"\n{script}");
+        let written = stdin.write_all(body.as_bytes()).await;
+        drop(stdin);
+        let output = child.output().await.map_err(upload)?;
+        if !output.status.success() {
+            return Err(SshUploadError::Failed {
+                target: server.target.clone(),
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        written.map_err(SshUploadError::Write)?;
+        Ok(self.ssh(server, &format!("sh {path}")))
+    }
+
     pub(crate) async fn probe_os(&self, server: &SshServer) -> Result<SshPlatform, SshProbeError> {
-        let output = async_process::Command::from(self.command(server, "uname -s -m"))
+        let output = async_process::Command::from(self.command(server, "uname -s -m").await?)
             .stdin(Stdio::null())
             .output()
             .await?;
