@@ -115,6 +115,9 @@ test-heel = ["dep:zenwave"]
 test-ids = []
 # Expose `test_budgets`, time and output budgets for tests, to dependents' tests.
 test-budgets = []
+# Expose `test_jobs`, jobs placed in a container or on a remote host, to
+# dependents' tests.
+test-util = ["test-ids", "test-budgets"]
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
 code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]

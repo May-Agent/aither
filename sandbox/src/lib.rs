@@ -86,6 +86,11 @@ pub mod test_budgets;
 #[cfg(any(test, feature = "test-budgets"))]
 pub mod test_wording;
 
+/// Jobs placed in a container or on a remote host for tests, shared with
+/// dependent crates through the `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_jobs;
+
 /// Id allocators for tests, shared with dependent crates through the
 /// `test-ids` feature.
 #[cfg(any(test, feature = "test-ids"))]
