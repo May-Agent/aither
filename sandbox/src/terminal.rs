@@ -5471,10 +5471,25 @@ mod tests {
         test_container_launch().bin_dir().clone()
     }
 
+    /// The commands of a router that serves each of `names`, taking no
+    /// positional arguments.
+    fn ipc_commands(names: &[&str]) -> heel::ipc::IpcCommands {
+        let declarations = names
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    serde_json::json!({"positional_args": [], "stdin_arg": null}),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        serde_json::from_value(serde_json::json!(declarations)).expect("valid IPC commands")
+    }
+
     /// `script` wrapped with the IPC setup for `commands` at `host:port`.
     fn wrap_with_ipc(
         script: &str,
-        commands: &[String],
+        commands: &heel::ipc::IpcCommands,
         endpoint: (&str, u16),
         priority: ProcessPriority,
     ) -> Result<String, TerminalError> {
@@ -5493,7 +5508,7 @@ mod tests {
     fn wrap_container_script_refreshes_command_hash_table() {
         let wrapped = wrap_with_ipc(
             "websearch \"gold price\"",
-            &[String::from("websearch")],
+            &ipc_commands(&["websearch"]),
             ("host.docker.internal", 9000),
             ProcessPriority::default(),
         )
@@ -5508,7 +5523,7 @@ mod tests {
         let script = "echo '$5,040' && subagent art_direction --prompt-file tmp/prompt.md";
         let wrapped = wrap_with_ipc(
             script,
-            &[String::from("subagent")],
+            &ipc_commands(&["subagent"]),
             ("host.docker.internal", 9000),
             ProcessPriority::default(),
         )
@@ -5518,32 +5533,39 @@ mod tests {
     }
 
     #[test]
-    fn wrap_container_script_rejects_invalid_ipc_command_names() {
-        let error = wrap_with_ipc(
-            "echo ok",
-            &[String::from("bad name")],
-            ("host.docker.internal", 9000),
-            ProcessPriority::default(),
-        )
-        .expect_err("invalid command name must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("cannot be a shim in a container")
-        );
-    }
-
-    #[test]
     fn wrap_container_script_renders_expected_endpoint() {
         let wrapped = wrap_with_ipc(
             "environment --query deployment",
-            &[String::from("environment"), String::from("session")],
+            &ipc_commands(&["environment", "session"]),
             ("host.containers.internal", 43123),
             ProcessPriority::default(),
         )
         .expect("wrap script");
         assert!(wrapped.contains("tcp://host.containers.internal:43123"));
-        assert!(wrapped.contains("for cmd in 'environment' 'session'; do"));
+        assert!(wrapped.contains(
+            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"stdin_arg":null,"raw_args":false},"session":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+        ));
+    }
+
+    /// The shims are written from the declarations, so a command's
+    /// positional and stdin arguments reach the container, where a shim
+    /// that knew only the name would pass neither.
+    #[test]
+    fn wrap_container_script_carries_the_commands_declarations() {
+        let commands: heel::ipc::IpcCommands =
+            serde_json::from_str(r#"{"issue":{"positional_args":["number"],"stdin_arg":"body"}}"#)
+                .expect("valid IPC commands");
+        let wrapped = wrap_with_ipc(
+            "issue",
+            &commands,
+            ("host.docker.internal", 9000),
+            ProcessPriority::default(),
+        )
+        .expect("wrap script");
+        assert!(wrapped.contains(
+            r#"--commands '{"issue":{"positional_args":["number"],"stdin_arg":"body","raw_args":false}}'"#
+        ));
+        assert!(!wrapped.contains("printf"));
     }
 
     /// Approves every request, and records what it was asked.
@@ -7404,7 +7426,7 @@ mod tests {
         .await
         .expect("the exec completes");
         let script = scripts.recv().await.expect("the exec ran a script");
-        assert!(script.contains("for cmd in 'probe'; do"), "{script}");
+        assert!(script.contains(r#"--commands '{"probe":"#), "{script}");
         let launches = provider.launches.lock().unwrap();
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].task_id.as_deref(), Some("probe"));
@@ -8710,7 +8732,7 @@ mod tests {
         let tools_dir = container_tools_dir();
         let executable = format!("--executable {}", shell_escape(tools_dir.as_str()));
         let setup = crate::spawn::container_ipc::exec_setup(
-            &[String::from("websearch")],
+            &ipc_commands(&["websearch"]),
             "host.docker.internal",
             9000,
         )
