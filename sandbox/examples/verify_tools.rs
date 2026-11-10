@@ -8,7 +8,7 @@ use aither_sandbox::{
     AnyShellWording, CommandBlocked, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
     JobRead, JobToolSettings, JsonAsTsv, MediaBounds, MonitorRefusal, MonitorStarted,
     OmittedLines, OutputLimits, OutputPolicy, OutputSaved, RepeatedLines, ReservedForMain,
-    ShellArgs, ShellLimits, ShellWording, StoredBinaryPart, TerminalTool, ToolDistribution,
+    ShellArgs, ShellLimits, ShellWording, StoredBinaryPart, Shell, ToolDistribution,
     ToolIdentity, ToolRegistryBuilder, ToolTarget,
 };
 
@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         job_preview_bytes: 50,
     });
-    let terminal = TerminalTool::new_exact(
+    let terminal = Shell::new_exact(
         PathBuf::from(workspace),
         executor_core::tokio::TokioGlobal,
         limits,

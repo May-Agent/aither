@@ -6,7 +6,7 @@
 //! syntax falls back to a real shell when needed.
 //! Commands run in a sandbox with configurable permission modes.
 //!
-//! Each `TerminalTool` works in one shared working directory. All terminal
+//! Each `Shell` works in one shared working directory. All terminal
 //! executions share this directory, but each execution gets a fresh sandbox
 //! (new TTY/process). The ids the model addresses — task ids, stored output
 //! names, subagent spaces — are leased from the terminal's
@@ -150,7 +150,7 @@ struct NetworkSettings {
 /// Opens a daily-rotated network audit log under `dir`, creating the directory if needed.
 ///
 /// Keeps at most `max_files` rotated files. Attach the log with
-/// [`TerminalTool::with_network_audit_log`] to record every sandboxed
+/// [`Shell::with_network_audit_log`] to record every sandboxed
 /// network policy decision.
 ///
 /// # Errors
@@ -756,7 +756,7 @@ impl TerminalToolFactory {
 /// command holding the launcher is gone.
 async fn serve_launches<E>(
     requests: Receiver<TerminalToolRequest>,
-    source: TerminalTool<E, Launching>,
+    source: Shell<E, Launching>,
 ) where
     E: Executor + Clone + 'static,
 {
@@ -786,7 +786,7 @@ async fn serve_launches<E>(
                 let tool = source
                     .launch_resolved(resolved, observer, gate, caller.as_deref())
                     .await
-                    .map(TerminalTool::to_dyn);
+                    .map(Shell::to_dyn);
                 if reply.send(tool).await.is_err() {
                     warn!("terminal tool factory response channel dropped");
                 }
@@ -975,7 +975,7 @@ trait TerminalRunnerImpl: Send + Sync {
 /// runner, so the terminal's copy here holds no registry of its own and the
 /// runner ends with the terminal.
 struct BoundRunner<E> {
-    terminal: TerminalTool<E, Unconfigured>,
+    terminal: Shell<E, Unconfigured>,
     registry: std::sync::Weak<ToolRegistry>,
 }
 
@@ -1044,7 +1044,7 @@ pub struct Launching {
 
 /// A registry state a terminal can launch subagents from.
 ///
-/// Sealed: declared `pub` only so it may bound the `TerminalTool` impl that
+/// Sealed: declared `pub` only so it may bound the `Shell` impl that
 /// launches subagents; it lives in this private module and is not
 /// re-exported.
 pub trait RegistryState: Clone + Send + Sync {
@@ -1154,7 +1154,7 @@ struct ContainerCarry {
 }
 
 /// The terminal tool for executing scripts in a sandbox.
-pub struct TerminalTool<E, State = Unconfigured> {
+pub struct Shell<E, State = Unconfigured> {
     /// Shared working directory, named by heel with four random words (e.g.,
     /// `amber-forest-thunder-pearl/`) rather than a leased id.
     working_dir: PathBuf,
@@ -1211,7 +1211,7 @@ pub struct TerminalTool<E, State = Unconfigured> {
     registry: State,
 }
 
-impl<E: Clone, State: Clone> Clone for TerminalTool<E, State> {
+impl<E: Clone, State: Clone> Clone for Shell<E, State> {
     fn clone(&self) -> Self {
         Self {
             working_dir: self.working_dir.clone(),
@@ -1242,7 +1242,7 @@ impl<E: Clone, State: Clone> Clone for TerminalTool<E, State> {
     }
 }
 
-impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
+impl<E: Executor + Clone + 'static> Shell<E, Unconfigured> {
     /// Sets the approver that answers the approvals of scripts no tool call
     /// carries ([`TerminalRunner::run`] and [`Self::run_background`]), and
     /// of calls whose dispatcher attached none. Without one, such a script
@@ -1494,10 +1494,10 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
     }
 }
 
-impl<E, State> TerminalTool<E, State> {
+impl<E, State> Shell<E, State> {
     /// Moves every part into a terminal with another registry state.
-    fn map_state<Next>(self, state: impl FnOnce(State) -> Next) -> TerminalTool<E, Next> {
-        TerminalTool {
+    fn map_state<Next>(self, state: impl FnOnce(State) -> Next) -> Shell<E, Next> {
+        Shell {
             working_dir: self.working_dir,
             shell_sessions: self.shell_sessions,
             approver: self.approver,
@@ -1526,7 +1526,7 @@ impl<E, State> TerminalTool<E, State> {
     }
 }
 
-impl<E> TerminalTool<E, Unconfigured>
+impl<E> Shell<E, Unconfigured>
 where
     E: Executor + Clone + 'static,
 {
@@ -1536,7 +1536,7 @@ where
     /// The terminal gets its own launcher for the subagents it starts, and
     /// the registry's terminal-bound commands are built for it.
     #[must_use]
-    pub fn with_registry(self, registry: Arc<ToolRegistry>) -> TerminalTool<E, Configured> {
+    pub fn with_registry(self, registry: Arc<ToolRegistry>) -> Shell<E, Configured> {
         let registry = Arc::new(
             Arc::unwrap_or_clone(registry)
                 .with_terminal_controls(
@@ -1551,7 +1551,7 @@ where
 }
 
 #[cfg(test)]
-impl<E> TerminalTool<E, Configured>
+impl<E> Shell<E, Configured>
 where
     E: Executor + Clone + 'static,
 {
@@ -1562,13 +1562,13 @@ where
     }
 }
 
-impl<E> TerminalTool<E, Launching>
+impl<E> Shell<E, Launching>
 where
     E: Executor + Clone + 'static,
 {
     /// Starts this terminal's launcher and binds its registry to it and to
     /// its runner.
-    fn into_served(self) -> TerminalTool<E, Configured> {
+    fn into_served(self) -> Shell<E, Configured> {
         let (launcher, requests) = async_channel::unbounded();
         // A run starts where it is told and leaves the main agent's carried
         // directory alone.
@@ -1601,7 +1601,7 @@ where
     }
 }
 
-impl<E, State> TerminalTool<E, State>
+impl<E, State> Shell<E, State>
 where
     E: Executor + Clone + 'static,
     State: Clone,
@@ -2017,7 +2017,7 @@ where
 /// the spaces of the subagents it launches.
 const SUBAGENT_SPACES_DIR: &str = "subagent-spaces";
 
-impl<E, State> TerminalTool<E, State>
+impl<E, State> Shell<E, State>
 where
     E: Executor + Clone + 'static,
     State: RegistryState,
@@ -2031,7 +2031,7 @@ where
         history: &mut LaunchHistory,
         grant: SubagentGrant,
         caller: Option<&Path>,
-    ) -> Result<TerminalTool<E, Configured>, SubagentGrantError> {
+    ) -> Result<Shell<E, Configured>, SubagentGrantError> {
         let resolved = self.resolve_launch(history, grant).await?;
         self.launch_resolved(resolved, None, None, caller).await
     }
@@ -2115,7 +2115,7 @@ where
         observer: Option<AnyCommandObserver>,
         gate: Option<AnyCommandGate>,
         caller: Option<&Path>,
-    ) -> Result<TerminalTool<E, Configured>, SubagentGrantError> {
+    ) -> Result<Shell<E, Configured>, SubagentGrantError> {
         async_fs::create_dir_all(&spaces_root)
             .await
             .map_err(|source| SubagentGrantError::Space {
@@ -2222,7 +2222,7 @@ where
                     self.output_store.clone(),
                 ),
         );
-        let launching = TerminalTool {
+        let launching = Shell {
             working_dir: space,
             shell_sessions: self.shell_sessions.clone(),
             approver: self.approver.clone(),
@@ -2326,7 +2326,7 @@ fn container_confinement_for(
     })
 }
 
-impl<E> TerminalTool<E, Configured>
+impl<E> Shell<E, Configured>
 where
     E: Executor + Clone + 'static,
 {
@@ -2361,7 +2361,7 @@ where
         })
     }
 
-    /// Converts this `TerminalTool` into a type-erased `DynTerminalTool`.
+    /// Converts this `Shell` into a type-erased `DynTerminalTool`.
     ///
     /// This is useful for creating child terminal tools for subagents where
     /// the concrete type cannot be known at compile time.
@@ -2409,7 +2409,7 @@ where
 
 /// The execution path every terminal state that serves a registry shares:
 /// a `terminal` call and a [`TerminalRunner`] run go through it alike.
-impl<E, S> TerminalTool<E, S>
+impl<E, S> Shell<E, S>
 where
     E: Executor + Clone + 'static,
     S: RegistryState,
@@ -2598,7 +2598,7 @@ where
     }
 }
 
-impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
+impl<E: Executor + Clone + 'static> Tool for Shell<E, Configured> {
     fn name(&self) -> Cow<'static, str> {
         "terminal".into()
     }
@@ -2704,7 +2704,7 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
     }
 }
 
-impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
+impl<E: Executor + Clone + 'static> Shell<E, Configured> {
     /// The directory report of a foreground command on the main agent's
     /// terminal; `None` for a subagent, for an ssh command and for a container
     /// whose workspace mount is not declared.
@@ -2988,7 +2988,7 @@ async fn left_in_start(carry: &CwdCarry, reported: &str, working_dir: &Path) -> 
     }
 }
 
-impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
+impl<E: Executor + Clone + 'static> Shell<E, Configured> {
     /// Runs `script` as a detached background job bounded by `timeout`, for
     /// embedders that drive the terminal directly rather than through the
     /// `terminal` tool schema. Shares [`Self::call`]'s `background: true`
@@ -3010,7 +3010,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
     }
 }
 
-impl<E, S> TerminalTool<E, S>
+impl<E, S> Shell<E, S>
 where
     E: Executor + Clone + 'static,
     S: RegistryState,
@@ -3463,7 +3463,7 @@ where
     }
 }
 
-/// What [`TerminalTool::admit_command`] admits: a script and how it came.
+/// What [`Shell::admit_command`] admits: a script and how it came.
 struct Admission<'a> {
     script: &'a str,
     interpreter: Interpreter,
@@ -6308,9 +6308,9 @@ impl From<crate::SpawnError> for TerminalError {
     }
 }
 
-impl<E, State> std::fmt::Debug for TerminalTool<E, State> {
+impl<E, State> std::fmt::Debug for Shell<E, State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TerminalTool")
+        f.debug_struct("Shell")
             .field("working_dir", &self.working_dir)
             .finish_non_exhaustive()
     }
@@ -6513,8 +6513,8 @@ mod tests {
         })
     }
 
-    async fn fresh_terminal(dir: &Path) -> TerminalTool<executor_core::tokio::TokioGlobal> {
-        TerminalTool::new_exact(
+    async fn fresh_terminal(dir: &Path) -> Shell<executor_core::tokio::TokioGlobal> {
+        Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -7298,10 +7298,10 @@ mod tests {
         approver: Option<Approvals>,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        Shell<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -7468,7 +7468,7 @@ mod tests {
     #[tokio::test]
     async fn uninitialized_terminal_rejects_execution_and_catalog() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -7494,7 +7494,7 @@ mod tests {
     async fn child_terminal_exposes_controls_with_isolated_jobs() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -7608,7 +7608,7 @@ mod tests {
     async fn a_main_exclusive_command_names_its_choices_and_does_not_exist_for_a_subagent() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -7707,7 +7707,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -7743,7 +7743,7 @@ mod tests {
         let ids = crate::test_ids::RecordingIds::default();
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -7821,10 +7821,10 @@ mod tests {
         ids: AnyIdAllocator,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        Shell<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -8106,7 +8106,7 @@ mod tests {
     async fn sandboxed_terminal_executes_pwd() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -8177,7 +8177,7 @@ mod tests {
         let readable = tempfile::tempdir().unwrap();
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tools = shell_sessions.local_tools().unwrap().clone();
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -8343,7 +8343,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tools = shell_sessions.local_tools().unwrap().clone();
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -8783,7 +8783,7 @@ mod tests {
     async fn failed_command_reports_nonzero_exit_code() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -8848,7 +8848,7 @@ mod tests {
     async fn a_detached_job_reads_pending_until_its_completion_is_taken() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -8920,7 +8920,7 @@ mod tests {
     async fn background_terminal_accepts_terminal_input() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -8996,7 +8996,7 @@ mod tests {
     async fn a_job_handle_reads_waits_and_kills() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -9066,7 +9066,7 @@ mod tests {
     async fn killing_background_terminal_kills_descendant_processes() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -9196,7 +9196,7 @@ mod tests {
     /// Starts `script` as a background job and returns its task id.
     #[cfg(unix)]
     async fn start_background_job(
-        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        tool: &Shell<executor_core::tokio::TokioGlobal, Configured>,
         script: &str,
     ) -> String {
         let result = tool
@@ -9750,7 +9750,7 @@ mod tests {
         alert_after: Duration,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        Shell<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, tool) =
             unconfigured_test_terminal(dir, foreground_wait, timeout_cap, alert_after).await;
@@ -9766,10 +9766,10 @@ mod tests {
         alert_after: Duration,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<executor_core::tokio::TokioGlobal, Unconfigured>,
+        Shell<executor_core::tokio::TokioGlobal, Unconfigured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -9938,7 +9938,7 @@ mod tests {
 
     /// The directory the sandbox may execute programs from.
     #[cfg(unix)]
-    fn exec_dir<E>(tool: &TerminalTool<E, Configured>) -> PathBuf {
+    fn exec_dir<E>(tool: &Shell<E, Configured>) -> PathBuf {
         tool.shell_sessions
             .local_tools()
             .expect("the terminal has local tools")
@@ -10155,7 +10155,7 @@ mod tests {
     /// descendant still alive, and returns the task id and the descendant's pid.
     #[cfg(unix)]
     async fn background_job_whose_shell_exited(
-        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        tool: &Shell<executor_core::tokio::TokioGlobal, Configured>,
         script: &str,
         timeout: u64,
     ) -> (String, i32) {
@@ -10616,10 +10616,10 @@ mod tests {
         priority: ProcessPriority,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        Shell<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -11103,7 +11103,7 @@ mod tests {
             .filter(|path| path.is_file())
     }
 
-    /// End-to-end container path: `TerminalTool` execs the wrapped script in a
+    /// End-to-end container path: `Shell` execs the wrapped script in a
     /// real container through `BollardContainerExec`, and the script fires a
     /// real `heel ipc` request at the live host bridge.
     ///
@@ -11265,7 +11265,7 @@ mod tests {
         let (container, bundle, _tools_cache) = start_acceptance_container().await;
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let shell_sessions = acceptance_shell_sessions(&container, &bundle, dir.path()).await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -11326,7 +11326,7 @@ mod tests {
         let shell_sessions = acceptance_shell_sessions(&container, &bundle, Path::new("/")).await;
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -11401,7 +11401,7 @@ mod tests {
 
     // ---- subagent authority -------------------------------------------------
 
-    type ConfiguredTestTool = TerminalTool<executor_core::tokio::TokioGlobal, Configured>;
+    type ConfiguredTestTool = Shell<executor_core::tokio::TokioGlobal, Configured>;
 
     /// Runs `script` in `tool`'s sandbox and returns its exit code.
     #[cfg(unix)]
@@ -13084,7 +13084,7 @@ mod tests {
         let sibling = dir.path().join("sibling");
         std::fs::create_dir_all(&granted).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -13182,7 +13182,7 @@ mod tests {
     async fn sandboxed_only_command_leaves_unsafe_scripts_the_host_program() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -13246,8 +13246,8 @@ mod tests {
     async fn unsafe_terminal(
         dir: &Path,
         shell_sessions: ShellSessionRegistry,
-    ) -> TerminalTool<executor_core::tokio::TokioGlobal, Configured> {
-        let tool = TerminalTool::new_exact(
+    ) -> Shell<executor_core::tokio::TokioGlobal, Configured> {
+        let tool = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -13269,7 +13269,7 @@ mod tests {
     /// Runs an approved unsafe `script` to its end and renders the result.
     #[cfg(unix)]
     async fn run_unsafe(
-        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        tool: &Shell<executor_core::tokio::TokioGlobal, Configured>,
         script: &str,
     ) -> String {
         let result = tool
@@ -13385,7 +13385,7 @@ mod tests {
     async fn a_subagent_of_a_subagent_gets_the_subagent_registry() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -13520,7 +13520,7 @@ mod tests {
         let clone = tempfile::tempdir().expect("clone dir should be created");
         let read_only = tempfile::tempdir().expect("read-only dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir.path(),
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -13667,7 +13667,7 @@ mod tests {
         ConfiguredTestTool,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -13906,7 +13906,7 @@ mod tests {
         })
         .with_container_runtime(runtime)
         .with_test_container_tools(container_tools, "aither-test-confinement".to_string());
-        let tool = TerminalTool::new_exact(
+        let tool = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -14114,10 +14114,10 @@ mod tests {
         configure: impl FnOnce(&mut ToolRegistryBuilder),
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        Shell<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+        let tool: Shell<executor_core::tokio::TokioGlobal> = Shell::new_exact(
             dir,
             executor_core::tokio::TokioGlobal,
             crate::limits::fixture::limits(),
@@ -14454,7 +14454,7 @@ mod tests {
     /// The directory the terminal's next foreground script starts in.
     #[cfg(unix)]
     async fn starts_after(
-        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+        tool: &Shell<executor_core::tokio::TokioGlobal, Configured>,
     ) -> ScriptDir {
         carried_start(tool.carried_dir.as_ref()).await.map_or_else(
             || ScriptDir::Host(tool.working_dir.clone()),

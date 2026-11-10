@@ -9,14 +9,14 @@
 //! # Setting Up the Terminal Tool
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
+//! use aither_sandbox::{Shell, ToolRegistryBuilder};
 //! use std::sync::Arc;
 //!
 //! // Creates a working directory heel names with four random words (e.g.,
 //! // amber-forest-thunder-pearl/), not a leased id, with an outputs/
 //! // subdirectory and IPC command wrapper scripts; the ids the model reads are
 //! // leased from `with_id_allocator`'s allocator
-//! let tool = TerminalTool::new_in(std::env::temp_dir(), executor).await?;
+//! let tool = Shell::new_in(std::env::temp_dir(), executor).await?;
 //! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
 //! let tool = tool.with_registry(registry);
 //!
@@ -205,7 +205,7 @@ pub use subagent::{
 pub use terminal::{
     CompletedCommand, Configured, DescendantsKilled, DirectoryResetReason, ShellArgs,
     TerminalBinding, TerminalError, TerminalRunError, TerminalRunner, TerminalScript,
-    TerminalTool, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
+    Shell, TerminalToolFactory, TerminalToolFactoryError, TimeoutKill, Unconfigured,
     open_network_audit_log,
 };
 pub use tool_distribution::{

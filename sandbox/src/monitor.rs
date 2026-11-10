@@ -23,7 +23,7 @@ use crate::wording::{MonitorStarted, Refused};
 use crate::output::MediaResolution;
 use crate::policy::SandboxMode;
 use crate::events::{EventSender, ShellEvent};
-use crate::terminal::{Configured, ShellArgs, TerminalTool};
+use crate::terminal::{Configured, ShellArgs, Shell};
 
 /// What an embedder decides about monitoring: the tool's name and description
 /// and the bounds of a watch. The bounds are live, so changing one reaches
@@ -192,7 +192,7 @@ struct Watch {
 /// The native `monitor` tool: starts the watched source as a background job
 /// and a pump that raises its increments as [`ShellEvent`]s.
 pub struct MonitorTool<E> {
-    terminal: TerminalTool<E, Configured>,
+    terminal: Shell<E, Configured>,
     settings: MonitorSettings,
 }
 
@@ -211,7 +211,7 @@ impl<E> MonitorTool<E> {
     /// Creates the tool bound to `terminal`, the configured terminal whose
     /// jobs it watches.
     #[must_use]
-    pub const fn new(terminal: TerminalTool<E, Configured>, settings: MonitorSettings) -> Self {
+    pub const fn new(terminal: Shell<E, Configured>, settings: MonitorSettings) -> Self {
         Self { terminal, settings }
     }
 }

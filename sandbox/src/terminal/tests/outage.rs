@@ -5,7 +5,7 @@ use aither_core::llm::InterruptionCause;
 
 use super::*;
 
-type Terminal = TerminalTool<executor_core::tokio::TokioGlobal, Configured>;
+type Terminal = Shell<executor_core::tokio::TokioGlobal, Configured>;
 
 /// A terminal recording `connectivity`; the cache directory must outlive it.
 async fn terminal(
@@ -13,7 +13,7 @@ async fn terminal(
     connectivity: &Connectivity,
 ) -> (crate::tool_runtime::tests::UnlockingTempDir, Terminal) {
     let (cache, shell_sessions) = prepared_test_registry().await;
-    let tool = TerminalTool::new_exact(
+    let tool = Shell::new_exact(
         dir,
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),

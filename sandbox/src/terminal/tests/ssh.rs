@@ -36,7 +36,7 @@ impl crate::ScriptPolicy for RecordStarts {
     }
 }
 
-type Terminal = TerminalTool<executor_core::tokio::TokioGlobal, Configured>;
+type Terminal = Shell<executor_core::tokio::TokioGlobal, Configured>;
 
 #[derive(Template)]
 #[template(path = "test_sshd_config.txt", escape = "none")]
@@ -207,7 +207,7 @@ async fn terminal_with(
     approver: &Approvals,
     policy: RecordStarts,
 ) -> Terminal {
-    let tool = TerminalTool::new_exact(
+    let tool = Shell::new_exact(
         dir,
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),
@@ -449,7 +449,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
     let dir = tempfile::tempdir().unwrap();
 
     // No policy decided, and no approver exists: the script is not run.
-    let tool = TerminalTool::new_exact(
+    let tool = Shell::new_exact(
         dir.path(),
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),
@@ -478,7 +478,7 @@ async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_no
 
     // A policy's allow settles it without the approver; the connection is
     // refused, so the call fails later, and not for want of approval.
-    let tool = TerminalTool::new_exact(
+    let tool = Shell::new_exact(
         dir.path(),
         executor_core::tokio::TokioGlobal,
         crate::limits::fixture::limits(),
