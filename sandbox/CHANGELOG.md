@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0](https://github.com/May-Agent/aither/compare/sandbox-v0.29.0...sandbox-v0.30.0) - 2026-11-10
+
+### Fixed
+
+- *(sandbox)* skip deleted writable grants at admission
+- *(sandbox)* take heel 0.9.4, which answers a panicking IPC handler's request with an error
+
+### Other
+
+- Merge pull request #701 from May-Agent/fix/699-deleted-workdir
+- Mark collapsed blank-line runs with how many lines they held
+- Render the omitted range to the last line when the preview tail takes nothing
+
 ## [0.29.0](https://github.com/May-Agent/aither/compare/sandbox-v0.28.0...sandbox-v0.29.0) - 2026-11-10
 
 ### Added
