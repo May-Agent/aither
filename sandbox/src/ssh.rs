@@ -3,6 +3,7 @@
 //! state of each server and the OS probe an embedder runs when a server is
 //! added.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -118,8 +119,9 @@ pub async fn probe_ssh_os(server: &SshServer) -> Result<SshPlatform, SshProbeErr
 #[derive(Debug, Default)]
 struct Masters {
     dir: OnceLock<tempfile::TempDir>,
-    /// Held while a master is checked for and opened.
-    opening: async_lock::Mutex<()>,
+    /// Each target's once-only opening of its master; the map is locked only
+    /// to find the cell.
+    opened: std::sync::Mutex<HashMap<String, Arc<OnceCell<()>>>>,
 }
 
 impl Masters {
@@ -210,38 +212,42 @@ impl SshClient {
     }
 
     /// Makes sure the master connection to `server` is up, opening it when
-    /// it is not. Openers run one at a time: `ControlMaster=auto` makes a
-    /// second `ssh` that finds the socket still being bound give up
-    /// multiplexing and open a connection of its own.
+    /// it is not. A server's master opens once, under that server's own cell:
+    /// `ControlMaster=auto` makes a second `ssh` that finds the socket still
+    /// being bound give up multiplexing and open a connection of its own, so
+    /// concurrent first commands to one server wait for the one opening and
+    /// commands to other servers wait for nothing. A failed opening is not
+    /// remembered. Once opened, a master that later dies is re-created by
+    /// the next command's `ControlMaster=auto`.
     async fn ensure_master(&self, server: &SshServer) -> Result<(), SshUploadError> {
-        let _opening = self.masters.opening.lock().await;
-        let mut check = self.options(server);
-        check.args(["-O", "check", "--"]).arg(&server.target);
-        let alive = async_process::Command::from(check)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(SshUploadError::Spawn)?;
-        if alive.success() {
-            return Ok(());
-        }
-        let output = async_process::Command::from(self.ssh(server, "true"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(SshUploadError::Spawn)?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(SshUploadError::Failed {
-            target: server.target.clone(),
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
+        let opened = Arc::clone(
+            self.masters
+                .opened
+                .lock()
+                .expect("the map of opened masters is never held across a panic")
+                .entry(server.target.clone())
+                .or_default(),
+        );
+        opened
+            .get_or_try_init(|| async {
+                let output = async_process::Command::from(self.ssh(server, "true"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .map_err(SshUploadError::Spawn)?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                Err(SshUploadError::Failed {
+                    target: server.target.clone(),
+                    status: output.status,
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                })
+            })
+            .await?;
+        Ok(())
     }
 
     /// `ssh` running `script` under `sh` on `server`, with the command's

@@ -933,6 +933,51 @@ async fn every_command_to_a_server_shares_one_connection() {
     );
 }
 
+/// A server that accepts a connection and never speaks keeps its master
+/// opening in flight; commands to another server must not wait for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_master_still_opening_holds_up_no_other_server() {
+    let sshd = Sshd::start().await;
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = sshd.dir.path().join("two_servers_config");
+    let fixture = std::fs::read_to_string(sshd.dir.path().join("ssh_config")).unwrap();
+    let port = stalled.local_addr().unwrap().port();
+    std::fs::write(
+        &config,
+        format!("Host stalled\n  HostName 127.0.0.1\n  Port {port}\n\n{fixture}"),
+    )
+    .unwrap();
+    let client = SshClient::with_config(config);
+    let stalled_server = SshServer {
+        name: "stalled".to_string(),
+        target: "stalled".to_string(),
+    };
+
+    let opening = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .command(&stalled_server, "echo never")
+                .await
+                .map(drop)
+        })
+    };
+    async_io::Timer::after(Duration::from_millis(500)).await;
+    assert!(!opening.is_finished(), "the stalled opening is in flight");
+
+    let started = std::time::Instant::now();
+    assert_eq!(run_script(&client, "echo other").await, "other\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the other server's command did not wait for the stalled opening"
+    );
+    assert!(
+        !opening.is_finished(),
+        "the stalled opening is still in flight"
+    );
+    opening.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_the_client_ends_its_master_and_removes_its_sockets() {
     let sshd = Sshd::start().await;
