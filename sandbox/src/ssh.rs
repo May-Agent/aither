@@ -3,15 +3,17 @@
 //! state of each server and the OS probe an embedder runs when a server is
 //! added.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use async_lock::OnceCell;
 use futures_lite::io::AsyncWriteExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::tool_runtime::PreparedTools;
 
@@ -111,20 +113,70 @@ pub async fn probe_ssh_os(server: &SshServer) -> Result<SshPlatform, SshProbeErr
     SshClient::default().probe_os(server).await
 }
 
+/// The private directory holding the control sockets of the master
+/// connections a client owns, one per server. It exists from the client's
+/// first connection until its last clone drops, which ends every master.
+#[derive(Debug, Default)]
+struct Masters {
+    dir: OnceLock<tempfile::TempDir>,
+    /// Each target's once-only opening of its master; the map is locked only
+    /// to find the cell.
+    opened: std::sync::Mutex<HashMap<String, Arc<OnceCell<()>>>>,
+}
+
+impl Masters {
+    /// The control socket of the master to `target`. The name is a short
+    /// digest because a unix socket path is limited to about a hundred bytes
+    /// and `ssh` appends a suffix of its own while binding.
+    fn socket(&self, target: &str) -> PathBuf {
+        let dir = self.dir.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("ssh-")
+                .tempdir()
+                .expect("the private directory of the SSH control sockets can be created")
+        });
+        let digest = Sha256::digest(target.as_bytes());
+        dir.path().join(hex::encode(&digest[..6]))
+    }
+}
+
+impl Drop for Masters {
+    fn drop(&mut self) {
+        let Some(dir) = self.dir.get() else { return };
+        let Ok(sockets) = std::fs::read_dir(dir.path()) else {
+            return;
+        };
+        for socket in sockets.flatten() {
+            let _ = std::process::Command::new("ssh")
+                .args(["-O", "exit", "-o"])
+                .arg(format!("ControlPath={}", socket.path().display()))
+                .args(["--", "master"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
 /// How every SSH connection is made: `ssh` in batch mode with a bounded
 /// connect time, the remote command run by `sh` whatever the login shell.
+/// Every command to a server shares one master connection the client opens on
+/// the first and ends when its last clone drops.
 #[derive(Debug, Clone, Default)]
 pub struct SshClient {
     /// An `ssh_config(5)` file read instead of the user's; only tests set
     /// one, to reach their own server.
     config: Option<PathBuf>,
+    masters: Arc<Masters>,
 }
 
 impl SshClient {
     #[cfg(test)]
-    pub(crate) const fn with_config(config: PathBuf) -> Self {
+    pub(crate) fn with_config(config: PathBuf) -> Self {
         Self {
             config: Some(config),
+            masters: Arc::default(),
         }
     }
 
@@ -133,14 +185,69 @@ impl SshClient {
     /// The remote login shell parses `line` before anything else runs, and
     /// shells disagree on quoting, so every line this client sends is made
     /// only of letters, digits and `-`, `.`, `/`, `;`, `>` and spaces.
-    fn ssh(&self, server: &SshServer, line: &str) -> std::process::Command {
+    pub(crate) fn ssh(&self, server: &SshServer, line: &str) -> std::process::Command {
+        let mut command = self.options(server);
+        command.arg("--").arg(&server.target).arg(line);
+        command
+    }
+
+    /// `ssh` with every option of this client, before the target.
+    fn options(&self, server: &SshServer) -> std::process::Command {
         let mut command = std::process::Command::new("ssh");
         command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
+        // `ControlPersist` keeps the master the first command starts alive
+        // for the next ones; the timeout only reaps a master whose client
+        // died without ending it.
+        command
+            .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"])
+            .arg("-o")
+            .arg(format!(
+                "ControlPath={}",
+                self.masters.socket(&server.target).display()
+            ));
         if let Some(config) = &self.config {
             command.arg("-F").arg(config);
         }
-        command.arg("--").arg(&server.target).arg(line);
         command
+    }
+
+    /// Makes sure the master connection to `server` is up, opening it when
+    /// it is not. A server's master opens once, under that server's own cell:
+    /// `ControlMaster=auto` makes a second `ssh` that finds the socket still
+    /// being bound give up multiplexing and open a connection of its own, so
+    /// concurrent first commands to one server wait for the one opening and
+    /// commands to other servers wait for nothing. A failed opening is not
+    /// remembered. Once opened, a master that later dies is re-created by
+    /// the next command's `ControlMaster=auto`.
+    async fn ensure_master(&self, server: &SshServer) -> Result<(), SshUploadError> {
+        let opened = Arc::clone(
+            self.masters
+                .opened
+                .lock()
+                .expect("the map of opened masters is never held across a panic")
+                .entry(server.target.clone())
+                .or_default(),
+        );
+        opened
+            .get_or_try_init(|| async {
+                let output = async_process::Command::from(self.ssh(server, "true"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .map_err(SshUploadError::Spawn)?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                Err(SshUploadError::Failed {
+                    target: server.target.clone(),
+                    status: output.status,
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                })
+            })
+            .await?;
+        Ok(())
     }
 
     /// `ssh` running `script` under `sh` on `server`, with the command's
@@ -160,6 +267,7 @@ impl SshClient {
         server: &SshServer,
         script: &str,
     ) -> Result<std::process::Command, SshUploadError> {
+        self.ensure_master(server).await?;
         let path = format!("/tmp/aither-{}.sh", uuid::Uuid::new_v4().simple());
         let upload = |error: std::io::Error| SshUploadError::Spawn(error);
         let mut child =

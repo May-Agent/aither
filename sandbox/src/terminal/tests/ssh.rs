@@ -200,6 +200,17 @@ impl Sshd {
             target: ALIAS.to_string(),
         }
     }
+
+    /// How many connections the server has authenticated so far, read from
+    /// its own log: `sshd` records each accepted connection at its default
+    /// verbosity.
+    fn accepted_connections(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("sshd.log"))
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("Accepted publickey"))
+            .count()
+    }
 }
 
 impl Drop for Sshd {
@@ -879,6 +890,118 @@ async fn the_commands_stdin_is_free_for_the_scripts_input() {
     drop(stdin);
     let output = child.output().await.unwrap();
     assert_eq!(output.stdout, "输入 'x'\n".as_bytes());
+}
+
+async fn run_script(client: &SshClient, script: &str) -> String {
+    let command = client.command(&Sshd::server(), script).await.unwrap();
+    let output = async_process::Command::from(command)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// The server's own log counts the connections: one script is an upload and
+/// a run, and none of them, sequential or concurrent, opens a second one.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_command_to_a_server_shares_one_connection() {
+    let sshd = Sshd::start().await;
+    assert_eq!(run_script(&sshd.client, "echo one").await, "one\n");
+    assert_eq!(
+        sshd.accepted_connections(),
+        1,
+        "the upload and the run of one script share a connection"
+    );
+    assert_eq!(run_script(&sshd.client, "echo two").await, "two\n");
+    assert_eq!(sshd.accepted_connections(), 1);
+
+    let fresh = Sshd::start().await;
+    let scripts = ["echo a", "echo b", "echo c", "echo d", "echo e", "echo f"];
+    let outputs = futures::future::join_all(
+        scripts
+            .iter()
+            .map(|script| run_script(&fresh.client, script)),
+    )
+    .await;
+    assert_eq!(outputs, ["a\n", "b\n", "c\n", "d\n", "e\n", "f\n"]);
+    assert_eq!(
+        fresh.accepted_connections(),
+        1,
+        "concurrent first uses start one master"
+    );
+}
+
+/// A server that accepts a connection and never speaks keeps its master
+/// opening in flight; commands to another server must not wait for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_master_still_opening_holds_up_no_other_server() {
+    let sshd = Sshd::start().await;
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = sshd.dir.path().join("two_servers_config");
+    let fixture = std::fs::read_to_string(sshd.dir.path().join("ssh_config")).unwrap();
+    let port = stalled.local_addr().unwrap().port();
+    std::fs::write(
+        &config,
+        format!("Host stalled\n  HostName 127.0.0.1\n  Port {port}\n\n{fixture}"),
+    )
+    .unwrap();
+    let client = SshClient::with_config(config);
+    let stalled_server = SshServer {
+        name: "stalled".to_string(),
+        target: "stalled".to_string(),
+    };
+
+    let opening = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .command(&stalled_server, "echo never")
+                .await
+                .map(drop)
+        })
+    };
+    async_io::Timer::after(Duration::from_millis(500)).await;
+    assert!(!opening.is_finished(), "the stalled opening is in flight");
+
+    let started = std::time::Instant::now();
+    assert_eq!(run_script(&client, "echo other").await, "other\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the other server's command did not wait for the stalled opening"
+    );
+    assert!(
+        !opening.is_finished(),
+        "the stalled opening is still in flight"
+    );
+    opening.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_client_ends_its_master_and_removes_its_sockets() {
+    let sshd = Sshd::start().await;
+    let command = sshd
+        .client
+        .command(&Sshd::server(), "echo up")
+        .await
+        .unwrap();
+    drop(command);
+    let socket_dir = {
+        let ssh = sshd.client.ssh(&Sshd::server(), "true");
+        let path = ssh
+            .get_args()
+            .find_map(|arg| arg.to_str()?.strip_prefix("ControlPath="))
+            .unwrap()
+            .to_string();
+        PathBuf::from(path).parent().unwrap().to_path_buf()
+    };
+    assert!(socket_dir.is_dir());
+    let Sshd { client, .. } = &sshd;
+    let client = client.clone();
+    drop(sshd);
+    drop(client);
+    assert!(!socket_dir.exists(), "the socket directory is removed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
