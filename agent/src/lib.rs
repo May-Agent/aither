@@ -57,6 +57,7 @@ mod idle_compaction_tests;
 mod midstream_retry_tests;
 mod model_group;
 mod request_parameters;
+mod subagent;
 #[cfg(test)]
 mod test_support;
 mod tools;
@@ -101,6 +102,7 @@ pub use hook::{
     AfterTool, Hooks, RequestCx, StopCx, StopDecision, ToolDecision, ToolInvocation, ToolOutcome,
     TurnBoundaryAction, TurnBoundaryContext,
 };
+pub use subagent::{ChildAgent, ChildEvents, SubagentRun, SubagentRunInfo, SubagentRuns};
 pub use tools::AgentTools;
 pub use warmth::{CacheState, CacheWarmth};
 

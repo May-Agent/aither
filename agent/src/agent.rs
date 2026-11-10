@@ -117,7 +117,18 @@ struct EventSink {
     agent: AgentPath,
 }
 
+/// What the loop waits on while tools run.
+enum ToolStep {
+    Finished(Option<ToolExecutionResult>),
+    Child(Option<TimedEvent>),
+}
+
 impl EventSink {
+    /// Puts an event another agent stamped on this stream as it is.
+    fn forward(&self, event: TimedEvent) {
+        let _ = self.sender.try_send(event);
+    }
+
     fn emit(&self, event: AgentEvent) {
         let _ = self.sender.try_send(TimedEvent {
             at: jiff::Timestamp::now(),
@@ -146,7 +157,7 @@ impl CancelHandle {
         self.0.is_cancelled()
     }
 
-    fn signal(&self) -> CancelSignal {
+    pub(crate) fn signal(&self) -> CancelSignal {
         self.0.signal()
     }
 }
@@ -860,6 +871,9 @@ pub struct Agent<M, H = (), C = M, Schema = HandoffDocument> {
     /// approval fails.
     pub(crate) approver: Option<AnyApprover>,
 
+    /// The children in flight, whose events join this agent's stream.
+    pub(crate) subagents: Option<crate::SubagentRuns>,
+
     /// The pauses emitted, numbering the next.
     pub(crate) pauses: Arc<AtomicU64>,
 
@@ -1019,6 +1033,7 @@ impl<M: LanguageModel> Agent<M> {
             delivering: None,
             fork_source: None,
             identity: aither_core::llm::AgentIdentity::Main,
+            subagents: None,
             cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
@@ -1519,6 +1534,7 @@ where
                 pauses: Arc::clone(&self.pauses),
             })
         });
+        let incoming = self.subagents.as_ref().map(|runs| runs.incoming().clone());
         let (hooks, tools, agent) = (&self.hooks, &self.tools, &self.identity);
         let results = &mut self.tool_results;
         let tool_futures = tool_calls.iter().map(|call| {
@@ -1543,8 +1559,36 @@ where
         });
 
         let mut pending = tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
-        while let Some(result) = pending.next().await {
-            results.push_back(result);
+        loop {
+            // A child a tool runs reports through the registry; its events
+            // join this stream as they arrive, not when the tool returns.
+            let step = futures_lite::future::or(
+                async { ToolStep::Finished(pending.next().await) },
+                async {
+                    match &incoming {
+                        Some(incoming) => ToolStep::Child(incoming.recv().await.ok()),
+                        None => std::future::pending().await,
+                    }
+                },
+            )
+            .await;
+            match step {
+                ToolStep::Finished(Some(result)) => results.push_back(result),
+                ToolStep::Finished(None) => break,
+                ToolStep::Child(Some(event)) => cx.events.forward(event),
+                ToolStep::Child(None) => {}
+            }
+        }
+        drop(pending);
+        self.forward_child_events(cx.events);
+    }
+
+    /// Puts the events children reported onto this agent's stream.
+    fn forward_child_events(&self, events: &EventSink) {
+        if let Some(runs) = &self.subagents {
+            while let Ok(event) = runs.incoming().try_recv() {
+                events.forward(event);
+            }
         }
     }
 
@@ -2730,6 +2774,12 @@ where
         Ok(self.context_window_snapshot(&self.last_tail))
     }
 
+    /// The identity this agent was built with.
+    #[must_use]
+    pub const fn identity(&self) -> &aither_core::llm::AgentIdentity {
+        &self.identity
+    }
+
     /// Returns the model profile if available.
     #[must_use]
     pub const fn profile(&self) -> Option<&ModelProfile> {
@@ -2869,6 +2919,7 @@ where
         turn: usize,
     ) -> Result<Option<(LLMRequest, PromptPrefix)>, AgentError> {
         let events = cx.events;
+        self.forward_child_events(events);
         self.apply_completed_compaction(events).await;
         self.rebuild_if_cache_is_cold(events).await?;
         self.settle_effort()?;

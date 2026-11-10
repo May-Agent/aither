@@ -68,6 +68,7 @@ pub struct AgentBuilder<M, H = (), C = M, Schema = HandoffDocument> {
     context_sources: Vec<AnyContextSource>,
     live_sources: Vec<AnyLiveSource>,
     approver: Option<AnyApprover>,
+    subagents: Option<crate::SubagentRuns>,
     fork_source: Option<crate::fork::ForkSource>,
     identity: aither_core::llm::AgentIdentity,
     tools: AgentTools,
@@ -114,6 +115,7 @@ impl<M: LanguageModel> AgentBuilder<M> {
             context_sources: Vec::new(),
             live_sources: Vec::new(),
             approver: None,
+            subagents: None,
             fork_source: None,
             identity: aither_core::llm::AgentIdentity::Main,
             tools: AgentTools::new(),
@@ -202,6 +204,13 @@ where
             S::TAG
         );
         self.live_sources.push(AnyLiveSource::new(source));
+        self
+    }
+
+    /// Sets the registry of children the agent's tools run, whose events
+    /// join the agent's stream (see [`SubagentRuns`](crate::SubagentRuns)).
+    pub fn subagents(mut self, runs: crate::SubagentRuns) -> Self {
+        self.subagents = Some(runs);
         self
     }
 
@@ -342,6 +351,7 @@ where
             context_sources: self.context_sources,
             live_sources: self.live_sources,
             approver: self.approver,
+            subagents: self.subagents,
             fork_source: self.fork_source,
             identity: self.identity,
             tools: self.tools,
@@ -387,6 +397,7 @@ where
             context_sources: self.context_sources,
             live_sources: self.live_sources,
             approver: self.approver,
+            subagents: self.subagents,
             fork_source: self.fork_source,
             identity: self.identity,
             tools: self.tools,
@@ -415,6 +426,7 @@ where
             context_sources: self.context_sources,
             live_sources: self.live_sources,
             approver: self.approver,
+            subagents: self.subagents,
             fork_source: self.fork_source,
             identity: self.identity,
             tools: self.tools,
@@ -545,6 +557,7 @@ where
             context_sources: self.context_sources,
             live_sources: self.live_sources,
             approver: self.approver,
+            subagents: self.subagents,
             pauses: std::sync::Arc::default(),
             last_tail: Vec::new(),
             reassembled: false,
