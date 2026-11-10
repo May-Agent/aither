@@ -16,7 +16,7 @@ use heel::{
 
 use super::{ContainerConfinement, prioritized_container_script};
 use crate::MountRoot;
-use crate::shell_session::{ContainerExecOutcome, ShellSessionRegistry};
+use crate::shell_session::ContainerExecOutcome;
 use crate::subagent::{
     CommittingWorktree, ExportError, SandboxedExit, SandboxedGitImpl, SandboxedRun,
 };
@@ -337,7 +337,7 @@ impl<E: Executor + Clone + 'static> SandboxedGitImpl for LocalGit<E> {
 /// Git in the per-command sandbox of a subagent inside a container.
 pub(super) struct ContainerGit<E> {
     pub executor: E,
-    pub shell_sessions: ShellSessionRegistry,
+    pub launch: crate::ContainerLaunch,
     pub runtime: crate::ContainerShellRuntime,
     pub confinement: ContainerConfinement,
     pub mount: MountRoot,
@@ -347,10 +347,6 @@ pub(super) struct ContainerGit<E> {
 impl<E: Executor + Clone + 'static> ContainerGit<E> {
     async fn run_in_container(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
         let runtime = self.runtime.clone();
-        let tools = self
-            .shell_sessions
-            .container_tools()
-            .map_err(|error| ExportError::Launch(error.to_string()))?;
         let repository = self
             .mount
             .container_path(run.repository)
@@ -363,7 +359,7 @@ impl<E: Executor + Clone + 'static> ContainerGit<E> {
         let wrapped = prioritized_container_script(
             &script,
             self.priority,
-            tools.bin_dir(),
+            self.launch.bin_dir(),
             self.confinement.working_dir.as_str(),
             Some(&self.confinement),
         )

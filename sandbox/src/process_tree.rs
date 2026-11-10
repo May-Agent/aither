@@ -2492,7 +2492,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_env_cleaned_setsid_descendant_is_still_killed() {
         let config = heel::SandboxConfig::builder()
-            .heel_binary(crate::test_heel::pinned().await.unwrap())
+            .heel_binary(crate::test_heel::binary().await.unwrap())
             .network(heel::DenyAll)
             .security(heel::SecurityConfig::interactive())
             .supervised_spawn(true)

@@ -6,7 +6,8 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::tool_python::PYTHON_COMMAND;
+/// The command the sandbox's `PATH` resolves to run Python source.
+const PYTHON_COMMAND: &str = "python3";
 
 // The interpreter a script of the shell tool or the monitor runs under.
 // Undocumented in rustdoc: the schema's descriptions are the embedder's.

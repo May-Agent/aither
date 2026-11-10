@@ -461,23 +461,6 @@ impl Sandbox {
         self.edit(|inner| inner.backend = backend)
     }
 
-    /// The sandbox with what a tool session adds for the programs it
-    /// prepared: grants that lead the embedder's fixed ones, environment the
-    /// embedder's own and its source's override, and the write denylist unless
-    /// the embedder gave one.
-    pub(crate) fn with_session(
-        self,
-        grants: Vec<heel::Grant>,
-        environment: Vec<(String, String)>,
-        write_denylist: heel::WriteDenylist,
-    ) -> Self {
-        self.edit(|inner| {
-            inner.fixed_grants.splice(0..0, grants);
-            inner.environment.splice(0..0, environment);
-            inner.write_denylist.get_or_insert(write_denylist);
-        })
-    }
-
     /// The `heel` binary of a sandbox on the host.
     pub(crate) fn host_heel(&self) -> Option<&heel::HeelBinary> {
         match &self.inner.backend {

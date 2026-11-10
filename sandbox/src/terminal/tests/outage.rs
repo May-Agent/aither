@@ -5,30 +5,11 @@ use aither_core::llm::InterruptionCause;
 
 use super::*;
 
-type Terminal = Shell<executor_core::tokio::TokioGlobal, Configured>;
+type Terminal = Shell<executor_core::tokio::TokioGlobal>;
 
-/// A terminal recording `connectivity`; the cache directory must outlive it.
-async fn terminal(
-    dir: &Path,
-    connectivity: &Connectivity,
-) -> (crate::tool_runtime::tests::UnlockingTempDir, Terminal) {
-    let (cache, shell_sessions) = prepared_test_registry().await;
-    let tool = Shell::new_exact(
-        dir,
-        executor_core::tokio::TokioGlobal,
-        crate::limits::fixture::limits(),
-        crate::output_policy::fixture::policy(),
-        crate::test_wording::TestWording::any(),
-        crate::test_wording::job_tools(),
-    )
-    .await
-    .expect("terminal tool should initialize")
-    .adopt_prepared_tools(shell_sessions)
-    .await
-    .expect("prepared tools should be adopted")
-    .with_connectivity(connectivity);
-    let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
-    (cache, tool.with_registry(registry))
+/// A terminal recording `connectivity`.
+async fn terminal(dir: &Path, connectivity: &Connectivity) -> Terminal {
+    fresh_terminal(dir).await.with_connectivity(connectivity)
 }
 
 /// A script that announces itself, then spins on the test's release file (a
@@ -87,7 +68,7 @@ fn sleep_and_wake(controller: &Controller) -> impl FnOnce() + Send + 'static {
 async fn a_foreground_command_spanning_sleep_and_wake_reports_it() {
     let dir = tempfile::tempdir().unwrap();
     let (connectivity, controller) = Connectivity::manual(true);
-    let (_cache, tool) = terminal(dir.path(), &connectivity).await;
+    let tool = terminal(dir.path(), &connectivity).await;
 
     let result = run_held(&tool, false, sleep_and_wake(&controller))
         .await
@@ -106,7 +87,7 @@ async fn a_foreground_command_spanning_sleep_and_wake_reports_it() {
 async fn a_foreground_command_spanning_offline_and_online_reports_it() {
     let dir = tempfile::tempdir().unwrap();
     let (connectivity, controller) = Connectivity::manual(true);
-    let (_cache, tool) = terminal(dir.path(), &connectivity).await;
+    let tool = terminal(dir.path(), &connectivity).await;
 
     let result = run_held(&tool, false, {
         let controller = controller.clone();
@@ -130,7 +111,7 @@ async fn a_foreground_command_spanning_offline_and_online_reports_it() {
 async fn an_outage_still_open_when_the_command_ends_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let (connectivity, controller) = Connectivity::manual(true);
-    let (_cache, tool) = terminal(dir.path(), &connectivity).await;
+    let tool = terminal(dir.path(), &connectivity).await;
 
     let result = run_held(&tool, false, {
         let controller = controller.clone();
@@ -150,7 +131,7 @@ async fn an_outage_still_open_when_the_command_ends_is_reported() {
 async fn a_command_with_no_interruption_renders_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let (connectivity, controller) = Connectivity::manual(true);
-    let (_cache, tool) = terminal(dir.path(), &connectivity).await;
+    let tool = terminal(dir.path(), &connectivity).await;
     // An outage that is over before the command starts is not its own.
     controller.sleep();
     controller.wake();
@@ -166,7 +147,7 @@ async fn a_command_with_no_interruption_renders_unchanged() {
 async fn a_background_jobs_completion_carries_the_interval() {
     let dir = tempfile::tempdir().unwrap();
     let (connectivity, controller) = Connectivity::manual(true);
-    let (_cache, tool) = terminal(dir.path(), &connectivity).await;
+    let tool = terminal(dir.path(), &connectivity).await;
     let receiver = tool.background_receiver();
 
     run_held(&tool, true, sleep_and_wake(&controller))

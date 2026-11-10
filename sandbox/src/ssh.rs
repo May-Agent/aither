@@ -8,11 +8,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use async_lock::OnceCell;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::tool_runtime::PreparedTools;
+use crate::RemoteLaunch;
 
 /// A named SSH destination commands may run on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -141,30 +140,31 @@ impl SshClient {
     }
 }
 
-/// A server prepared on its first command: what the embedder prepared on it.
+/// What the embedder prepared on a server: its `heel` and the programs its
+/// scripts run with.
 #[derive(Debug, Clone)]
 pub struct PreparedSsh {
     /// The `heel` binary on the server, when it has one; a default-mode
     /// command needs it, an `unsafe` one does not.
     pub(crate) heel: Option<String>,
-    pub(crate) tools: PreparedTools<PathBuf>,
+    pub(crate) launch: RemoteLaunch,
 }
 
 impl PreparedSsh {
     /// The preparation of a server whose `heel` is at the path `heel` on the
-    /// server, if it has one, and whose managed tools are `tools`.
+    /// server, if it has one, and whose programs `launch` describes.
     #[must_use]
-    pub const fn new(heel: Option<String>, tools: PreparedTools<PathBuf>) -> Self {
-        Self { heel, tools }
+    pub const fn new(heel: Option<String>, launch: RemoteLaunch) -> Self {
+        Self { heel, launch }
     }
 }
 
-/// One server of a registry's set and the tools prepared there. Removing the
-/// server drops them; adding it again starts over.
+/// One server of a registry's set and what the embedder prepared on it.
+/// Removing the server drops them.
 #[derive(Debug)]
 pub struct SshEnvironment {
     server: SshServer,
-    prepared: OnceCell<PreparedSsh>,
+    prepared: PreparedSsh,
 }
 
 impl SshEnvironment {
@@ -172,26 +172,8 @@ impl SshEnvironment {
         &self.server
     }
 
-    /// The server's prepared state, produced by `prepare` the first time.
-    pub(crate) async fn prepared<F, Fut, E>(&self, prepare: F) -> Result<&PreparedSsh, E>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<PreparedSsh, E>>,
-    {
-        self.prepared.get_or_try_init(prepare).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_prepared(&self, prepared: PreparedSsh) {
-        assert!(
-            self.prepared.set_blocking(prepared).is_ok(),
-            "a test server is prepared once"
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_prepared(&self) -> bool {
-        self.prepared.is_initialized()
+    pub(crate) const fn prepared(&self) -> &PreparedSsh {
+        &self.prepared
     }
 }
 
@@ -214,7 +196,11 @@ impl SshEnvironments {
         &self.client
     }
 
-    pub(crate) fn add(&self, server: SshServer) -> Result<(), SshServerError> {
+    pub(crate) fn add(
+        &self,
+        server: SshServer,
+        prepared: PreparedSsh,
+    ) -> Result<(), SshServerError> {
         let SshServer { name, target } = server;
         let server = SshServer {
             name: name.trim().to_string(),
@@ -223,10 +209,7 @@ impl SshEnvironments {
         if server.name.is_empty() || server.target.is_empty() {
             return Err(SshServerError::Blank);
         }
-        let environment = Arc::new(SshEnvironment {
-            server,
-            prepared: OnceCell::new(),
-        });
+        let environment = Arc::new(SshEnvironment { server, prepared });
         let mut duplicate = false;
         self.servers.rcu(|servers| {
             duplicate = servers
@@ -285,11 +268,18 @@ mod tests {
         }
     }
 
+    fn prepared() -> PreparedSsh {
+        PreparedSsh::new(
+            None,
+            RemoteLaunch::new("/opt/tools/bin", "/opt/tools/bin/bash"),
+        )
+    }
+
     #[test]
     fn servers_join_and_leave_a_live_set_every_clone_sees() {
         let set = SshEnvironments::default();
         let clone = set.clone();
-        set.add(server(" build ", " builder@build.internal "))
+        set.add(server(" build ", " builder@build.internal "), prepared())
             .unwrap();
         assert_eq!(
             clone.list(),
@@ -297,11 +287,11 @@ mod tests {
             "names and targets are trimmed and the clone sees the addition"
         );
         assert!(matches!(
-            clone.add(server("build", "other@build.internal")),
+            clone.add(server("build", "other@build.internal"), prepared()),
             Err(SshServerError::Duplicate(name)) if name == "build"
         ));
         assert!(matches!(
-            set.add(server("staging", "  ")),
+            set.add(server("staging", "  "), prepared()),
             Err(SshServerError::Blank)
         ));
         assert_eq!(

@@ -1,68 +1,38 @@
-//! Terminal-first command execution with heel sandboxing.
+//! Sandboxed shell execution with heel.
 //!
-//! This crate provides a terminal-first execution model where:
-//! - LLM has a single `terminal` tool with different permission modes
-//! - All tools are exposed as CLI commands via IPC
-//! - Commands can be piped and composed freely
-//! - Outputs are stored with URLs for context management
+//! This crate provides the general capabilities an embedder builds a
+//! terminal-style agent tool on:
 //!
-//! # Setting Up the Terminal Tool
+//! - [`Sandbox`] spawns a process under heel's sandbox, in a container or on
+//!   an SSH server, with live [`Grants`] and an [`EnvSource`] the embedder
+//!   fills at each launch.
+//! - [`Shell`] executes scripts for a model on a [`Sandbox`]: a carried
+//!   directory, jobs, waiting, output handling and [`ScriptPolicy`] checks
+//!   before a script runs.
+//! - [`ShellTool`] and the job control tools are ordinary
+//!   [`Tool`](aither_core::llm::Tool)s the embedder names and describes.
+//!
+//! The embedder owns the commands its scripts call back into, the programs
+//! its sandboxes run with and every sentence the model reads.
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{Shell, ToolRegistryBuilder};
-//! use std::sync::Arc;
+//! use aither_sandbox::{Backend, Sandbox, Shell};
 //!
-//! // Creates a working directory heel names with four random words (e.g.,
-//! // amber-forest-thunder-pearl/), not a leased id, with an outputs/
-//! // subdirectory and IPC command wrapper scripts; the ids the model reads are
-//! // leased from `with_id_allocator`'s allocator
+//! let sandbox = Sandbox::new(Backend::Host { heel }, executor, working_dir);
 //! let shell = Shell::builder(sandbox)
+//!     .interpreters(interpreters)
 //!     .limits(limits)
 //!     .output(output)
 //!     .wording(wording)
 //!     .tools(tools)
 //!     .build()
 //!     .await?;
-//! let registry = Arc::new(ToolRegistryBuilder::new().build(shell.output_store().clone()));
-//! let tool = shell.with_registry(registry);
-//!
-//! // Access the working directory path
-//! tracing::info!("Working dir: {}", tool.working_dir().display());
+//! let tool = shell.tool();
 //! ```
-//!
-//! # Registering Tools as IPC Commands
-//!
-//! Tools can be made available to terminal sessions running in the sandbox:
-//!
-//! ```rust,ignore
-//! use aither_sandbox::{ToolRegistryBuilder, register_tool_command};
-//! use aither_sandbox::builtin::builtin_router;
-//!
-//! // 1. Configure tools
-//! let mut registry = ToolRegistryBuilder::new();
-//! registry.configure_tool(websearch_tool);
-//! registry.configure_tool(webfetch_tool);
-//! let registry = std::sync::Arc::new(registry.build("./outputs"));
-//!
-//! // 2. Create router with built-in commands (reload)
-//! let router = builtin_router();
-//!
-//! // 3. Register tool commands with the router
-//! let router = register_tool_command(router, registry.clone(), "websearch");
-//! let router = register_tool_command(router, registry.clone(), "webfetch");
-//! ```
-//!
-//! # Built-in Commands
-//!
-//! The [`builtin`] module provides commands always available in the sandbox:
-//!
-//! - `reload <url>` - Request to load file content back into agent context
 
 #![allow(clippy::module_name_repetitions)]
 
 mod bollard_exec;
-mod command;
-mod command_set;
 mod container;
 #[cfg(all(unix, feature = "jobserver"))]
 mod container_jobserver;
@@ -87,14 +57,9 @@ mod ssh;
 mod stdin_watch;
 mod subagent;
 mod terminal;
-mod tool_distribution;
-mod tool_environment;
-mod tool_python;
-mod tool_runtime;
-mod tool_transport;
 mod wording;
 
-/// Built-in IPC commands (ask, reload).
+/// The job control tools and the identities an embedder gives its shell tools.
 pub mod builtin;
 
 /// Jobserver token pool brokering across commands.
@@ -108,8 +73,8 @@ pub mod network_policy;
 #[cfg(any(test, feature = "test-git"))]
 pub mod test_git;
 
-/// The distribution's pinned heel for tests, shared with dependent crates
-/// through the `test-heel` feature.
+/// A `heel` for tests, shared with dependent crates through the `test-heel`
+/// feature.
 #[cfg(any(test, feature = "test-heel"))]
 pub mod test_heel;
 
@@ -131,15 +96,6 @@ pub use builtin::{
     JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
     ShellToolSettings, ToolIdentity,
 };
-pub use command::{
-    AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandCall, CommandEnvelope, CommandGate,
-    CommandObserver, CommandPayload, CommandRole, CommandUsage, DynTerminalTool, DynToolHandler,
-    GateDecision, IpcToolCommand, KeptExchangeReceiver, POSITIONAL_KEYWORD, PositionalLayoutError,
-    ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
-    output_saved_text, register_ipc_gateway_command, register_tool_command, register_tool_direct,
-    schema_to_help, tool_output_to_payload, validate_positional_layout,
-};
-pub use command_set::{AnyCommandSet, CommandSet};
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
     MountRoot, MountRootError, MountSpec, RelativeContainerPath, RuntimePreference,
@@ -189,7 +145,7 @@ pub use process_tree::{
 };
 pub use shell_session::{
     AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerProbe, ContainerProbeError,
-    ContainerShellRuntime, ExecLifetime, ShellBackend, ShellSessionRegistry,
+    ContainerShellRuntime, ExecLifetime, ShellSessionRegistry,
 };
 pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
@@ -208,25 +164,11 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    CompletedCommand, Configured, DirectoryResetReason, Given, Missing, Script, Shell, ShellArgs,
-    ShellBuilder, ShellRunError, ShellTool, TerminalBinding, TerminalError, TerminalToolFactory,
-    TerminalToolFactoryError, TimeoutKill, Unconfigured, open_network_audit_log,
-};
-pub use tool_distribution::{
-    HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,
-    ToolDistribution,
-};
-pub use tool_runtime::{
-    DistributedTool, HostProgram, HostProgramPath, ImageTool, ImageToolDefect, ImageTools,
-    ManagedTool, PreparedEnvironment, PreparedTools, PythonPin, PythonRuntime, ToolBinary,
-    ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
-};
-pub use tool_transport::{
-    ContainerToolTransport, SshToolTransport, ToolEnvironmentInfo, ToolTransport,
-    probe_tool_environment,
+    CompletedCommand, DirectoryResetReason, Given, Missing, Script, Shell, ShellArgs, ShellBuilder,
+    ShellRunError, ShellTool, TerminalError, TimeoutKill, open_network_audit_log,
 };
 pub use wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
     JsonAsTsv, LineRange, MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines,
-    ReservedForMain, RunFailure, ShellWording, StoredBinaryPart,
+    RunFailure, ShellWording, StoredBinaryPart,
 };

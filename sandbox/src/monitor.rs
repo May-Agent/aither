@@ -22,7 +22,7 @@ use crate::job_registry::{JobRegistry, JobStatus};
 use crate::limits::LiveDuration;
 use crate::output::MediaResolution;
 use crate::policy::SandboxMode;
-use crate::terminal::{Configured, Shell, ShellArgs};
+use crate::terminal::{Shell, ShellArgs};
 use crate::wording::{MonitorStarted, Refused};
 
 /// How long the watched job's own `timeout` bound outlasts the monitor's
@@ -227,7 +227,7 @@ struct Watch {
 /// The native `monitor` tool: starts the watched source as a background job
 /// and a pump that raises its increments as [`ShellEvent`]s.
 pub struct MonitorTool<E> {
-    terminal: Shell<E, Configured>,
+    terminal: Shell<E>,
     settings: MonitorSettings,
 }
 
@@ -249,7 +249,7 @@ impl<E> MonitorTool<E> {
     /// Creates the tool bound to `terminal`, the configured terminal whose
     /// jobs it watches.
     #[must_use]
-    pub const fn new(terminal: Shell<E, Configured>, settings: MonitorSettings) -> Self {
+    pub const fn new(terminal: Shell<E>, settings: MonitorSettings) -> Self {
         Self { terminal, settings }
     }
 }

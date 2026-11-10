@@ -4,8 +4,11 @@ use std::sync::Arc;
 
 use executor_core::AnyExecutor;
 
-use super::{Interpreter, Shell, ShellToolSettings, TerminalError, Unconfigured};
-use crate::{AnyShellWording, OutputPolicy, Sandbox, ShellEvents, ShellLimits, ShellWording};
+use super::{Interpreter, Shell, ShellToolSettings, TerminalError};
+use crate::{
+    AnyScriptPolicy, AnyShellWording, OutputPolicy, Sandbox, ScriptPolicy, ShellEvents,
+    ShellLimits, ShellWording,
+};
 
 /// A value the builder has not been given yet.
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +26,8 @@ pub struct ShellParts {
     pub(crate) wording: AnyShellWording,
     pub(crate) tools: ShellToolSettings,
     pub(crate) events: Option<ShellEvents>,
+    pub(crate) policies: Vec<AnyScriptPolicy>,
+    pub(crate) host_shell: Option<Arc<str>>,
 }
 
 /// Builds a [`Shell`] on the [`Sandbox`] its scripts run in.
@@ -38,9 +43,11 @@ pub struct ShellBuilder<I, L, O, W, T> {
     wording: W,
     tools: T,
     events: Option<ShellEvents>,
+    policies: Vec<AnyScriptPolicy>,
+    host_shell: Option<Arc<str>>,
 }
 
-impl Shell<Arc<AnyExecutor>, Unconfigured> {
+impl Shell<Arc<AnyExecutor>> {
     /// Starts a shell whose scripts run in `sandbox`: its working directory,
     /// live grants, environment source, network policy, priority and
     /// backend are the shell's.
@@ -56,11 +63,31 @@ impl Shell<Arc<AnyExecutor>, Unconfigured> {
             wording: Missing,
             tools: Missing,
             events: None,
+            policies: Vec::new(),
+            host_shell: None,
         }
     }
 }
 
 impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
+    /// Puts every script to `policy`, after the policies given before it.
+    /// Each agent's shell gets state of its own from the policy's
+    /// definition, see [`ScriptPolicies::for_agent`](crate::ScriptPolicies).
+    #[must_use]
+    pub fn policy(mut self, policy: impl ScriptPolicy) -> Self {
+        self.policies.push(AnyScriptPolicy::new(policy));
+        self
+    }
+
+    /// The shell program, a path on the host, that scripts run under when the
+    /// sandbox runs on the host. The embedder prepares it; a shell on a
+    /// container or a server runs the one its launch names.
+    #[must_use]
+    pub fn host_shell(mut self, program: impl Into<Arc<str>>) -> Self {
+        self.host_shell = Some(program.into());
+        self
+    }
+
     /// Raises the shell's events, and those of the subagent shells it
     /// launches, on `events`, which other shells may share. Without it the
     /// shell has a handle of its own, read with [`Shell::events`].
@@ -85,6 +112,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: self.tools,
             events: self.events,
+            policies: self.policies,
+            host_shell: self.host_shell,
         }
     }
 
@@ -99,6 +128,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: self.tools,
             events: self.events,
+            policies: self.policies,
+            host_shell: self.host_shell,
         }
     }
 
@@ -113,6 +144,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: self.tools,
             events: self.events,
+            policies: self.policies,
+            host_shell: self.host_shell,
         }
     }
 
@@ -130,6 +163,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: Given(AnyShellWording::new(wording)),
             tools: self.tools,
             events: self.events,
+            policies: self.policies,
+            host_shell: self.host_shell,
         }
     }
 
@@ -148,6 +183,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: Given(tools),
             events: self.events,
+            policies: self.policies,
+            host_shell: self.host_shell,
         }
     }
 }
@@ -165,9 +202,10 @@ impl
     ///
     /// # Errors
     /// Returns an error when the working directory or the output store cannot
-    /// be created, or when the sandbox runs its processes on an SSH server:
-    /// a server is a location a script names, not a shell's home.
-    pub async fn build(self) -> Result<Shell<Arc<AnyExecutor>, Unconfigured>, TerminalError> {
+    /// be created, when the sandbox runs its processes on an SSH server (a
+    /// server is a location a script names, not a shell's home), or when it
+    /// runs on the host and no [`host_shell`](Self::host_shell) was given.
+    pub async fn build(self) -> Result<Shell<Arc<AnyExecutor>>, TerminalError> {
         let Self {
             sandbox,
             interpreters: Given(interpreters),
@@ -176,6 +214,8 @@ impl
             wording: Given(wording),
             tools: Given(tools),
             events,
+            policies,
+            host_shell,
         } = self;
         let executor = sandbox.executor();
         Shell::from_parts(
@@ -188,6 +228,8 @@ impl
                 wording,
                 tools,
                 events,
+                policies,
+                host_shell,
             },
         )
         .await
@@ -206,8 +248,8 @@ mod tests {
         directory: &std::path::Path,
         grants: Grants,
         interpreters: &[Interpreter],
-    ) -> Shell<Arc<AnyExecutor>, Unconfigured> {
-        let heel = crate::test_heel::pinned().await.expect("the pinned heel");
+    ) -> Shell<Arc<AnyExecutor>> {
+        let heel = crate::test_heel::binary().await.expect("a heel for tests");
         let sandbox = Sandbox::new(
             Backend::Host { heel },
             executor_core::tokio::TokioGlobal,
@@ -215,6 +257,7 @@ mod tests {
         )
         .with_grants(grants);
         Shell::builder(sandbox)
+            .host_shell("/bin/bash")
             .interpreters(interpreters.iter().copied())
             .limits(test_budgets::limits())
             .output(test_budgets::output_policy())
@@ -254,8 +297,7 @@ mod tests {
             ),
         ] {
             let shell = shell(directory.path(), Grants::new(), &configured).await;
-            let registry = crate::ToolRegistryBuilder::new().build(shell.output_store().clone());
-            let tool = shell.with_registry(Arc::new(registry)).tool();
+            let tool = shell.tool();
             assert_eq!(tool.name(), "terminal");
             let schema = tool.arguments_schema().to_value();
             assert_eq!(schema["$defs"]["Interpreter"]["enum"], listed);
@@ -266,12 +308,7 @@ mod tests {
     async fn every_argument_is_described_by_the_identity_alone() {
         let directory = tempfile::tempdir().unwrap();
         let shell = shell(directory.path(), Grants::new(), &[Interpreter::Shell]).await;
-        let registry = crate::ToolRegistryBuilder::new().build(shell.output_store().clone());
-        let schema = shell
-            .with_registry(Arc::new(registry))
-            .tool()
-            .arguments_schema()
-            .to_value();
+        let schema = shell.tool().arguments_schema().to_value();
         let described = test_wording::argument_descriptions();
         let properties = schema["properties"].as_object().expect("an object schema");
         assert!(!properties.is_empty());
@@ -293,8 +330,6 @@ mod tests {
     async fn a_script_in_an_interpreter_the_shell_lacks_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let shell = shell(directory.path(), Grants::new(), &[Interpreter::Shell]).await;
-        let registry = crate::ToolRegistryBuilder::new().build(shell.output_store().clone());
-        let shell = shell.with_registry(Arc::new(registry));
         let arguments: super::super::ShellArgs = serde_json::from_value(serde_json::json!({
             "description": "print",
             "script": "print(1)",
