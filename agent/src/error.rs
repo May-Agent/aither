@@ -315,3 +315,32 @@ impl<'de> serde::Deserialize<'de> for AgentError {
         AgentErrorRepr::deserialize(deserializer).map(Self::from)
     }
 }
+
+/// A tool's future panicked while handling a call.
+///
+/// The loop reports it as the call's failed result, so the call still gets a
+/// result and the run continues; a hook reads it by downcasting the
+/// [`ToolOutcome`](crate::ToolOutcome) error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("tool '{name}' panicked: {message}")]
+pub struct ToolPanic {
+    /// Name of the tool that panicked.
+    pub name: String,
+    /// The panic message, or a note that the payload was not a string.
+    pub message: String,
+}
+
+impl ToolPanic {
+    /// Builds the report of the tool `name` from a caught panic `payload`.
+    pub(crate) fn caught(name: &str, payload: &(dyn std::any::Any + Send)) -> Self {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "the panic payload is not a string".to_owned());
+        Self {
+            name: name.to_owned(),
+            message,
+        }
+    }
+}
