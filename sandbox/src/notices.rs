@@ -18,7 +18,7 @@ use askama::Template;
 
 use crate::command::CommandBlocked;
 use crate::job_registry::UnchangedTaskRead;
-use crate::monitor::{MAX_TIMEOUT_SECS, MonitorRefusal};
+use crate::monitor::MonitorRefusal;
 use crate::terminal::TimeoutKill;
 
 /// A `monitor` call that started watching a task.
@@ -120,9 +120,13 @@ pub trait SandboxNotices: Send + Sync + 'static {
 
     /// A `monitor` call refused before anything started.
     fn monitor_refusal(&self, refusal: &MonitorRefusal) -> String {
+        let max_timeout_secs = match refusal {
+            MonitorRefusal::TimeoutOutOfRange { max } => max.as_secs(),
+            _ => 0,
+        };
         rendered(&MonitorRefused {
             refusal,
-            max_timeout_secs: MAX_TIMEOUT_SECS,
+            max_timeout_secs,
         })
     }
 
@@ -286,7 +290,9 @@ mod tests {
 
     #[test]
     fn default_monitor_refusal_names_the_cap() {
-        let text = DefaultSandboxNotices.monitor_refusal(&MonitorRefusal::TimeoutOutOfRange);
+        let text = DefaultSandboxNotices.monitor_refusal(&MonitorRefusal::TimeoutOutOfRange {
+            max: std::time::Duration::from_secs(7200),
+        });
         assert_eq!(
             text,
             "The monitor call was refused: timeout_secs must be between 1 and 7200."

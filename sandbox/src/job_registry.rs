@@ -11,10 +11,11 @@ use aither_core::{IdLease, WeakIdLease};
 use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::AsyncWriteExt;
 
+use crate::interpreter::Interpreter;
 use crate::memory::MemoryDomain;
-use crate::permission::TerminalMode;
+use crate::output_policy::OutputPolicy;
+use crate::policy::SandboxMode;
 use crate::process_tree::{JobTree, KillTreeError, ProcessScanner};
-use crate::script_language::ScriptLanguage;
 
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
@@ -27,10 +28,10 @@ pub struct JobInfo {
     pub execution_key: String,
     /// The script that was executed.
     pub script: String,
-    /// The language of `script`.
-    pub language: ScriptLanguage,
+    /// The interpreter of `script`.
+    pub interpreter: Interpreter,
     /// The permission mode used.
-    pub mode: TerminalMode,
+    pub mode: SandboxMode,
     /// When the job was started.
     pub started_at: Instant,
     /// Current status of the job.
@@ -358,8 +359,8 @@ enum StateCommand {
         task_id: IdLease,
         execution_key: String,
         script: String,
-        language: ScriptLanguage,
-        mode: TerminalMode,
+        interpreter: Interpreter,
+        mode: SandboxMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
         place: JobPlace,
@@ -561,11 +562,14 @@ pub struct JobRegistryService {
     /// What each [`PendingCompletion`] reports back on; weak, so the service
     /// still ends with the last handle.
     tx: WeakSender<JobCommand>,
+    /// How much of a script a job listing shows.
+    policy: OutputPolicy,
 }
 
-/// Creates a registry handle and its background service.
+/// Creates a registry handle and its background service; job listings are
+/// cut at the `job_preview_bytes` of `policy`.
 #[must_use]
-pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
+pub fn job_registry_channel(policy: OutputPolicy) -> (JobRegistry, JobRegistryService) {
     let (tx, rx) = async_channel::unbounded();
     let weak = tx.downgrade();
     (
@@ -573,7 +577,11 @@ pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
             tx,
             scanner: ProcessScanner::default(),
         },
-        JobRegistryService { rx, tx: weak },
+        JobRegistryService {
+            rx,
+            tx: weak,
+            policy,
+        },
     )
 }
 
@@ -605,7 +613,7 @@ impl JobRegistry {
         task_id: &IdLease,
         execution_key: &str,
         script: &str,
-        mode: TerminalMode,
+        mode: SandboxMode,
         output_path: Option<PathBuf>,
     ) {
         self.register_with_tree(
@@ -613,7 +621,7 @@ impl JobRegistry {
             task_id,
             execution_key,
             script,
-            ScriptLanguage::Shell,
+            Interpreter::Shell,
             mode,
             output_path,
             None,
@@ -624,7 +632,7 @@ impl JobRegistry {
 
     /// Registers a new running job like [`Self::register`], for a job that
     /// runs at `place` instead of on this machine, with `script` in
-    /// `language`.
+    /// `interpreter`.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_at(
         &self,
@@ -633,15 +641,15 @@ impl JobRegistry {
         task_id: &IdLease,
         execution_key: &str,
         script: &str,
-        language: ScriptLanguage,
-        mode: TerminalMode,
+        interpreter: Interpreter,
+        mode: SandboxMode,
     ) {
         self.register_with_tree(
             pid,
             task_id,
             execution_key,
             script,
-            language,
+            interpreter,
             mode,
             None,
             None,
@@ -660,8 +668,8 @@ impl JobRegistry {
         task_id: &IdLease,
         execution_key: &str,
         script: &str,
-        language: ScriptLanguage,
-        mode: TerminalMode,
+        interpreter: Interpreter,
+        mode: SandboxMode,
         output_path: Option<PathBuf>,
         process_tree: Option<JobTree>,
         place: JobPlace,
@@ -672,7 +680,7 @@ impl JobRegistry {
             task_id: task_id.clone(),
             execution_key: execution_key.to_string(),
             script: script.to_string(),
-            language,
+            interpreter,
             mode,
             output_path,
             process_tree,
@@ -1255,7 +1263,16 @@ impl JobRegistryService {
                     handle_state_command(&mut jobs, &mut reads, &mut parked, command).await;
                 }
                 JobCommand::Request(request) => {
-                    handle_job_request(&mut jobs, &mut reads, &mut parked, &self.tx, request).await;
+                    let preview = self.policy.get().job_preview_bytes;
+                    handle_job_request(
+                        &mut jobs,
+                        &mut reads,
+                        &mut parked,
+                        &self.tx,
+                        preview,
+                        request,
+                    )
+                    .await;
                 }
             }
         }
@@ -1274,7 +1291,7 @@ async fn handle_state_command(
             task_id,
             execution_key,
             script,
-            language,
+            interpreter,
             mode,
             output_path,
             process_tree,
@@ -1292,7 +1309,7 @@ async fn handle_state_command(
                 task_id,
                 execution_key,
                 script,
-                language,
+                interpreter,
                 mode,
                 output_path,
                 place,
@@ -1379,6 +1396,7 @@ async fn handle_job_request(
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
     tx: &WeakSender<JobCommand>,
+    script_preview_bytes: usize,
     request: JobRequest,
 ) {
     match request {
@@ -1486,7 +1504,9 @@ async fn handle_job_request(
             let _ = reply.send(closed).await;
         }
         JobRequest::FormatRunning { reply } => {
-            let _ = reply.send(format_running_jobs(jobs)).await;
+            let _ = reply
+                .send(format_running_jobs(jobs, script_preview_bytes))
+                .await;
         }
         JobRequest::HasRunning { reply } => {
             let _ = reply.send(has_running_job(jobs)).await;
@@ -1534,8 +1554,8 @@ fn register_job(
     task_id: IdLease,
     execution_key: String,
     script: String,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     output_path: Option<PathBuf>,
     place: JobPlace,
     timeout: Option<Duration>,
@@ -1547,7 +1567,7 @@ fn register_job(
         task_id: task_id.to_string(),
         execution_key,
         script,
-        language,
+        interpreter,
         mode,
         started_at: Instant::now(),
         status: JobStatus::Running,
@@ -2135,23 +2155,20 @@ async fn release_settled_waiters(
     }
 }
 
-/// The bytes of a script a running-jobs line shows.
-const SCRIPT_PREVIEW_BYTES: usize = 50;
-
-/// The start of `script`, cut at a character boundary at or below
-/// [`SCRIPT_PREVIEW_BYTES`] bytes.
-fn script_preview(script: &str) -> String {
-    if script.len() <= SCRIPT_PREVIEW_BYTES {
+/// The start of `script`, cut at a character boundary at or below `limit`
+/// bytes.
+fn script_preview(script: &str, limit: usize) -> String {
+    if script.len() <= limit {
         return script.to_string();
     }
-    let end = (0..=SCRIPT_PREVIEW_BYTES)
+    let end = (0..=limit)
         .rev()
         .find(|index| script.is_char_boundary(*index))
         .unwrap_or(0);
     format!("{}...", &script[..end])
 }
 
-fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
+fn format_running_jobs(jobs: &HashMap<u32, JobState>, script_preview_bytes: usize) -> String {
     let running: Vec<_> = jobs
         .values()
         .filter(|job| matches!(job.info.status, JobStatus::Running))
@@ -2163,7 +2180,7 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
 
     let mut output = String::new();
     for job in running {
-        let script_preview = script_preview(&job.info.script);
+        let script_preview = script_preview(&job.info.script, script_preview_bytes);
 
         let output_path = job
             .info
@@ -2219,7 +2236,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn spawn_registry() -> JobRegistry {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2230,7 +2247,7 @@ mod tests {
     /// job nothing bounded reports none.
     #[tokio::test]
     async fn a_job_reports_the_timeout_it_runs_under() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         tokio::spawn(service.serve());
         let bounded = crate::test_ids::lease("bounded");
         let free = crate::test_ids::lease("free");
@@ -2239,10 +2256,10 @@ mod tests {
             .bound_by_timeout(&bounded, Duration::from_secs(600))
             .await;
         registry
-            .register(1, &bounded, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &bounded, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry
-            .register(2, &free, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &free, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
 
         let info = registry.get(1).await.expect("job exists");
@@ -2261,16 +2278,16 @@ mod tests {
     async fn a_job_keeps_its_task_id_leased_until_the_registry_forgets_it() {
         let ids = crate::test_ids::RecordingIds::default();
         let allocator = ids.allocator();
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         let served = tokio::spawn(service.serve());
 
         let first = allocator.lease().unwrap();
         registry
-            .register(1, &first, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &first, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         let second = allocator.lease().unwrap();
         registry
-            .register(2, &second, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &second, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         drop((first, second));
         registry.complete(1, 0, None).await;
@@ -2279,7 +2296,7 @@ mod tests {
 
         let reused_pid = allocator.lease().unwrap();
         registry
-            .register(1, &reused_pid, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &reused_pid, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         drop(reused_pid);
         // The registry serves commands in order, so this list sees the
@@ -2304,7 +2321,7 @@ mod tests {
         let registry = spawn_registry();
         let river = ids.lease().unwrap();
         registry
-            .register(1, &river, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         drop(river);
         registry.append_stdout(1, b"done\n".to_vec()).await;
@@ -2347,7 +2364,7 @@ mod tests {
         // repeat of the old job's last one.
         let again = ids.lease().expect("river went back to the allocator");
         registry
-            .register(2, &again, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &again, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry.append_stdout(2, b"done\n".to_vec()).await;
         registry.complete(2, 0, None).await;
@@ -2376,7 +2393,7 @@ mod tests {
         assert!(registry.get_by_task_id("early").await.is_none());
 
         registry
-            .register(9, &early, "exec-e", "run", TerminalMode::Sandboxed, None)
+            .register(9, &early, "exec-e", "run", SandboxMode::Sandboxed, None)
             .await;
         appends.await.expect("appends are released by registration");
         registry.append_stdout(9, b"three\n".to_vec()).await;
@@ -2412,7 +2429,7 @@ mod tests {
         assert!(reporter.await.unwrap_err().is_cancelled());
         let second = ids.lease().expect("parked output holds no lease");
         registry
-            .register(2, &second, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &second, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry
             .append_task_stdout(&second, b"fresh\n".to_vec())
@@ -2431,7 +2448,7 @@ mod tests {
         let registry = spawn_registry();
         let river = ids.lease().unwrap();
         registry
-            .register(1, &river, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry.complete(1, 0, None).await;
         drop(registry.owe_completion("river", Ok(0)).await.unwrap());
@@ -2448,7 +2465,7 @@ mod tests {
         drop(river);
         let again = ids.lease().expect("nothing kept river");
         registry
-            .register(2, &again, "exec", "run", TerminalMode::Sandboxed, None)
+            .register(2, &again, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         let (stdout, _) = registry.terminal_output(2).await.expect("job exists");
         assert!(stdout.is_empty(), "the late report reached no job");
@@ -2463,7 +2480,7 @@ mod tests {
                 &lease("alpha"),
                 "exec-a",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2493,7 +2510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_job_registry_lifecycle() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2504,7 +2521,7 @@ mod tests {
                 &lease("amber"),
                 "exec-test",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 Some(PathBuf::from("outputs/12345.txt")),
             )
             .await;
@@ -2529,7 +2546,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_format_running_jobs() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2540,7 +2557,7 @@ mod tests {
                 &lease("alpha"),
                 "exec-a",
                 "echo hello",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2550,7 +2567,7 @@ mod tests {
                 &lease("beta"),
                 "exec-b",
                 "sleep 5",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2563,7 +2580,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_redirect_streams_full_output() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2577,7 +2594,7 @@ mod tests {
                 &lease("stream"),
                 "exec-stream",
                 "printf one",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2608,7 +2625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_terminal_delta_reads_incrementally() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2619,7 +2636,7 @@ mod tests {
                 &lease("delta"),
                 "exec-delta",
                 "tail -f log",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2647,7 +2664,7 @@ mod tests {
     /// order.
     #[tokio::test]
     async fn monitor_reads_whole_lines_when_partial_writes_interleave() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2657,7 +2674,7 @@ mod tests {
                 &lease("lines"),
                 "exec-lines",
                 "tail -F f",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2685,7 +2702,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_by_execution_key_no_match() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2696,7 +2713,7 @@ mod tests {
                 &lease("alpha"),
                 "exec-a",
                 "echo hello",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2708,7 +2725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_switch_path_marks_job_killed() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2719,7 +2736,7 @@ mod tests {
                 &lease("switch"),
                 "exec-kill-switch",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2741,7 +2758,7 @@ mod tests {
                 &lease("input"),
                 "exec-input",
                 "cat",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2767,7 +2784,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_does_not_override_killed_status() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2778,7 +2795,7 @@ mod tests {
                 &lease("finished"),
                 "exec-killed-complete",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2795,21 +2812,22 @@ mod tests {
     /// the cut, is listed instead of panicking inside the registry.
     #[tokio::test]
     async fn test_format_running_jobs_cuts_a_multibyte_script_at_a_boundary() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
 
         // Three bytes per character: byte 50 lies inside the 17th.
         let script = "日".repeat(30);
-        assert!(!script.is_char_boundary(SCRIPT_PREVIEW_BYTES));
+        let preview_bytes = crate::output_policy::fixture::LIMITS.job_preview_bytes;
+        assert!(!script.is_char_boundary(preview_bytes));
         registry
             .register(
                 1,
                 &lease("cjk"),
                 "exec-cjk",
                 &script,
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2819,12 +2837,13 @@ mod tests {
             running.contains(&format!("`{}...`", "日".repeat(16))),
             "{running}"
         );
-        assert_eq!(script_preview("short"), "short");
-        assert_eq!(script_preview(&"x".repeat(50)), "x".repeat(50));
+        assert_eq!(script_preview("short", 50), "short");
+        assert_eq!(script_preview(&"x".repeat(50), 50), "x".repeat(50));
         assert_eq!(
-            script_preview(&"x".repeat(51)),
+            script_preview(&"x".repeat(51), 50),
             format!("{}...", "x".repeat(50))
         );
+        assert_eq!(script_preview("abcdef", 3), "abc...");
     }
 
     fn running_job(pid: u32) -> HashMap<u32, JobState> {
@@ -2835,8 +2854,8 @@ mod tests {
             lease("task"),
             "exec".to_string(),
             "true".to_string(),
-            ScriptLanguage::Shell,
-            TerminalMode::Sandboxed,
+            Interpreter::Shell,
+            SandboxMode::Sandboxed,
             None,
             JobPlace::Host,
             None,
@@ -2901,7 +2920,7 @@ mod tests {
     /// the kill records its outcome; the settled read waits for it.
     #[tokio::test]
     async fn the_settled_read_waits_for_a_kill_in_flight() {
-        let (registry, service) = job_registry_channel();
+        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
         TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -2911,7 +2930,7 @@ mod tests {
                 &lease("settled"),
                 "exec-settled",
                 "sleep 10",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -2970,7 +2989,7 @@ mod tests {
                 &lease("owed"),
                 "exec",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -3008,7 +3027,7 @@ mod tests {
                 &lease("lost"),
                 "exec",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -3043,7 +3062,7 @@ mod tests {
                 &lease("kill"),
                 "exec",
                 "run",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -3108,8 +3127,8 @@ mod tests {
             lease("twice"),
             "exec".to_string(),
             "run".to_string(),
-            ScriptLanguage::Shell,
-            TerminalMode::Sandboxed,
+            Interpreter::Shell,
+            SandboxMode::Sandboxed,
             None,
             JobPlace::Host,
             None,

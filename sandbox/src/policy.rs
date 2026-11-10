@@ -28,10 +28,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_core::llm::tool::{ApprovalRequest, CallIdentity};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::container::ContainerPath;
-use crate::permission::TerminalMode;
-use crate::script_language::ScriptLanguage;
+use crate::interpreter::Interpreter;
 use crate::shell_syntax::{ShellParseError, ShellScript};
 use crate::terminal::DirectoryResetReason;
 
@@ -48,19 +49,23 @@ pub enum ScriptOrigin {
 }
 
 /// Whether a script runs inside the sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
     /// Inside the sandbox.
+    #[default]
     Sandboxed,
     /// Outside it, with the access of the user who runs the agent.
     Unsandboxed,
 }
 
-impl From<TerminalMode> for SandboxMode {
-    fn from(mode: TerminalMode) -> Self {
-        match mode {
-            TerminalMode::Sandboxed => Self::Sandboxed,
-            TerminalMode::Unsafe => Self::Unsandboxed,
+impl SandboxMode {
+    /// The mode as a phrase in a sentence about a script.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandboxed",
+            Self::Unsandboxed => "unsandboxed (no sandbox, full access)",
         }
     }
 }
@@ -108,7 +113,7 @@ pub struct ScriptCheck<'a> {
     /// The script as written.
     pub script: &'a str,
     /// The language it is written in.
-    pub language: ScriptLanguage,
+    pub interpreter: Interpreter,
     /// The script parsed as shell: `None` for a script in another language,
     /// an error when it is not valid shell.
     pub shell: Option<Result<&'a ShellScript, &'a ShellParseError>>,
@@ -488,7 +493,7 @@ mod tests {
         ScriptCheck {
             task_id,
             script: "true",
-            language: ScriptLanguage::Shell,
+            interpreter: Interpreter::Shell,
             shell: None,
             origin: ScriptOrigin::Foreground,
             sandbox: SandboxMode::Sandboxed,

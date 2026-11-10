@@ -23,6 +23,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::output_policy::{MediaBounds, OutputPolicy};
+
 /// Expected output format for terminal execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -47,25 +49,17 @@ pub enum MediaResolution {
     /// Use the source media bytes as-is.
     #[default]
     Auto,
-    /// Downscale to a 512px bounding box before loading into context.
+    /// Downscale to the low bounding box of the output policy before loading
+    /// into context.
     Low,
-    /// Downscale to a 1024px bounding box before loading into context.
+    /// Downscale to the medium bounding box of the output policy before
+    /// loading into context.
     Medium,
-    /// Downscale to a 2048px bounding box before loading into context.
+    /// Downscale to the high bounding box of the output policy before loading
+    /// into context.
     High,
     /// Preserve the original media resolution without resizing.
     Native,
-}
-
-impl MediaResolution {
-    const fn max_dimension(self) -> Option<u32> {
-        match self {
-            Self::Auto | Self::Native => None,
-            Self::Low => Some(512),
-            Self::Medium => Some(1024),
-            Self::High => Some(2048),
-        }
-    }
 }
 
 /// An output stream holding no output.
@@ -93,13 +87,6 @@ fn stored_file(url: String, path: &Path) -> StoredFile {
         path: path.display().to_string(),
     }
 }
-
-/// Maximum output size (in bytes) delivered inline to the model.
-/// Outputs exceeding this are saved to file; the model still receives a
-/// head+tail preview capped at this budget together with the file reference,
-/// so it can always make progress without an extra read round-trip.
-/// This is the single source of truth for output size limits.
-pub const INLINE_OUTPUT_LIMIT: usize = 16_000;
 
 /// A text output that exceeded a limit, with the limits that cut it.
 struct CutText<'a> {
@@ -201,6 +188,7 @@ struct StoreInner {
     /// Base directory for outputs (e.g., $WORKDIR/outputs)
     dir: PathBuf,
     ids: AnyIdAllocator,
+    policy: OutputPolicy,
     /// The words of the files this store wrote.
     names: Mutex<Vec<IdLease>>,
     /// The words naming the files the directory held when this store first
@@ -210,25 +198,36 @@ struct StoreInner {
 
 impl OutputStore {
     /// Creates an output store in `dir`, naming its files with words leased
-    /// from `ids`.
+    /// from `ids` and cutting outputs at the limits of `policy`.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created.
-    pub async fn new(dir: impl Into<PathBuf>, ids: AnyIdAllocator) -> std::io::Result<Self> {
+    pub async fn new(
+        dir: impl Into<PathBuf>,
+        ids: AnyIdAllocator,
+        policy: OutputPolicy,
+    ) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
-        Ok(Self::at(dir, ids))
+        Ok(Self::at(dir, ids, policy))
     }
 
     /// An output store in `dir`, which exists.
-    pub(crate) fn at(dir: PathBuf, ids: AnyIdAllocator) -> Self {
+    pub(crate) fn at(dir: PathBuf, ids: AnyIdAllocator, policy: OutputPolicy) -> Self {
         Self(Arc::new(StoreInner {
             dir,
             ids,
+            policy,
             names: Mutex::new(Vec::new()),
             earlier: async_lock::OnceCell::new(),
         }))
+    }
+
+    /// The limits this store cuts outputs at.
+    #[must_use]
+    pub fn policy(&self) -> &OutputPolicy {
+        &self.0.policy
     }
 
     /// Returns the base directory path.
@@ -239,7 +238,7 @@ impl OutputStore {
 
     /// Saves output data and returns the stream the result carries.
     ///
-    /// Uses the system-wide `INLINE_OUTPUT_LIMIT` constant:
+    /// Cuts at the `inline_bytes` of the store's output policy:
     /// - Empty data → an empty `Inline` stream
     /// - Below limit → `Inline` (shown directly)
     /// - Above limit → `Stored` (file created, preview kept for text)
@@ -254,7 +253,8 @@ impl OutputStore {
         format: OutputFormat,
         resolution: MediaResolution,
     ) -> std::io::Result<CommandStream> {
-        self.save_with_limit(data, format, resolution, Some(INLINE_OUTPUT_LIMIT))
+        let inline_bytes = self.policy().get().inline_bytes;
+        self.save_with_limit(data, format, resolution, Some(inline_bytes))
             .await
     }
 
@@ -291,7 +291,8 @@ impl OutputStore {
         match format {
             OutputFormat::Text | OutputFormat::Auto => save_text_output(self, data, format).await,
             OutputFormat::Image => {
-                let prepared = prepare_image_for_context(data, resolution)?;
+                let prepared =
+                    prepare_image_for_context(data, resolution, self.policy().get().media)?;
                 let (url, path) = self.create(&prepared.bytes, format).await?;
                 Ok(CommandStream::Image {
                     media_type: prepared.media_type,
@@ -355,7 +356,7 @@ impl OutputStore {
         // Cut: store the full output and hand the model a preview within its
         // requested budget so it never has to re-read blind, unless the preview
         // would not be smaller than the output.
-        let byte_budget = byte_limit.unwrap_or(INLINE_OUTPUT_LIMIT);
+        let byte_budget = byte_limit.unwrap_or_else(|| self.policy().get().preview_bytes);
         cut_text_output(
             self,
             format,
@@ -505,14 +506,14 @@ async fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Saves text output with simple size-based classification.
 ///
-/// - Below `INLINE_OUTPUT_LIMIT` → show inline
-/// - Above `INLINE_OUTPUT_LIMIT` → save to file, return a head+tail preview plus file reference
+/// - Within the policy's `inline_bytes` → show inline
+/// - Above it → save to file, return a head+tail preview plus file reference
 async fn save_text_output(
     store: &OutputStore,
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<CommandStream> {
-    if data.len() <= INLINE_OUTPUT_LIMIT {
+    if data.len() <= store.policy().get().inline_bytes {
         Ok(CommandStream::Inline {
             text: String::from_utf8_lossy(data).into_owned(),
         })
@@ -537,7 +538,7 @@ async fn save_large_output(
                 data,
                 text: &text,
                 max_lines: usize::MAX,
-                byte_budget: INLINE_OUTPUT_LIMIT,
+                byte_budget: store.policy().get().preview_bytes,
             },
         )
         .await;
@@ -561,9 +562,10 @@ struct PreparedImage {
 fn prepare_image_for_context(
     data: &[u8],
     resolution: MediaResolution,
+    bounds: MediaBounds,
 ) -> std::io::Result<PreparedImage> {
     let media_type = detect_image_media_type(data);
-    let Some(max_dimension) = resolution.max_dimension() else {
+    let Some(max_dimension) = bounds.bound(resolution) else {
         return Ok(PreparedImage {
             bytes: data.to_vec(),
             media_type,
@@ -720,16 +722,90 @@ mod tests {
         );
     }
 
+    const INLINE_OUTPUT_LIMIT: usize = crate::output_policy::fixture::LIMITS.inline_bytes;
+
     /// A store in `dir` leasing from the default allocator.
     fn store(dir: &Path) -> OutputStore {
-        OutputStore::at(dir.to_path_buf(), AnyIdAllocator::default())
+        OutputStore::at(
+            dir.to_path_buf(),
+            AnyIdAllocator::default(),
+            crate::output_policy::fixture::policy(),
+        )
+    }
+
+    /// Limits unlike the fixture's, so a test cannot pass on a value the
+    /// code under test would have shipped.
+    const SMALL: crate::output_policy::OutputLimits = crate::output_policy::OutputLimits {
+        inline_bytes: 100,
+        preview_bytes: 60,
+        default_lines: 5,
+        ceiling_lines: 8,
+        read_bytes: 7,
+        media: crate::output_policy::MediaBounds {
+            low: 16,
+            medium: 32,
+            high: 64,
+        },
+        job_preview_bytes: 9,
+    };
+
+    #[test]
+    fn the_line_budget_defaults_and_clamps_to_the_policy() {
+        let policy = OutputPolicy::new(SMALL);
+        assert_eq!(policy.lines(None), 5);
+        assert_eq!(policy.lines(Some(3)), 3);
+        assert_eq!(policy.lines(Some(500)), 8);
+        let mut wider = SMALL;
+        wider.default_lines = 6;
+        wider.ceiling_lines = 9;
+        policy.set(wider);
+        assert_eq!(policy.lines(None), 6);
+        assert_eq!(policy.lines(Some(500)), 9);
+    }
+
+    #[tokio::test]
+    async fn a_non_default_policy_cuts_the_inline_output_and_follows_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = OutputPolicy::new(SMALL);
+        let store = OutputStore::at(
+            dir.path().to_path_buf(),
+            AnyIdAllocator::default(),
+            policy.clone(),
+        );
+        // Long enough that the stored notice with its preview is smaller than
+        // the output, which is what makes a cut worth its file.
+        let text = "0123456789\n".repeat(200);
+        assert!(text.len() > SMALL.inline_bytes);
+
+        let cut = store
+            .save(text.as_bytes(), OutputFormat::Text, MediaResolution::Auto)
+            .await
+            .unwrap();
+        let CommandStream::Stored { preview, .. } = cut else {
+            panic!("a text over the policy's inline bytes is stored: {cut:?}");
+        };
+        assert!(preview.len() < text.len() / 4, "{preview}");
+
+        // The handle is live: raising the limit reaches the running store.
+        let mut roomy = SMALL;
+        roomy.inline_bytes = 10_000;
+        policy.set(roomy);
+        let inline = store
+            .save(text.as_bytes(), OutputFormat::Text, MediaResolution::Auto)
+            .await
+            .unwrap();
+        assert!(matches!(inline, CommandStream::Inline { .. }), "{inline:?}");
     }
 
     #[tokio::test]
     async fn a_stored_file_is_named_by_a_word_leased_until_the_store_drops() {
         let dir = tempfile::tempdir().unwrap();
         let ids = crate::test_ids::RecordingIds::default();
-        let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
+        let store = OutputStore::at(
+            dir.path().to_path_buf(),
+            ids.allocator(),
+            crate::output_policy::fixture::policy(),
+        );
 
         let (url, path) = store.save_raw(b"kept").await.unwrap();
         let [word] = ids.leased().try_into().expect("one lease");
@@ -762,7 +838,11 @@ mod tests {
         // store: one by a file of another extension.
         std::fs::write(dir.path().join("alfa.png"), "earlier").unwrap();
         std::fs::write(dir.path().join("bravo.txt"), "earlier").unwrap();
-        let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
+        let store = OutputStore::at(
+            dir.path().to_path_buf(),
+            ids.allocator(),
+            crate::output_policy::fixture::policy(),
+        );
 
         let (url, _) = store.save_raw(b"new").await.unwrap();
         assert_eq!(url, "outputs/charlie.txt");
@@ -781,7 +861,11 @@ mod tests {
     async fn a_name_a_file_takes_later_is_skipped_too() {
         let dir = tempfile::tempdir().unwrap();
         let ids = crate::test_ids::RecordingIds::default();
-        let store = OutputStore::at(dir.path().to_path_buf(), ids.allocator());
+        let store = OutputStore::at(
+            dir.path().to_path_buf(),
+            ids.allocator(),
+            crate::output_policy::fixture::policy(),
+        );
         let (first, _) = store.save_raw(b"first").await.unwrap();
         assert_eq!(first, "outputs/alfa.txt");
 

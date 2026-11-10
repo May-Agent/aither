@@ -149,6 +149,19 @@ async fn a_tool_added_by_list_changed_is_a_terminal_command_at_once() {
     let outputs = aither_sandbox::OutputStore::new(
         std::env::temp_dir(),
         aither_core::AnyIdAllocator::default(),
+        aither_sandbox::OutputPolicy::new(aither_sandbox::OutputLimits {
+            inline_bytes: 16_000,
+            preview_bytes: 16_000,
+            default_lines: 200,
+            ceiling_lines: 800,
+            read_bytes: 32 * 1024,
+            media: aither_sandbox::MediaBounds {
+                low: 512,
+                medium: 1024,
+                high: 2048,
+            },
+            job_preview_bytes: 50,
+        }),
     )
     .await
     .unwrap();

@@ -132,8 +132,9 @@ pub fn output_saved_text(
     path: &str,
     line_count: usize,
     byte_count: usize,
+    preview_bytes: usize,
 ) -> String {
-    let preview = crate::output_compress::stored_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
+    let preview = crate::output_compress::stored_preview(rendered, usize::MAX, preview_bytes);
     CommandOutputSavedTemplate {
         preview: preview.trim_end_matches('\n'),
         path,
@@ -422,10 +423,10 @@ enum ModeScope {
 impl ModeScope {
     /// Whether a command in this scope answers in `mode`; `None`, a registry
     /// no terminal execution serves, has every command.
-    const fn admits(self, mode: Option<TerminalMode>) -> bool {
+    const fn admits(self, mode: Option<SandboxMode>) -> bool {
         match (self, mode) {
-            (Self::Every, _) | (Self::Sandboxed, None | Some(TerminalMode::Sandboxed)) => true,
-            (Self::Sandboxed, Some(TerminalMode::Unsafe)) => false,
+            (Self::Every, _) | (Self::Sandboxed, None | Some(SandboxMode::Sandboxed)) => true,
+            (Self::Sandboxed, Some(SandboxMode::Unsandboxed)) => false,
         }
     }
 }
@@ -497,7 +498,7 @@ impl<T> RoleEntries<T> {
 
     /// Whether `role` has the command at all in `mode`, reserved or not: a
     /// command absent from it is neither listed nor callable there.
-    const fn exists_for(&self, role: CommandRole, mode: Option<TerminalMode>) -> bool {
+    const fn exists_for(&self, role: CommandRole, mode: Option<SandboxMode>) -> bool {
         self.modes.admits(mode)
             && !matches!(
                 (role, &self.subagent),
@@ -711,8 +712,8 @@ struct Resolved<'a> {
     stdin_arg: Option<&'a str>,
 }
 
-use crate::output::{INLINE_OUTPUT_LIMIT, OutputStore};
-use crate::permission::TerminalMode;
+use crate::output::OutputStore;
+use crate::policy::SandboxMode;
 use crate::terminal::TerminalBinding;
 
 /// Handles large outputs by saving to file in the sandbox output directory.
@@ -732,7 +733,7 @@ async fn handle_large_output(output: ToolResult, outputs: &OutputStore) -> Comma
         return CommandEnvelope::success_empty();
     }
 
-    if rendered.len() <= INLINE_OUTPUT_LIMIT {
+    if rendered.len() <= outputs.policy().get().inline_bytes {
         return CommandEnvelope::success(output);
     }
 
@@ -751,6 +752,7 @@ async fn handle_large_output(output: ToolResult, outputs: &OutputStore) -> Comma
             &filepath.to_string_lossy(),
             line_count,
             rendered.len(),
+            outputs.policy().get().preview_bytes,
         ),
     })
 }
@@ -851,6 +853,8 @@ pub struct DynTerminalTool {
     pub(crate) role: CommandRole,
     /// The terminal registry's notices, which its controls render through.
     pub(crate) notices: crate::AnySandboxNotices,
+    /// The output budgets the terminal's controls read with.
+    pub(crate) output: crate::OutputPolicy,
 }
 
 impl DynTerminalTool {
@@ -931,6 +935,7 @@ impl DynTerminalTool {
             erase_terminal_tool(ReadTerminalDeltaTool::new(
                 self.job_registry.clone(),
                 self.notices.clone(),
+                self.output.clone(),
             )),
         ]
     }
@@ -960,7 +965,7 @@ impl std::fmt::Debug for DynTerminalTool {
 /// role. A command whose handler depends on the terminal serving it is
 /// registered with [`Self::configure_terminal_bound_tool`] and built anew for
 /// every terminal, a subagent's included. Every command answers in every
-/// [`TerminalMode`]; [`Self::sandboxed_only`] leaves what it registers out of
+/// [`SandboxMode`]; [`Self::sandboxed_only`] leaves what it registers out of
 /// unsafe commands.
 #[derive(Debug, Default)]
 pub struct ToolRegistryBuilder {
@@ -1531,7 +1536,7 @@ pub struct ToolRegistry {
     role: CommandRole,
     /// The mode of the terminal execution this registry serves, once
     /// [`Self::in_mode`] has scoped it to one; `None` has every command.
-    mode: Option<TerminalMode>,
+    mode: Option<SandboxMode>,
     observer: Option<AnyCommandObserver>,
     gate: Option<AnyCommandGate>,
     /// The command policies, bound to the state of the agent this registry
@@ -1594,6 +1599,7 @@ impl ToolRegistry {
         controls.configure_tool(crate::builtin::ReadTerminalDeltaTool::new(
             jobs,
             self.notices.clone(),
+            outputs.policy().clone(),
         ));
         self.entries.extend(controls.entries);
         self.outputs = outputs;
@@ -1711,7 +1717,7 @@ impl ToolRegistry {
     /// registry's commands that answer in `mode`, the others neither listed
     /// nor callable (see [`ToolRegistryBuilder::sandboxed_only`]).
     #[must_use]
-    pub fn in_mode(&self, mode: TerminalMode) -> Self {
+    pub fn in_mode(&self, mode: SandboxMode) -> Self {
         Self {
             mode: Some(mode),
             ..self.clone()
@@ -3392,7 +3398,11 @@ mod tests {
 
     /// An output store in `dir` leasing from the default allocator.
     fn test_outputs(dir: &Path) -> OutputStore {
-        OutputStore::at(dir.to_path_buf(), aither_core::AnyIdAllocator::default())
+        OutputStore::at(
+            dir.to_path_buf(),
+            aither_core::AnyIdAllocator::default(),
+            crate::output_policy::fixture::policy(),
+        )
     }
 
     fn single_stored_file(dir: &Path) -> PathBuf {
@@ -4366,7 +4376,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let output_dir = tmp.path().join("not-a-directory");
         std::fs::write(&output_dir, "occupied").unwrap();
-        let output = ToolResult::text("x".repeat(INLINE_OUTPUT_LIMIT + 1));
+        let output =
+            ToolResult::text("x".repeat(crate::output_policy::fixture::LIMITS.inline_bytes + 1));
 
         let result = handle_large_output(output, &test_outputs(&output_dir)).await;
         assert!(!result.ok);
@@ -4879,13 +4890,13 @@ mod tests {
         });
         let main = builder.build(test_outputs(tmp.path()));
 
-        let sandboxed = main.in_mode(TerminalMode::Sandboxed);
+        let sandboxed = main.in_mode(SandboxMode::Sandboxed);
         let answered = run_command(&sandboxed, "gh").await;
         assert!(answered.ok, "a sandboxed command has it: {answered:?}");
         assert_eq!(answered.payload.unwrap().render_for_cli(), "use `issue`");
         assert!(sandboxed.registered_tool_names().contains(&"gh".into()));
 
-        let unsafe_mode = main.in_mode(TerminalMode::Unsafe);
+        let unsafe_mode = main.in_mode(SandboxMode::Unsandboxed);
         assert!(!unsafe_mode.is_tool_configured("gh"));
         assert!(!unsafe_mode.registered_tool_names().contains(&"gh".into()));
         let unknown = run_command(&unsafe_mode, "gh").await;
@@ -4894,11 +4905,13 @@ mod tests {
         assert!(run_command(&unsafe_mode, "shared").await.ok);
 
         // The main-only restriction wrapped around the scope keeps it.
-        let subagent = main.for_subagent(None, None).in_mode(TerminalMode::Unsafe);
+        let subagent = main
+            .for_subagent(None, None)
+            .in_mode(SandboxMode::Unsandboxed);
         assert!(!subagent.registered_tool_names().contains(&"gh".into()));
         assert!(
             main.for_subagent(None, None)
-                .in_mode(TerminalMode::Sandboxed)
+                .in_mode(SandboxMode::Sandboxed)
                 .is_reserved("gh")
         );
     }
@@ -4994,13 +5007,13 @@ mod tests {
     /// then reaches no later job leasing the same word.
     #[tokio::test]
     async fn a_jobs_output_reports_to_it_without_keeping_its_word_leased() {
-        let (jobs, service) = crate::job_registry::job_registry_channel();
+        let (jobs, service) = crate::job_registry::job_registry_channel(crate::test_budgets::output_policy());
         tokio::spawn(service.serve());
         let ids =
             aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river", "stone"]));
         let first = ids.lease().expect("river is free");
         assert_eq!(&*first, "river");
-        jobs.register(1, &first, "exec", "run", TerminalMode::Sandboxed, None)
+        jobs.register(1, &first, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         let mut output = JobOutput::new(jobs.clone(), &first);
         output.report(Progress::new(1.0).with_total(2.0)).await;
@@ -5011,14 +5024,14 @@ mod tests {
         // reusing its pid replaces.
         drop(first);
         let replacing = ids.lease().expect("stone is free");
-        jobs.register(1, &replacing, "exec", "run", TerminalMode::Sandboxed, None)
+        jobs.register(1, &replacing, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         // The registry serves commands in order, so this list sees the
         // replacement.
         assert_eq!(jobs.list().await.len(), 1);
         let again = ids.lease().expect("the output keeps nothing leased");
         assert_eq!(&*again, "river");
-        jobs.register(2, &again, "exec", "run", TerminalMode::Sandboxed, None)
+        jobs.register(2, &again, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         output.report(Progress::new(2.0).with_total(2.0)).await;
         let (stdout, _) = jobs.terminal_output(2).await.expect("job 2 is registered");

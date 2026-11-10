@@ -113,7 +113,11 @@ mod tests {
 
     /// A store in `dir` leasing from the default allocator.
     fn store(dir: &Path) -> OutputStore {
-        OutputStore::at(dir.to_path_buf(), aither_core::AnyIdAllocator::default())
+        OutputStore::at(
+            dir.to_path_buf(),
+            aither_core::AnyIdAllocator::default(),
+            crate::output_policy::fixture::policy(),
+        )
     }
 
     async fn compress(text: &str) -> Option<String> {

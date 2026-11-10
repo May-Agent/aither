@@ -71,11 +71,12 @@ use crate::{
     command::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
     },
+    interpreter::Interpreter,
     job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
-    output::{INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, stored_path},
-    permission::TerminalMode,
+    limits::{LiveDuration, ShellLimits},
+    output::{MediaResolution, OutputFormat, OutputStore, stored_path},
+    output_policy::OutputPolicy,
     process_tree::{JobProcess, JobTree},
-    script_language::ScriptLanguage,
     shell_session::{
         ContainerExecOutcome, ContainerShellRuntime, ExecLifetime, ShellBackend,
         ShellRuntimeAvailability, ShellSessionRegistry,
@@ -263,11 +264,11 @@ pub fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) 
 /// The shell script that runs `script`, written in `language`, for the job
 /// `task_id`.
 fn launch_script<'a>(
-    language: ScriptLanguage,
+    interpreter: Interpreter,
     script: &'a str,
     task_id: &str,
 ) -> Result<Cow<'a, str>, TerminalError> {
-    language.launch_script(script, task_id).map_err(|error| {
+    interpreter.launch_script(script, task_id).map_err(|error| {
         TerminalError::Execution(format!("failed to render the launch script: {error}"))
     })
 }
@@ -451,7 +452,7 @@ fn carry_cwd_script(script: &str, report: &str) -> Result<String, TerminalError>
 /// `language` is `shell` by default; `python` runs `script` as Python source,
 /// without a shell wrapper.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TerminalArgs {
+pub struct ShellArgs {
     /// Short human-readable explanation of what this command is doing.
     /// This is shown in the UI instead of echoing the shell source.
     pub description: String,
@@ -463,27 +464,18 @@ pub struct TerminalArgs {
     /// - "shell" (default): shell source
     /// - "python": Python source, run from a file so tracebacks carry line numbers
     #[serde(default)]
-    pub language: ScriptLanguage,
+    pub interpreter: Interpreter,
 
     /// How the command runs.
-    /// - "default": inside the sandbox, with network enabled
-    /// - "unsafe": without the sandbox, after approval
+    /// - "sandboxed" (default): inside the sandbox
+    /// - "unsandboxed": without the sandbox, after approval
     #[serde(default)]
-    pub mode: TerminalExecutionMode,
+    pub sandbox: SandboxMode,
 
     /// Where the command runs: omitted or empty for the home environment,
     /// otherwise the name of a configured SSH server.
     #[serde(default)]
     pub location: Option<String>,
-
-    /// Expected output format for proper handling.
-    /// - "text" (default): plain text
-    /// - "image": image data (auto-loaded to context)
-    /// - "video": video data
-    /// - "binary": binary data
-    /// - "auto": auto-detect
-    #[serde(default)]
-    pub expect: OutputFormat,
 
     /// Requested delivery resolution for media returned to the model.
     /// - "auto" (default): preserve the source resolution
@@ -500,10 +492,10 @@ pub struct TerminalArgs {
     /// For executions detached with `background: true` or promoted past
     /// the foreground window, only the first `max_lines` are returned
     /// immediately, while full output is redirected to file.
-    /// Clamped to 800 max.
-    /// Default: 200.
-    #[serde(default = "default_max_lines")]
-    pub max_lines: u32,
+    /// Clamped to the ceiling of the output policy; omitted, the policy's
+    /// default.
+    #[serde(default)]
+    pub max_lines: Option<u32>,
 
     /// When true, skip all output compression and return the verbatim
     /// stdout bytes. Use this when you need exact byte-level fidelity
@@ -524,54 +516,6 @@ pub struct TerminalArgs {
     pub background: bool,
 }
 
-/// How a `terminal` command runs, wherever its `location` is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalExecutionMode {
-    /// Inside the sandbox.
-    #[default]
-    Default,
-    /// Without the sandbox, after the permission handler approves it.
-    Unsafe,
-}
-
-impl From<TerminalExecutionMode> for TerminalMode {
-    fn from(mode: TerminalExecutionMode) -> Self {
-        match mode {
-            TerminalExecutionMode::Default => Self::Sandboxed,
-            TerminalExecutionMode::Unsafe => Self::Unsafe,
-        }
-    }
-}
-
-impl From<TerminalMode> for TerminalExecutionMode {
-    fn from(mode: TerminalMode) -> Self {
-        match mode {
-            TerminalMode::Sandboxed => Self::Default,
-            TerminalMode::Unsafe => Self::Unsafe,
-        }
-    }
-}
-
-const fn default_max_lines() -> u32 {
-    200
-}
-
-const MAX_LINES_CEILING: u32 = 800;
-
-/// How long a `terminal` call waits in the foreground before a still-running
-/// command promotes to a background task.
-pub const DEFAULT_FOREGROUND_WAIT: Duration = Duration::from_secs(10);
-/// How long the agent has to act on a final memory warning by default.
-pub const DEFAULT_RESPONSE_WINDOW: Duration = Duration::from_secs(120);
-/// The default of the most bytes a subagent's sandbox may send the host while
-/// its commits are imported into the main repository.
-pub const DEFAULT_SUBAGENT_IMPORT_LIMIT: u64 = 1024 * 1024 * 1024;
-/// Largest `timeout` a command accepts.
-pub const DEFAULT_TIMEOUT_CAP: Duration = Duration::from_secs(120 * 60);
-/// A background job still running after this long produces one system alert.
-pub const DEFAULT_LONG_JOB_ALERT_AFTER: Duration = Duration::from_secs(40 * 60);
-
 /// Time bounds applied to every execution this terminal spawns.
 #[derive(Debug, Clone)]
 struct TerminalLimits {
@@ -579,9 +523,9 @@ struct TerminalLimits {
     /// task.
     foreground_wait: ForegroundWait,
     /// Maximum accepted `timeout` for a command.
-    timeout_cap: Duration,
+    timeout_cap: LiveDuration,
     /// Runtime after which a background job produces a long-running alert.
-    long_job_alert: Duration,
+    long_job_alert: LiveDuration,
     /// Most bytes a subagent's sandbox may send while its commits are
     /// imported; shared with every terminal derived from this one, and
     /// adjustable at runtime.
@@ -596,16 +540,16 @@ struct TerminalLimits {
     footprint_registry: Option<AnyFootprintRegistry>,
 }
 
-impl Default for TerminalLimits {
-    fn default() -> Self {
+impl TerminalLimits {
+    fn new(limits: ShellLimits) -> Self {
         Self {
-            response_window: ResponseWindow::new(DEFAULT_RESPONSE_WINDOW),
+            response_window: limits.response_window,
             footprints: AnyFootprintReader::new(SystemFootprints),
             footprint_registry: None,
-            foreground_wait: ForegroundWait::new(DEFAULT_FOREGROUND_WAIT),
-            timeout_cap: DEFAULT_TIMEOUT_CAP,
-            long_job_alert: DEFAULT_LONG_JOB_ALERT_AFTER,
-            subagent_import: ImportBudget::new(DEFAULT_SUBAGENT_IMPORT_LIMIT),
+            foreground_wait: limits.foreground_wait,
+            timeout_cap: limits.timeout_cap,
+            long_job_alert: limits.long_job_alert,
+            subagent_import: limits.subagent_import,
         }
     }
 }
@@ -1249,12 +1193,12 @@ pub struct TerminalScript {
     script: String,
     working_dir: PathBuf,
     timeout: Duration,
-    mode: TerminalMode,
+    mode: SandboxMode,
 }
 
 impl TerminalScript {
     /// `script`, started in `working_dir` on the host and killed with its
-    /// process tree once `timeout` passes, in [`TerminalMode::Sandboxed`].
+    /// process tree once `timeout` passes, in [`SandboxMode::Sandboxed`].
     /// For a container terminal, `working_dir` lies in its workspace mount.
     #[must_use]
     pub fn new(
@@ -1266,14 +1210,14 @@ impl TerminalScript {
             script: script.into(),
             working_dir: working_dir.into(),
             timeout,
-            mode: TerminalMode::Sandboxed,
+            mode: SandboxMode::Sandboxed,
         }
     }
 
     /// Runs the script in `mode`; an unsafe one is put to the terminal's
     /// permission handler like any unsafe command.
     #[must_use]
-    pub const fn with_mode(mut self, mode: TerminalMode) -> Self {
+    pub const fn with_mode(mut self, mode: SandboxMode) -> Self {
         self.mode = mode;
         self
     }
@@ -1723,7 +1667,11 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
     /// own [`AnyIdAllocator::default`].
     #[must_use]
     pub fn with_id_allocator(mut self, ids: AnyIdAllocator) -> Self {
-        self.output_store = OutputStore::at(self.output_store.dir().to_path_buf(), ids.clone());
+        self.output_store = OutputStore::at(
+            self.output_store.dir().to_path_buf(),
+            ids.clone(),
+            self.output_store.policy().clone(),
+        );
         self.ids = ids;
         self
     }
@@ -1739,6 +1687,8 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
     pub async fn new_in(
         parent_dir: impl AsRef<std::path::Path>,
         executor: E,
+        limits: ShellLimits,
+        output: OutputPolicy,
     ) -> Result<Self, TerminalError> {
         let parent_dir = parent_dir.as_ref();
 
@@ -1758,10 +1708,12 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
 
         // Create outputs directory inside working dir
         let ids = AnyIdAllocator::default();
-        let output_store = OutputStore::new(working_dir_path.join("outputs"), ids.clone()).await?;
+        let output_store =
+            OutputStore::new(working_dir_path.join("outputs"), ids.clone(), output).await?;
 
         // Start job registry service
-        let (job_registry, job_registry_service) = job_registry_channel();
+        let (job_registry, job_registry_service) =
+            job_registry_channel(output_store.policy().clone());
         executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1786,7 +1738,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             alert_tx,
             started_rx,
             started_tx,
-            limits: TerminalLimits::default(),
+            limits: TerminalLimits::new(limits),
             running_tasks,
             grants: Grants::new(),
             subagent: None,
@@ -1815,6 +1767,8 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
     pub async fn new_exact(
         working_dir: impl AsRef<std::path::Path>,
         executor: E,
+        limits: ShellLimits,
+        output: OutputPolicy,
     ) -> Result<Self, TerminalError> {
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
@@ -1825,10 +1779,12 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
 
         // Create outputs directory inside working dir
         let ids = AnyIdAllocator::default();
-        let output_store = OutputStore::new(working_dir_path.join("outputs"), ids.clone()).await?;
+        let output_store =
+            OutputStore::new(working_dir_path.join("outputs"), ids.clone(), output).await?;
 
         // Start job registry service
-        let (job_registry, job_registry_service) = job_registry_channel();
+        let (job_registry, job_registry_service) =
+            job_registry_channel(output_store.policy().clone());
         executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1853,7 +1809,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
             alert_tx,
             started_rx,
             started_tx,
-            limits: TerminalLimits::default(),
+            limits: TerminalLimits::new(limits),
             running_tasks,
             grants: Grants::new(),
             subagent: None,
@@ -2182,8 +2138,8 @@ where
     /// Sets the largest `timeout` a command accepts.
     /// Defaults to [`DEFAULT_TIMEOUT_CAP`].
     #[must_use]
-    pub const fn with_timeout_cap(mut self, cap: Duration) -> Self {
-        self.limits.timeout_cap = cap;
+    pub fn with_timeout_cap(self, cap: Duration) -> Self {
+        self.limits.timeout_cap.set(cap);
         self
     }
 
@@ -2212,8 +2168,8 @@ where
     /// Sets how long a background job may run before it produces one system
     /// alert naming it. Defaults to [`DEFAULT_LONG_JOB_ALERT_AFTER`].
     #[must_use]
-    pub const fn with_long_job_alert_after(mut self, after: Duration) -> Self {
-        self.limits.long_job_alert = after;
+    pub fn with_long_job_alert_after(self, after: Duration) -> Self {
+        self.limits.long_job_alert.set(after);
         self
     }
 
@@ -2563,7 +2519,8 @@ where
         let (alert_tx, alert_rx) = async_channel::unbounded();
         let (started_tx, started_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
-        let (job_registry, job_registry_service) = job_registry_channel();
+        let (job_registry, job_registry_service) =
+            job_registry_channel(self.output_store.policy().clone());
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -2760,6 +2717,7 @@ where
         let prepared_space = self.prepared_space();
         let role = self.registry().role();
         let notices = self.registry().notices().clone();
+        let output = self.output_store.policy().clone();
         let prepared_tools = self
             .shell_sessions
             .prepared_catalog()
@@ -2779,6 +2737,7 @@ where
             prepared_space,
             role,
             notices,
+            output,
         }
     }
 }
@@ -2809,12 +2768,12 @@ where
             .ok_or_else(|| TerminalError::UnknownLocation(name.to_string()))
     }
 
-    fn resolve_home_target(&self, mode: TerminalMode) -> Result<ExecutionTarget, TerminalError> {
+    fn resolve_home_target(&self, mode: SandboxMode) -> Result<ExecutionTarget, TerminalError> {
         let backend = self
             .shell_sessions
             .resolve_local_backend()
             .map_err(TerminalError::InvalidTarget)?;
-        if mode == TerminalMode::Unsafe && backend != ShellBackend::Local {
+        if mode == SandboxMode::Unsandboxed && backend != ShellBackend::Local {
             return Err(TerminalError::InvalidTarget(
                 "unsafe mode is only available in heel local runtime".into(),
             ));
@@ -2844,16 +2803,16 @@ where
     async fn resolve_ssh_target(
         &self,
         environment: &SshEnvironment,
-        mode: TerminalMode,
+        mode: SandboxMode,
     ) -> Result<ExecutionTarget, TerminalError> {
         let prepared = self.shell_sessions.ssh_tools(environment).await?;
         let server = environment.server();
         let heel = match (mode, &prepared.heel) {
-            (TerminalMode::Sandboxed, Some(heel)) => Some(heel.clone()),
-            (TerminalMode::Sandboxed, None) => {
+            (SandboxMode::Sandboxed, Some(heel)) => Some(heel.clone()),
+            (SandboxMode::Sandboxed, None) => {
                 return Err(TerminalError::NoRemoteSandbox(server.name.clone()));
             }
-            (TerminalMode::Unsafe, _) => None,
+            (SandboxMode::Unsandboxed, _) => None,
         };
         Ok(ExecutionTarget {
             mode,
@@ -2872,7 +2831,7 @@ where
             task_id,
             execution_id,
             script,
-            language,
+            interpreter,
             expect,
             resolution,
             max_lines,
@@ -2941,7 +2900,7 @@ where
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 script,
-                language,
+                interpreter,
                 mode,
                 backend,
                 stdin_alerts,
@@ -2979,7 +2938,7 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
         "terminal".into()
     }
 
-    type Arguments = TerminalArgs;
+    type Arguments = ShellArgs;
     type Res = ToolResult;
 
     async fn call(
@@ -2987,7 +2946,7 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
         arguments: Self::Arguments,
         mut cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let cap = self.limits.timeout_cap;
+        let cap = self.limits.timeout_cap.get();
         let timeout = Duration::from_secs(arguments.timeout);
         if arguments.timeout == 0 || timeout > cap {
             return Err(anyhow::anyhow!(
@@ -3001,15 +2960,15 @@ impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
         let carry = if arguments.background {
             None
         } else {
-            self.cwd_carry(&prepared, &arguments.script, arguments.language)
+            self.cwd_carry(&prepared, &arguments.script, arguments.interpreter)
         };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             task_id: prepared.task_id.clone(),
             execution_id: prepared.execution_id,
             script: arguments.script,
-            language: arguments.language,
-            expect: arguments.expect,
+            interpreter: arguments.interpreter,
+            expect: OutputFormat::Auto,
             resolution: arguments.resolution,
             max_lines: prepared.max_lines,
             raw: arguments.raw,
@@ -3088,7 +3047,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
         &self,
         prepared: &ExecutionPreparation,
         script: &str,
-        language: ScriptLanguage,
+        interpreter: Interpreter,
     ) -> Option<CwdCarry> {
         let carried = self.carried_dir.as_ref()?;
         let mount = match &prepared.target.backend {
@@ -3130,7 +3089,7 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
         // A Python script runs from a shell wrapper, so its report is written
         // like a shell script's.
         let shell =
-            container.is_some() || language == ScriptLanguage::Python || runs_in_shell(script);
+            container.is_some() || interpreter == Interpreter::Python || runs_in_shell(script);
         Some(CwdCarry {
             start,
             report: Some(report),
@@ -3374,9 +3333,9 @@ impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
     ///
     /// Fails the way a `terminal` call does: an invalid `timeout`, a
     /// refused permission, a blocked command or a spawn failure.
-    pub async fn run_background(&self, arguments: TerminalArgs) -> aither_core::Result<ToolResult> {
+    pub async fn run_background(&self, arguments: ShellArgs) -> aither_core::Result<ToolResult> {
         self.call(
-            TerminalArgs {
+            ShellArgs {
                 background: true,
                 ..arguments
             },
@@ -3431,7 +3390,7 @@ where
     /// [`Self::admit_command`].
     async fn prepare_execution(
         &self,
-        arguments: &TerminalArgs,
+        arguments: &ShellArgs,
         cx: &mut ToolContext,
     ) -> anyhow::Result<ExecutionPreparation> {
         if arguments.description.trim().is_empty() {
@@ -3446,8 +3405,8 @@ where
         self.admit_command(
             Admission {
                 script: &arguments.script,
-                language: arguments.language,
-                mode: arguments.mode,
+                interpreter: arguments.interpreter,
+                mode: arguments.sandbox,
                 location: arguments.location.as_deref(),
                 max_lines: arguments.max_lines,
                 origin,
@@ -3556,15 +3515,15 @@ where
         if policies.is_empty() {
             return Ok(Clearance::Pass);
         }
-        let shell = (admission.language == ScriptLanguage::Shell)
+        let shell = (admission.interpreter == Interpreter::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
         let check = crate::ScriptCheck {
             task_id,
             script: admission.script,
-            language: admission.language,
+            interpreter: admission.interpreter,
             shell: shell.as_ref().map(Result::as_ref),
             origin: admission.origin,
-            sandbox: SandboxMode::from(TerminalMode::from(admission.mode)),
+            sandbox: admission.mode,
             location: admission.location(),
             start,
             call: admission.call(),
@@ -3588,7 +3547,7 @@ where
         // Ahead of target resolution and permission, so a blocked command
         // never asks the user for anything. The decision carries no grant.
         // The gate reads shell syntax, so Python source skips it.
-        if admission.language == ScriptLanguage::Shell
+        if admission.interpreter == Interpreter::Shell
             && let Some(gate) = self.registry.registry().gate()
             && let GateDecision::Block { reason } = gate.check(admission.script).await
         {
@@ -3597,7 +3556,7 @@ where
                 |blocked| self.notices().command_blocked(blocked),
             )));
         }
-        let mode = TerminalMode::from(admission.mode);
+        let mode = admission.mode;
         let target = match environment {
             None => {
                 let target = self.resolve_home_target(mode)?;
@@ -3619,7 +3578,10 @@ where
                 Box::pin(self.admit_on_server(environment, admission, clearance, cx)).await?
             }
         };
-        Ok((target, admission.max_lines.min(MAX_LINES_CEILING) as usize))
+        Ok((
+            target,
+            self.output_store.policy().lines(admission.max_lines),
+        ))
     }
 
     /// Admission of a command on a server. The question is put before the
@@ -3632,8 +3594,7 @@ where
         cx: Option<&mut ToolContext>,
     ) -> Result<ExecutionTarget, TerminalError> {
         self.clear(admission, clearance, cx).await?;
-        self.resolve_ssh_target(environment, TerminalMode::from(admission.mode))
-            .await
+        self.resolve_ssh_target(environment, admission.mode).await
     }
 
     /// Settles whether the script may run, once the policies did not refuse
@@ -3696,7 +3657,7 @@ where
 
     /// Runs `run` to its end on this terminal; see [`TerminalRunner::run`].
     async fn run_to_end(&self, run: TerminalScript) -> Result<CommandResult, TerminalRunError> {
-        let cap = self.limits.timeout_cap;
+        let cap = self.limits.timeout_cap.get();
         if run.timeout.is_zero() || run.timeout > cap {
             return Err(TerminalRunError::Timeout { cap });
         }
@@ -3706,10 +3667,10 @@ where
             .admit_command(
                 Admission {
                     script: &run.script,
-                    language: ScriptLanguage::Shell,
-                    mode: run.mode.into(),
+                    interpreter: Interpreter::Shell,
+                    mode: run.mode,
                     location: None,
-                    max_lines: default_max_lines(),
+                    max_lines: None,
                     origin: ScriptOrigin::Run,
                     call: None,
                     run_dir: Some(&run.working_dir),
@@ -3729,7 +3690,7 @@ where
             task_id: prepared.task_id.clone(),
             execution_id: prepared.execution_id,
             script: run.script,
-            language: ScriptLanguage::Shell,
+            interpreter: Interpreter::Shell,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: prepared.max_lines,
@@ -3814,7 +3775,7 @@ where
         let alert_tx = self.alert_tx.clone();
         // Weak for the same reason as the watchdog's.
         let task_id = task_id.downgrade();
-        let alert_after = self.limits.long_job_alert;
+        let alert_after = self.limits.long_job_alert.get();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(alert_after).await;
@@ -3840,11 +3801,11 @@ where
 /// What [`TerminalTool::admit_command`] admits: a script and how it came.
 struct Admission<'a> {
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalExecutionMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     /// The SSH server the command names; `None` or empty for home.
     location: Option<&'a str>,
-    max_lines: u32,
+    max_lines: Option<u32>,
     origin: ScriptOrigin,
     /// The tool call that carries the script and the agent that made it;
     /// `None` for a script no call carries.
@@ -3867,12 +3828,12 @@ impl<'a> Admission<'a> {
     /// Whether the script runs outside the sandbox, unsandboxed or on a
     /// server.
     fn crosses_boundary(&self) -> bool {
-        self.mode == TerminalExecutionMode::Unsafe || self.location().is_some()
+        self.mode == SandboxMode::Unsandboxed || self.location().is_some()
     }
 
     /// What the approver is asked about a script the policies only passed.
     fn boundary_request(&self) -> ApprovalRequest {
-        let (kind, reason) = if self.mode == TerminalExecutionMode::Unsafe {
+        let (kind, reason) = if self.mode == SandboxMode::Unsandboxed {
             ("unsandboxed", "the script runs outside the sandbox")
         } else {
             ("remote", "the script runs on a remote server")
@@ -4054,8 +4015,8 @@ struct StandaloneExecution<E> {
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4083,8 +4044,8 @@ struct StandaloneStart<'a, E> {
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     backend: &'a ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4107,8 +4068,8 @@ struct LocalBackgroundExecution<'a, E> {
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     job_registry: &'a JobRegistry,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4127,8 +4088,8 @@ struct ContainerBackgroundExecution<'a, E> {
     task_id: &'a IdLease,
     execution_id: &'a str,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     container_runtime: &'a ContainerShellRuntime,
     prepared_tools: &'a PreparedTools<ContainerPath>,
     confinement: Option<&'a ContainerConfinement>,
@@ -4150,8 +4111,8 @@ struct SshBackgroundExecution<'a> {
     task_id: &'a IdLease,
     execution_id: &'a str,
     script: &'a str,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     client: &'a SshClient,
     server: &'a SshServer,
     heel: Option<&'a str>,
@@ -4195,7 +4156,7 @@ enum ExecutionBackend {
 }
 
 struct ExecutionTarget {
-    mode: TerminalMode,
+    mode: SandboxMode,
     backend: ExecutionBackend,
 }
 
@@ -4204,7 +4165,7 @@ struct TerminalSpawnRequest {
     task_id: IdLease,
     execution_id: String,
     script: String,
-    language: ScriptLanguage,
+    interpreter: Interpreter,
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
@@ -4252,8 +4213,8 @@ struct SpawnedTerminalTask<E> {
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
-    language: ScriptLanguage,
-    mode: TerminalMode,
+    interpreter: Interpreter,
+    mode: SandboxMode,
     backend: ExecutionBackend,
     stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
@@ -4296,7 +4257,7 @@ where
         carry,
         carried_dir,
         script,
-        language,
+        interpreter,
         mode,
         backend,
         stdin_alerts,
@@ -4346,7 +4307,7 @@ where
         carry,
         carried_dir,
         script: script.clone(),
-        language,
+        interpreter,
         mode,
         backend,
         stdin_alerts,
@@ -4463,7 +4424,7 @@ where
         carry,
         carried_dir,
         script,
-        language,
+        interpreter,
         mode,
         backend,
         stdin_alerts,
@@ -4498,7 +4459,7 @@ where
         execution_id: &execution_id,
         carry: carry.as_ref(),
         script: &script,
-        language,
+        interpreter,
         mode,
         backend: &backend,
         stdin_alerts,
@@ -4599,7 +4560,7 @@ where
                 task_id: request.task_id,
                 execution_id: request.execution_id,
                 script: request.script,
-                language: request.language,
+                interpreter: request.interpreter,
                 mode: request.mode,
                 container_runtime: runtime,
                 prepared_tools: tools,
@@ -4629,7 +4590,7 @@ where
                 task_id: request.task_id,
                 execution_id: request.execution_id,
                 script: request.script,
-                language: request.language,
+                interpreter: request.interpreter,
                 mode: request.mode,
                 client,
                 server,
@@ -4656,7 +4617,7 @@ where
         execution_id: request.execution_id,
         carry: request.carry,
         script: request.script,
-        language: request.language,
+        interpreter: request.interpreter,
         mode: request.mode,
         job_registry: request.job_registry,
         stdin_alerts: request.stdin_alerts,
@@ -4727,7 +4688,7 @@ async fn save_completed_stdout(
     stdout: &[u8],
     format: CompletedStdoutFormat<'_>,
 ) -> Result<CommandStream, TerminalError> {
-    let byte_limit = Some(INLINE_OUTPUT_LIMIT);
+    let byte_limit = Some(format.outputs.policy().get().inline_bytes);
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
     } else {
@@ -4793,7 +4754,7 @@ async fn save_completed_stderr(
             stderr,
             OutputFormat::Text,
             MediaResolution::Auto,
-            Some(INLINE_OUTPUT_LIMIT),
+            Some(outputs.policy().get().inline_bytes),
         )
         .await
     {
@@ -5063,17 +5024,17 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
 ) -> Result<(u32, std::process::Output), TerminalError> {
     let (sandbox, additions) = local_sandbox(&context).await?;
     let sandbox = match context.mode {
-        TerminalMode::Sandboxed => sandbox,
-        TerminalMode::Unsafe => sandbox.unconfined(),
+        SandboxMode::Sandboxed => sandbox,
+        SandboxMode::Unsandboxed => sandbox.unconfined(),
     };
     // The sandboxed IPC router offers the built-in commands and every
     // command of the mode; the unsafe one the `ipc` gateway.
     let ipc = match context.mode {
-        TerminalMode::Sandboxed => create_ipc_router(context.registry),
-        TerminalMode::Unsafe => create_ipc_gateway_router(context.registry),
+        SandboxMode::Sandboxed => create_ipc_router(context.registry),
+        SandboxMode::Unsandboxed => create_ipc_gateway_router(context.registry),
     };
 
-    let launch_script = launch_script(context.language, context.script, context.task_id)?;
+    let launch_script = launch_script(context.interpreter, context.script, context.task_id)?;
     let launch = build_terminal_launch(
         &context.prepared_tools.shell()?,
         &launch_script,
@@ -5120,7 +5081,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             context.task_id,
             context.execution_id,
             context.script,
-            context.language,
+            context.interpreter,
             context.mode,
             None,
             Some(tree.clone()),
@@ -5574,7 +5535,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             context.task_id,
             context.execution_id,
             context.script,
-            context.language,
+            context.interpreter,
             context.mode,
         )
         .await;
@@ -5583,7 +5544,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         context.container_runtime,
         context.prepared_tools,
         context.carry,
-        &launch_script(context.language, context.script, context.task_id)?,
+        &launch_script(context.interpreter, context.script, context.task_id)?,
     )?;
     let script = inject_env_exports(script, context.env_source.as_ref())?;
     // Exported ahead of the embedder's variables, which win as they do for
@@ -5743,7 +5704,7 @@ async fn execute_ssh_background(
     let remote_cmd = crate::spawn::remote_command(
         &context.prepared_tools.remote_launch()?,
         context.heel,
-        &launch_script(context.language, context.script, context.task_id)?,
+        &launch_script(context.interpreter, context.script, context.task_id)?,
     )
     .map_err(ToolRuntimeError::from)?;
 
@@ -5771,7 +5732,7 @@ async fn execute_ssh_background(
             context.task_id,
             context.execution_id,
             context.script,
-            context.language,
+            context.interpreter,
             context.mode,
         )
         .await;
@@ -6711,7 +6672,11 @@ mod tests {
     /// An output store in `dir`, which exists, leasing from the default
     /// allocator.
     fn test_outputs(dir: impl Into<PathBuf>) -> OutputStore {
-        OutputStore::at(dir.into(), AnyIdAllocator::default())
+        OutputStore::at(
+            dir.into(),
+            AnyIdAllocator::default(),
+            crate::output_policy::fixture::policy(),
+        )
     }
 
     /// A stdin whose drop reports that the writer thread holding it ended.
@@ -6738,7 +6703,8 @@ mod tests {
     #[tokio::test]
     async fn finished_job_ends_its_stdin_writer_thread() {
         use executor_core::{Executor as _, Task as _};
-        let (registry, service) = crate::job_registry::job_registry_channel();
+        let (registry, service) =
+            crate::job_registry::job_registry_channel(crate::output_policy::fixture::policy());
         executor_core::tokio::TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
@@ -6748,7 +6714,7 @@ mod tests {
                 &crate::test_ids::lease("writer"),
                 "exec-writer",
                 "cat",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -6870,9 +6836,14 @@ mod tests {
     }
 
     async fn fresh_terminal(dir: &Path) -> TerminalTool<executor_core::tokio::TokioGlobal> {
-        TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
+        TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
     }
 
     /// A trusted manifest serving one script, which reports `tool 1.0.0` and
@@ -6955,16 +6926,15 @@ mod tests {
         let terminal = terminal.with_registry(registry);
         let result = terminal
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "report the shell".to_string(),
                     script: "[[ -n $BASH_VERSION ]] && echo \"managed=$AITHER_FIXTURE_BASH bash\""
                         .to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    max_lines: 50,
+                    max_lines: Some(50),
                     raw: true,
                     timeout: 30,
                     background: false,
@@ -7010,16 +6980,15 @@ mod tests {
         let terminal = terminal.with_registry(registry);
         let result = terminal
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "run every baseline command".to_string(),
                     script: "apply_patch --version && rg --version && ast-grep --version && jq --version"
                         .to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    max_lines: 50,
+                    max_lines: Some(50),
                     raw: true,
                     timeout: 30,
                     background: false,
@@ -7362,13 +7331,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_defaults() {
-        let args: TerminalArgs = serde_json::from_str(
+        let args: ShellArgs = serde_json::from_str(
             r#"{"description":"print a greeting","script":"echo hello","timeout":30}"#,
         )
         .unwrap();
-        assert_eq!(args.expect, OutputFormat::Text);
         assert_eq!(args.resolution, MediaResolution::Auto);
-        assert_eq!(args.mode, TerminalExecutionMode::Default);
+        assert_eq!(args.sandbox, SandboxMode::Sandboxed);
         assert!(!args.background);
     }
 
@@ -7440,7 +7408,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_parsing() {
-        let args: TerminalArgs = serde_json::from_str(
+        let args: ShellArgs = serde_json::from_str(
             r#"{"description":"sleep in background","script":"sleep 5","timeout":30,"background":true}"#,
         )
         .unwrap();
@@ -7448,21 +7416,21 @@ mod tests {
         assert_eq!(args.script, "sleep 5");
         assert!(args.background);
 
-        let missing_timeout = serde_json::from_str::<TerminalArgs>(
+        let missing_timeout = serde_json::from_str::<ShellArgs>(
             r#"{"description":"sleep in background","script":"sleep 5"}"#,
         )
         .unwrap_err();
         assert!(missing_timeout.to_string().contains("timeout"));
 
         let missing_description =
-            serde_json::from_str::<TerminalArgs>(r#"{"script":"echo hello","timeout":1}"#)
+            serde_json::from_str::<ShellArgs>(r#"{"script":"echo hello","timeout":1}"#)
                 .unwrap_err();
         assert!(missing_description.to_string().contains("description"));
     }
 
     #[test]
     fn terminal_args_schema_lists_required_fields() {
-        let schema = serde_json::to_value(schemars::schema_for!(TerminalArgs)).unwrap();
+        let schema = serde_json::to_value(schemars::schema_for!(ShellArgs)).unwrap();
         let properties = schema["properties"].as_object().expect("object schema");
         for field in [
             "description",
@@ -7653,9 +7621,14 @@ mod tests {
         TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize");
+        let tool = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize");
         let tool = match approver {
             Some(approver) => tool.with_approver(approver),
             None => tool,
@@ -7676,9 +7649,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn unsandboxed_args(script: &str) -> TerminalArgs {
-        TerminalArgs {
-            mode: TerminalExecutionMode::Unsafe,
+    fn unsandboxed_args(script: &str) -> ShellArgs {
+        ShellArgs {
+            sandbox: SandboxMode::Unsandboxed,
             ..terminal_args("run outside the sandbox", script)
         }
     }
@@ -7768,7 +7741,7 @@ mod tests {
         );
         assert_eq!((calls.asked().len(), terminals.asked().len()), (1, 0));
 
-        tool.run_background(TerminalArgs {
+        tool.run_background(ShellArgs {
             background: true,
             ..unsandboxed_args("true")
         })
@@ -7786,20 +7759,17 @@ mod tests {
     }
 
     #[test]
-    fn mode_is_default_or_unsafe_and_location_replaces_the_ssh_arguments() {
+    fn sandbox_is_sandboxed_or_unsandboxed_and_location_replaces_the_ssh_arguments() {
         for (text, mode) in [
-            ("\"default\"", TerminalExecutionMode::Default),
-            ("\"unsafe\"", TerminalExecutionMode::Unsafe),
+            ("\"sandboxed\"", SandboxMode::Sandboxed),
+            ("\"unsandboxed\"", SandboxMode::Unsandboxed),
         ] {
-            assert_eq!(
-                serde_json::from_str::<TerminalExecutionMode>(text).unwrap(),
-                mode
-            );
+            assert_eq!(serde_json::from_str::<SandboxMode>(text).unwrap(), mode);
         }
-        for removed in ["\"sandboxed\"", "\"ssh\""] {
-            assert!(serde_json::from_str::<TerminalExecutionMode>(removed).is_err());
+        for removed in ["\"default\"", "\"unsafe\"", "\"ssh\""] {
+            assert!(serde_json::from_str::<SandboxMode>(removed).is_err());
         }
-        let args: TerminalArgs = serde_json::from_value(serde_json::json!({
+        let args: ShellArgs = serde_json::from_value(serde_json::json!({
             "description": "list the build host",
             "script": "ls",
             "timeout": 30,
@@ -7807,8 +7777,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(args.location.as_deref(), Some("build"));
-        assert_eq!(args.mode, TerminalExecutionMode::Default);
-        let schema = serde_json::to_value(schemars::schema_for!(TerminalArgs)).unwrap();
+        assert_eq!(args.sandbox, SandboxMode::Sandboxed);
+        let schema = serde_json::to_value(schemars::schema_for!(ShellArgs)).unwrap();
         assert!(schema["properties"].get("ssh_server_id").is_none());
         assert!(schema["properties"].get("location").is_some());
     }
@@ -7816,9 +7786,14 @@ mod tests {
     #[tokio::test]
     async fn uninitialized_terminal_rejects_execution_and_catalog() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-            .await
-            .unwrap();
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             tool.prepared_tools_context(),
             Err(ToolRuntimeError::NotInitialized(_))
@@ -7826,7 +7801,7 @@ mod tests {
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         assert!(matches!(
-            tool.resolve_home_target(TerminalMode::Sandboxed),
+            tool.resolve_home_target(SandboxMode::Sandboxed),
             Err(TerminalError::Tools(ToolRuntimeError::NotInitialized(_)))
         ));
     }
@@ -7835,20 +7810,24 @@ mod tests {
     async fn child_terminal_exposes_controls_with_isolated_jobs() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         tool.job_registry()
             .register(
                 424_242,
                 &crate::test_ids::lease("parent"),
                 "parent-execution",
                 "sleep 30",
-                TerminalMode::Sandboxed,
+                SandboxMode::Sandboxed,
                 None,
             )
             .await;
@@ -7943,13 +7922,17 @@ mod tests {
     async fn a_main_exclusive_command_names_its_choices_and_does_not_exist_for_a_subagent() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.main_exclusive(|main| {
             main.configure_terminal_bound_usage_tool("pick", |binding| PickTool {
@@ -8008,16 +7991,15 @@ mod tests {
 
     /// Background terminal arguments for `script`.
     #[cfg(unix)]
-    fn background_args(description: &str, script: &str) -> TerminalArgs {
-        TerminalArgs {
+    fn background_args(description: &str, script: &str) -> ShellArgs {
+        ShellArgs {
             description: description.to_string(),
             script: script.to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            max_lines: 50,
+            max_lines: Some(50),
             raw: false,
             timeout: 30,
             background: true,
@@ -8037,17 +8019,21 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let parent = tool.with_registry(registry);
         let child = parent
@@ -8067,18 +8053,22 @@ mod tests {
         let ids = crate::test_ids::RecordingIds::default();
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .with_id_allocator(ids.allocator())
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .with_id_allocator(ids.allocator())
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let terminal = tool.with_registry(registry);
 
@@ -8142,17 +8132,22 @@ mod tests {
         TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .with_id_allocator(ids)
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .with_id_allocator(ids)
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
@@ -8168,7 +8163,7 @@ mod tests {
         for run in 0..4 {
             let result = terminal
                 .call(
-                    TerminalArgs {
+                    ShellArgs {
                         background: false,
                         ..background_args("finish at once", "exit 0")
                     },
@@ -8420,13 +8415,17 @@ mod tests {
     async fn sandboxed_terminal_executes_pwd() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
@@ -8443,8 +8442,8 @@ mod tests {
             carry: None,
             carried_dir: None,
             script: "/bin/pwd".to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tool.shell_sessions.local_tools().unwrap().clone()),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
@@ -8485,13 +8484,17 @@ mod tests {
         let readable = tempfile::tempdir().unwrap();
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tools = shell_sessions.local_tools().unwrap().clone();
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let working_dir = tool.working_dir().clone();
         let writable_paths = vec![writable.path().to_path_buf()];
         let readable_paths = vec![readable.path().to_path_buf()];
@@ -8545,8 +8548,8 @@ mod tests {
             carry: None,
             carried_dir: None,
             script,
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
@@ -8645,13 +8648,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tools = shell_sessions.local_tools().unwrap().clone();
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
@@ -8667,8 +8674,8 @@ mod tests {
             carry: None,
             carried_dir: None,
             script,
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local(tools),
             stdin_alerts: None,
             lifetime: JobLifetime::Foreground {
@@ -9079,31 +9086,34 @@ mod tests {
     async fn failed_command_reports_nonzero_exit_code() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
 
         let result = tool
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "exit with non-zero status".to_string(),
                     script: "exit 42".to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    max_lines: 50,
+                    max_lines: Some(50),
                     raw: false,
                     timeout: 30,
                     background: false,
@@ -9139,31 +9149,34 @@ mod tests {
     async fn a_detached_job_reads_pending_until_its_completion_is_taken() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let receiver = tool.background_receiver();
         let jobs = tool.job_registry();
 
-        tool.run_background(TerminalArgs {
+        tool.run_background(ShellArgs {
             description: "finish at once".to_string(),
             script: "exit 3".to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            max_lines: 50,
+            max_lines: Some(50),
             raw: false,
             timeout: 30,
             background: true,
@@ -9206,32 +9219,35 @@ mod tests {
     async fn background_terminal_accepts_terminal_input() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let background_receiver = tool.background_receiver();
         let input_tool = InputTerminalTool::new(tool.job_registry());
 
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "wait for terminal input and echo it back".to_string(),
                 script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
-                max_lines: 50,
+                max_lines: Some(50),
                 raw: false,
                 timeout: 30,
                 background: true,
@@ -9275,31 +9291,34 @@ mod tests {
     async fn killing_background_terminal_kills_descendant_processes() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let child_pid_path = dir.path().join("child.pid");
 
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "start a descendant process".to_string(),
                 script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
-                max_lines: 50,
+                max_lines: Some(50),
                 raw: false,
                 timeout: 30,
                 background: true,
@@ -9382,16 +9401,15 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn terminal_args(description: &str, script: &str) -> TerminalArgs {
-        TerminalArgs {
+    fn terminal_args(description: &str, script: &str) -> ShellArgs {
+        ShellArgs {
             description: description.to_string(),
             script: script.to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            max_lines: 50,
+            max_lines: Some(50),
             raw: false,
             timeout: 30,
             background: false,
@@ -9405,7 +9423,7 @@ mod tests {
         script: &str,
     ) -> String {
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 background: true,
                 ..terminal_args("background job", script)
             })
@@ -9419,9 +9437,9 @@ mod tests {
 
     /// Python terminal arguments for `code`.
     #[cfg(unix)]
-    fn python_args(code: &str) -> TerminalArgs {
-        TerminalArgs {
-            language: ScriptLanguage::Python,
+    fn python_args(code: &str) -> ShellArgs {
+        ShellArgs {
+            interpreter: Interpreter::Python,
             ..terminal_args("run python", code)
         }
     }
@@ -9496,7 +9514,7 @@ mod tests {
             .iter()
             .find(|job| job.task_id == task_id)
             .expect("the job is recorded");
-        assert_eq!(job.language, ScriptLanguage::Python);
+        assert_eq!(job.interpreter, Interpreter::Python);
         assert!(job.script.contains("time.sleep(60)"), "{}", job.script);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -9527,8 +9545,8 @@ mod tests {
         let code = "import os\nprint(os.getcwd())";
         let refused = tool
             .call(
-                TerminalArgs {
-                    mode: TerminalExecutionMode::Unsafe,
+                ShellArgs {
+                    sandbox: SandboxMode::Unsandboxed,
                     ..python_args(code)
                 },
                 ToolContext::new(),
@@ -9543,13 +9561,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn omitting_language_runs_shell() {
-        let args: TerminalArgs = serde_json::from_value(serde_json::json!({
+        let args: ShellArgs = serde_json::from_value(serde_json::json!({
             "description": "print",
             "script": "echo $((6 * 7))",
             "timeout": 30,
         }))
         .expect("language is optional");
-        assert_eq!(args.language, ScriptLanguage::Shell);
+        assert_eq!(args.interpreter, Interpreter::Shell);
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = configured_test_terminal(
@@ -9632,7 +9650,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let registry = Arc::new(ToolRegistryBuilder::new().build(test_outputs(dir.path())));
-        let (job_registry, job_registry_service) = job_registry_channel();
+        let (job_registry, job_registry_service) =
+            job_registry_channel(crate::output_policy::fixture::policy());
         tokio::spawn(async move { job_registry_service.serve().await });
         let container_tools =
             crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
@@ -9654,8 +9673,8 @@ mod tests {
             task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
             script: "cat",
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             prepared_tools: &container_tools,
             ipc_commands: &[],
@@ -9779,7 +9798,8 @@ mod tests {
                 .expect("broker should start");
         tokio::spawn(async move { service.serve().await });
         let registry = Arc::new(ToolRegistryBuilder::new().build(test_outputs(dir.path())));
-        let (job_registry, job_registry_service) = job_registry_channel();
+        let (job_registry, job_registry_service) =
+            job_registry_channel(crate::output_policy::fixture::policy());
         tokio::spawn(async move { job_registry_service.serve().await });
         let container_tools =
             crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
@@ -9815,8 +9835,8 @@ mod tests {
             task_id: &crate::test_ids::lease("probe"),
             execution_id: "exec-test",
             script: "make",
-            language: ScriptLanguage::Shell,
-            mode: TerminalMode::Sandboxed,
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             prepared_tools: &container_tools,
             ipc_commands: &[],
@@ -9972,15 +9992,20 @@ mod tests {
         TerminalTool<executor_core::tokio::TokioGlobal, Unconfigured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_foreground_wait(foreground_wait)
-            .with_timeout_cap(timeout_cap)
-            .with_long_job_alert_after(alert_after);
+        let tool = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_foreground_wait(foreground_wait)
+        .with_timeout_cap(timeout_cap)
+        .with_long_job_alert_after(alert_after);
         (cache, tool)
     }
 
@@ -10004,15 +10029,14 @@ mod tests {
 
         let result = tool
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "start a descendant process".to_string(),
                     script: "sleep 30 & echo $! > child.pid; wait".to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    max_lines: 50,
+                    max_lines: Some(50),
                     raw: false,
                     timeout: 3,
                     background: false,
@@ -10080,15 +10104,14 @@ mod tests {
         let run = || async {
             let result = tool
                 .call(
-                    TerminalArgs {
+                    ShellArgs {
                         description: "outlast the normal window".to_string(),
                         script: "sleep 2 & wait; echo finished".to_string(),
-                        language: ScriptLanguage::Shell,
-                        mode: TerminalExecutionMode::Default,
+                        interpreter: Interpreter::Shell,
+                        sandbox: SandboxMode::Sandboxed,
                         location: None,
-                        expect: OutputFormat::Text,
                         resolution: MediaResolution::Auto,
-                        max_lines: 50,
+                        max_lines: Some(50),
                         raw: false,
                         timeout: 30,
                         background: false,
@@ -10358,7 +10381,7 @@ mod tests {
         timeout: u64,
     ) -> (String, i32) {
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 background: true,
                 timeout,
                 ..terminal_args("background job", script)
@@ -10565,15 +10588,14 @@ mod tests {
         )
         .await;
         let background_receiver = tool.background_receiver();
-        let args = |timeout: u64| TerminalArgs {
+        let args = |timeout: u64| ShellArgs {
             description: "sleep in the background".to_string(),
             script: "sleep 30".to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            max_lines: 50,
+            max_lines: Some(50),
             raw: false,
             timeout,
             background: true,
@@ -10626,8 +10648,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn spinning_args(timeout: u64, background: bool) -> TerminalArgs {
-        TerminalArgs {
+    fn spinning_args(timeout: u64, background: bool) -> ShellArgs {
+        ShellArgs {
             description: "spin past the timeout".to_string(),
             script: if background {
                 "while :; do sleep 0.1; done"
@@ -10637,12 +10659,11 @@ mod tests {
                 "nice -n 19 sh -c 'while :; do :; done'"
             }
             .to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            max_lines: 50,
+            max_lines: Some(50),
             raw: false,
             timeout,
             background,
@@ -10763,15 +10784,14 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let _result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "sleep in the background".to_string(),
                 script: "sleep 30".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
-                max_lines: 50,
+                max_lines: Some(50),
                 raw: false,
                 timeout: 30,
                 background: true,
@@ -10820,14 +10840,18 @@ mod tests {
         TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_process_priority(priority);
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_process_priority(priority);
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
@@ -10837,20 +10861,19 @@ mod tests {
     /// so it reports its own `$$` into `pid` and waits for the host's `go`
     /// marker instead of running `nice`.
     #[cfg(unix)]
-    fn pid_probe_args() -> TerminalArgs {
-        TerminalArgs {
+    fn pid_probe_args() -> ShellArgs {
+        ShellArgs {
             description: "report the process pid and wait".to_string(),
             script: concat!(
                 "printf '%s\\n' $$ > \"$PWD/pid\"; ",
                 "while [ ! -f \"$PWD/go\" ]; do :; done"
             )
             .to_string(),
-            language: ScriptLanguage::Shell,
-            mode: TerminalExecutionMode::Default,
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
             location: None,
-            expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
-            max_lines: 50,
+            max_lines: Some(50),
             raw: false,
             timeout: 30,
             background: false,
@@ -10920,15 +10943,14 @@ mod tests {
         // `exec` keeps `$$` — the pid the probe wrote — on the interactive
         // shell the session then drives.
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description: "start a persistent shell".to_string(),
                 script: "printf '%s\\n' $$ > \"$PWD/pid\"; exec sh".to_string(),
-                language: ScriptLanguage::Shell,
-                mode: TerminalExecutionMode::Default,
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
-                max_lines: 50,
+                max_lines: Some(50),
                 raw: false,
                 timeout: 30,
                 background: true,
@@ -10977,7 +10999,7 @@ mod tests {
         let background_receiver = tool.background_receiver();
 
         let result = tool
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 background: true,
                 ..pid_probe_args()
             })
@@ -11462,13 +11484,17 @@ mod tests {
         let (container, bundle, _tools_cache) = start_acceptance_container().await;
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let shell_sessions = acceptance_shell_sessions(&container, &bundle, dir.path()).await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(
             ToolRegistryBuilder::new().build(test_outputs(dir.path())),
         ));
@@ -11517,17 +11543,21 @@ mod tests {
         let shell_sessions = acceptance_shell_sessions(&container, &bundle, Path::new("/")).await;
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_process_priority(ProcessPriority::new(
-                    CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
-                    IoPriority::Normal,
-                ));
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_process_priority(ProcessPriority::new(
+            CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
+            IoPriority::Normal,
+        ));
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(ProbeEchoTool);
         let registry = Arc::new(builder.build(tool.output_store().clone()));
@@ -11535,7 +11565,7 @@ mod tests {
 
         let result = tool
             .call(
-                TerminalArgs {
+                ShellArgs {
                     description: "probe container priority and IPC transport".to_string(),
                     script: concat!(
                         "printf 'nice=%s\\n' \"$(nice)\"; ",
@@ -11544,12 +11574,11 @@ mod tests {
                         "printf 'probe_exit=%s\\n' \"$?\""
                     )
                     .to_string(),
-                    language: ScriptLanguage::Shell,
-                    mode: TerminalExecutionMode::Default,
+                    interpreter: Interpreter::Shell,
+                    sandbox: SandboxMode::Sandboxed,
                     location: None,
-                    expect: OutputFormat::Text,
                     resolution: MediaResolution::Auto,
-                    max_lines: 50,
+                    max_lines: Some(50),
                     raw: false,
                     timeout: 30,
                     background: false,
@@ -12988,7 +13017,7 @@ mod tests {
     async fn the_import_budget_is_a_setting_adjustable_while_subagents_run() {
         let setup = CommitSetup::new("budget").await;
         let budget = setup.parent.subagent_import_budget();
-        assert_eq!(budget.get(), DEFAULT_SUBAGENT_IMPORT_LIMIT);
+        assert_eq!(budget.get(), 1024 * 1024 * 1024);
         let child = setup.committing_child(&setup.parent).await;
         let ledger = child.commit_ledger().unwrap();
         let mark = ledger.mark().await.unwrap();
@@ -13270,12 +13299,17 @@ mod tests {
         let sibling = dir.path().join("sibling");
         std::fs::create_dir_all(&granted).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
-        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_terminal_bound_tool("launch_probe", |binding: &TerminalBinding| {
             LaunchProbe {
@@ -13361,13 +13395,18 @@ mod tests {
     async fn sandboxed_only_command_leaves_unsafe_scripts_the_host_program() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .with_approver(ApproveAll)
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .with_approver(ApproveAll)
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.sandboxed_only(|sandboxed| sandboxed.configure_tool(SandboxedUname));
         let tool = tool.with_registry(Arc::new(
@@ -13389,8 +13428,8 @@ mod tests {
 
         let unsafe_run = tool
             .call(
-                TerminalArgs {
-                    mode: TerminalExecutionMode::Unsafe,
+                ShellArgs {
+                    sandbox: SandboxMode::Unsandboxed,
                     ..terminal_args("host uname", "uname -s; ipc uname")
                 },
                 ToolContext::new(),
@@ -13419,13 +13458,18 @@ mod tests {
         dir: &Path,
         shell_sessions: ShellSessionRegistry,
     ) -> TerminalTool<executor_core::tokio::TokioGlobal, Configured> {
-        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .with_approver(ApproveAll)
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .with_approver(ApproveAll)
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         tool.with_registry(Arc::new(
             ToolRegistryBuilder::new().build(test_outputs(dir.join("outputs"))),
         ))
@@ -13439,8 +13483,8 @@ mod tests {
     ) -> String {
         let result = tool
             .call(
-                TerminalArgs {
-                    mode: TerminalExecutionMode::Unsafe,
+                ShellArgs {
+                    sandbox: SandboxMode::Unsandboxed,
                     ..terminal_args("unsafe probe", script)
                 },
                 ToolContext::new(),
@@ -13550,12 +13594,17 @@ mod tests {
     async fn a_subagent_of_a_subagent_gets_the_subagent_registry() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.main_only(|reserved| reserved.configure_tool(ProbeEchoTool));
         let parent = tool.with_registry(Arc::new(
@@ -13678,13 +13727,18 @@ mod tests {
         let clone = tempfile::tempdir().expect("clone dir should be created");
         let read_only = tempfile::tempdir().expect("read-only dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_readable_paths([read_only.path()]);
+        let tool = TerminalTool::new_exact(
+            dir.path(),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_readable_paths([read_only.path()]);
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_terminal_bound_tool("check_probe", |binding: &TerminalBinding| {
             CheckProbe {
@@ -13720,7 +13774,7 @@ mod tests {
         let unsafe_run = runner
             .run(
                 TerminalScript::new("true", &clone_dir, Duration::from_secs(30))
-                    .with_mode(TerminalMode::Unsafe),
+                    .with_mode(SandboxMode::Unsandboxed),
             )
             .await;
         assert!(
@@ -13818,12 +13872,17 @@ mod tests {
         ConfiguredTestTool,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(probe);
         builder.observe_commands(crate::AnyCommandObserver::new(IdentityObserver(observer)));
@@ -14050,12 +14109,17 @@ mod tests {
         })
         .with_container_runtime(runtime)
         .with_test_container_tools(container_tools, "aither-test-confinement".to_string());
-        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(
             ToolRegistryBuilder::new().build(test_outputs(dir)),
         ));
@@ -14254,17 +14318,21 @@ mod tests {
         TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
-                .await
-                .expect("terminal tool should initialize")
-                .adopt_prepared_tools(shell_sessions)
-                .await
-                .expect("prepared tools should be adopted")
-                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                    local: true,
-                    container: false,
-                });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> = TerminalTool::new_exact(
+            dir,
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+        )
+        .await
+        .expect("terminal tool should initialize")
+        .adopt_prepared_tools(shell_sessions)
+        .await
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
         let mut registry = ToolRegistryBuilder::new();
         configure(&mut registry);
         let registry = Arc::new(registry.build(tool.output_store().clone()));
@@ -14692,9 +14760,9 @@ mod tests {
         MonitorArgs {
             source: MonitorSource::Command {
                 command: command.to_string(),
-                language: ScriptLanguage::Shell,
+                interpreter: Interpreter::Shell,
             },
-            interval_secs: 1,
+            interval_secs: Some(1),
             filter: None,
             stop_on: None,
             kill_on_stop: false,
@@ -14714,7 +14782,7 @@ mod tests {
             Duration::from_secs(600),
         )
         .await;
-        let monitor = MonitorTool::new(tool.clone());
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
         monitor
             .call(
                 monitor_command("echo a; sleep 2; echo b", 30),
@@ -14760,7 +14828,7 @@ mod tests {
             Duration::from_secs(600),
         )
         .await;
-        let monitor = MonitorTool::new(tool.clone());
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
         let mut args = monitor_command(
             "printf 'keep one\\ndrop\\nkeep two\\nlast\\n'; sleep 60",
             30,
@@ -14811,7 +14879,7 @@ mod tests {
             Duration::from_secs(600),
         )
         .await;
-        let monitor = MonitorTool::new(tool.clone());
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
         let refused = monitor
             .call(monitor_command("sleep 60", 7201), ToolContext::new())
             .await;
@@ -14842,7 +14910,7 @@ mod tests {
             Duration::from_secs(600),
         )
         .await;
-        let monitor = MonitorTool::new(tool.clone());
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
         let mut args = monitor_command("sleep 4; echo done", 30);
         args.stall_secs = Some(1);
         monitor
@@ -14869,7 +14937,7 @@ mod tests {
             Duration::from_secs(600),
         )
         .await;
-        let monitor = MonitorTool::new(tool.clone());
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
         let unreadable = monitor
             .call(
                 MonitorArgs {
