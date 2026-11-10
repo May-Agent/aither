@@ -237,6 +237,7 @@ impl Sandbox {
         let heel = self.heel_binary()?.clone();
         let SpawnSpec {
             program,
+            script,
             args,
             env,
             cwd,
@@ -244,6 +245,12 @@ impl Sandbox {
             extra_grants,
             ipc,
         } = spec;
+        if script.is_some() {
+            return Err(SpawnError::Setup(
+                "a process on the host is a program: only a container or a server has a managed shell to run a script in"
+                    .into(),
+            ));
+        }
         let marker = JobMarker::new();
         let mut env = self.host_environment(env);
         env.push(marker.entry());

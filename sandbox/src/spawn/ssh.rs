@@ -133,6 +133,7 @@ impl Sandbox {
         let setup = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let SpawnSpec {
             program,
+            script,
             args,
             env,
             cwd,
@@ -161,7 +162,8 @@ impl Sandbox {
 
         // Only what the spec names travels: the sandbox's own environment and
         // its source describe this machine.
-        let script = shell_words::join(std::iter::once(&program).chain(&args));
+        let script =
+            script.unwrap_or_else(|| shell_words::join(std::iter::once(&program).chain(&args)));
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
         let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| setup(&e))?;
         let remote = remote_command(launch, heel, &script).map_err(|e| setup(&e))?;

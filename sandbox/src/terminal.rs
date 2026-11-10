@@ -25,7 +25,6 @@ use std::{
     io::Read,
     net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -3674,7 +3673,9 @@ struct ContainerBackgroundExecution<'a, E> {
     job_fifo: Option<crate::container_jobserver::ContainerJobFifo>,
 }
 
-struct SshBackgroundExecution<'a> {
+struct SshBackgroundExecution<'a, E> {
+    executor: E,
+    working_dir: &'a Path,
     prepared_tools: &'a PreparedTools<PathBuf>,
     task_id: &'a IdLease,
     execution_id: &'a str,
@@ -4158,6 +4159,8 @@ where
             // The pool bounds the jobs of this machine; the server is another
             // machine, so its commands take no token and get no fifo.
             return execute_ssh_background(SshBackgroundExecution {
+                executor: request.executor,
+                working_dir: request.working_dir,
                 prepared_tools: tools,
                 task_id: request.task_id,
                 execution_id: request.execution_id,
@@ -5274,30 +5277,62 @@ async fn record_container_exec_outcome(
     }
 }
 
-async fn execute_ssh_background(
-    context: SshBackgroundExecution<'_>,
+/// Moves the chunks of a spawned process's stream to `tx` until the stream
+/// ends, then says it closed.
+async fn forward_stream(
+    stream: async_channel::Receiver<Vec<u8>>,
+    tx: async_channel::Sender<TerminalChunk>,
+    is_stderr: bool,
+) {
+    while let Ok(bytes) = stream.recv().await {
+        let chunk = if is_stderr {
+            TerminalChunk::Stderr(bytes)
+        } else {
+            TerminalChunk::Stdout(bytes)
+        };
+        if tx.send(chunk).await.is_err() {
+            return;
+        }
+    }
+    let _ = tx
+        .send(if is_stderr {
+            TerminalChunk::StderrClosed
+        } else {
+            TerminalChunk::StdoutClosed
+        })
+        .await;
+}
+
+/// Runs a command on an SSH server through a [`Sandbox`] on the server's
+/// backend: a default-mode command runs the managed shell under the server's
+/// `heel`, an `unsafe` one runs it directly.
+async fn execute_ssh_background<E: Executor + Clone + 'static>(
+    context: SshBackgroundExecution<'_, E>,
 ) -> Result<(u32, std::process::Output), TerminalError> {
-    // A default-mode command runs the managed shell under the server's
-    // `heel`; an `unsafe` one runs it directly.
-    let remote_cmd = crate::spawn::remote_command(
-        &context.prepared_tools.remote_launch()?,
-        context.heel,
-        &launch_script(context.interpreter, context.script, context.task_id)?,
+    let launch = context.prepared_tools.remote_launch()?;
+    let sandbox = Sandbox::new(
+        crate::Backend::Ssh {
+            server: context.server.clone(),
+            heel: context.heel.map(str::to_owned),
+            launch,
+        },
+        context.executor.clone(),
+        context.working_dir,
     )
-    .map_err(ToolRuntimeError::from)?;
-
-    let mut command = context.client.command(context.server, &remote_cmd);
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-
-    // The pipes are set on the async command: converting a std command
-    // resets them, and spawning would then inherit this process's stdio.
-    let child = async_process::Command::from(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| TerminalError::Execution(e.to_string()))?;
+    .with_ssh_client(context.client.clone());
+    let sandbox = match context.mode {
+        SandboxMode::Sandboxed => sandbox,
+        SandboxMode::Unsandboxed => sandbox.unconfined(),
+    };
+    let script = launch_script(context.interpreter, context.script, context.task_id)?;
+    let mut child = sandbox.spawn(SpawnSpec::script(script)).await?;
+    let stdout = child
+        .take_stdout()
+        .ok_or_else(|| TerminalError::Execution("missing stdout pipe for ssh process".into()))?;
+    let stderr = child
+        .take_stderr()
+        .ok_or_else(|| TerminalError::Execution("missing stderr pipe for ssh process".into()))?;
+    let child = Arc::new(child);
 
     let pid = child.id();
     // The local `ssh` process stands for a job that runs on the remote host,
@@ -5314,33 +5349,66 @@ async fn execute_ssh_background(
             context.mode,
         )
         .await;
+    // A kill of the job ends the command on the server as well as the local
+    // client.
+    let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
+    context.job_registry.attach_kill_switch(pid, kill_tx).await;
+    let killed = Arc::clone(&child);
+    context
+        .executor
+        .spawn(async move {
+            if kill_rx.recv().await.is_ok()
+                && let Err(error) = killed.kill().await
+            {
+                warn!(%error, "ending the job on the server failed");
+            }
+        })
+        .detach();
     context.background_startup.report_ready().await;
 
-    match child.output().await {
-        Ok(output) => {
-            if !output.stdout.is_empty() {
-                context
-                    .job_registry
-                    .append_stdout(pid, output.stdout.clone())
-                    .await;
-            }
-            if !output.stderr.is_empty() {
-                context
-                    .job_registry
-                    .append_stderr(pid, output.stderr.clone())
-                    .await;
-            }
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
-            Ok((pid, output))
-        }
-        Err(err) => {
-            context.job_registry.fail(pid, &err.to_string(), None).await;
-            context.job_registry.close_stdout(pid).await;
-            context.job_registry.close_stderr(pid).await;
-            Err(TerminalError::Execution(err.to_string()))
-        }
+    let (chunk_tx, chunk_rx) = async_channel::unbounded();
+    for (stream, is_stderr) in [(stdout, false), (stderr, true)] {
+        context
+            .executor
+            .spawn(forward_stream(stream, chunk_tx.clone(), is_stderr))
+            .detach();
     }
+    drop(chunk_tx);
+    context
+        .executor
+        .spawn(drain_terminal_chunks(
+            context.job_registry.clone(),
+            pid,
+            chunk_rx,
+        ))
+        .detach();
+
+    let status = match child.wait().await {
+        crate::ChildExit::Exited(status) => status,
+        crate::ChildExit::Killed => unreachable!("an SSH process is ended by its own signal"),
+        crate::ChildExit::Failed(error) => {
+            context.job_registry.close_stdout(pid).await;
+            context.job_registry.close_stderr(pid).await;
+            context.job_registry.fail(pid, &error, None).await;
+            return Err(TerminalError::Execution(error));
+        }
+    };
+    wait_for_terminal_stream_close(context.job_registry, pid).await;
+    let (stdout, stderr) = context
+        .job_registry
+        .terminal_output(pid)
+        .await
+        .ok_or_else(|| {
+            TerminalError::Execution(format!("missing terminal output for pid {pid}"))
+        })?;
+    Ok((
+        pid,
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+    ))
 }
 
 /// Prepends a source's env pairs to `script` as `export` statements, for

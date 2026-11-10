@@ -69,6 +69,7 @@ impl Sandbox {
         let setup = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let SpawnSpec {
             program,
+            script,
             args,
             env,
             cwd,
@@ -86,7 +87,8 @@ impl Sandbox {
 
         // The exec channel accepts only a script, so the environment travels
         // as exports ahead of it; the spec's lead the source's.
-        let script = shell_words::join(std::iter::once(&program).chain(&args));
+        let script =
+            script.unwrap_or_else(|| shell_words::join(std::iter::once(&program).chain(&args)));
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
         let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| setup(&e))?;
         let script =

@@ -48,7 +48,6 @@ pub use grants::{GitDirAccess, GrantSnapshot, Grants};
 pub use host::{LocalSpawn, TreeLifetime, resolved};
 pub use launch::{ContainerLaunch, RemoteLaunch, shell_arguments};
 pub use route::{HostRoute, HostRouteError};
-pub use ssh::remote_command;
 
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::process_tree::ProcessScanner;
@@ -101,6 +100,8 @@ impl Default for Stdio {
 /// A process to start under a [`Sandbox`].
 pub struct SpawnSpec {
     pub(crate) program: String,
+    /// A script for the backend's managed shell, in place of a program.
+    pub(crate) script: Option<String>,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) cwd: Option<PathBuf>,
@@ -130,12 +131,28 @@ impl SpawnSpec {
     pub fn new(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
+            script: None,
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
             stdio: Stdio::default(),
             extra_grants: Vec::new(),
             ipc: None,
+        }
+    }
+
+    /// A process running `source` in the managed shell the backend was given
+    /// the programs of, with the default [`Stdio`].
+    ///
+    /// A script is one level of quoting for a server's login shell, which
+    /// parses the command line first; a program that runs the shell would
+    /// need two. Only the container and SSH backends have a managed shell
+    /// to run it in: a spawn on the host names a program.
+    #[must_use]
+    pub fn script(source: impl Into<String>) -> Self {
+        Self {
+            script: Some(source.into()),
+            ..Self::new(String::new())
         }
     }
 
@@ -397,7 +414,6 @@ impl Sandbox {
     }
 
     /// Reaches SSH servers through `client` instead of the default one.
-    #[cfg(test)]
     pub(crate) fn with_ssh_client(self, client: crate::ssh::SshClient) -> Self {
         self.edit(|inner| inner.ssh_client = client)
     }

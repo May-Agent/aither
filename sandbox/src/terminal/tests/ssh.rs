@@ -2,6 +2,8 @@
 //! on a server is asked for, lazy preparation, both modes, the live server
 //! set and the OS probe, against a private `sshd` on loopback.
 
+use std::process::Stdio;
+
 use crate::ssh::SshClient;
 use crate::{SshPlatform, SshProbeError, SshServer};
 
@@ -748,4 +750,51 @@ async fn spawn_on_a_server_streams_output_and_kill_ends_the_remote_tree() {
     })
     .await
     .expect("the remote descendant ends with the client");
+}
+
+/// A script spawned on a server is quoted once for its login shell, which
+/// parses the command line first: a double-quoted script survives a login
+/// shell that does not read single quotes the way POSIX does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_spawned_on_a_server_runs_in_the_managed_shell() {
+    use crate::SpawnSpec;
+
+    let sshd = Sshd::start().await;
+    let (_cache, registry) = prepared_test_registry().await;
+    let tools = registry.local_tools().unwrap().clone();
+    let dir = tempfile::tempdir().unwrap();
+    let heel = sshd.home().join(".local/bin/heel");
+    let sandbox = Sandbox::new(
+        crate::Backend::Ssh {
+            server: Sshd::server(),
+            heel: Some(text(&heel).to_string()),
+            launch: tools.remote_launch().unwrap(),
+        },
+        executor_core::tokio::TokioGlobal,
+        dir.path(),
+    )
+    .with_ssh_client(sshd.client.clone());
+
+    let mut child = sandbox
+        .spawn(SpawnSpec::script("echo \"from-the-script\""))
+        .await
+        .expect("the script starts under the server's heel");
+    let stdout = child.take_stdout().unwrap();
+    let stderr = child.take_stderr().unwrap();
+    let mut printed = Vec::new();
+    while let Ok(chunk) = stdout.recv().await {
+        printed.extend(chunk);
+    }
+    let mut failed = Vec::new();
+    while let Ok(chunk) = stderr.recv().await {
+        failed.extend(chunk);
+    }
+    let exit = child.wait().await;
+    assert_eq!(
+        String::from_utf8_lossy(&printed),
+        "from-the-script\n",
+        "{exit:?}: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert!(exit.success());
 }
