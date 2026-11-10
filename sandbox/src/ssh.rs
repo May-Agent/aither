@@ -1,13 +1,14 @@
 //! SSH servers as execution locations: the server set a registry holds while
-//! it lives, the client every connection goes through, the first-use state of
-//! each server and the OS probe an embedder runs when a server is added.
+//! it lives, the client every connection goes through, the lazily prepared
+//! state of each server and the OS probe an embedder runs when a server is
+//! added.
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use async_lock::{Mutex, OnceCell};
+use async_lock::OnceCell;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -158,50 +159,17 @@ impl PreparedSsh {
     }
 }
 
-/// One server of a registry's set and what its first use settled: whether
-/// commands may run there and the tools prepared there. Removing the server
-/// drops both; adding it again starts over.
+/// One server of a registry's set and the tools prepared there. Removing the
+/// server drops them; adding it again starts over.
 #[derive(Debug)]
 pub struct SshEnvironment {
     server: SshServer,
-    /// Whether a session approval was given. Held while a request is
-    /// asked, so concurrent commands wait for it.
-    approved: Mutex<bool>,
     prepared: OnceCell<PreparedSsh>,
-}
-
-/// How far an approval that let a command run on a server reaches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalReach {
-    /// The command that asked.
-    Once,
-    /// Every command on the server while it stays in the registry.
-    Session,
 }
 
 impl SshEnvironment {
     pub(crate) const fn server(&self) -> &SshServer {
         &self.server
-    }
-
-    /// Settles approval: a session approval is asked once and kept, with
-    /// concurrent commands waiting for the one request; a once-only or a
-    /// refused request leaves the next command to ask again.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the guard is held across the request so concurrent commands wait for it"
-    )]
-    pub(crate) async fn approve<F, Fut, E>(&self, ask: F) -> Result<(), E>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<ApprovalReach, E>>,
-    {
-        let mut approved = self.approved.lock().await;
-        if !*approved {
-            let reach = ask().await?;
-            *approved = reach == ApprovalReach::Session;
-        }
-        Ok(())
     }
 
     /// The server's prepared state, produced by `prepare` the first time.
@@ -219,11 +187,6 @@ impl SshEnvironment {
             self.prepared.set_blocking(prepared).is_ok(),
             "a test server is prepared once"
         );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_approved(&self) -> bool {
-        *self.approved.lock_blocking()
     }
 
     #[cfg(test)]
@@ -262,7 +225,6 @@ impl SshEnvironments {
         }
         let environment = Arc::new(SshEnvironment {
             server,
-            approved: Mutex::new(false),
             prepared: OnceCell::new(),
         });
         let mut duplicate = false;
@@ -348,54 +310,5 @@ mod tests {
         );
         assert_eq!(set.list(), []);
         assert_eq!(set.remove("build"), None);
-    }
-
-    #[tokio::test]
-    async fn a_server_added_again_starts_its_first_use_over() {
-        let set = SshEnvironments::default();
-        set.add(server("build", "builder@build.internal")).unwrap();
-        let first = set.get("build").unwrap();
-        first
-            .approve(|| async { Ok::<_, ()>(ApprovalReach::Session) })
-            .await
-            .unwrap();
-        assert!(first.is_approved());
-        set.remove("build");
-        set.add(server("build", "builder@build.internal")).unwrap();
-        assert!(!set.get("build").unwrap().is_approved());
-    }
-
-    #[tokio::test]
-    async fn a_refused_approval_is_asked_again() {
-        let set = SshEnvironments::default();
-        set.add(server("build", "builder@build.internal")).unwrap();
-        let environment = set.get("build").unwrap();
-        assert_eq!(environment.approve(|| async { Err("no") }).await, Err("no"));
-        assert!(!environment.is_approved());
-        environment
-            .approve(|| async { Ok::<_, &str>(ApprovalReach::Session) })
-            .await
-            .unwrap();
-        // Settled: a later ask is never made.
-        environment
-            .approve(|| async { Err("asked again") })
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_once_only_approval_is_not_kept() {
-        let set = SshEnvironments::default();
-        set.add(server("build", "builder@build.internal")).unwrap();
-        let environment = set.get("build").unwrap();
-        environment
-            .approve(|| async { Ok::<_, &str>(ApprovalReach::Once) })
-            .await
-            .unwrap();
-        assert!(!environment.is_approved());
-        assert_eq!(
-            environment.approve(|| async { Err("asked again") }).await,
-            Err("asked again")
-        );
     }
 }

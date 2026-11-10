@@ -6,7 +6,7 @@
 //! into the natural language the model reads; [`DefaultSandboxNotices`]
 //! renders the sandbox's own wording. An embedder rewords a family by
 //! overriding its one method and keeps the default for the rest. A
-//! [`CommandPolicy`](crate::CommandPolicy) refusal carries its own text and
+//! [`ScriptPolicy`](crate::ScriptPolicy) refusal carries its own text and
 //! has no family here.
 //!
 //! [`ToolRegistryBuilder`]: crate::ToolRegistryBuilder

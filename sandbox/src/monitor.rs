@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use crate::job_registry::{JobRegistry, JobStatus};
 use crate::notices::{MonitorStarted, Refused};
 use crate::output::{MediaResolution, OutputFormat};
-use crate::permission::PermissionHandler;
 use crate::script_language::ScriptLanguage;
 use crate::terminal::{Configured, JobAlert, TerminalArgs, TerminalExecutionMode, TerminalTool};
 
@@ -177,20 +176,20 @@ struct Watch {
 
 /// The native `monitor` tool: starts the watched source as a background job
 /// and a pump that delivers its increments through [`JobAlert`].
-pub struct MonitorTool<P, E> {
-    terminal: TerminalTool<P, E, Configured>,
+pub struct MonitorTool<E> {
+    terminal: TerminalTool<E, Configured>,
 }
 
-impl<P, E> MonitorTool<P, E> {
+impl<E> MonitorTool<E> {
     /// Creates the tool bound to `terminal`, the configured terminal whose
     /// jobs it watches.
     #[must_use]
-    pub const fn new(terminal: TerminalTool<P, E, Configured>) -> Self {
+    pub const fn new(terminal: TerminalTool<E, Configured>) -> Self {
         Self { terminal }
     }
 }
 
-impl<P, E> std::fmt::Debug for MonitorTool<P, E> {
+impl<E> std::fmt::Debug for MonitorTool<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("MonitorTool")
     }
@@ -201,7 +200,7 @@ fn single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
+impl<E: Executor + Clone + 'static> MonitorTool<E> {
     /// The script the monitored job runs for `source` and its language; an
     /// unreadable file is refused before anything spawns.
     fn job_script(
@@ -245,9 +244,8 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
     }
 }
 
-impl<P, E> Tool for MonitorTool<P, E>
+impl<E> Tool for MonitorTool<E>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
@@ -287,7 +285,7 @@ where
     }
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
+impl<E: Executor + Clone + 'static> MonitorTool<E> {
     /// Starts the watched job and its pump; returns the job's task id.
     async fn start(&self, args: MonitorArgs) -> Result<String, MonitorRefusal> {
         if args.timeout_secs == 0 || args.timeout_secs > MAX_TIMEOUT_SECS {

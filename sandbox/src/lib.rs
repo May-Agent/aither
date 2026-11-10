@@ -9,14 +9,14 @@
 //! # Setting Up the Terminal Tool
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{TerminalTool, ToolRegistryBuilder, permission::NoopPermissionHandler};
+//! use aither_sandbox::{TerminalTool, ToolRegistryBuilder};
 //! use std::sync::Arc;
 //!
 //! // Creates a working directory heel names with four random words (e.g.,
 //! // amber-forest-thunder-pearl/), not a leased id, with an outputs/
 //! // subdirectory and IPC command wrapper scripts; the ids the model reads are
 //! // leased from `with_id_allocator`'s allocator
-//! let tool = TerminalTool::new_in(std::env::temp_dir(), NoopPermissionHandler, executor).await?;
+//! let tool = TerminalTool::new_in(std::env::temp_dir(), executor).await?;
 //! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
 //! let tool = tool.with_registry(registry);
 //!
@@ -161,12 +161,10 @@ pub use notices::{
     ReservedForMain, SandboxNotices,
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
-pub use permission::{
-    CommandLocation, LocationApproval, PermissionHandler, PermissionRequest, Review, TerminalMode,
-};
+pub use permission::TerminalMode;
 pub use policy::{
-    AnyCommandPolicy, CommandPolicy, PolicyDecision, PolicyRefusal, ScriptCheck, ScriptEnd,
-    ScriptOrigin, ScriptOutcome,
+    AnyScriptPolicy, Carry, SandboxMode, ScriptCheck, ScriptDecision, ScriptDir, ScriptEnd,
+    ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptPolicy, ScriptRefusal,
 };
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
@@ -196,8 +194,7 @@ pub use terminal::{
     BackgroundTaskEvent, BackgroundTaskReceiver, BackgroundTaskSender, CompletedCommand,
     CompletedTask, Configured, DEFAULT_FOREGROUND_WAIT, DEFAULT_LONG_JOB_ALERT_AFTER,
     DEFAULT_RESPONSE_WINDOW, DEFAULT_SUBAGENT_IMPORT_LIMIT, DEFAULT_TIMEOUT_CAP, DescendantsKilled,
-    DirectoryReset, DirectoryResetReason, JobAlert, LongRunningJob, PermissionEvent,
-    PermissionEventReceiver, PermissionEventStage, StartedBackgroundTask, StdinBlockedJob,
+    DirectoryResetReason, JobAlert, LongRunningJob, StartedBackgroundTask, StdinBlockedJob,
     StdinProbeFailedJob, TerminalArgs, TerminalBinding, TerminalError, TerminalExecutionMode,
     TerminalRunError, TerminalRunner, TerminalScript, TerminalTool, TerminalToolFactory,
     TerminalToolFactoryError, TimeoutKill, Unconfigured, background_task_channel,

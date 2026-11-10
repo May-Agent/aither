@@ -35,6 +35,9 @@ use std::{
     time::Duration,
 };
 
+use aither_core::llm::tool::{
+    AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
+};
 use aither_core::llm::{CallIdentity, ToolContext};
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
@@ -62,18 +65,15 @@ use tracing::{debug, info, warn};
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
-    ContainerPath, MountRoot, PolicyRefusal, PreparedTools, ScriptOrigin, ScriptOutcome,
-    ToolDistribution, ToolRuntimeError,
+    Carry, ContainerPath, MountRoot, PreparedTools, SandboxMode, ScriptDecision, ScriptDir,
+    ScriptOrigin, ScriptOutcome, ScriptRefusal, ToolDistribution, ToolRuntimeError,
     builtin::builtin_router,
     command::{
         AnyCommandGate, AnyCommandObserver, CommandBlocked, CommandRole, GateDecision, ToolRegistry,
     },
     job_registry::{JobRegistry, JobStatus, PendingCompletion, job_registry_channel},
     output::{INLINE_OUTPUT_LIMIT, MediaResolution, OutputFormat, OutputStore, stored_path},
-    permission::{
-        CommandLocation, LocationApproval, PermissionError, PermissionHandler, PermissionRequest,
-        Review, TerminalMode,
-    },
+    permission::TerminalMode,
     process_tree::{JobProcess, JobTree},
     script_language::ScriptLanguage,
     shell_session::{
@@ -85,7 +85,7 @@ use crate::{
         AnyDomainApprover, DomainApprover, EnvSource, GrantSnapshot, Grants, LocalSpawn, Pipe,
         Sandbox, SpawnSpec, Stdio as SpawnStdio, TreeLifetime,
     },
-    ssh::{ApprovalReach, SshClient, SshEnvironment, SshServer},
+    ssh::{SshClient, SshEnvironment, SshServer},
     stdin_watch::{
         EpisodeDetector, FeedCounter, LocalStdinProbe, STDIN_WATCH_INTERVAL, StdinWatchSignal,
     },
@@ -399,27 +399,6 @@ fn carry_cwd_script(script: &str, report: &str) -> Result<String, TerminalError>
     })
 }
 
-async fn ensure_mode_allowed<P: PermissionHandler>(
-    permission_handler: &P,
-    mode: TerminalMode,
-    script: &str,
-    language: ScriptLanguage,
-    location: CommandLocation<'_>,
-) -> Result<(), TerminalError> {
-    if !mode.requires_approval() {
-        return Ok(());
-    }
-
-    let allowed = permission_handler
-        .check(mode, script, language, location)
-        .await?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(TerminalError::PermissionDenied(mode))
-    }
-}
-
 /// Execute terminal commands in a sandboxed environment.
 ///
 /// The primary interface to all system capabilities. Scripts run in a sandbox
@@ -690,17 +669,6 @@ pub enum DirectoryResetReason {
     Removed,
 }
 
-/// The working directory carried between foreground commands was reset.
-///
-/// Sent once per reset, at the moment it happens.
-#[derive(Debug, Clone)]
-pub struct DirectoryReset {
-    /// The directory the next command runs in, as the command sees it.
-    pub dir: PathBuf,
-    /// Why the shell's directory was not carried.
-    pub reason: DirectoryResetReason,
-}
-
 /// The most processes a [`DescendantsKilled`] alert names.
 const KILLED_PROCESSES_NAMED: usize = 8;
 
@@ -727,15 +695,13 @@ impl DescendantsKilled {
     }
 }
 
-/// A system alert about a background job, or about the carried working
-/// directory, delivered through the terminal's alert channel.
+/// A system alert about a job, delivered through the terminal's alert
+/// channel.
 #[derive(Debug, Clone)]
 pub enum JobAlert {
     /// A foreground command's shell exited while descendants were still
     /// running, and they were killed.
     DescendantsKilled(DescendantsKilled),
-    /// The directory carried between foreground commands was reset.
-    DirectoryReset(DirectoryReset),
     /// The job crossed the long-running threshold.
     LongRunning(LongRunningJob),
     /// The job is waiting for input on its stdin.
@@ -848,32 +814,6 @@ pub struct CompletedTask {
     /// takes the completion by dropping it; `None` for a command the registry
     /// never registered and for one whose call returned its result.
     pub pending: Option<PendingCompletion>,
-}
-
-/// Stage of a permission-lifecycle event for `terminal`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionEventStage {
-    /// Permission request is waiting for a decision.
-    Waiting,
-    /// Permission request has been resolved.
-    Resolved,
-}
-
-/// Permission-lifecycle event emitted by `terminal` while waiting for approval.
-#[derive(Debug, Clone)]
-pub struct PermissionEvent {
-    /// Requested terminal mode.
-    pub mode: TerminalMode,
-    /// Script awaiting permission.
-    pub script: String,
-    /// The language of `script`.
-    pub language: ScriptLanguage,
-    /// The SSH server the command names; `None` for the home environment.
-    /// A wait for a server's first-use approval carries it as well as a wait
-    /// for an `unsafe` approval there.
-    pub location: Option<String>,
-    /// Permission lifecycle stage.
-    pub stage: PermissionEventStage,
 }
 
 /// Receiver for completed background tasks.
@@ -1116,37 +1056,6 @@ impl std::fmt::Debug for BackgroundTaskReceiver {
     }
 }
 
-/// Receiver for permission wait/resume events.
-#[derive(Clone)]
-pub struct PermissionEventReceiver {
-    rx: Receiver<PermissionEvent>,
-}
-
-impl PermissionEventReceiver {
-    /// Takes pending permission events without blocking.
-    #[must_use]
-    pub fn take_pending(&self) -> Vec<PermissionEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.rx.try_recv() {
-            events.push(event);
-        }
-        events
-    }
-
-    /// Waits for the next permission event.
-    pub async fn recv(&self) -> Option<PermissionEvent> {
-        self.rx.recv().await.ok()
-    }
-}
-
-impl std::fmt::Debug for PermissionEventReceiver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PermissionEventReceiver")
-            .field("pending", &self.rx.len())
-            .finish()
-    }
-}
-
 /// Launches subagents from one terminal: every subagent it creates runs with
 /// at most that terminal's authority.
 ///
@@ -1231,11 +1140,10 @@ impl TerminalToolFactory {
 /// `source` is the terminal with its registry not yet bound: it holds no
 /// handle to its own launcher, so the loop ends once every terminal-bound
 /// command holding the launcher is gone.
-async fn serve_launches<P, E>(
+async fn serve_launches<E>(
     requests: Receiver<TerminalToolRequest>,
-    source: TerminalTool<P, E, Launching>,
+    source: TerminalTool<E, Launching>,
 ) where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     let mut history = LaunchHistory::default();
@@ -1385,7 +1293,7 @@ pub enum TerminalRunError {
     },
     /// A command policy refused the script.
     #[error(transparent)]
-    Refused(PolicyRefusal),
+    Refused(ScriptRefusal),
     /// The terminal's command gate blocked the script.
     #[error(transparent)]
     Blocked(crate::Refused<CommandBlocked>),
@@ -1452,14 +1360,13 @@ trait TerminalRunnerImpl: Send + Sync {
 /// The registry is held weakly: it holds the commands, which hold this
 /// runner, so the terminal's copy here holds no registry of its own and the
 /// runner ends with the terminal.
-struct BoundRunner<P, E> {
-    terminal: TerminalTool<P, E, Unconfigured>,
+struct BoundRunner<E> {
+    terminal: TerminalTool<E, Unconfigured>,
     registry: std::sync::Weak<ToolRegistry>,
 }
 
-impl<P, E> TerminalRunnerImpl for BoundRunner<P, E>
+impl<E> TerminalRunnerImpl for BoundRunner<E>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     fn run(
@@ -1587,6 +1494,18 @@ impl CarriedDir {
     fn set(&self, dir: Option<PathBuf>) {
         *self.0.lock().expect("carried directory lock") = dir;
     }
+
+    /// Records `moved_to` when there is one and returns the directory carried
+    /// afterwards, under one lock: the directory the next foreground script
+    /// starts in is the one returned here, whatever scripts settle beside
+    /// this one.
+    fn settle(&self, moved_to: Option<PathBuf>) -> Option<PathBuf> {
+        let mut carried = self.0.lock().expect("carried directory lock");
+        if moved_to.is_some() {
+            *carried = moved_to;
+        }
+        carried.clone()
+    }
 }
 
 /// Where a command starts, and for a foreground command of the main agent,
@@ -1605,6 +1524,9 @@ struct CwdCarry {
     /// Whether the command runs in a shell and so writes the report; a
     /// direct command cannot change directory and writes none.
     shell: bool,
+    /// Whether the directory carried to this command no longer existed, so
+    /// the command starts in the terminal's own directory instead.
+    removed: bool,
 }
 
 /// How a container command spells its start and directory report.
@@ -1618,14 +1540,15 @@ struct ContainerCarry {
 }
 
 /// The terminal tool for executing scripts in a sandbox.
-pub struct TerminalTool<P, E, State = Unconfigured> {
+pub struct TerminalTool<E, State = Unconfigured> {
     /// Shared working directory, named by heel with four random words (e.g.,
     /// `amber-forest-thunder-pearl/`) rather than a leased id.
     working_dir: PathBuf,
     /// Runtime registry for container and ssh execution metadata.
     shell_sessions: ShellSessionRegistry,
-    /// Permission handler wrapped in Arc for sharing between parent and child tools.
-    permission_handler: Arc<P>,
+    /// Approves what no call's context can: a script run with no tool call
+    /// to ask through. Shared with the subagents' terminals.
+    approver: Option<AnyApprover>,
     executor: E,
     /// Leases the words naming what the model addresses: task ids, stored
     /// outputs and subagent spaces. Shared with the output store and every
@@ -1649,10 +1572,6 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     limits: TerminalLimits,
     /// Number of still-running spawned executions associated with this tool.
     running_tasks: Arc<AtomicUsize>,
-    /// Channel for permission lifecycle events.
-    permission_rx: Receiver<PermissionEvent>,
-    /// Channel sender for permission lifecycle events.
-    permission_tx: Sender<PermissionEvent>,
     /// Filesystem grants, shared by every clone; commands snapshot them at
     /// launch.
     grants: Grants,
@@ -1683,13 +1602,12 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     registry: State,
 }
 
-// Manual Clone impl because P doesn't need to be Clone (we use Arc<P>)
-impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
+impl<E: Clone, State: Clone> Clone for TerminalTool<E, State> {
     fn clone(&self) -> Self {
         Self {
             working_dir: self.working_dir.clone(),
             shell_sessions: self.shell_sessions.clone(),
-            permission_handler: self.permission_handler.clone(),
+            approver: self.approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
@@ -1702,8 +1620,6 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             started_tx: self.started_tx.clone(),
             limits: self.limits.clone(),
             running_tasks: self.running_tasks.clone(),
-            permission_rx: self.permission_rx.clone(),
-            permission_tx: self.permission_tx.clone(),
             grants: self.grants.clone(),
             subagent: self.subagent.clone(),
             carried_dir: self.carried_dir.clone(),
@@ -1720,7 +1636,17 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
     }
 }
 
-impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
+impl<E: Executor + Clone + 'static> TerminalTool<E, Unconfigured> {
+    /// Sets the approver that answers the approvals of scripts no tool call
+    /// carries ([`TerminalRunner::run`] and [`Self::run_background`]), and
+    /// of calls whose dispatcher attached none. Without one, such a script
+    /// that needs approval does not run.
+    #[must_use]
+    pub fn with_approver(mut self, approver: impl Approver) -> Self {
+        self.approver = Some(AnyApprover::new(approver));
+        self
+    }
+
     /// Injects the runtime configuration used by `terminal` execution mode resolution.
     ///
     /// The registry is configuration to prepare with [`Self::initialize_tools`];
@@ -1802,7 +1728,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         self
     }
 
-    /// Creates a new terminal tool with permission handler and executor.
+    /// Creates a new terminal tool with an executor.
     ///
     /// Creates a working directory under the specified parent directory, which
     /// heel names with four random words (not a leased id). The executor is
@@ -1812,7 +1738,6 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
     /// Returns an error when the working directory or output store cannot be created.
     pub async fn new_in(
         parent_dir: impl AsRef<std::path::Path>,
-        permission_handler: P,
         executor: E,
     ) -> Result<Self, TerminalError> {
         let parent_dir = parent_dir.as_ref();
@@ -1846,12 +1771,11 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         let (alert_tx, alert_rx) = async_channel::unbounded();
         let (started_tx, started_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
-        let (permission_tx, permission_rx) = async_channel::unbounded();
 
         Ok(Self {
             working_dir: working_dir_path,
             shell_sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
-            permission_handler: Arc::new(permission_handler),
+            approver: None,
             executor,
             ids,
             output_store,
@@ -1864,8 +1788,6 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             started_tx,
             limits: TerminalLimits::default(),
             running_tasks,
-            permission_rx,
-            permission_tx,
             grants: Grants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
@@ -1881,7 +1803,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         })
     }
 
-    /// Creates a new terminal tool with permission handler and executor,
+    /// Creates a new terminal tool with an executor,
     /// using the provided directory directly as the working directory.
     ///
     /// Unlike `new_in` which creates a random subdirectory, this method
@@ -1892,7 +1814,6 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
     /// Returns an error when the working directory or output store cannot be created.
     pub async fn new_exact(
         working_dir: impl AsRef<std::path::Path>,
-        permission_handler: P,
         executor: E,
     ) -> Result<Self, TerminalError> {
         // Ensure working directory exists, then resolve it once: heel and the
@@ -1917,12 +1838,11 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
         let (alert_tx, alert_rx) = async_channel::unbounded();
         let (started_tx, started_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
-        let (permission_tx, permission_rx) = async_channel::unbounded();
 
         Ok(Self {
             working_dir: working_dir_path,
             shell_sessions: ShellSessionRegistry::new(ShellRuntimeAvailability::default()),
-            permission_handler: Arc::new(permission_handler),
+            approver: None,
             executor,
             ids,
             output_store,
@@ -1935,8 +1855,6 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             started_tx,
             limits: TerminalLimits::default(),
             running_tasks,
-            permission_rx,
-            permission_tx,
             grants: Grants::new(),
             subagent: None,
             carried_dir: Some(CarriedDir::default()),
@@ -1953,13 +1871,13 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
     }
 }
 
-impl<P, E, State> TerminalTool<P, E, State> {
+impl<E, State> TerminalTool<E, State> {
     /// Moves every part into a terminal with another registry state.
-    fn map_state<Next>(self, state: impl FnOnce(State) -> Next) -> TerminalTool<P, E, Next> {
+    fn map_state<Next>(self, state: impl FnOnce(State) -> Next) -> TerminalTool<E, Next> {
         TerminalTool {
             working_dir: self.working_dir,
             shell_sessions: self.shell_sessions,
-            permission_handler: self.permission_handler,
+            approver: self.approver,
             executor: self.executor,
             ids: self.ids,
             output_store: self.output_store,
@@ -1972,8 +1890,6 @@ impl<P, E, State> TerminalTool<P, E, State> {
             started_tx: self.started_tx,
             limits: self.limits,
             running_tasks: self.running_tasks,
-            permission_rx: self.permission_rx,
-            permission_tx: self.permission_tx,
             grants: self.grants,
             subagent: self.subagent,
             carried_dir: self.carried_dir,
@@ -1990,9 +1906,8 @@ impl<P, E, State> TerminalTool<P, E, State> {
     }
 }
 
-impl<P, E> TerminalTool<P, E, Unconfigured>
+impl<E> TerminalTool<E, Unconfigured>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     /// Attaches a tool registry to this terminal tool, enabling IPC command
@@ -2001,7 +1916,7 @@ where
     /// The terminal gets its own launcher for the subagents it starts, and
     /// the registry's terminal-bound commands are built for it.
     #[must_use]
-    pub fn with_registry(self, registry: Arc<ToolRegistry>) -> TerminalTool<P, E, Configured> {
+    pub fn with_registry(self, registry: Arc<ToolRegistry>) -> TerminalTool<E, Configured> {
         let registry = Arc::new(
             Arc::unwrap_or_clone(registry)
                 .with_terminal_controls(self.job_registry(), self.output_store.clone()),
@@ -2012,9 +1927,8 @@ where
 }
 
 #[cfg(test)]
-impl<P, E> TerminalTool<P, E, Configured>
+impl<E> TerminalTool<E, Configured>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     /// A subagent terminal with an empty grant, told to no observer or gate.
@@ -2024,14 +1938,13 @@ where
     }
 }
 
-impl<P, E> TerminalTool<P, E, Launching>
+impl<E> TerminalTool<E, Launching>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     /// Starts this terminal's launcher and binds its registry to it and to
     /// its runner.
-    fn into_served(self) -> TerminalTool<P, E, Configured> {
+    fn into_served(self) -> TerminalTool<E, Configured> {
         let (launcher, requests) = async_channel::unbounded();
         // A run starts where it is told and leaves the main agent's carried
         // directory alone.
@@ -2064,7 +1977,7 @@ where
     }
 }
 
-impl<P, E, State> TerminalTool<P, E, State>
+impl<E, State> TerminalTool<E, State>
 where
     E: Executor + Clone + 'static,
     State: Clone,
@@ -2327,7 +2240,6 @@ where
         cache_root: &Path,
     ) -> Result<Self, ToolRuntimeError>
     where
-        P: PermissionHandler,
         State: Send,
     {
         self.shell_sessions = self
@@ -2366,7 +2278,6 @@ where
         sessions: ShellSessionRegistry,
     ) -> Result<Self, ToolRuntimeError>
     where
-        P: PermissionHandler,
         State: Send,
     {
         sessions.prepared_catalog()?;
@@ -2468,13 +2379,6 @@ where
         }
     }
 
-    /// Returns a receiver for permission lifecycle events.
-    pub fn permission_receiver(&self) -> PermissionEventReceiver {
-        PermissionEventReceiver {
-            rx: self.permission_rx.clone(),
-        }
-    }
-
     /// Takes all completed background tasks without blocking.
     ///
     /// Returns an empty vector if no tasks have completed.
@@ -2497,9 +2401,8 @@ where
 /// the spaces of the subagents it launches.
 const SUBAGENT_SPACES_DIR: &str = "subagent-spaces";
 
-impl<P, E, State> TerminalTool<P, E, State>
+impl<E, State> TerminalTool<E, State>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
     State: RegistryState,
 {
@@ -2512,7 +2415,7 @@ where
         history: &mut LaunchHistory,
         grant: SubagentGrant,
         caller: Option<&Path>,
-    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
+    ) -> Result<TerminalTool<E, Configured>, SubagentGrantError> {
         let resolved = self.resolve_launch(history, grant).await?;
         self.launch_resolved(resolved, None, None, caller).await
     }
@@ -2596,7 +2499,7 @@ where
         observer: Option<AnyCommandObserver>,
         gate: Option<AnyCommandGate>,
         caller: Option<&Path>,
-    ) -> Result<TerminalTool<P, E, Configured>, SubagentGrantError> {
+    ) -> Result<TerminalTool<E, Configured>, SubagentGrantError> {
         async_fs::create_dir_all(&spaces_root)
             .await
             .map_err(|source| SubagentGrantError::Space {
@@ -2660,7 +2563,6 @@ where
         let (alert_tx, alert_rx) = async_channel::unbounded();
         let (started_tx, started_rx) = async_channel::unbounded();
         let running_tasks = Arc::new(AtomicUsize::new(0));
-        let (permission_tx, permission_rx) = async_channel::unbounded();
         let (job_registry, job_registry_service) = job_registry_channel();
         self.executor
             .spawn(async move { job_registry_service.serve().await })
@@ -2700,10 +2602,7 @@ where
         let launching = TerminalTool {
             working_dir: space,
             shell_sessions: self.shell_sessions.clone(),
-            permission_handler: self
-                .permission_handler
-                .for_subagent()
-                .map_or_else(|| self.permission_handler.clone(), Arc::new),
+            approver: self.approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
@@ -2716,8 +2615,6 @@ where
             started_tx,
             limits: self.limits.clone(),
             running_tasks,
-            permission_rx,
-            permission_tx,
             grants,
             subagent: Some(SubagentAuthority {
                 _space_name: space_name,
@@ -2809,9 +2706,8 @@ fn container_confinement_for(
     })
 }
 
-impl<P, E> TerminalTool<P, E, Configured>
+impl<E> TerminalTool<E, Configured>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     /// Returns a receiver for the `terminal` calls in which a command
@@ -2856,7 +2752,6 @@ where
         use crate::command::DynTerminalTool;
 
         let background_receiver = self.background_receiver();
-        let permission_receiver = self.permission_receiver();
         let kept_receiver = self.kept_receiver();
         let job_registry = self.job_registry();
         let working_dir = self.working_dir().clone();
@@ -2875,7 +2770,6 @@ where
         DynTerminalTool {
             entries,
             background_receiver,
-            permission_receiver,
             kept_receiver,
             job_registry,
             working_dir,
@@ -2891,9 +2785,8 @@ where
 
 /// The execution path every terminal state that serves a registry shares:
 /// a `terminal` call and a [`TerminalRunner`] run go through it alike.
-impl<P, E, S> TerminalTool<P, E, S>
+impl<E, S> TerminalTool<E, S>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
     S: RegistryState,
 {
@@ -2973,146 +2866,6 @@ where
         })
     }
 
-    /// Asks the permission handler whether commands may run on
-    /// `environment`, unless a command there was already approved.
-    async fn ensure_location_allowed(
-        &self,
-        environment: &SshEnvironment,
-        admission: &Admission<'_>,
-    ) -> Result<(), TerminalError> {
-        environment
-            .approve(|| async {
-                let server = environment.server();
-                let role = self.registry.registry().role();
-                match self
-                    .permission_handler
-                    .review(&PermissionRequest::Location { server, role })
-                    .await
-                {
-                    Review::Approved => return Ok(ApprovalReach::Session),
-                    Review::Denied(reason) => {
-                        return Err(TerminalError::from(PermissionError::Denied(reason)));
-                    }
-                    Review::Passed => {}
-                }
-                let waits = self
-                    .permission_handler
-                    .will_wait_for_location(server, role)
-                    .await;
-                let mode = admission.mode.into();
-                let location = Some(server.name.as_str());
-                if waits {
-                    self.emit_permission_event(
-                        mode,
-                        admission.script,
-                        admission.language,
-                        location,
-                        PermissionEventStage::Waiting,
-                    )
-                    .await;
-                }
-                let allowed = self.permission_handler.check_location(server, role).await;
-                if waits {
-                    self.emit_permission_event(
-                        mode,
-                        admission.script,
-                        admission.language,
-                        location,
-                        PermissionEventStage::Resolved,
-                    )
-                    .await;
-                }
-                match allowed? {
-                    LocationApproval::Session => Ok(ApprovalReach::Session),
-                    LocationApproval::Once => Ok(ApprovalReach::Once),
-                    LocationApproval::Refused => {
-                        Err(TerminalError::LocationDenied(server.name.clone()))
-                    }
-                }
-            })
-            .await
-    }
-
-    async fn ensure_permission_allowed(
-        &self,
-        mode: TerminalMode,
-        script: &str,
-        language: ScriptLanguage,
-        location: CommandLocation<'_>,
-    ) -> Result<(), TerminalError> {
-        if mode.requires_approval() {
-            match self
-                .permission_handler
-                .review(&PermissionRequest::Command {
-                    mode,
-                    script,
-                    language,
-                    location,
-                })
-                .await
-            {
-                Review::Approved => return Ok(()),
-                Review::Denied(reason) => {
-                    return Err(TerminalError::from(PermissionError::Denied(reason)));
-                }
-                Review::Passed => {}
-            }
-        }
-        let permission_waits = self
-            .permission_handler
-            .will_wait_for_approval(mode, script, language, location)
-            .await;
-        if permission_waits {
-            self.emit_permission_event(
-                mode,
-                script,
-                language,
-                location.server(),
-                PermissionEventStage::Waiting,
-            )
-            .await;
-        }
-        let permission_result = ensure_mode_allowed(
-            self.permission_handler.as_ref(),
-            mode,
-            script,
-            language,
-            location,
-        )
-        .await;
-        if permission_waits {
-            self.emit_permission_event(
-                mode,
-                script,
-                language,
-                location.server(),
-                PermissionEventStage::Resolved,
-            )
-            .await;
-        }
-        permission_result
-    }
-
-    async fn emit_permission_event(
-        &self,
-        mode: TerminalMode,
-        script: &str,
-        language: ScriptLanguage,
-        location: Option<&str>,
-        stage: PermissionEventStage,
-    ) {
-        let _ = self
-            .permission_tx
-            .send(PermissionEvent {
-                mode,
-                script: script.to_string(),
-                language,
-                location: location.map(str::to_string),
-                stage,
-            })
-            .await;
-    }
-
     fn spawn_terminal_execution(&self, request: TerminalSpawnRequest) -> SpawnedTerminal {
         let TerminalSpawnRequest {
             target,
@@ -3187,7 +2940,6 @@ where
                 timeout_watch: timeout_watch.clone(),
                 carry,
                 carried_dir: self.carried_dir.clone(),
-                alert_tx: self.alert_tx.clone(),
                 script,
                 language,
                 mode,
@@ -3222,9 +2974,7 @@ where
     }
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
-    for TerminalTool<P, E, Configured>
-{
+impl<E: Executor + Clone + 'static> Tool for TerminalTool<E, Configured> {
     fn name(&self) -> Cow<'static, str> {
         "terminal".into()
     }
@@ -3235,7 +2985,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
     async fn call(
         &self,
         arguments: Self::Arguments,
-        cx: ToolContext,
+        mut cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         let cap = self.limits.timeout_cap;
         let timeout = Duration::from_secs(arguments.timeout);
@@ -3245,14 +2995,13 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                 cap.as_secs()
             ));
         }
-        let prepared = self.prepare_execution(&arguments, cx.identity()).await?;
+        let prepared = self.prepare_execution(&arguments, &mut cx).await?;
         // A detached job cannot report a directory carry: its final
         // directory is unknowable when the call returns.
         let carry = if arguments.background {
             None
         } else {
             self.cwd_carry(&prepared, &arguments.script, arguments.language)
-                .await
         };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
@@ -3331,11 +3080,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
     }
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
+impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
     /// The directory report of a foreground command on the main agent's
     /// terminal; `None` for a subagent, for an ssh command and for a container
     /// whose workspace mount is not declared.
-    async fn cwd_carry(
+    fn cwd_carry(
         &self,
         prepared: &ExecutionPreparation,
         script: &str,
@@ -3347,33 +3096,15 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             ExecutionBackend::Container { runtime, .. } => Some(runtime.workspace_mount()?.clone()),
             _ => return None,
         };
-        let start = carried.get();
-        // A directory removed since it was recorded no longer carries.
-        let start = match start {
-            Some(dir)
-                if async_fs::metadata(&dir)
-                    .await
-                    .is_ok_and(|meta| meta.is_dir()) =>
-            {
-                Some(dir)
-            }
-            Some(_) => {
+        // Where admission found the script starts, as the policies saw it;
+        // a directory removed since it was recorded no longer carries.
+        let (start, removed) = match (&prepared.carried_start, carried.get()) {
+            (Some(dir), _) => (Some(dir.clone()), false),
+            (None, Some(_)) => {
                 carried.set(None);
-                let dir = if mount.is_some() {
-                    PathBuf::from(CONTAINER_EXEC_WORKING_DIR)
-                } else {
-                    self.own_dir().await
-                };
-                let _ = self
-                    .alert_tx
-                    .send(JobAlert::DirectoryReset(DirectoryReset {
-                        dir,
-                        reason: DirectoryResetReason::Removed,
-                    }))
-                    .await;
-                None
+                (None, true)
             }
-            None => None,
+            (None, None) => (None, false),
         };
         let report = self.working_dir.join(format!(".cwd-{}", prepared.task_id));
         let container = match mount {
@@ -3405,36 +3136,83 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
             report: Some(report),
             container,
             shell,
+            removed,
         })
     }
 
     /// Makes the directory a finished foreground command ended in the start
-    /// of the next one, with the missing-report alert a task end does not
-    /// raise for a killed job. In production the task consumes the report
-    /// (see [`execute_script_standalone`]); tests drive the same logic here.
+    /// of the next one, and says what became of the carried directory. In
+    /// production the task consumes the report (see
+    /// [`execute_script_standalone`]); tests drive the same logic here.
     #[cfg(test)]
-    async fn record_carried_dir(&self, carry: &CwdCarry, succeeded: bool) {
+    async fn record_carried_dir(&self, carry: &CwdCarry, succeeded: bool) -> Settled {
         let ctx = CarryContext {
             carried_dir: self.carried_dir.as_ref(),
-            alert_tx: &self.alert_tx,
             working_dir: &self.working_dir,
             grants: self.grants.snapshot(),
         };
-        let Some(reported) = take_cwd_report(carry).await else {
-            if carry.shell {
-                alert_directory_reset(carry, DirectoryResetReason::Unreported, &ctx).await;
+        settle_cwd(carry, take_cwd_report(carry).await, succeeded, &ctx).await
+    }
+}
+
+/// A host directory of a container script as the container names it: through
+/// the workspace mount when `host` lies in it, otherwise the directory the
+/// container starts in.
+fn container_script_dir(mount: Option<&MountRoot>, host: Option<PathBuf>, own: &Path) -> ScriptDir {
+    let inside = host
+        .as_ref()
+        .zip(mount)
+        .and_then(|(host, mount)| mount.container_path(host).ok())
+        .unwrap_or_else(|| {
+            ContainerPath::new(CONTAINER_EXEC_WORKING_DIR).expect("the exec directory is absolute")
+        });
+    ScriptDir::Container {
+        inside,
+        host: host.unwrap_or_else(|| own.to_path_buf()),
+    }
+}
+
+/// How the backend of a script names the directory the next foreground
+/// script starts in.
+#[derive(Clone)]
+enum DirSpelling {
+    Host,
+    Container(Option<MountRoot>),
+    Remote(String),
+}
+
+impl DirSpelling {
+    fn of(backend: &ExecutionBackend) -> Self {
+        match backend {
+            ExecutionBackend::Local(_) => Self::Host,
+            ExecutionBackend::Container { runtime, .. } => {
+                Self::Container(runtime.workspace_mount().cloned())
             }
-            return;
-        };
-        apply_cwd_report(carry, reported, succeeded, &ctx).await;
+            ExecutionBackend::Ssh { server, .. } => Self::Remote(server.name.clone()),
+        }
     }
 
-    /// The terminal's own directory as a command sees it.
-    async fn own_dir(&self) -> PathBuf {
-        canonical_path(&self.working_dir)
-            .await
-            .unwrap_or_else(|_| self.working_dir.clone())
+    /// `host`, the directory carried as settled under the lock of the
+    /// carried directory, or the terminal's own directory `own` when none is.
+    fn dir(&self, host: Option<PathBuf>, own: &Path) -> ScriptDir {
+        match self {
+            Self::Host => ScriptDir::Host(host.unwrap_or_else(|| own.to_path_buf())),
+            Self::Container(mount) => container_script_dir(mount.as_ref(), host, own),
+            Self::Remote(server) => ScriptDir::Remote {
+                server: server.clone(),
+            },
+        }
     }
+}
+
+/// The directory `carried` holds, while it still exists: where the next
+/// foreground script starts.
+async fn carried_start(carried: Option<&CarriedDir>) -> Option<PathBuf> {
+    let dir = carried?.get()?;
+    async_fs::metadata(&dir)
+        .await
+        .is_ok_and(|meta| meta.is_dir())
+        .then_some(dir)
 }
 
 /// Shared state needed to settle a finished command's directory report,
@@ -3442,9 +3220,49 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
 /// and ended as a background task.
 struct CarryContext<'a> {
     carried_dir: Option<&'a CarriedDir>,
-    alert_tx: &'a Sender<JobAlert>,
     working_dir: &'a Path,
     grants: std::sync::Arc<GrantSnapshot>,
+}
+
+/// What a finished command did to the carried directory: the fact for the
+/// policies, and the directory now carried, read in the same critical
+/// section that recorded it.
+struct Settled {
+    carry: Carry,
+    carried: Option<PathBuf>,
+}
+
+/// Settles a finished command's directory report.
+///
+/// `report` is what [`take_cwd_report`] read: `None` when the shell wrote
+/// none.
+async fn settle_cwd(
+    carry: &CwdCarry,
+    report: Option<String>,
+    succeeded: bool,
+    ctx: &CarryContext<'_>,
+) -> Settled {
+    // A subagent's terminal carries nothing, and a run reports no directory.
+    let Some(carried) = ctx.carried_dir.filter(|_| carry.report.is_some()) else {
+        return Settled {
+            carry: Carry::NotCarried,
+            carried: ctx.carried_dir.and_then(CarriedDir::get),
+        };
+    };
+    let (moved_to, outcome) = match report {
+        Some(reported) => apply_cwd_report(carry, &reported, succeeded, ctx).await,
+        // A direct command cannot change directory and writes no report.
+        None if carry.shell => (None, Carry::Reset(DirectoryResetReason::Unreported)),
+        None => (None, Carry::Unchanged),
+    };
+    let outcome = match outcome {
+        Carry::Unchanged if carry.removed => Carry::Reset(DirectoryResetReason::Removed),
+        other => other,
+    };
+    Settled {
+        carry: outcome,
+        carried: carried.settle(moved_to),
+    }
 }
 
 /// Reads and removes a command's directory report, returning the directory
@@ -3462,42 +3280,48 @@ async fn take_cwd_report(carry: &CwdCarry) -> Option<String> {
         .filter(|reported| !reported.is_empty())
 }
 
-/// Makes the directory a finished command ended in the start of the next
-/// one, when the command succeeded and the directory lies inside the paths
-/// this terminal may read. When the next command does not start where the
-/// shell ended the model is alerted once.
+/// The directory a finished command ended in as the directory the next one
+/// starts in, when the command succeeded and the directory lies inside the
+/// paths this terminal may read, and what became of the carried directory.
+/// When the next command does not start where the shell ended, the answer
+/// says why.
 async fn apply_cwd_report(
     carry: &CwdCarry,
-    reported: String,
+    reported: &str,
     succeeded: bool,
     ctx: &CarryContext<'_>,
-) {
-    let Some(carried) = ctx.carried_dir else {
-        return;
-    };
+) -> (Option<PathBuf>, Carry) {
     if !succeeded {
-        if !left_in_start(carry, &reported, ctx.working_dir).await {
-            alert_directory_reset(carry, DirectoryResetReason::Failed, ctx).await;
-        }
-        return;
+        let carry = if left_in_start(carry, reported, ctx.working_dir).await {
+            Carry::Unchanged
+        } else {
+            Carry::Reset(DirectoryResetReason::Failed)
+        };
+        return (None, carry);
     }
     if let Some(container) = &carry.container {
         // A container is an unconfined main agent: what bounds its
         // directory is the workspace mount.
-        match ContainerPath::new(reported.as_str())
+        return match ContainerPath::new(reported)
             .map_err(drop)
             .and_then(|dir| container.mount.host_path(&dir).map_err(drop))
         {
-            Ok(dir) => carried.set(Some(dir)),
-            Err(()) => {
-                alert_directory_reset(carry, DirectoryResetReason::OutsideWorkspace, ctx).await;
+            Ok(dir) => {
+                let moved = reported != container.start.as_str();
+                (
+                    Some(dir),
+                    if moved {
+                        Carry::Moved
+                    } else {
+                        Carry::Unchanged
+                    },
+                )
             }
-        }
-        return;
+            Err(()) => (None, Carry::Reset(DirectoryResetReason::OutsideWorkspace)),
+        };
     }
-    let Ok(dir) = canonical_path(Path::new(&reported)).await else {
-        alert_directory_reset(carry, DirectoryResetReason::Removed, ctx).await;
-        return;
+    let Ok(dir) = canonical_path(Path::new(reported)).await else {
+        return (None, Carry::Reset(DirectoryResetReason::Removed));
     };
     for grant in std::iter::once(ctx.working_dir)
         .chain(ctx.grants.writable.iter().map(PathBuf::as_path))
@@ -3507,11 +3331,22 @@ async fn apply_cwd_report(
             .await
             .is_ok_and(|grant| dir.starts_with(grant))
         {
-            carried.set(Some(dir));
-            return;
+            let start = match &carry.start {
+                Some(start) => Some(start.clone()),
+                None => canonical_path(ctx.working_dir).await.ok(),
+            };
+            let moved = start.as_ref() != Some(&dir);
+            return (
+                Some(dir),
+                if moved {
+                    Carry::Moved
+                } else {
+                    Carry::Unchanged
+                },
+            );
         }
     }
-    alert_directory_reset(carry, DirectoryResetReason::OutsideReadable, ctx).await;
+    (None, Carry::Reset(DirectoryResetReason::OutsideReadable))
 }
 
 /// Whether the shell ended in the directory the command started in.
@@ -3529,29 +3364,7 @@ async fn left_in_start(carry: &CwdCarry, reported: &str, working_dir: &Path) -> 
     }
 }
 
-/// Alerts the model that the next command starts where `carry` started,
-/// not where the shell ended.
-async fn alert_directory_reset(
-    carry: &CwdCarry,
-    reason: DirectoryResetReason,
-    ctx: &CarryContext<'_>,
-) {
-    let dir = match &carry.container {
-        Some(container) => PathBuf::from(container.start.as_str()),
-        None => match &carry.start {
-            Some(start) => start.clone(),
-            None => canonical_path(ctx.working_dir)
-                .await
-                .unwrap_or_else(|_| ctx.working_dir.to_path_buf()),
-        },
-    };
-    let _ = ctx
-        .alert_tx
-        .send(JobAlert::DirectoryReset(DirectoryReset { dir, reason }))
-        .await;
-}
-
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool<P, E, Configured> {
+impl<E: Executor + Clone + 'static> TerminalTool<E, Configured> {
     /// Runs `script` as a detached background job bounded by `timeout`, for
     /// embedders that drive the terminal directly rather than through the
     /// `terminal` tool schema. Shares [`Self::call`]'s `background: true`
@@ -3573,12 +3386,33 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> TerminalTool
     }
 }
 
-impl<P, E, S> TerminalTool<P, E, S>
+impl<E, S> TerminalTool<E, S>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
     S: RegistryState,
 {
+    /// The terminal's own directory as a command sees it.
+    async fn own_dir(&self) -> PathBuf {
+        canonical_path(&self.working_dir)
+            .await
+            .unwrap_or_else(|_| self.working_dir.clone())
+    }
+
+    /// `host`, or the terminal's own directory `own` when the script starts
+    /// in neither a carried nor a named one, as the home backend names it.
+    fn home_script_dir(&self, host: Option<PathBuf>, own: &Path) -> ScriptDir {
+        match self.shell_sessions.resolve_local_backend() {
+            Ok(ShellBackend::Container) => container_script_dir(
+                self.shell_sessions
+                    .container_runtime()
+                    .and_then(|runtime| runtime.workspace_mount()),
+                host,
+                own,
+            ),
+            _ => ScriptDir::Host(host.unwrap_or_else(|| own.to_path_buf())),
+        }
+    }
+
     /// What renders this terminal's refusals and notices: its registry's.
     pub(crate) fn notices(&self) -> &crate::AnySandboxNotices {
         self.registry.registry().notices()
@@ -3598,7 +3432,7 @@ where
     async fn prepare_execution(
         &self,
         arguments: &TerminalArgs,
-        call: Option<&CallIdentity>,
+        cx: &mut ToolContext,
     ) -> anyhow::Result<ExecutionPreparation> {
         if arguments.description.trim().is_empty() {
             return Err(anyhow::anyhow!("terminal description must not be empty"));
@@ -3608,15 +3442,20 @@ where
         } else {
             ScriptOrigin::Foreground
         };
-        self.admit_command(Admission {
-            script: &arguments.script,
-            language: arguments.language,
-            mode: arguments.mode,
-            location: arguments.location.as_deref(),
-            max_lines: arguments.max_lines,
-            origin,
-            call,
-        })
+        let call = cx.identity().cloned();
+        self.admit_command(
+            Admission {
+                script: &arguments.script,
+                language: arguments.language,
+                mode: arguments.mode,
+                location: arguments.location.as_deref(),
+                max_lines: arguments.max_lines,
+                origin,
+                call,
+                run_dir: None,
+            },
+            Some(cx),
+        )
         .await
         .map_err(|error| match error {
             // Kept unwrapped, so the agent loop recognises the refusal.
@@ -3636,17 +3475,48 @@ where
     async fn admit_command(
         &self,
         admission: Admission<'_>,
+        cx: Option<&mut ToolContext>,
     ) -> Result<ExecutionPreparation, TerminalRunError> {
         // Leased for as long as the command can be addressed: the registry
         // keeps a clone once the job is registered.
         let task_id = self.ids.lease()?;
-        let policies = self.registry.registry().policies();
-        self.check_policies(&task_id, &admission)
+        let environment = self.resolve_location(admission.location)?;
+        // Decided once, here: the policies see the directory the command
+        // then starts in, and so does its launch.
+        let carried_start = if admission.origin == ScriptOrigin::Foreground {
+            carried_start(self.carried_dir.as_ref()).await
+        } else {
+            None
+        };
+        let own = self.own_dir().await;
+        let start = match &environment {
+            Some(environment) => ScriptDir::Remote {
+                server: environment.server().name.clone(),
+            },
+            None => self.home_script_dir(
+                admission
+                    .run_dir
+                    .map(Path::to_path_buf)
+                    .or_else(|| carried_start.clone()),
+                &own,
+            ),
+        };
+        let clearance = self
+            .check_policies(&task_id, &admission, &start)
             .await
-            .map_err(TerminalRunError::Refused)?;
-        let admitted = self.admit_checked(&admission).await;
+            .map_err(TerminalRunError::Refused);
+        let clearance = match clearance {
+            Ok(clearance) => clearance,
+            Err(refusal) => {
+                self.end_unrun(&task_id).await;
+                return Err(refusal);
+            }
+        };
+        let admitted = self
+            .admit_checked(&admission, environment.as_deref(), clearance, cx)
+            .await;
         if admitted.is_err() {
-            policies.ended(&task_id, ScriptOutcome::NotRun).await;
+            self.end_unrun(&task_id).await;
         }
         let (target, max_lines) = admitted?;
         Ok(ExecutionPreparation {
@@ -3655,19 +3525,36 @@ where
             task_id,
             outputs: self.output_store.clone(),
             max_lines,
+            carried_start,
         })
     }
 
-    /// Puts the script to the registry's command policies, the shell parsed
-    /// once for all of them. A refused script is reported to them, unrun.
+    /// Tells the policies a script they were asked about never started, and
+    /// where the next foreground script starts.
+    async fn end_unrun(&self, task_id: &str) {
+        let policies = self.registry.registry().policies();
+        if policies.is_empty() {
+            return;
+        }
+        let own = self.own_dir().await;
+        let end = self.home_script_dir(carried_start(self.carried_dir.as_ref()).await, &own);
+        policies
+            .ended(task_id, ScriptOutcome::NotRun, &end, Carry::NotCarried)
+            .await;
+    }
+
+    /// Puts the script to the registry's script policies, the shell parsed
+    /// once for all of them, and folds their decisions into what admission
+    /// does next.
     async fn check_policies(
         &self,
         task_id: &str,
         admission: &Admission<'_>,
-    ) -> Result<(), PolicyRefusal> {
+        start: &ScriptDir,
+    ) -> Result<Clearance, ScriptRefusal> {
         let policies = self.registry.registry().policies();
         if policies.is_empty() {
-            return Ok(());
+            return Ok(Clearance::Pass);
         }
         let shell = (admission.language == ScriptLanguage::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
@@ -3677,21 +3564,26 @@ where
             language: admission.language,
             shell: shell.as_ref().map(Result::as_ref),
             origin: admission.origin,
-            role: self.registry.registry().role(),
-            working_dir: &self.working_dir,
-            call: admission.call,
+            sandbox: SandboxMode::from(TerminalMode::from(admission.mode)),
+            location: admission.location(),
+            start,
+            call: admission.call(),
         };
-        let checked = policies.check(&check).await;
-        if checked.is_err() {
-            policies.ended(task_id, ScriptOutcome::NotRun).await;
+        match policies.check(&check).await {
+            ScriptDecision::Pass => Ok(Clearance::Pass),
+            ScriptDecision::Allow => Ok(Clearance::Allow),
+            ScriptDecision::Ask(request) => Ok(Clearance::Ask(request)),
+            ScriptDecision::Refuse(refusal) => Err(refusal),
         }
-        checked
     }
 
-    /// The rest of admission once the policies allowed the script.
+    /// The rest of admission once the policies did not refuse the script.
     async fn admit_checked(
         &self,
         admission: &Admission<'_>,
+        environment: Option<&SshEnvironment>,
+        clearance: Clearance,
+        cx: Option<&mut ToolContext>,
     ) -> Result<(ExecutionTarget, usize), TerminalRunError> {
         // Ahead of target resolution and permission, so a blocked command
         // never asks the user for anything. The decision carries no grant.
@@ -3706,7 +3598,7 @@ where
             )));
         }
         let mode = TerminalMode::from(admission.mode);
-        let target = match self.resolve_location(admission.location)? {
+        let target = match environment {
             None => {
                 let target = self.resolve_home_target(mode)?;
                 if let ExecutionBackend::Local(tools) = &target.backend {
@@ -3718,43 +3610,88 @@ where
                         .await
                         .map_err(TerminalError::from)?;
                 }
-                self.ensure_permission_allowed(
-                    mode,
-                    admission.script,
-                    admission.language,
-                    CommandLocation::Local,
-                )
-                .await?;
+                self.clear(admission, clearance, cx).await?;
                 target
             }
             // Boxed: a server's first command carries its preparation,
             // which would otherwise inflate every command's future.
             Some(environment) => {
-                Box::pin(self.admit_on_server(&environment, admission, mode)).await?
+                Box::pin(self.admit_on_server(environment, admission, clearance, cx)).await?
             }
         };
         Ok((target, admission.max_lines.min(MAX_LINES_CEILING) as usize))
     }
 
-    /// Admission of a command on a server. Both questions are put before the
+    /// Admission of a command on a server. The question is put before the
     /// server is prepared, which may take a while on its first command.
     async fn admit_on_server(
         &self,
         environment: &SshEnvironment,
         admission: &Admission<'_>,
-        mode: TerminalMode,
+        clearance: Clearance,
+        cx: Option<&mut ToolContext>,
     ) -> Result<ExecutionTarget, TerminalError> {
-        self.ensure_location_allowed(environment, admission).await?;
-        self.ensure_permission_allowed(
-            mode,
-            admission.script,
-            admission.language,
-            CommandLocation::Ssh {
-                server: environment.server().name.as_str(),
+        self.clear(admission, clearance, cx).await?;
+        self.resolve_ssh_target(environment, TerminalMode::from(admission.mode))
+            .await
+    }
+
+    /// Settles whether the script may run, once the policies did not refuse
+    /// it: a script that crosses the sandbox boundary, unsandboxed or on a
+    /// server, runs only after an [`Allow`](ScriptDecision::Allow) or an
+    /// approved [`Ask`](ScriptDecision::Ask); one the policies only passed
+    /// is asked about.
+    async fn clear(
+        &self,
+        admission: &Admission<'_>,
+        clearance: Clearance,
+        cx: Option<&mut ToolContext>,
+    ) -> Result<(), TerminalError> {
+        let request = match clearance {
+            Clearance::Ask(request) => request,
+            Clearance::Pass if admission.crosses_boundary() => admission.boundary_request(),
+            Clearance::Allow | Clearance::Pass => return Ok(()),
+        };
+        self.approve(request, admission.call(), cx).await
+    }
+
+    /// Puts `request` to the approver of the call that carries the script, or
+    /// to the terminal's own when the script has no call to ask through:
+    /// a run, a background script started directly, or a call whose
+    /// dispatcher attached none.
+    async fn approve(
+        &self,
+        request: ApprovalRequest,
+        call: Option<&CallIdentity>,
+        cx: Option<&mut ToolContext>,
+    ) -> Result<(), TerminalError> {
+        let kind = request.kind().clone();
+        let answer = match cx {
+            Some(cx) => match cx.approve(request.clone()).await {
+                Err(ApprovalError::NoApprover { .. }) => None,
+                answer => Some(answer),
             },
-        )
-        .await?;
-        self.resolve_ssh_target(environment, mode).await
+            None => None,
+        };
+        let answer = if let Some(answer) = answer {
+            answer
+        } else {
+            let Some(approver) = &self.approver else {
+                return Err(TerminalError::NoApprover(kind));
+            };
+            let request = match call {
+                Some(call) => request.with_call(call.clone()),
+                None => request,
+            };
+            approver
+                .approve(request)
+                .await
+                .map_err(|failure| ApprovalError::Failed { kind, failure })
+        };
+        match answer? {
+            Approval::Approved => Ok(()),
+            Approval::Denied { reason } => Err(TerminalError::Denied(reason)),
+        }
     }
 
     /// Runs `run` to its end on this terminal; see [`TerminalRunner::run`].
@@ -3766,24 +3703,24 @@ where
         // A run starts in a host directory, so it resolves the terminal's
         // home backend, never an SSH server.
         let prepared = self
-            .admit_command(Admission {
-                script: &run.script,
-                language: ScriptLanguage::Shell,
-                mode: run.mode.into(),
-                location: None,
-                max_lines: default_max_lines(),
-                origin: ScriptOrigin::Run,
-                call: None,
-            })
+            .admit_command(
+                Admission {
+                    script: &run.script,
+                    language: ScriptLanguage::Shell,
+                    mode: run.mode.into(),
+                    location: None,
+                    max_lines: default_max_lines(),
+                    origin: ScriptOrigin::Run,
+                    call: None,
+                    run_dir: Some(&run.working_dir),
+                },
+                None,
+            )
             .await?;
         let start = match run_start(&prepared.target, run.working_dir) {
             Ok(start) => start,
             Err(error) => {
-                self.registry
-                    .registry()
-                    .policies()
-                    .ended(&prepared.task_id, ScriptOutcome::NotRun)
-                    .await;
+                self.end_unrun(&prepared.task_id).await;
                 return Err(error);
             }
         };
@@ -3909,7 +3846,51 @@ struct Admission<'a> {
     location: Option<&'a str>,
     max_lines: u32,
     origin: ScriptOrigin,
-    call: Option<&'a CallIdentity>,
+    /// The tool call that carries the script and the agent that made it;
+    /// `None` for a script no call carries.
+    call: Option<CallIdentity>,
+    /// The directory a run names; `None` for a `terminal` call.
+    run_dir: Option<&'a Path>,
+}
+
+impl<'a> Admission<'a> {
+    /// The tool call that carries the script and the agent that made it.
+    const fn call(&self) -> Option<&CallIdentity> {
+        self.call.as_ref()
+    }
+
+    /// The SSH server the command names, when it names one.
+    fn location(&self) -> Option<&'a str> {
+        self.location.map(str::trim).filter(|name| !name.is_empty())
+    }
+
+    /// Whether the script runs outside the sandbox, unsandboxed or on a
+    /// server.
+    fn crosses_boundary(&self) -> bool {
+        self.mode == TerminalExecutionMode::Unsafe || self.location().is_some()
+    }
+
+    /// What the approver is asked about a script the policies only passed.
+    fn boundary_request(&self) -> ApprovalRequest {
+        let (kind, reason) = if self.mode == TerminalExecutionMode::Unsafe {
+            ("unsandboxed", "the script runs outside the sandbox")
+        } else {
+            ("remote", "the script runs on a remote server")
+        };
+        ApprovalRequest::new(ApprovalKind::new(kind), self.script).with_reason(reason)
+    }
+}
+
+/// What the policies' decisions leave admission to do, with a refusal
+/// already answered.
+enum Clearance {
+    /// No policy decided: a script inside the sandbox runs, one that crosses
+    /// its boundary is asked about.
+    Pass,
+    /// A policy approved the script.
+    Allow,
+    /// A policy asks the approver first.
+    Ask(ApprovalRequest),
 }
 
 struct ExecutionPreparation {
@@ -3918,6 +3899,9 @@ struct ExecutionPreparation {
     execution_id: String,
     outputs: OutputStore,
     max_lines: usize,
+    /// The carried directory a foreground command starts in, when the
+    /// terminal carries one and it still exists.
+    carried_start: Option<PathBuf>,
 }
 
 /// Where a run starts: `dir` on the host, mapped through the workspace
@@ -3945,6 +3929,7 @@ fn run_start(target: &ExecutionTarget, dir: PathBuf) -> Result<CwdCarry, Termina
         report: None,
         container,
         shell: false,
+        removed: false,
     })
 }
 
@@ -4068,7 +4053,6 @@ struct StandaloneExecution<E> {
     background: bool,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
-    alert_tx: Sender<JobAlert>,
     script: String,
     language: ScriptLanguage,
     mode: TerminalMode,
@@ -4267,7 +4251,6 @@ struct SpawnedTerminalTask<E> {
     timeout_watch: Arc<TimeoutWatch>,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
-    alert_tx: Sender<JobAlert>,
     script: String,
     language: ScriptLanguage,
     mode: TerminalMode,
@@ -4312,7 +4295,6 @@ where
         timeout_watch,
         carry,
         carried_dir,
-        alert_tx,
         script,
         language,
         mode,
@@ -4342,6 +4324,15 @@ where
         .await;
     let status_registry = job_registry.clone();
     let policies = registry.policies().clone();
+    // What the policies are told the next script starts in, spelled as this
+    // script's backend names a directory.
+    let end_view = (!policies.is_empty()).then(|| {
+        (
+            DirSpelling::of(&backend),
+            carried_dir.clone(),
+            working_dir.clone(),
+        )
+    });
     let result = execute_script_standalone(StandaloneExecution {
         working_dir,
         grants,
@@ -4354,7 +4345,6 @@ where
         background,
         carry,
         carried_dir,
-        alert_tx,
         script: script.clone(),
         language,
         mode,
@@ -4375,6 +4365,10 @@ where
     })
     .await;
     let interruptions = outages.end(&task_id).await;
+    let (result, settled) = match result {
+        Ok((command, settled)) => (Ok(command), Some(settled)),
+        Err(error) => (Err(error), None),
+    };
     let result = result.map(|command| CompletedCommand {
         interruptions,
         ..command
@@ -4386,7 +4380,22 @@ where
         .map_or(ScriptOutcome::Failed, |command| ScriptOutcome::Exited {
             code: command.exit_code,
         });
-    policies.ended(&task_id, outcome).await;
+    if let Some((spelling, carried, working_dir)) = &end_view {
+        // A settled script already read the carried directory under the
+        // lock that recorded it; one that settled nothing reads it now.
+        let (carry, host) = match settled {
+            Some(Settled { carry, carried }) => (carry, carried),
+            None => (
+                Carry::NotCarried,
+                carried.as_ref().and_then(CarriedDir::get),
+            ),
+        };
+        let own = canonical_path(working_dir)
+            .await
+            .unwrap_or_else(|_| working_dir.clone());
+        let end = spelling.dir(host, &own);
+        policies.ended(&task_id, outcome, &end, carry).await;
+    }
 
     let quick_result = match &result {
         Ok(ok) => Ok(ok.clone()),
@@ -4437,7 +4446,7 @@ where
 #[allow(clippy::too_many_lines)]
 async fn execute_script_standalone<E>(
     request: StandaloneExecution<E>,
-) -> Result<CompletedCommand, TerminalError>
+) -> Result<(CompletedCommand, Settled), TerminalError>
 where
     E: Executor + Clone + 'static,
 {
@@ -4453,7 +4462,6 @@ where
         background,
         carry,
         carried_dir,
-        alert_tx,
         script,
         language,
         mode,
@@ -4534,21 +4542,24 @@ where
     // answered in the foreground window or the command promoted: the task
     // is its sole consumer, so the next command starts where the shell
     // ended and the report file never lingers.
-    if let Some(carry) = &carry {
-        let ctx = CarryContext {
-            carried_dir: carried_dir.as_ref(),
-            alert_tx: &alert_tx,
-            working_dir: &working_dir,
-            grants: grants.snapshot(),
-        };
-        if let Some(reported) = take_cwd_report(carry).await {
-            apply_cwd_report(carry, reported, exit_code == 0, &ctx).await;
-        } else if ctx.carried_dir.is_some() && carry.shell {
-            alert_directory_reset(carry, DirectoryResetReason::Unreported, &ctx).await;
+    let settled = match &carry {
+        Some(carry) => {
+            let ctx = CarryContext {
+                carried_dir: carried_dir.as_ref(),
+                working_dir: &working_dir,
+                grants: grants.snapshot(),
+            };
+            settle_cwd(carry, take_cwd_report(carry).await, exit_code == 0, &ctx).await
         }
-    }
+        // Nothing carries: a background or subagent script, a run, or a
+        // script on a server. The next script starts where it would have.
+        None => Settled {
+            carry: Carry::NotCarried,
+            carried: carried_dir.as_ref().and_then(CarriedDir::get),
+        },
+    };
 
-    Ok(result)
+    Ok((result, settled))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6611,25 +6622,26 @@ pub enum TerminalError {
     /// `location` names no configured SSH server.
     #[error("no SSH server named `{0}` is configured")]
     UnknownLocation(String),
-    /// The permission handler refused the first command on a server.
-    #[error("running commands on `{0}` was not approved")]
-    LocationDenied(String),
     /// A default-mode command names a server that has no `heel` to sandbox it.
     #[error("default mode runs under `heel`, which `{0}` does not have")]
     NoRemoteSandbox(String),
     /// Required tool runtime is unavailable or unsafe to expose.
     #[error(transparent)]
     Tools(#[from] ToolRuntimeError),
-    /// Permission denied for the requested mode.
-    #[error(
-        "sandbox blocked {mode} execution; approval is required to escalate this terminal command",
-        mode = .0.description()
-    )]
-    PermissionDenied(TerminalMode),
+    /// The approver denied the script; the model reads the reason it gave.
+    #[error("{0}")]
+    Denied(String),
 
-    /// Permission check failed.
-    #[error("permission error: {0}")]
-    Permission(#[from] PermissionError),
+    /// The script needs approval, and neither its call nor the terminal has
+    /// an approver to give it.
+    #[error(
+        "approval for `{0}` is required to run this script, but no approver is configured for this terminal"
+    )]
+    NoApprover(ApprovalKind),
+
+    /// Asking for approval failed or was cancelled.
+    #[error(transparent)]
+    Approval(#[from] ApprovalError),
 
     /// Sandbox setup failed.
     #[error("sandbox setup failed: {0}")]
@@ -6658,7 +6670,7 @@ impl From<crate::SpawnError> for TerminalError {
     }
 }
 
-impl<P, E, State> std::fmt::Debug for TerminalTool<P, E, State> {
+impl<E, State> std::fmt::Debug for TerminalTool<E, State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalTool")
             .field("working_dir", &self.working_dir)
@@ -6669,7 +6681,6 @@ impl<P, E, State> std::fmt::Debug for TerminalTool<P, E, State> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use super::*;
@@ -6852,16 +6863,10 @@ mod tests {
         })
     }
 
-    async fn fresh_terminal(
-        dir: &Path,
-    ) -> TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> {
-        TerminalTool::new_exact(
-            dir,
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
+    async fn fresh_terminal(dir: &Path) -> TerminalTool<executor_core::tokio::TokioGlobal> {
+        TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
     }
 
     /// A trusted manifest serving one script, which reports `tool 1.0.0` and
@@ -7349,28 +7354,6 @@ mod tests {
         .expect("background task should complete after terminal input")
     }
 
-    #[derive(Default)]
-    struct TestPermissionHandler {
-        mode_checks: AtomicUsize,
-        allow_unsafe: bool,
-    }
-
-    impl PermissionHandler for TestPermissionHandler {
-        fn check(
-            &self,
-            mode: TerminalMode,
-            _script: &str,
-            _language: ScriptLanguage,
-            _location: CommandLocation<'_>,
-        ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
-            self.mode_checks.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(Ok(match mode {
-                TerminalMode::Sandboxed => true,
-                TerminalMode::Unsafe => self.allow_unsafe,
-            }))
-        }
-    }
-
     #[tokio::test]
     async fn test_terminal_args_defaults() {
         let args: TerminalArgs = serde_json::from_str(
@@ -7588,146 +7571,212 @@ mod tests {
         assert!(wrapped.contains("for cmd in 'environment' 'session'; do"));
     }
 
-    #[tokio::test]
-    async fn ensure_mode_allowed_requires_unsafe_approval() {
-        let handler = TestPermissionHandler::default();
-        let err = ensure_mode_allowed(
-            &handler,
-            TerminalMode::Unsafe,
-            "rm -rf /tmp/demo",
-            ScriptLanguage::Shell,
-            CommandLocation::Local,
-        )
-        .await
-        .expect_err("unsafe mode should be denied");
-        assert!(matches!(
-            err,
-            TerminalError::PermissionDenied(TerminalMode::Unsafe)
-        ));
-        assert_eq!(handler.mode_checks.load(AtomicOrdering::Relaxed), 1);
+    /// Approves every request, and records what it was asked.
+    #[derive(Clone, Default)]
+    struct Approvals {
+        asked: Arc<Mutex<Vec<ApprovalRequest>>>,
+        /// Denies with this reason instead of approving.
+        deny: Option<&'static str>,
     }
 
-    /// A handler whose review step answers `review` and whose own route
-    /// waits for a person.
-    struct ReviewingHandler {
-        review: Review,
-        waits: AtomicUsize,
-        checks: AtomicUsize,
-    }
-
-    impl ReviewingHandler {
-        fn new(review: Review) -> Self {
+    impl Approvals {
+        fn denying(reason: &'static str) -> Self {
             Self {
-                review,
-                waits: AtomicUsize::new(0),
-                checks: AtomicUsize::new(0),
+                deny: Some(reason),
+                ..Self::default()
             }
         }
+
+        fn asked(&self) -> Vec<ApprovalRequest> {
+            self.asked.lock().unwrap().clone()
+        }
     }
 
-    impl PermissionHandler for ReviewingHandler {
-        fn review(
+    impl Approver for Approvals {
+        fn approve(
             &self,
-            _request: &PermissionRequest<'_>,
-        ) -> impl std::future::Future<Output = Review> + Send {
-            std::future::ready(self.review.clone())
+            request: ApprovalRequest,
+        ) -> impl Future<Output = Result<Approval, aither_core::llm::tool::ApproverFailure>> + Send
+        {
+            self.asked.lock().unwrap().push(request);
+            std::future::ready(Ok(self.deny.map_or(Approval::Approved, |reason| {
+                Approval::Denied {
+                    reason: reason.to_string(),
+                }
+            })))
         }
+    }
+
+    /// Approves everything it is asked.
+    struct ApproveAll;
+
+    impl Approver for ApproveAll {
+        fn approve(
+            &self,
+            _request: ApprovalRequest,
+        ) -> impl Future<Output = Result<Approval, aither_core::llm::tool::ApproverFailure>> + Send
+        {
+            std::future::ready(Ok(Approval::Approved))
+        }
+    }
+
+    /// Decides the same way on every script.
+    struct Decide(ScriptDecision);
+
+    impl crate::ScriptPolicy for Decide {
+        type State = ();
 
         fn check(
             &self,
-            _mode: TerminalMode,
-            _script: &str,
-            _language: ScriptLanguage,
-            _location: CommandLocation<'_>,
-        ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
-            self.checks.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(Ok(true))
-        }
-
-        fn will_wait_for_approval(
-            &self,
-            _mode: TerminalMode,
-            _script: &str,
-            _language: ScriptLanguage,
-            _location: CommandLocation<'_>,
-        ) -> impl std::future::Future<Output = bool> + Send {
-            self.waits.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(true)
+            _script: &crate::ScriptCheck<'_>,
+            (): &(),
+        ) -> impl Future<Output = ScriptDecision> + Send {
+            std::future::ready(self.0.clone())
         }
     }
 
-    async fn permission_stages(
-        review: Review,
-    ) -> (Result<(), String>, Vec<PermissionEventStage>, [usize; 2]) {
-        let dir = tempfile::tempdir().unwrap();
-        let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir.path(),
-            ReviewingHandler::new(review),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
+    /// A local terminal in `dir` whose script policies are `decisions`,
+    /// asking `approver` for what needs approval.
+    #[cfg(unix)]
+    async fn approval_tool(
+        dir: &Path,
+        decisions: impl IntoIterator<Item = ScriptDecision>,
+        approver: Option<Approvals>,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+    ) {
+        let (cache, shell_sessions) = prepared_test_registry().await;
+        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize");
+        let tool = match approver {
+            Some(approver) => tool.with_approver(approver),
+            None => tool,
+        }
         .adopt_prepared_tools(shell_sessions)
         .await
-        .expect("prepared tools should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
-        let tool = tool.with_registry(registry);
-        let result = tool
-            .ensure_permission_allowed(
-                TerminalMode::Unsafe,
-                "make install",
-                ScriptLanguage::Shell,
-                CommandLocation::Local,
+        .expect("prepared tools should be adopted")
+        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+            local: true,
+            container: false,
+        });
+        let mut registry = ToolRegistryBuilder::new();
+        for decision in decisions {
+            registry.script_policy(Decide(decision));
+        }
+        let registry = Arc::new(registry.build(tool.output_store().clone()));
+        (cache, tool.with_registry(registry))
+    }
+
+    #[cfg(unix)]
+    fn unsandboxed_args(script: &str) -> TerminalArgs {
+        TerminalArgs {
+            mode: TerminalExecutionMode::Unsafe,
+            ..terminal_args("run outside the sandbox", script)
+        }
+    }
+
+    /// A script that runs outside the sandbox and that no policy decided is
+    /// asked about; a script inside the sandbox is not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsandboxed_script_with_only_passes_is_asked() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let approvals = Approvals::default();
+        let (_cache, tool) =
+            approval_tool(dir.path(), [ScriptDecision::Pass], Some(approvals.clone())).await;
+
+        tool.call(terminal_args("inside", "true"), ToolContext::new())
+            .await
+            .expect("a sandboxed script with only passes runs");
+        assert_eq!(approvals.asked(), []);
+
+        tool.call(unsandboxed_args("true"), ToolContext::new())
+            .await
+            .expect("the approver approved");
+        let asked = approvals.asked();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].kind().as_str(), "unsandboxed");
+        assert_eq!(asked[0].subject(), "true");
+    }
+
+    /// An `Allow` runs a script that crosses the boundary without asking;
+    /// a denied `Ask` keeps it from running and its reason reaches the
+    /// caller.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_allow_runs_and_a_denied_ask_does_not() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let approvals = Approvals::default();
+        let (_cache, allowed) =
+            approval_tool(dir.path(), [ScriptDecision::Allow], Some(approvals.clone())).await;
+        allowed
+            .call(unsandboxed_args("true"), ToolContext::new())
+            .await
+            .expect("an allowed script runs");
+        assert_eq!(approvals.asked(), [], "an allow asks nobody");
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let marker = dir.path().join("ran");
+        let denying = Approvals::denying("not today");
+        let ask = ScriptDecision::Ask(ApprovalRequest::new(ApprovalKind::new("test"), "touch ran"));
+        let (_cache, asking) = approval_tool(
+            dir.path(),
+            [ScriptDecision::Allow, ask],
+            Some(denying.clone()),
+        )
+        .await;
+        let error = asking
+            .call(
+                terminal_args("touch the marker", &format!("touch {}", marker.display())),
+                ToolContext::new(),
             )
             .await
-            .map_err(|error| error.to_string());
-        let stages = tool
-            .permission_receiver()
-            .take_pending()
-            .into_iter()
-            .map(|event| event.stage)
-            .collect();
-        let handler = &tool.permission_handler;
-        (
-            result,
-            stages,
-            [
-                handler.waits.load(AtomicOrdering::Relaxed),
-                handler.checks.load(AtomicOrdering::Relaxed),
-            ],
-        )
+            .expect_err("the approver denied the script");
+        assert!(error.to_string().contains("not today"), "{error}");
+        assert_eq!(denying.asked().len(), 1);
+        assert!(!marker.exists(), "a denied script does not run");
     }
 
+    /// The approver of the call that carries the script is asked before the
+    /// terminal's own, and a call without one falls back to the terminal's;
+    /// with neither the script does not run.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_request_a_reviewer_approves_emits_no_permission_event() {
-        let (result, stages, [waits, checks]) = permission_stages(Review::Approved).await;
-        result.expect("approved");
-        assert_eq!(stages, Vec::<PermissionEventStage>::new());
-        assert_eq!([waits, checks], [0, 0], "the route is not asked");
-    }
-
-    #[tokio::test]
-    async fn a_request_a_reviewer_denies_emits_no_permission_event() {
-        let (result, stages, [waits, checks]) =
-            permission_stages(Review::Denied("not today".into())).await;
-        assert!(result.unwrap_err().contains("not today"));
-        assert_eq!(stages, Vec::<PermissionEventStage>::new());
-        assert_eq!([waits, checks], [0, 0], "the route is not asked");
-    }
-
-    #[tokio::test]
-    async fn a_request_every_reviewer_passes_waits_then_resolves() {
-        let (result, stages, [waits, checks]) = permission_stages(Review::Passed).await;
-        result.expect("the route allows");
-        assert_eq!(
-            stages,
-            [
-                PermissionEventStage::Waiting,
-                PermissionEventStage::Resolved
-            ]
+    async fn an_ask_goes_to_the_calls_approver_then_the_terminals() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let terminals = Approvals::default();
+        let (_cache, tool) = approval_tool(dir.path(), [], Some(terminals.clone())).await;
+        let calls = Approvals::denying("the call's approver decides");
+        let error = tool
+            .call(
+                unsandboxed_args("true"),
+                ToolContext::new().with_approver(AnyApprover::new(calls.clone())),
+            )
+            .await
+            .expect_err("the call's approver denied the script");
+        assert!(
+            error.to_string().contains("the call's approver decides"),
+            "{error}"
         );
-        assert_eq!([waits, checks], [1, 1]);
+        assert_eq!((calls.asked().len(), terminals.asked().len()), (1, 0));
+
+        tool.run_background(TerminalArgs {
+            background: true,
+            ..unsandboxed_args("true")
+        })
+        .await
+        .expect("a call with no approver falls back to the terminal's");
+        assert_eq!(terminals.asked().len(), 1);
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, bare) = approval_tool(dir.path(), [], None).await;
+        let error = bare
+            .call(unsandboxed_args("true"), ToolContext::new())
+            .await
+            .expect_err("nobody can approve the script");
+        assert!(error.to_string().contains("no approver"), "{error}");
     }
 
     #[test]
@@ -7761,13 +7810,9 @@ mod tests {
     #[tokio::test]
     async fn uninitialized_terminal_rejects_execution_and_catalog() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = TerminalTool::new_exact(
-            dir.path(),
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .unwrap();
+        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+            .await
+            .unwrap();
         assert!(matches!(
             tool.prepared_tools_context(),
             Err(ToolRuntimeError::NotInitialized(_))
@@ -7784,17 +7829,13 @@ mod tests {
     async fn child_terminal_exposes_controls_with_isolated_jobs() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted");
         tool.job_registry()
             .register(
                 424_242,
@@ -7896,17 +7937,13 @@ mod tests {
     async fn a_main_exclusive_command_names_its_choices_and_does_not_exist_for_a_subagent() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.main_exclusive(|main| {
             main.configure_terminal_bound_usage_tool("pick", |binding| PickTool {
@@ -7994,21 +8031,17 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let parent = tool.with_registry(registry);
         let child = parent
@@ -8028,22 +8061,18 @@ mod tests {
         let ids = crate::test_ids::RecordingIds::default();
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .with_id_allocator(ids.allocator())
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .with_id_allocator(ids.allocator())
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let terminal = tool.with_registry(registry);
 
@@ -8104,24 +8133,20 @@ mod tests {
         ids: AnyIdAllocator,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir,
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .with_id_allocator(ids)
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted")
-        .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-            local: true,
-            container: false,
-        });
+        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .with_id_allocator(ids)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+            });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
@@ -8389,17 +8414,13 @@ mod tests {
     async fn sandboxed_terminal_executes_pwd() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let job_registry = tool.job_registry();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
@@ -8415,7 +8436,6 @@ mod tests {
             background: false,
             carry: None,
             carried_dir: None,
-            alert_tx: async_channel::unbounded().0,
             script: "/bin/pwd".to_string(),
             language: ScriptLanguage::Shell,
             mode: TerminalMode::Sandboxed,
@@ -8438,7 +8458,7 @@ mod tests {
         })
         .await;
         match result {
-            Ok(ok) => {
+            Ok((ok, _settled)) => {
                 eprintln!("PWD RESULT: {ok:?}");
                 assert_eq!(ok.exit_code, 0, "unexpected terminal result: {ok:?}");
             }
@@ -8459,17 +8479,13 @@ mod tests {
         let readable = tempfile::tempdir().unwrap();
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tools = shell_sessions.local_tools().unwrap().clone();
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted");
         let working_dir = tool.working_dir().clone();
         let writable_paths = vec![writable.path().to_path_buf()];
         let readable_paths = vec![readable.path().to_path_buf()];
@@ -8522,7 +8538,6 @@ mod tests {
             background: false,
             carry: None,
             carried_dir: None,
-            alert_tx: async_channel::unbounded().0,
             script,
             language: ScriptLanguage::Shell,
             mode: TerminalMode::Sandboxed,
@@ -8545,7 +8560,7 @@ mod tests {
         })
         .await
         .expect("the sandboxed script runs");
-        let stdout = output_text(&result.stdout).expect("inline stdout");
+        let stdout = output_text(&result.0.stdout).expect("inline stdout");
         let mut lines = stdout.lines();
         for name in names {
             let expected = base
@@ -8624,17 +8639,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
         let tools = shell_sessions.local_tools().unwrap().clone();
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted");
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let result = execute_script_standalone(StandaloneExecution {
@@ -8649,7 +8660,6 @@ mod tests {
             background: false,
             carry: None,
             carried_dir: None,
-            alert_tx: async_channel::unbounded().0,
             script,
             language: ScriptLanguage::Shell,
             mode: TerminalMode::Sandboxed,
@@ -8672,7 +8682,7 @@ mod tests {
         })
         .await
         .expect("the sandboxed script runs");
-        output_text(&result.stdout)
+        output_text(&result.0.stdout)
             .expect("inline stdout")
             .to_string()
     }
@@ -9063,21 +9073,17 @@ mod tests {
     async fn failed_command_reports_nonzero_exit_code() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
 
@@ -9127,21 +9133,17 @@ mod tests {
     async fn a_detached_job_reads_pending_until_its_completion_is_taken() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let receiver = tool.background_receiver();
@@ -9198,21 +9200,17 @@ mod tests {
     async fn background_terminal_accepts_terminal_input() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let background_receiver = tool.background_receiver();
@@ -9271,21 +9269,17 @@ mod tests {
     async fn killing_background_terminal_kills_descendant_processes() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                });
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         let tool = tool.with_registry(registry);
         let child_pid_path = dir.path().join("child.pid");
@@ -9401,7 +9395,7 @@ mod tests {
     /// Starts `script` as a background job and returns its task id.
     #[cfg(unix)]
     async fn start_background_job(
-        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
         script: &str,
     ) -> String {
         let result = tool
@@ -9517,47 +9511,12 @@ mod tests {
         wait_for_completed_task(&receiver, &task_id).await;
     }
 
-    /// Records the unsafe approvals it is asked for and refuses them.
-    #[derive(Default)]
-    struct RecordingApprovals {
-        asked: Mutex<Vec<(String, ScriptLanguage, CommandLocation<'static>)>>,
-    }
-
-    impl PermissionHandler for RecordingApprovals {
-        fn check(
-            &self,
-            _mode: TerminalMode,
-            script: &str,
-            language: ScriptLanguage,
-            location: CommandLocation<'_>,
-        ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
-            // Only home-environment commands reach this handler in the test.
-            assert_eq!(location, CommandLocation::Local);
-            self.asked
-                .lock()
-                .unwrap()
-                .push((script.to_string(), language, CommandLocation::Local));
-            std::future::ready(Ok(false))
-        }
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn unsafe_python_asks_for_approval_with_its_code_and_language() {
+    async fn unsafe_python_asks_for_approval_with_its_code() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir.path(),
-            RecordingApprovals::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted");
-        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
-        let tool = tool.with_registry(registry);
+        let refusing = Approvals::denying("no");
+        let (_cache, tool) = approval_tool(dir.path(), [], Some(refusing.clone())).await;
 
         let code = "import os\nprint(os.getcwd())";
         let refused = tool
@@ -9570,14 +9529,9 @@ mod tests {
             )
             .await;
         assert!(refused.is_err(), "the refused approval stops the run");
-        assert_eq!(
-            *tool.permission_handler.asked.lock().unwrap(),
-            [(
-                code.to_string(),
-                ScriptLanguage::Python,
-                CommandLocation::Local
-            )]
-        );
+        let asked = refusing.asked();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].subject(), code);
     }
 
     #[cfg(unix)]
@@ -9993,7 +9947,7 @@ mod tests {
         alert_after: Duration,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, tool) =
             unconfigured_test_terminal(dir, foreground_wait, timeout_cap, alert_after).await;
@@ -10009,22 +9963,18 @@ mod tests {
         alert_after: Duration,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Unconfigured>,
+        TerminalTool<executor_core::tokio::TokioGlobal, Unconfigured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir,
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted")
-        .with_foreground_wait(foreground_wait)
-        .with_timeout_cap(timeout_cap)
-        .with_long_job_alert_after(alert_after);
+        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_foreground_wait(foreground_wait)
+            .with_timeout_cap(timeout_cap)
+            .with_long_job_alert_after(alert_after);
         (cache, tool)
     }
 
@@ -10180,7 +10130,7 @@ mod tests {
 
     /// The directory the sandbox may execute programs from.
     #[cfg(unix)]
-    fn exec_dir<P, E>(tool: &TerminalTool<P, E, Configured>) -> PathBuf {
+    fn exec_dir<E>(tool: &TerminalTool<E, Configured>) -> PathBuf {
         tool.shell_sessions
             .local_tools()
             .expect("the terminal has local tools")
@@ -10397,7 +10347,7 @@ mod tests {
     /// descendant still alive, and returns the task id and the descendant's pid.
     #[cfg(unix)]
     async fn background_job_whose_shell_exited(
-        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
         script: &str,
         timeout: u64,
     ) -> (String, i32) {
@@ -10861,21 +10811,17 @@ mod tests {
         priority: ProcessPriority,
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir,
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_process_priority(priority);
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_process_priority(priority);
         let registry = Arc::new(ToolRegistryBuilder::new().build(tool.output_store().clone()));
         (cache, tool.with_registry(registry))
     }
@@ -11510,17 +11456,13 @@ mod tests {
         let (container, bundle, _tools_cache) = start_acceptance_container().await;
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let shell_sessions = acceptance_shell_sessions(&container, &bundle, dir.path()).await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted");
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(
             ToolRegistryBuilder::new().build(test_outputs(dir.path())),
         ));
@@ -11569,21 +11511,17 @@ mod tests {
         let shell_sessions = acceptance_shell_sessions(&container, &bundle, Path::new("/")).await;
 
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir.path(),
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_process_priority(ProcessPriority::new(
-                CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
-                IoPriority::Normal,
-            ));
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_process_priority(ProcessPriority::new(
+                    CpuPriority::Nice(NiceLevel::new(5).expect("nice level 5 is in range")),
+                    IoPriority::Normal,
+                ));
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(ProbeEchoTool);
         let registry = Arc::new(builder.build(tool.output_store().clone()));
@@ -11643,8 +11581,7 @@ mod tests {
 
     // ---- subagent authority -------------------------------------------------
 
-    type ConfiguredTestTool =
-        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>;
+    type ConfiguredTestTool = TerminalTool<executor_core::tokio::TokioGlobal, Configured>;
 
     /// Runs `script` in `tool`'s sandbox and returns its exit code.
     #[cfg(unix)]
@@ -12247,30 +12184,64 @@ mod tests {
         );
     }
 
-    /// Asserts `receiver` holds exactly one alert: a reset of the carried
-    /// directory to `dir` for `reason`.
-    #[cfg(unix)]
-    fn assert_directory_reset(
-        receiver: &BackgroundTaskReceiver,
-        dir: impl AsRef<Path>,
-        reason: DirectoryResetReason,
-    ) {
-        let alerts = receiver.take_job_alerts();
-        match alerts.as_slice() {
-            [JobAlert::DirectoryReset(reset)] => {
-                assert_eq!(reset.dir, dir.as_ref());
-                assert_eq!(reset.reason, reason);
-            }
-            other => panic!("expected one directory reset, got {other:?}"),
+    /// Reports how each script ended, to a channel the test holds.
+    struct RecordCarries(async_channel::Sender<(ScriptDir, Carry)>);
+
+    impl crate::ScriptPolicy for RecordCarries {
+        type State = ();
+
+        fn check(
+            &self,
+            _script: &crate::ScriptCheck<'_>,
+            (): &(),
+        ) -> impl Future<Output = ScriptDecision> + Send {
+            std::future::ready(ScriptDecision::Pass)
         }
+
+        async fn ended(&self, end: &crate::ScriptEnd<'_>, (): &()) {
+            self.0
+                .send((end.end.clone(), end.carry))
+                .await
+                .expect("the test holds the receiver");
+        }
+    }
+
+    /// The main agent's terminal of [`authority_terminal`], with the end of
+    /// every script reported on the returned channel.
+    #[cfg(unix)]
+    async fn carry_terminal(
+        dir: &Path,
+    ) -> (
+        crate::tool_runtime::tests::UnlockingTempDir,
+        ConfiguredTestTool,
+        async_channel::Receiver<(ScriptDir, Carry)>,
+    ) {
+        let (cache, tool) = unconfigured_test_terminal(
+            dir,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        let (ends_tx, ends) = async_channel::unbounded();
+        let mut registry = ToolRegistryBuilder::new();
+        registry.script_policy(RecordCarries(ends_tx));
+        let registry = Arc::new(registry.build(tool.output_store().clone()));
+        (cache, tool.with_registry(registry), ends)
+    }
+
+    /// The ends reported since the last call.
+    #[cfg(unix)]
+    fn carries(ends: &async_channel::Receiver<(ScriptDir, Carry)>) -> Vec<(ScriptDir, Carry)> {
+        std::iter::from_fn(|| ends.try_recv().ok()).collect()
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_carried_directory_raises_no_alert() {
+    async fn a_carried_directory_is_moved_or_unchanged() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = authority_terminal(dir.path()).await;
-        let receiver = tool.background_receiver();
+        let (_cache, tool, ends) = carry_terminal(dir.path()).await;
+        let sub = ScriptDir::Host(dunce::canonicalize(dir.path()).unwrap().join("sub"));
 
         assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
         assert_eq!(exit_code_of(&tool, "true").await, 0);
@@ -12278,72 +12249,98 @@ mod tests {
         // A failure that stayed in its directory, and a direct command.
         assert_ne!(exit_code_of(&tool, "false").await, 0);
         assert_ne!(exit_code_of(&tool, "ls /nonexistent-directory").await, 0);
-        assert!(receiver.take_job_alerts().is_empty());
+        assert_eq!(
+            carries(&ends),
+            [
+                (sub.clone(), Carry::Moved),
+                (sub.clone(), Carry::Unchanged),
+                (sub.clone(), Carry::Unchanged),
+                (sub.clone(), Carry::Unchanged),
+                (sub, Carry::Unchanged),
+            ]
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_command_alerts_once_with_the_directory_commands_run_in() {
+    async fn a_failed_command_resets_to_the_directory_commands_run_in() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = authority_terminal(dir.path()).await;
-        let receiver = tool.background_receiver();
+        let (_cache, tool, ends) = carry_terminal(dir.path()).await;
         let root = dunce::canonicalize(dir.path()).unwrap();
 
         assert_ne!(exit_code_of(&tool, "mkdir sub && cd sub && false").await, 0);
-        assert_directory_reset(&receiver, &root, DirectoryResetReason::Failed);
+        assert_eq!(
+            carries(&ends),
+            [(
+                ScriptDir::Host(root.clone()),
+                Carry::Reset(DirectoryResetReason::Failed)
+            )]
+        );
         assert_eq!(pwd_of(&tool).await, root);
-        assert!(receiver.take_job_alerts().is_empty());
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn exit_without_a_report_alerts_once() {
+    async fn exit_without_a_report_resets() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = authority_terminal(dir.path()).await;
-        let receiver = tool.background_receiver();
+        let (_cache, tool, ends) = carry_terminal(dir.path()).await;
         let root = dunce::canonicalize(dir.path()).unwrap();
+        let sub = ScriptDir::Host(root.join("sub"));
 
         assert_eq!(exit_code_of(&tool, "mkdir sub && cd sub").await, 0);
         assert_eq!(exit_code_of(&tool, "cd ..; exit 0").await, 0);
-        assert_directory_reset(
-            &receiver,
-            root.join("sub"),
-            DirectoryResetReason::Unreported,
+        assert_eq!(
+            carries(&ends),
+            [
+                (sub.clone(), Carry::Moved),
+                (sub, Carry::Reset(DirectoryResetReason::Unreported)),
+            ]
         );
         assert_eq!(pwd_of(&tool).await, root.join("sub"));
-        assert!(receiver.take_job_alerts().is_empty());
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_directory_outside_the_readable_paths_alerts_once() {
+    async fn a_directory_outside_the_readable_paths_resets() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = authority_terminal(dir.path()).await;
-        let receiver = tool.background_receiver();
+        let (_cache, tool, ends) = carry_terminal(dir.path()).await;
         let root = dunce::canonicalize(dir.path()).unwrap();
 
         // Readable to the sandbox, yet in none of the terminal's grants.
         assert_eq!(exit_code_of(&tool, "cd /usr").await, 0);
-        assert_directory_reset(&receiver, &root, DirectoryResetReason::OutsideReadable);
+        assert_eq!(
+            carries(&ends),
+            [(
+                ScriptDir::Host(root.clone()),
+                Carry::Reset(DirectoryResetReason::OutsideReadable)
+            )]
+        );
         assert_eq!(pwd_of(&tool).await, root);
-        assert!(receiver.take_job_alerts().is_empty());
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_removed_carried_directory_alerts_once() {
+    async fn a_removed_carried_directory_resets() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = authority_terminal(dir.path()).await;
-        let receiver = tool.background_receiver();
+        let (_cache, tool, ends) = carry_terminal(dir.path()).await;
         let root = dunce::canonicalize(dir.path()).unwrap();
 
         assert_eq!(exit_code_of(&tool, "mkdir gone && cd gone").await, 0);
-        assert!(receiver.take_job_alerts().is_empty());
+        assert_eq!(
+            carries(&ends),
+            [(ScriptDir::Host(root.join("gone")), Carry::Moved)]
+        );
         std::fs::remove_dir(root.join("gone")).unwrap();
         assert_eq!(pwd_of(&tool).await, root);
-        assert_directory_reset(&receiver, &root, DirectoryResetReason::Removed);
+        assert_eq!(
+            carries(&ends),
+            [(
+                ScriptDir::Host(root.clone()),
+                Carry::Reset(DirectoryResetReason::Removed)
+            )]
+        );
         assert_eq!(pwd_of(&tool).await, root);
-        assert!(receiver.take_job_alerts().is_empty());
+        assert_eq!(carries(&ends), [(ScriptDir::Host(root), Carry::Unchanged)]);
     }
 
     #[cfg(unix)]
@@ -12369,8 +12366,8 @@ mod tests {
                 start: ContainerPath::new("/workspace").unwrap(),
             }),
             shell: true,
+            removed: false,
         };
-        let receiver = tool.background_receiver();
         assert_eq!(
             carry
                 .container
@@ -12389,35 +12386,34 @@ mod tests {
 
         // A directory inside the mount, spelled as the container sees it.
         std::fs::write(&report, "/workspace/sub/dir\n").unwrap();
-        tool.record_carried_dir(&carry, true).await;
+        let settled = tool.record_carried_dir(&carry, true).await;
         assert_eq!(carried.get(), Some(tool.working_dir().join("sub/dir")));
         assert!(!report.exists(), "the report is consumed");
-
-        assert!(
-            receiver.take_job_alerts().is_empty(),
-            "a carried directory raises no alert"
-        );
+        assert_eq!(settled.carry, Carry::Moved);
+        assert_eq!(settled.carried, carried.get());
 
         // Outside the mount, after a failure and an empty report: unchanged,
-        // and each raises one alert naming where the next command starts.
+        // and each says why the next command starts where the last did.
         std::fs::write(&report, "/etc\n").unwrap();
-        tool.record_carried_dir(&carry, true).await;
+        let settled = tool.record_carried_dir(&carry, true).await;
         assert_eq!(carried.get(), Some(tool.working_dir().join("sub/dir")));
-        assert_directory_reset(
-            &receiver,
-            "/workspace",
-            DirectoryResetReason::OutsideWorkspace,
+        assert_eq!(
+            settled.carry,
+            Carry::Reset(DirectoryResetReason::OutsideWorkspace)
         );
         std::fs::write(&report, "/workspace/other\n").unwrap();
-        tool.record_carried_dir(&carry, false).await;
+        let settled = tool.record_carried_dir(&carry, false).await;
         assert_eq!(carried.get(), Some(tool.working_dir().join("sub/dir")));
-        assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Failed);
-        tool.record_carried_dir(&carry, true).await;
-        assert_directory_reset(&receiver, "/workspace", DirectoryResetReason::Unreported);
+        assert_eq!(settled.carry, Carry::Reset(DirectoryResetReason::Failed));
+        let settled = tool.record_carried_dir(&carry, true).await;
+        assert_eq!(
+            settled.carry,
+            Carry::Reset(DirectoryResetReason::Unreported)
+        );
         // A failure that stayed where it started changes nothing.
         std::fs::write(&report, "/workspace\n").unwrap();
-        tool.record_carried_dir(&carry, false).await;
-        assert!(receiver.take_job_alerts().is_empty());
+        let settled = tool.record_carried_dir(&carry, false).await;
+        assert_eq!(settled.carry, Carry::Unchanged);
 
         // The mapping back to the container for the next start.
         assert_eq!(
@@ -13268,16 +13264,12 @@ mod tests {
         let sibling = dir.path().join("sibling");
         std::fs::create_dir_all(&granted).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
-        let tool = TerminalTool::new_exact(
-            dir.path(),
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_terminal_bound_tool("launch_probe", |binding: &TerminalBinding| {
             LaunchProbe {
@@ -13363,19 +13355,13 @@ mod tests {
     async fn sandboxed_only_command_leaves_unsafe_scripts_the_host_program() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir.path(),
-            TestPermissionHandler {
-                allow_unsafe: true,
-                ..Default::default()
-            },
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .with_approver(ApproveAll)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.sandboxed_only(|sandboxed| sandboxed.configure_tool(SandboxedUname));
         let tool = tool.with_registry(Arc::new(
@@ -13426,20 +13412,14 @@ mod tests {
     async fn unsafe_terminal(
         dir: &Path,
         shell_sessions: ShellSessionRegistry,
-    ) -> TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured> {
-        let tool = TerminalTool::new_exact(
-            dir,
-            TestPermissionHandler {
-                allow_unsafe: true,
-                ..Default::default()
-            },
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted");
+    ) -> TerminalTool<executor_core::tokio::TokioGlobal, Configured> {
+        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .with_approver(ApproveAll)
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         tool.with_registry(Arc::new(
             ToolRegistryBuilder::new().build(test_outputs(dir.join("outputs"))),
         ))
@@ -13448,7 +13428,7 @@ mod tests {
     /// Runs an approved unsafe `script` to its end and renders the result.
     #[cfg(unix)]
     async fn run_unsafe(
-        tool: &TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
         script: &str,
     ) -> String {
         let result = tool
@@ -13564,16 +13544,12 @@ mod tests {
     async fn a_subagent_of_a_subagent_gets_the_subagent_registry() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir.path(),
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.main_only(|reserved| reserved.configure_tool(ProbeEchoTool));
         let parent = tool.with_registry(Arc::new(
@@ -13696,17 +13672,13 @@ mod tests {
         let clone = tempfile::tempdir().expect("clone dir should be created");
         let read_only = tempfile::tempdir().expect("read-only dir should be created");
         let (_cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir.path(),
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted")
-        .with_readable_paths([read_only.path()]);
+        let tool = TerminalTool::new_exact(dir.path(), executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted")
+            .with_readable_paths([read_only.path()]);
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_terminal_bound_tool("check_probe", |binding: &TerminalBinding| {
             CheckProbe {
@@ -13748,11 +13720,9 @@ mod tests {
         assert!(
             matches!(
                 unsafe_run,
-                Err(TerminalRunError::Terminal(TerminalError::PermissionDenied(
-                    TerminalMode::Unsafe
-                )))
+                Err(TerminalRunError::Terminal(TerminalError::NoApprover(_)))
             ),
-            "an unsafe run is put to the permission handler: {unsafe_run:?}"
+            "an unsafe run is put to an approver, and this terminal has none: {unsafe_run:?}"
         );
 
         drop(terminal);
@@ -13842,16 +13812,12 @@ mod tests {
         ConfiguredTestTool,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool = TerminalTool::new_exact(
-            dir,
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(probe);
         builder.observe_commands(crate::AnyCommandObserver::new(IdentityObserver(observer)));
@@ -14078,16 +14044,12 @@ mod tests {
         })
         .with_container_runtime(runtime)
         .with_test_container_tools(container_tools, "aither-test-confinement".to_string());
-        let tool = TerminalTool::new_exact(
-            dir,
-            TestPermissionHandler::default(),
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .expect("terminal tool should initialize")
-        .adopt_prepared_tools(shell_sessions)
-        .await
-        .expect("prepared tools should be adopted");
+        let tool = TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("terminal tool should initialize")
+            .adopt_prepared_tools(shell_sessions)
+            .await
+            .expect("prepared tools should be adopted");
         let parent = tool.with_registry(Arc::new(
             ToolRegistryBuilder::new().build(test_outputs(dir)),
         ));
@@ -14283,24 +14245,20 @@ mod tests {
         configure: impl FnOnce(&mut ToolRegistryBuilder),
     ) -> (
         crate::tool_runtime::tests::UnlockingTempDir,
-        TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal, Configured>,
+        TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
     ) {
         let (cache, shell_sessions) = prepared_test_registry().await;
-        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
-            TerminalTool::new_exact(
-                dir,
-                TestPermissionHandler::default(),
-                executor_core::tokio::TokioGlobal,
-            )
-            .await
-            .expect("terminal tool should initialize")
-            .adopt_prepared_tools(shell_sessions)
-            .await
-            .expect("prepared tools should be adopted")
-            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
-                local: true,
-                container: false,
-            });
+        let tool: TerminalTool<executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(dir, executor_core::tokio::TokioGlobal)
+                .await
+                .expect("terminal tool should initialize")
+                .adopt_prepared_tools(shell_sessions)
+                .await
+                .expect("prepared tools should be adopted")
+                .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                });
         let mut registry = ToolRegistryBuilder::new();
         configure(&mut registry);
         let registry = Arc::new(registry.build(tool.output_store().clone()));
@@ -14323,22 +14281,22 @@ mod tests {
         }
     }
 
-    impl crate::CommandPolicy for RefuseProgram {
+    impl crate::ScriptPolicy for RefuseProgram {
         type State = ();
 
         fn check(
             &self,
             script: &crate::ScriptCheck<'_>,
             _state: &(),
-        ) -> impl Future<Output = crate::PolicyDecision> + Send {
+        ) -> impl Future<Output = ScriptDecision> + Send {
             let runs = matches!(
                 script.shell,
                 Some(Ok(shell)) if shell.commands().iter().any(|command| command.program() == self.program)
             );
             std::future::ready(if runs {
-                crate::PolicyDecision::Refuse(PolicyRefusal::new(self.refusal()))
+                ScriptDecision::Refuse(ScriptRefusal::new(self.refusal()))
             } else {
-                crate::PolicyDecision::Allow
+                ScriptDecision::Pass
             })
         }
 
@@ -14361,16 +14319,16 @@ mod tests {
         last_success: std::sync::Mutex<Option<String>>,
     }
 
-    impl crate::CommandPolicy for RefuseRepeat {
+    impl crate::ScriptPolicy for RefuseRepeat {
         type State = Repeats;
 
         fn check(
             &self,
             script: &crate::ScriptCheck<'_>,
             state: &Repeats,
-        ) -> impl Future<Output = crate::PolicyDecision> + Send {
+        ) -> impl Future<Output = ScriptDecision> + Send {
             let decision = if state.last_success.lock().unwrap().as_deref() == Some(script.script) {
-                crate::PolicyDecision::Refuse(PolicyRefusal::unchanged_read(
+                ScriptDecision::Refuse(ScriptRefusal::new(
                     "It would print what it printed last time.",
                 ))
             } else {
@@ -14379,7 +14337,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .insert(script.task_id.to_string(), script.script.to_string());
-                crate::PolicyDecision::Allow
+                ScriptDecision::Pass
             };
             std::future::ready(decision)
         }
@@ -14411,7 +14369,7 @@ mod tests {
         };
         let text = policy.refusal();
         let (_cache, tool) =
-            policy_tool(dir.path(), |registry| registry.command_policy(policy)).await;
+            policy_tool(dir.path(), |registry| registry.script_policy(policy)).await;
         let marker = dir.path().join("ran");
         let script = format!("touch {}; sudo env pkill anything", marker.display());
 
@@ -14424,9 +14382,9 @@ mod tests {
             .expect_err("the policy refuses the script");
         assert_eq!(error.to_string(), text);
         let refusal = error
-            .downcast_ref::<PolicyRefusal>()
+            .downcast_ref::<ScriptRefusal>()
             .expect("the refusal stays typed for the agent loop");
-        assert!(!refusal.is_unchanged_read());
+        assert_eq!(refusal.text(), text);
         let error = tool
             .run_background(terminal_args("name-based kill", &script))
             .await
@@ -14449,6 +14407,206 @@ mod tests {
             Ok(crate::ScriptOutcome::Exited { code: 3 }),
             "the policy learns how the script ended before its result returns"
         );
+    }
+
+    /// Records the directory each script started in and the one it ended in.
+    struct RecordDirs {
+        starts: async_channel::Sender<ScriptDir>,
+        ends: async_channel::Sender<(ScriptDir, Carry)>,
+    }
+
+    impl crate::ScriptPolicy for RecordDirs {
+        type State = ();
+
+        async fn check(&self, script: &crate::ScriptCheck<'_>, (): &()) -> ScriptDecision {
+            self.starts
+                .send(script.start.clone())
+                .await
+                .expect("the test holds the receiver");
+            ScriptDecision::Pass
+        }
+
+        async fn ended(&self, end: &crate::ScriptEnd<'_>, (): &()) {
+            self.ends
+                .send((end.end.clone(), end.carry))
+                .await
+                .expect("the test holds the receiver");
+        }
+    }
+
+    /// A policy sees where each script starts: after a script that ran `cd`,
+    /// the next starts in that directory, and the end directory of a script
+    /// is the start directory of the next.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_policy_sees_the_directory_a_script_starts_and_ends_in() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (starts_tx, starts) = async_channel::unbounded();
+        let (ends_tx, ends) = async_channel::unbounded();
+        let policy = RecordDirs {
+            starts: starts_tx,
+            ends: ends_tx,
+        };
+        let (_cache, tool) =
+            policy_tool(dir.path(), |registry| registry.script_policy(policy)).await;
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        for (description, script) in [
+            ("enter a directory", "mkdir sub && cd sub"),
+            ("stay there", "true"),
+            ("leave it", "cd .."),
+            ("stay at the root", "true"),
+        ] {
+            tool.call(terminal_args(description, script), ToolContext::new())
+                .await
+                .expect("the script runs");
+        }
+
+        let starts: Vec<_> = std::iter::from_fn(|| starts.try_recv().ok()).collect();
+        let ends: Vec<_> = std::iter::from_fn(|| ends.try_recv().ok()).collect();
+        let sub = root.join("sub");
+        let host = |dir: &Path| ScriptDir::Host(dir.to_path_buf());
+        assert_eq!(starts, [host(&root), host(&sub), host(&sub), host(&root)]);
+        assert_eq!(
+            ends,
+            [
+                (host(&sub), Carry::Moved),
+                (host(&sub), Carry::Unchanged),
+                (host(&root), Carry::Moved),
+                (host(&root), Carry::Unchanged),
+            ]
+        );
+        for ((end, _), next) in ends.iter().zip(&starts[1..]) {
+            assert_eq!(end, next, "a script starts where the last ended");
+        }
+    }
+
+    /// `Carry` reports each of its cases: a script that moved the shell, left
+    /// it where it started, failed after moving it, exited without a report,
+    /// and one that runs in the background.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_policy_is_told_what_each_script_did_to_the_carried_directory() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (starts_tx, _starts) = async_channel::unbounded();
+        let (ends_tx, ends) = async_channel::unbounded();
+        let policy = RecordDirs {
+            starts: starts_tx,
+            ends: ends_tx,
+        };
+        let (_cache, tool) =
+            policy_tool(dir.path(), |registry| registry.script_policy(policy)).await;
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let sub = ScriptDir::Host(root.join("sub"));
+
+        for script in ["mkdir sub && cd sub", "true", "cd ..; false", "exit 0"] {
+            tool.call(terminal_args("carry", script), ToolContext::new())
+                .await
+                .expect("the script runs");
+        }
+        // The call returns before a background script ends.
+        tool.run_background(terminal_args("detach", "sleep 1"))
+            .await
+            .expect("the background script starts");
+        assert!(
+            ends.len() == 4,
+            "a background script's end is told after its call returned"
+        );
+        let carries: Vec<_> = std::iter::from_fn(|| ends.try_recv().ok()).collect();
+        assert_eq!(
+            carries,
+            [
+                (sub.clone(), Carry::Moved),
+                (sub.clone(), Carry::Unchanged),
+                (sub.clone(), Carry::Reset(DirectoryResetReason::Failed)),
+                (sub.clone(), Carry::Reset(DirectoryResetReason::Unreported)),
+            ]
+        );
+        let background = tokio::time::timeout(Duration::from_secs(20), ends.recv())
+            .await
+            .expect("the background script ends")
+            .expect("the test holds the sender");
+        assert_eq!(background, (sub, Carry::NotCarried));
+    }
+
+    /// Scripts started together start in the directory that was carried when
+    /// each was admitted, and each reports an end directory that is a
+    /// directory some script of the group settled, which the next script
+    /// then starts in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parallel_scripts_start_alike_and_the_next_starts_where_a_last_ended() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (starts_tx, starts) = async_channel::unbounded();
+        let (ends_tx, ends) = async_channel::unbounded();
+        let policy = RecordDirs {
+            starts: starts_tx,
+            ends: ends_tx,
+        };
+        let (_cache, tool) =
+            policy_tool(dir.path(), |registry| registry.script_policy(policy)).await;
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        let calls = ["a", "b", "c", "d"].map(|name| {
+            let tool = &tool;
+            async move {
+                tool.call(
+                    terminal_args("enter", &format!("mkdir -p {name} && cd {name}")),
+                    ToolContext::new(),
+                )
+                .await
+                .expect("the script runs");
+            }
+        });
+        futures::future::join_all(calls).await;
+        let starts: Vec<_> = std::iter::from_fn(|| starts.try_recv().ok()).collect();
+        assert_eq!(starts, vec![ScriptDir::Host(root.clone()); 4]);
+        let ends: Vec<_> = std::iter::from_fn(|| ends.try_recv().ok()).collect();
+        assert_eq!(ends.len(), 4);
+        let settled = ["a", "b", "c", "d"].map(|name| ScriptDir::Host(root.join(name)));
+        for (end, carry) in &ends {
+            assert!(settled.contains(end), "{end:?}");
+            assert_eq!(*carry, Carry::Moved);
+        }
+
+        tool.call(terminal_args("next", "true"), ToolContext::new())
+            .await
+            .expect("the script runs");
+        let next = starts_after(&tool).await;
+        assert!(ends.iter().any(|(end, _)| *end == next));
+    }
+
+    /// The directory the terminal's next foreground script starts in.
+    #[cfg(unix)]
+    async fn starts_after(
+        tool: &TerminalTool<executor_core::tokio::TokioGlobal, Configured>,
+    ) -> ScriptDir {
+        carried_start(tool.carried_dir.as_ref()).await.map_or_else(
+            || ScriptDir::Host(tool.working_dir.clone()),
+            ScriptDir::Host,
+        )
+    }
+
+    /// Two policies that disagree resolve to the strictest decision: a
+    /// refusal outranks an approval, wherever they stand in the registry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policies_that_disagree_resolve_to_the_strictest_decision() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (_cache, tool) = approval_tool(
+            dir.path(),
+            [
+                ScriptDecision::Refuse(ScriptRefusal::new("refused by the second")),
+                ScriptDecision::Allow,
+            ],
+            None,
+        )
+        .await;
+        let error = tool
+            .call(terminal_args("disagree", "true"), ToolContext::new())
+            .await
+            .expect_err("the refusal outranks the approval");
+        assert_eq!(error.to_string(), "refused by the second");
     }
 
     /// With no policy the sandbox refuses nothing: `grep` and a foreground
@@ -14481,7 +14639,7 @@ mod tests {
     async fn a_policy_state_follows_each_script_to_its_end() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let (_cache, tool) = policy_tool(dir.path(), |registry| {
-            registry.command_policy(RefuseRepeat);
+            registry.script_policy(RefuseRepeat);
         })
         .await;
         assert_eq!(exit_code_of(&tool, "exit 3").await, 3);
@@ -14495,12 +14653,7 @@ mod tests {
             .call(terminal_args("again", "echo once"), ToolContext::new())
             .await
             .expect_err("a repeat of a successful script is refused");
-        assert!(
-            error
-                .downcast_ref::<PolicyRefusal>()
-                .is_some_and(PolicyRefusal::is_unchanged_read),
-            "{error}"
-        );
+        assert!(error.downcast_ref::<ScriptRefusal>().is_some(), "{error}");
         assert_eq!(exit_code_of(&tool, "echo twice").await, 0);
     }
 
@@ -14866,8 +15019,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_deleted_writable_grant_does_not_block_the_next_command() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (_cache, tool) = authority_terminal(dir.path()).await;
-        let receiver = tool.background_receiver();
+        let (_cache, tool, ends) = carry_terminal(dir.path()).await;
         let root = dunce::canonicalize(dir.path()).unwrap();
         let outside = tempfile::tempdir().expect("outside dir should be created");
         let granted = dunce::canonicalize(outside.path()).unwrap();
@@ -14876,11 +15028,20 @@ mod tests {
             exit_code_of(&tool, &format!("cd '{}'", granted.display())).await,
             0
         );
-        assert!(receiver.take_job_alerts().is_empty());
+        assert_eq!(
+            carries(&ends),
+            [(ScriptDir::Host(granted.clone()), Carry::Moved)]
+        );
 
         std::fs::remove_dir_all(&granted).unwrap();
         assert_eq!(exit_code_of(&tool, "echo test").await, 0);
-        assert_directory_reset(&receiver, &root, DirectoryResetReason::Removed);
+        assert_eq!(
+            carries(&ends),
+            [(
+                ScriptDir::Host(root.clone()),
+                Carry::Reset(DirectoryResetReason::Removed)
+            )]
+        );
         assert_eq!(pwd_of(&tool).await, root);
     }
 
