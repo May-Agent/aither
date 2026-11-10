@@ -1,7 +1,6 @@
 //! The SSH backend: a process on a server, under the server's own `heel`.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
 use std::process::Stdio as ProcessStdio;
 use std::sync::Arc;
 
@@ -10,11 +9,11 @@ use executor_core::Executor;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::child::{ChildExit, KillHandle, SandboxedChild, Streams, exit_watch};
-use super::{EnvSource, Pipe, Sandbox, SpawnError, SpawnSpec};
+use super::{EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnError, SpawnSpec};
+use crate::SshServer;
 use crate::process_tree::{KillTreeError, kill_process_tree};
-use crate::ssh::{PreparedSsh, SshClient};
-use crate::terminal::{TerminalError, inject_env_exports, shell_launch};
-use crate::{PreparedTools, SshServer, ToolRuntimeError};
+use crate::ssh::SshClient;
+use crate::terminal::{inject_env_exports, shell_launch};
 
 #[derive(Template)]
 #[template(path = "ssh_tool_execution.sh", escape = "none")]
@@ -29,37 +28,32 @@ struct SshToolExecutionTemplate<'a> {
 
 /// The command line that runs `script` on a server: the managed shell under
 /// the server's `heel` when `heel` is given, directly otherwise.
+///
+/// # Errors
+/// Fails when a template cannot render.
 pub fn remote_command(
-    tools: &PreparedTools<PathBuf>,
+    launch: &RemoteLaunch,
     heel: Option<&str>,
     script: &str,
-) -> Result<String, TerminalError> {
-    let script = tools.wrap_script(script)?;
-    let (program, args) = shell_launch(&tools.shell()?, &script);
+) -> Result<String, askama::Error> {
+    let script = launch.wrap_script(script)?;
+    let (program, args) = shell_launch(launch.shell(), &script);
     let Some(binary) = heel else {
         return Ok(shell_words::join(
             std::iter::once(program.as_str()).chain(args.iter().map(String::as_str)),
         ));
     };
-    let directory = tools.script_bin_dir()?;
-    let uv_grant = tools
-        .uv_dir()
-        .map(|dir| {
-            let dir = dir
-                .to_str()
-                .ok_or_else(|| ToolRuntimeError::InvalidCache(dir.clone()))?;
-            Ok::<_, ToolRuntimeError>(shell_words::quote(&format!("{dir}=rwx")).into_owned())
-        })
-        .transpose()?;
-    Ok(SshToolExecutionTemplate {
+    let uv_grant = launch
+        .writable_dir()
+        .map(|dir| shell_words::quote(&format!("{dir}=rwx")).into_owned());
+    SshToolExecutionTemplate {
         binary: shell_words::quote(binary),
-        tools_dir: shell_words::quote(directory),
+        tools_dir: shell_words::quote(launch.bin_dir()),
         uv_grant,
         program: shell_words::quote(&program),
         arguments: shell_words::join(&args),
     }
     .render()
-    .map_err(ToolRuntimeError::from)?)
 }
 
 #[derive(Template)]
@@ -132,7 +126,8 @@ impl Sandbox {
     pub(super) fn spawn_ssh(
         &self,
         server: &SshServer,
-        prepared: &PreparedSsh,
+        server_heel: Option<&str>,
+        launch: &RemoteLaunch,
         spec: SpawnSpec,
     ) -> Result<SandboxedChild, SpawnError> {
         let setup = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
@@ -156,7 +151,7 @@ impl Sandbox {
         let heel = if self.inner.unconfined {
             None
         } else {
-            Some(prepared.heel.as_deref().ok_or_else(|| {
+            Some(server_heel.ok_or_else(|| {
                 SpawnError::Setup(format!(
                     "the server {} has no heel, so a process on it cannot be sandboxed",
                     server.name
@@ -169,7 +164,7 @@ impl Sandbox {
         let script = shell_words::join(std::iter::once(&program).chain(&args));
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
         let script = inject_env_exports(script, Some(&spec_env)).map_err(|e| setup(&e))?;
-        let remote = remote_command(&prepared.tools, heel, &script).map_err(|e| setup(&e))?;
+        let remote = remote_command(launch, heel, &script).map_err(|e| setup(&e))?;
         let pidfile = shell_words::quote(&format!(
             "/tmp/aither-spawn-{}.pgid",
             uuid::Uuid::new_v4().simple()

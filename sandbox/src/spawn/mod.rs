@@ -26,6 +26,7 @@ mod domain;
 mod env;
 mod grants;
 pub mod host;
+mod launch;
 mod route;
 mod ssh;
 pub mod stdio;
@@ -37,7 +38,6 @@ use std::sync::Arc;
 
 use executor_core::{AnyExecutor, Executor};
 
-pub use crate::ssh::PreparedSsh;
 pub use backend::Backend;
 pub use child::{ChildExit, SandboxedChild};
 pub use domain::{
@@ -46,6 +46,7 @@ pub use domain::{
 pub use env::EnvSource;
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
 pub use host::{LocalSpawn, TreeLifetime, resolved};
+pub use launch::{ContainerLaunch, RemoteLaunch, shell_arguments};
 pub use route::{HostRoute, HostRouteError};
 pub use ssh::remote_command;
 
@@ -376,8 +377,12 @@ impl Sandbox {
     pub async fn spawn(&self, spec: SpawnSpec) -> Result<SandboxedChild, SpawnError> {
         match &self.inner.backend {
             Backend::Host { .. } => self.spawn_host(spec).await,
-            Backend::Container { runtime, tools } => self.spawn_container(runtime, tools, spec),
-            Backend::Ssh { server, prepared } => self.spawn_ssh(server, prepared, spec),
+            Backend::Container { runtime, launch } => self.spawn_container(runtime, launch, spec),
+            Backend::Ssh {
+                server,
+                heel,
+                launch,
+            } => self.spawn_ssh(server, heel.as_deref(), launch, spec),
         }
     }
 }
