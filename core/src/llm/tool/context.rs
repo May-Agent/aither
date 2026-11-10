@@ -5,6 +5,9 @@
 //! connected to: an MCP server connects it to the request's progress token, an
 //! agent that has nowhere to show progress passes [`ToolContext::new`]. The
 //! tool reports the same way in both cases and never learns which it got.
+//! The same holds for approval: a tool asks [`ToolContext::approve`] and the
+//! request reaches whichever [`Approver`] the dispatcher attached, and for
+//! cancellation, which it observes through [`ToolContext::cancellation`].
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -12,7 +15,9 @@ use core::fmt::{self, Debug, Display};
 use core::future::Future;
 use core::pin::Pin;
 
-use super::CallIdentity;
+use super::{
+    AnyApprover, Approval, ApprovalError, ApprovalRequest, Approver, CallIdentity, CancelSignal,
+};
 
 /// How far a running tool call has got.
 ///
@@ -146,6 +151,8 @@ pub struct ToolContext {
     last_progress: Option<f64>,
     identity: Option<CallIdentity>,
     working_dir: Option<String>,
+    approver: Option<AnyApprover>,
+    cancellation: CancelSignal,
 }
 
 impl ToolContext {
@@ -160,6 +167,8 @@ impl ToolContext {
             last_progress: None,
             identity: None,
             working_dir: None,
+            approver: None,
+            cancellation: CancelSignal::never(),
         }
     }
 
@@ -168,9 +177,71 @@ impl ToolContext {
     pub fn with_progress(sink: impl ProgressSink) -> Self {
         Self {
             sink: Some(Box::new(sink)),
-            last_progress: None,
-            identity: None,
-            working_dir: None,
+            ..Self::new()
+        }
+    }
+
+    /// Attaches the approver that answers this call's
+    /// [`approve`](Self::approve) requests.
+    #[must_use]
+    pub fn with_approver(mut self, approver: AnyApprover) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    /// Attaches the signal through which the dispatcher cancels this call.
+    #[must_use]
+    pub fn with_cancellation(mut self, signal: CancelSignal) -> Self {
+        self.cancellation = signal;
+        self
+    }
+
+    /// The signal that fires when the dispatcher cancels this call; one
+    /// that never fires when the dispatcher attached none.
+    ///
+    /// Work the call's future drives stops when the future is dropped; a
+    /// tool watches this for work that outlives it, such as a spawned
+    /// process, and clones it into that work.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancelSignal {
+        &self.cancellation
+    }
+
+    /// Asks this call's approver whether `request` may go ahead, attributing
+    /// it to this call when the context carries its identity.
+    ///
+    /// The returned future owns what it needs, so it is `'static` and can be
+    /// moved into the part of the work that waits for the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`ApprovalError::NoApprover`] when the dispatcher attached no
+    /// approver: nobody can approve the action, so it must not go ahead.
+    /// [`ApprovalError::Cancelled`] when the call is cancelled before the
+    /// approver answers; the approver's pending future is dropped.
+    pub fn approve(
+        &self,
+        mut request: ApprovalRequest,
+    ) -> impl Future<Output = Result<Approval, ApprovalError>> + Send + 'static {
+        let approver = self.approver.clone();
+        let cancellation = self.cancellation.clone();
+        if let Some(identity) = &self.identity {
+            request = request.with_call(identity.clone());
+        }
+        async move {
+            let Some(approver) = approver else {
+                return Err(ApprovalError::NoApprover {
+                    kind: request.kind().clone(),
+                });
+            };
+            if cancellation.is_cancelled() {
+                return Err(ApprovalError::Cancelled);
+            }
+            futures_lite::future::or(async { Ok(approver.approve(request).await) }, async {
+                cancellation.cancelled().await;
+                Err(ApprovalError::Cancelled)
+            })
+            .await
         }
     }
 
@@ -264,6 +335,8 @@ impl Debug for ToolContext {
             .field("last_progress", &self.last_progress)
             .field("identity", &self.identity)
             .field("working_dir", &self.working_dir)
+            .field("approver", &self.approver)
+            .field("cancellation", &self.cancellation)
             .finish()
     }
 }
@@ -353,6 +426,146 @@ mod tests {
             seen.try_iter().collect::<Vec<_>>(),
             [Progress::new(3.0), Progress::new(3.5)]
         );
+    }
+
+    /// Approves `allowed` and denies everything else, recording the call each
+    /// request was attributed to.
+    struct ApproveOnly {
+        allowed: &'static str,
+        seen: mpsc::Sender<Option<CallIdentity>>,
+    }
+
+    impl Approver for ApproveOnly {
+        fn approve(&self, request: ApprovalRequest) -> impl Future<Output = Approval> + Send {
+            self.seen
+                .send(request.call().cloned())
+                .expect("test receiver alive");
+            core::future::ready(if request.subject() == self.allowed {
+                Approval::Approved
+            } else {
+                Approval::Denied {
+                    reason: alloc::format!("{} is not allowed", request.subject()),
+                }
+            })
+        }
+    }
+
+    /// Never answers, like a person who is away.
+    struct Unanswered;
+
+    impl Approver for Unanswered {
+        async fn approve(&self, _request: ApprovalRequest) -> Approval {
+            core::future::pending().await
+        }
+    }
+
+    fn unsandboxed(subject: &str) -> ApprovalRequest {
+        ApprovalRequest::new(super::super::ApprovalKind::new("unsandboxed"), subject)
+    }
+
+    #[tokio::test]
+    async fn approve_reaches_the_attached_approver() {
+        use super::super::{AgentIdentity, ToolCallId};
+
+        let (tx, seen) = mpsc::channel();
+        let identity = CallIdentity::new(ToolCallId::new("call_7"), AgentIdentity::Main);
+        let cx = ToolContext::new()
+            .with_identity(identity.clone())
+            .with_approver(AnyApprover::new(ApproveOnly {
+                allowed: "cargo build",
+                seen: tx,
+            }));
+
+        assert_eq!(
+            cx.approve(unsandboxed("cargo build")).await,
+            Ok(Approval::Approved)
+        );
+        assert_eq!(
+            cx.approve(unsandboxed("rm -rf ~")).await,
+            Ok(Approval::Denied {
+                reason: "rm -rf ~ is not allowed".into(),
+            })
+        );
+        assert_eq!(
+            seen.try_iter().collect::<Vec<_>>(),
+            [Some(identity.clone()), Some(identity)]
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_without_an_approver_fails() {
+        let error = ToolContext::new()
+            .approve(unsandboxed("cargo build"))
+            .await
+            .expect_err("no approver, no approval");
+        assert_eq!(
+            error,
+            ApprovalError::NoApprover {
+                kind: super::super::ApprovalKind::new("unsandboxed"),
+            }
+        );
+        assert!(
+            alloc::string::ToString::to_string(&error).contains("no approver"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_call_withdraws_a_pending_approval() {
+        let canceller = super::super::Canceller::new();
+        let cx = ToolContext::new()
+            .with_approver(AnyApprover::new(Unanswered))
+            .with_cancellation(canceller.signal());
+        let pending = cx.approve(unsandboxed("cargo build"));
+        futures_lite::pin!(pending);
+        assert_eq!(futures_lite::future::poll_once(&mut pending).await, None);
+        canceller.cancel();
+        assert_eq!(pending.await, Err(ApprovalError::Cancelled));
+        // Asking after the cancellation does not reach the approver.
+        assert_eq!(
+            cx.approve(unsandboxed("cargo build")).await,
+            Err(ApprovalError::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_observes_its_cancellation() {
+        use super::super::{Canceller, Tool, ToolResult};
+
+        /// Works until its call is cancelled, then says so.
+        struct UntilCancelled;
+
+        impl Tool for UntilCancelled {
+            fn name(&self) -> alloc::borrow::Cow<'static, str> {
+                "until_cancelled".into()
+            }
+
+            fn description(&self) -> alloc::borrow::Cow<'static, str> {
+                "Works until its call is cancelled.".into()
+            }
+
+            type Arguments = ();
+            type Res = ToolResult;
+
+            async fn call(&self, (): (), cx: ToolContext) -> crate::Result<ToolResult> {
+                assert!(!cx.cancellation().is_cancelled());
+                cx.cancellation().cancelled().await;
+                Ok(ToolResult::text("stopped on cancel"))
+            }
+        }
+
+        let canceller = Canceller::new();
+        let cx = ToolContext::new().with_cancellation(canceller.signal());
+        let call = UntilCancelled.call((), cx);
+        futures_lite::pin!(call);
+        assert!(
+            futures_lite::future::poll_once(&mut call).await.is_none(),
+            "the tool works until it is cancelled"
+        );
+        canceller.cancel();
+        let result = call.await.expect("tool result");
+        assert_eq!(result, ToolResult::text("stopped on cancel"));
+        assert!(!ToolContext::new().cancellation().is_cancelled());
     }
 
     #[tokio::test]

@@ -339,6 +339,7 @@ dependencies = [
  "async-channel",
  "async-io",
  "base64 0.22.1",
+ "event-listener",
  "futures-core",
  "futures-lite",
  "gloo-timers 0.4.0",
