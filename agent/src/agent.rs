@@ -2111,7 +2111,9 @@ where
     /// shortly before the entry's [`CacheLifetime`] — counted from the
     /// start of the last request, or of the previous keep-alive — expires.
     /// A [`CacheLifetime::Permanent`] cache never gets one, and there is no
-    /// cap on sends: they repeat for as long as the run waits.
+    /// cap on sends: they repeat for as long as the run waits, but only while
+    /// some running command's `timeout` bound falls after the moment the
+    /// entry would go cold (a command with none counts as outliving it).
     ///
     /// [`CacheLifetime`]: crate::context::CacheLifetime
     ///
@@ -2129,8 +2131,66 @@ where
         if cold_in > keep_alive.send_before_expiry {
             return Ok(());
         }
-        let Some(last_request) = self.last_request.clone() else {
+        // A refresh buys nothing when every running command ends first.
+        if !self.background_outlives(cold_in).await {
             return Ok(());
+        }
+        if self.refresh_cache_entry().await?.is_none() {
+            return Ok(());
+        }
+        self.cache_keep_alive.sent += 1;
+        self.cache_keep_alive.last_reason = self.format_wait_reason().await;
+        if self.cache_keep_alive.sent >= keep_alive.frequent_idle_threshold {
+            self.cache_keep_alive.alerted = true;
+        }
+        Ok(())
+    }
+
+    /// Whether some running background command outlives `span` from now: its
+    /// `timeout` bound falls after it, or it has none. Without a job registry
+    /// no deadline is known, so the commands the run waits on count as
+    /// outliving it.
+    async fn background_outlives(&self, span: Duration) -> bool {
+        let Some(job_registry) = self.job_registry.as_ref() else {
+            return true;
+        };
+        job_registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|job| job.status == aither_sandbox::JobStatus::Running)
+            .any(|job| job.remaining().is_none_or(|remaining| remaining > span))
+    }
+
+    /// Refreshes the cache entry of an idle agent.
+    ///
+    /// Re-sends the last request with no output (`max_tokens: 0`,
+    /// non-streaming, the same thinking and effort settings), so the
+    /// provider restarts the entry's lifetime. The history is untouched, the
+    /// request's usage is recorded in [`cache_stats`](Self::cache_stats) and
+    /// the entry's [`cache_warmth`](Self::cache_warmth) restarts. The caller
+    /// decides when to call it, shortly before the entry goes cold.
+    ///
+    /// Returns the request's usage so the caller can account for its cost
+    /// (all fields empty when the provider reported none), or `None` when
+    /// there is nothing to refresh: the agent has sent no request yet, or its
+    /// entry is permanent or already cold.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error when the request fails.
+    pub async fn keep_cache_warm(&mut self) -> Result<Option<aither_core::llm::Usage>, AgentError> {
+        self.refresh_cache_entry().await
+    }
+
+    /// The request behind [`keep_cache_warm`](Self::keep_cache_warm) and the
+    /// in-run keep-alive.
+    async fn refresh_cache_entry(&mut self) -> Result<Option<aither_core::llm::Usage>, AgentError> {
+        if self.warmth.cold_in().is_none() {
+            return Ok(None);
+        }
+        let Some(last_request) = self.last_request.clone() else {
+            return Ok(None);
         };
         let (messages, parameters, tool_definitions) = last_request.into_parts();
         let request = LLMRequest::new(messages)
@@ -2145,20 +2205,19 @@ where
             request,
         );
         futures_lite::pin!(stream);
+        let mut refreshed = aither_core::llm::Usage::default();
         while let Some(event) = stream.next().await {
             match event {
-                Ok(Event::Usage(usage)) => self.cache_stats.record(&usage),
+                Ok(Event::Usage(usage)) => {
+                    self.cache_stats.record(&usage);
+                    refreshed = usage;
+                }
                 Ok(_) => {}
                 Err(error) => return Err(error),
             }
         }
         self.warmth.start_entry_now();
-        self.cache_keep_alive.sent += 1;
-        self.cache_keep_alive.last_reason = self.format_wait_reason().await;
-        if self.cache_keep_alive.sent >= keep_alive.frequent_idle_threshold {
-            self.cache_keep_alive.alerted = true;
-        }
-        Ok(())
+        Ok(Some(refreshed))
     }
 
     /// Describes the background commands this run is currently parked on.
@@ -4460,6 +4519,9 @@ fn truncate_script(script: &str, max_chars: usize) -> &str {
         None => script, // String is shorter than max_chars
     }
 }
+
+#[cfg(test)]
+mod keep_warm_tests;
 
 #[cfg(test)]
 mod tests {

@@ -4334,6 +4334,10 @@ where
         heel,
         outages,
     } = task;
+    // Before the job registers, so the registry reports the bound it runs under.
+    job_registry
+        .bound_by_timeout(&task_id, timeout_watch.timeout)
+        .await;
     let status_registry = job_registry.clone();
     let policies = registry.policies().clone();
     let result = execute_script_standalone(StandaloneExecution {
