@@ -1134,8 +1134,8 @@ impl JobRegistry {
 struct ParkedOutput {
     /// Appends waiting for their job to register, by its task id.
     by_task: HashMap<String, Parked>,
-    /// Forgotten jobs whose lease something still holds, such as a command
-    /// that may still report progress.
+    /// Forgotten jobs whose lease something still holds, such as the job's
+    /// flow or a progress report on its way.
     forgotten: Vec<WeakIdLease>,
     /// `timeout` bounds of jobs not registered yet, by task id.
     bounds: HashMap<String, (WeakIdLease, Duration)>,
