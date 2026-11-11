@@ -1,5 +1,5 @@
 name: Install apt packages
-description: Install Ubuntu packages on a hosted runner from archive.ubuntu.com rather than the runner's Azure mirror.
+description: Install Ubuntu packages on a hosted runner, falling back to a mirror outside ubuntu.com when the image's mirrors do not resolve.
 inputs:
   packages:
     description: Space-separated package names.
@@ -7,16 +7,17 @@ inputs:
 runs:
   using: composite
   steps:
-    # The hosted image lists azure.archive.ubuntu.com first in
-    # /etc/apt/apt-mirrors.txt, and runners lose that host for hours at a time
-    # (actions/runner-images#6894, #7048), failing every install. Without it
-    # apt goes to the next entry, archive.ubuntu.com.
+    # apt tries the entries of /etc/apt/apt-mirrors.txt in order. Every entry
+    # the hosted image lists (azure.archive, archive and security.ubuntu.com)
+    # is a name under Canonical's DNS, and runners lose all of them at once
+    # (actions/runner-images#6894, #7048), failing every install. The last
+    # entry is kernel.org's full Ubuntu mirror, resolved through other DNS.
     - shell: bash
       env:
         PACKAGES: ${{ inputs.packages }}
       run: |
         set -euo pipefail
-        sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+        printf 'https://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' | sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
         sudo apt-get update
         # shellcheck disable=SC2086 # PACKAGES is a word list.
         sudo apt-get install -y --no-install-recommends ${PACKAGES}
