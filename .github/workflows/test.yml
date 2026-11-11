@@ -71,7 +71,9 @@ jobs:
       # fish is installed.
       - name: Install fish
         if: ${{ runner.os == 'Linux' }}
-        run: sudo apt-get install -y --no-install-recommends fish
+        uses: ./.github/actions/apt-install
+        with:
+          packages: fish
       - shell: bash
         env:
           FILTERSET: ${{ inputs.filterset }}
