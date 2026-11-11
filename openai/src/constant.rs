@@ -11,6 +11,13 @@ pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 /// [`OpenRouter`](https://openrouter.ai)'s OpenAI-compatible base URL.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
+/// How long a request may wait for its response to start, and a response
+/// stream may stay silent between events, before the client gives up on it.
+///
+/// `OpenAI` documents no keep-alive interval for its event streams, so this is
+/// a conservative bound rather than a protocol constant.
+pub const DEFAULT_IDLE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(90);
+
 // ============================================================
 // 1. GPT-5 FAMILY (Latest, reasoning-enhanced large models)
 // ============================================================
