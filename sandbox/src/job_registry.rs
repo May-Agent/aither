@@ -63,7 +63,8 @@ impl JobInfo {
 /// Every finished status carries its [`Delivery`]: the transition that
 /// finishes a job also records that its completion is owed to the agent.
 /// The registry forgets a job once its completion was taken and nothing
-/// watches it, so a [`Delivery::Taken`] job reads only while it is watched.
+/// watches it, so a [`Delivery::Taken`] job reads only while it is watched
+/// or, taken by a waiter, until its own flow settles it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
     /// Job is currently running.
@@ -1540,10 +1541,10 @@ async fn handle_state_command(
 }
 
 /// Forgets job `task_id` once nothing can address it any more: it finished,
-/// its agent took the completion and nothing watches it. Its task id then
-/// goes back to the allocator once nothing else holds it, a later read of it
-/// answers as for any unknown task, and progress still reported to it is
-/// dropped.
+/// its own flow settled its completion, its agent took it and nothing
+/// watches it. Its task id then goes back to the allocator once nothing else
+/// holds it, a later read of it answers as for any unknown task, and
+/// progress still reported to it is dropped.
 fn forget_if_done(
     jobs: &mut Jobs,
     reads: &mut ReadTracker,
@@ -1551,7 +1552,12 @@ fn forget_if_done(
     task_id: &str,
 ) {
     let job = &jobs[task_id];
-    if job.info.status.delivery() == Some(Delivery::Taken) && job.watchers == 0 {
+    // A waiter's claim reads the job taken before its flow settles it; the
+    // flow still reads the job's output after that.
+    if job.completion_owed
+        && job.info.status.delivery() == Some(Delivery::Taken)
+        && job.watchers == 0
+    {
         let job = jobs.remove(task_id).expect("the job is registered");
         reads.delta_reads.remove(task_id);
         parked.forgot(&job.task_id);
@@ -1797,7 +1803,8 @@ enum JobEnd {
 /// Records how `job` ended: the one transition out of
 /// [`JobStatus::Running`]. The same step marks its completion
 /// [`Delivery::Pending`], so no reader ever sees the job finished with
-/// nothing owed to its agent.
+/// nothing owed to its agent, or [`Delivery::Taken`] when a waiter claimed
+/// it, so none sees a turn owed for a job its waiter read.
 fn finish(job: &mut JobState, end: JobEnd) {
     assert!(
         matches!(job.info.status, JobStatus::Running),
@@ -1805,7 +1812,11 @@ fn finish(job: &mut JobState, end: JobEnd) {
         job.info.task_id,
         job.info.status
     );
-    let delivery = Delivery::Pending;
+    let delivery = if job.claimed {
+        Delivery::Taken
+    } else {
+        Delivery::Pending
+    };
     job.info.status = match end {
         JobEnd::Completed { exit_code } => JobStatus::Completed {
             exit_code,
@@ -1895,8 +1906,15 @@ async fn owe_completion(
         !job.completion_owed,
         "job {task_id}'s completion was handed out twice"
     );
-    assert!(
-        job.info.status.completion_pending(),
+    // A waiter that claimed the job took its completion when it ended.
+    let delivery = if job.claimed {
+        Delivery::Taken
+    } else {
+        Delivery::Pending
+    };
+    assert_eq!(
+        job.info.status.delivery(),
+        Some(delivery),
         "job {task_id} owes a completion it never recorded: {:?}",
         job.info.status
     );
@@ -1904,7 +1922,6 @@ async fn owe_completion(
     let kill = job.info.status.kill_cause();
     if job.claimed {
         // A waiter read the job: nothing is owed to the agent.
-        mark_taken(job);
         return OwedCompletion {
             kill,
             pending: None,
@@ -2131,7 +2148,12 @@ async fn wait_for_end(jobs: &mut Jobs, task_id: &str, claim: bool, reply: Sender
             job.ended_waiters.push(reply);
         }
         Some(job) => {
-            job.claimed |= claim && !job.completion_owed;
+            // Its flow has yet to settle the completion: the claim takes it
+            // now, so no reader sees a turn owed for it meanwhile.
+            if claim && !job.completion_owed && !job.claimed {
+                job.claimed = true;
+                mark_taken(job);
+            }
             let _ = reply.send(Some(job.info.clone())).await;
         }
         None => {
@@ -2551,6 +2573,70 @@ mod tests {
             JobStatus::Running,
             "the second job is untouched"
         );
+    }
+
+    /// A waiter that takes a job's completion leaves nothing owed from the
+    /// moment the job ended, though the job's flow settles it later: a job
+    /// that ended before the wait and one that ends during it both read
+    /// taken, and the job stays readable until its flow settled and its
+    /// watch dropped.
+    #[tokio::test]
+    async fn a_claiming_wait_reads_the_job_taken_before_its_flow_settles() {
+        let registry = spawn_registry();
+        let (ended, ending) = (lease("ended"), lease("ending"));
+        registry
+            .register(1, &ended, "exec", "run", SandboxMode::Sandboxed, None)
+            .await;
+        registry
+            .register(2, &ending, "exec", "run", SandboxMode::Sandboxed, None)
+            .await;
+        let ended_watch = registry.watch("ended").await.expect("ended is held");
+        let ending_watch = registry.watch("ending").await.expect("ending is held");
+
+        registry.complete(&ended, 0, None).await;
+        let taken = JobStatus::Completed {
+            exit_code: 0,
+            delivery: Delivery::Taken,
+        };
+        assert_eq!(registry.wait_taking("ended").await.unwrap().status, taken);
+        assert_eq!(
+            registry.get_by_task_id("ended").await.unwrap().status,
+            taken
+        );
+
+        // The first poll queues the wait ahead of the ending, and the
+        // registry serves its commands in order.
+        let mut waiting = std::pin::pin!(registry.wait_taking("ending"));
+        assert!(
+            futures_lite::future::poll_once(waiting.as_mut())
+                .await
+                .is_none()
+        );
+        registry.complete(&ending, 0, None).await;
+        assert_eq!(waiting.await.unwrap().status, taken);
+        assert_eq!(
+            registry.get_by_task_id("ending").await.unwrap().status,
+            taken
+        );
+        assert!(
+            !registry
+                .list()
+                .await
+                .iter()
+                .any(|job| job.status.completion_pending()),
+            "no turn is owed for a job its waiter read"
+        );
+
+        // The watch dropping before the flow settles leaves the job readable
+        // to the flow.
+        drop(ended_watch);
+        assert!(registry.terminal_output("ended").await.is_some());
+        for task_id in ["ended", "ending"] {
+            let owed = registry.owe_completion(task_id, Ok(0)).await.unwrap();
+            assert!(owed.pending.is_none(), "{task_id} owes nothing");
+        }
+        drop(ending_watch);
+        assert!(registry.get_by_task_id("ending").await.is_none());
     }
 
     /// Once its completion is taken and nothing watches it, a finished job
