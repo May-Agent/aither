@@ -4,7 +4,9 @@
 //! added.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 
@@ -15,7 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::tool_runtime::PreparedTools;
+use crate::RemoteLaunch;
 
 /// A named SSH destination commands may run on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -318,29 +320,116 @@ impl SshClient {
     }
 }
 
-/// A server prepared on its first command: what the embedder prepared on it.
+/// What the embedder prepared on a server: its `heel` and the programs its
+/// scripts run with.
 #[derive(Debug, Clone)]
 pub struct PreparedSsh {
     /// The `heel` binary on the server, when it has one; a default-mode
     /// command needs it, an `unsafe` one does not.
     pub(crate) heel: Option<String>,
-    pub(crate) tools: PreparedTools<PathBuf>,
+    pub(crate) launch: RemoteLaunch,
 }
 
 impl PreparedSsh {
     /// The preparation of a server whose `heel` is at the path `heel` on the
-    /// server, if it has one, and whose managed tools are `tools`.
+    /// server, if it has one, and whose programs `launch` describes.
     #[must_use]
-    pub const fn new(heel: Option<String>, tools: PreparedTools<PathBuf>) -> Self {
-        Self { heel, tools }
+    pub const fn new(heel: Option<String>, launch: RemoteLaunch) -> Self {
+        Self { heel, launch }
     }
 }
 
-/// One server of a registry's set and the tools prepared there. Removing the
-/// server drops them; adding it again starts over.
+/// Why a server could not be prepared. The server stays in the set, and the
+/// next command naming it prepares it again.
+#[derive(Debug, thiserror::Error)]
+#[error("preparing the SSH server `{server}` failed: {source}")]
+pub struct SshPrepareError {
+    /// The name of the server.
+    pub server: String,
+    /// What the embedder's [`PrepareSsh`] reported.
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// Prepares a server for the shell's scripts: finds or installs its `heel`
+/// and the programs scripts run with.
+///
+/// It runs when the first command names the server, not when the server is
+/// added, so adding a server never waits on it and an unreachable server
+/// fails only the commands that name it. Commands that name the server
+/// together share the one preparation; a preparation that fails fails the
+/// commands waiting on it and is not remembered, so the next command
+/// prepares again. A [`PreparedSsh`] is a preparation already done.
+pub trait PrepareSsh: Send + Sync + 'static {
+    /// Why the preparation failed.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Prepares `server`.
+    fn prepare(
+        &self,
+        server: &SshServer,
+    ) -> impl Future<Output = Result<PreparedSsh, Self::Error>> + Send;
+}
+
+impl PrepareSsh for PreparedSsh {
+    type Error = std::convert::Infallible;
+
+    fn prepare(
+        &self,
+        _server: &SshServer,
+    ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        std::future::ready(Ok(self.clone()))
+    }
+}
+
+/// Object-safe twin of [`PrepareSsh`].
+trait PrepareSshImpl: Send + Sync {
+    fn prepare<'a>(
+        &'a self,
+        server: &'a SshServer,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedSsh, SshPrepareError>> + Send + 'a>>;
+}
+
+impl<T: PrepareSsh> PrepareSshImpl for T {
+    fn prepare<'a>(
+        &'a self,
+        server: &'a SshServer,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedSsh, SshPrepareError>> + Send + 'a>> {
+        Box::pin(async move {
+            PrepareSsh::prepare(self, server)
+                .await
+                .map_err(|error| SshPrepareError {
+                    server: server.name.clone(),
+                    source: Box::new(error),
+                })
+        })
+    }
+}
+
+/// A type-erased [`PrepareSsh`].
+#[derive(Clone)]
+pub struct AnyPrepareSsh(Arc<dyn PrepareSshImpl>);
+
+impl AnyPrepareSsh {
+    /// Erases `prepare`.
+    #[must_use]
+    pub fn new(prepare: impl PrepareSsh) -> Self {
+        Self(Arc::new(prepare))
+    }
+}
+
+impl std::fmt::Debug for AnyPrepareSsh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnyPrepareSsh")
+    }
+}
+
+/// One server of a registry's set and what the embedder prepared on it.
+/// Removing the server drops them.
 #[derive(Debug)]
 pub struct SshEnvironment {
     server: SshServer,
+    prepare: AnyPrepareSsh,
     prepared: OnceCell<PreparedSsh>,
 }
 
@@ -349,26 +438,16 @@ impl SshEnvironment {
         &self.server
     }
 
-    /// The server's prepared state, produced by `prepare` the first time.
-    pub(crate) async fn prepared<F, Fut, E>(&self, prepare: F) -> Result<&PreparedSsh, E>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<PreparedSsh, E>>,
-    {
-        self.prepared.get_or_try_init(prepare).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_prepared(&self, prepared: PreparedSsh) {
-        assert!(
-            self.prepared.set_blocking(prepared).is_ok(),
-            "a test server is prepared once"
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_prepared(&self) -> bool {
-        self.prepared.is_initialized()
+    /// What the embedder prepared on the server, preparing it first when no
+    /// command has yet. Concurrent callers share one preparation.
+    ///
+    /// # Errors
+    /// Fails with what the preparation reported; the next call prepares
+    /// again.
+    pub(crate) async fn prepared(&self) -> Result<&PreparedSsh, SshPrepareError> {
+        self.prepared
+            .get_or_try_init(|| self.prepare.0.prepare(&self.server))
+            .await
     }
 }
 
@@ -391,7 +470,11 @@ impl SshEnvironments {
         &self.client
     }
 
-    pub(crate) fn add(&self, server: SshServer) -> Result<(), SshServerError> {
+    pub(crate) fn add(
+        &self,
+        server: SshServer,
+        prepare: impl PrepareSsh,
+    ) -> Result<(), SshServerError> {
         let SshServer { name, target } = server;
         let server = SshServer {
             name: name.trim().to_string(),
@@ -402,6 +485,7 @@ impl SshEnvironments {
         }
         let environment = Arc::new(SshEnvironment {
             server,
+            prepare: AnyPrepareSsh::new(prepare),
             prepared: OnceCell::new(),
         });
         let mut duplicate = false;
@@ -462,11 +546,18 @@ mod tests {
         }
     }
 
+    fn prepared() -> PreparedSsh {
+        PreparedSsh::new(
+            None,
+            RemoteLaunch::new("/opt/tools/bin", "/opt/tools/bin/bash"),
+        )
+    }
+
     #[test]
     fn servers_join_and_leave_a_live_set_every_clone_sees() {
         let set = SshEnvironments::default();
         let clone = set.clone();
-        set.add(server(" build ", " builder@build.internal "))
+        set.add(server(" build ", " builder@build.internal "), prepared())
             .unwrap();
         assert_eq!(
             clone.list(),
@@ -474,11 +565,11 @@ mod tests {
             "names and targets are trimmed and the clone sees the addition"
         );
         assert!(matches!(
-            clone.add(server("build", "other@build.internal")),
+            clone.add(server("build", "other@build.internal"), prepared()),
             Err(SshServerError::Duplicate(name)) if name == "build"
         ));
         assert!(matches!(
-            set.add(server("staging", "  ")),
+            set.add(server("staging", "  "), prepared()),
             Err(SshServerError::Blank)
         ));
         assert_eq!(
@@ -487,5 +578,79 @@ mod tests {
         );
         assert_eq!(set.list(), []);
         assert_eq!(set.remove("build"), None);
+    }
+
+    /// Counts its preparations, takes its time over each and fails the first
+    /// `failures` of them.
+    struct Counting {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        failures: usize,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the server is unreachable")]
+    struct Unreachable;
+
+    impl PrepareSsh for Counting {
+        type Error = Unreachable;
+
+        async fn prepare(&self, _server: &SshServer) -> Result<PreparedSsh, Unreachable> {
+            let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            if run < self.failures {
+                Err(Unreachable)
+            } else {
+                Ok(prepared())
+            }
+        }
+    }
+
+    fn environment(failures: usize) -> (Arc<SshEnvironment>, Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let set = SshEnvironments::default();
+        set.add(
+            server("build", "builder@build.internal"),
+            Counting {
+                runs: Arc::clone(&runs),
+                failures,
+            },
+        )
+        .unwrap();
+        (set.get("build").unwrap(), runs)
+    }
+
+    #[tokio::test]
+    async fn a_server_is_prepared_on_its_first_use_and_only_once() {
+        let (environment, runs) = environment(0);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "adding the server prepares nothing"
+        );
+        let (first, second) = tokio::join!(environment.prepared(), environment.prepared());
+        first.unwrap();
+        second.unwrap();
+        environment.prepared().await.unwrap();
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two concurrent first commands and a later one share one preparation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_preparation_is_reported_and_retried_by_the_next_command() {
+        let (environment, runs) = environment(1);
+        let error = environment.prepared().await.unwrap_err();
+        assert_eq!(error.server, "build");
+        assert!(error.source.to_string().contains("unreachable"), "{error}");
+        environment
+            .prepared()
+            .await
+            .expect("the next command prepares again");
+        environment.prepared().await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

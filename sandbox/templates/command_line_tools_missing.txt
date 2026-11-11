@@ -1,1 +1,0 @@
-The Command Line Tools for Xcode are not installed. Install them with `xcode-select --install`, then start again.

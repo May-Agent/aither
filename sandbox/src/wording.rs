@@ -1,7 +1,7 @@
 //! The text the model reads: every refusal, notice, marker and reply the
 //! shell and its tools render.
 //!
-//! The shell raises each as typed data: a [`CommandBlocked`], a
+//! The shell raises each as typed data: a [`CallRefusal`], a
 //! [`MonitorStarted`], an [`OutputSaved`] and so on. The embedder's
 //! [`ShellWording`] turns each into the natural language its model reads;
 //! aither ships no implementation, so an embedder words every family itself.
@@ -12,7 +12,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::MountRootError;
-use crate::command::CommandBlocked;
 use crate::job_registry::JobRead;
 use crate::monitor::MonitorRefusal;
 use crate::terminal::{TerminalError, TimeoutKill};
@@ -51,13 +50,6 @@ pub enum CallRefusal {
     },
     /// A read asks for zero bytes.
     ZeroMaxBytes,
-}
-
-/// A command invoked by a subagent that only the main agent may run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReservedForMain<'a> {
-    /// The command's name.
-    pub command: &'a str,
 }
 
 /// Why a foreground command the shell killed was killed.
@@ -215,10 +207,6 @@ pub trait ShellWording: Send + Sync + 'static {
     /// A kill of a job was asked for.
     fn job_kill(&self, kill: &JobKillAsked<'_>) -> String;
 
-    /// A command the shell's command gate blocked, wrapping the reason the
-    /// gate gave.
-    fn command_blocked(&self, blocked: &CommandBlocked) -> String;
-
     /// A call of a tool of the shell refused before it ran.
     fn call_refused(&self, refusal: &CallRefusal) -> String;
 
@@ -230,9 +218,6 @@ pub trait ShellWording: Send + Sync + 'static {
 
     /// The result of a `monitor` call that started watching.
     fn monitor_started(&self, started: &MonitorStarted<'_>) -> String;
-
-    /// A subagent's call of a command reserved for the main agent.
-    fn reserved_for_main(&self, reserved: &ReservedForMain<'_>) -> String;
 
     /// Why a command was killed, appended to its result.
     fn command_killed(&self, killed: &CommandKilled<'_>) -> String;
@@ -302,7 +287,7 @@ impl fmt::Debug for AnyShellWording {
 ///
 /// Tools return it as their error, so an agent loop tells one refusal from
 /// another, and from any other failure, by downcasting to
-/// `Refused<CommandBlocked>` and so on.
+/// `Refused<CallRefusal>` and so on.
 #[derive(Debug)]
 pub struct Refused<R> {
     reason: R,

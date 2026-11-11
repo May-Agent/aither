@@ -27,6 +27,7 @@ mod domain;
 mod env;
 mod grants;
 pub mod host;
+mod ipc;
 mod launch;
 mod route;
 mod ssh;
@@ -44,12 +45,17 @@ pub use child::{ChildExit, Descendants, SandboxedChild};
 pub use domain::{
     AnyDomainApprover, ApproveAllDomains, DenyAllDomains, DomainApprover, DomainRequest,
 };
-pub use env::EnvSource;
+pub use env::{EnvSource, LaunchInfo};
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
-pub use host::{LocalSpawn, TreeLifetime, resolved};
+#[cfg(all(unix, feature = "jobserver"))]
+pub use host::resolved;
+pub use host::{LocalSpawn, TreeLifetime};
+#[cfg(test)]
+pub use ipc::fixture as ipc_fixture;
+pub use ipc::{AnyIpcProvider, IpcProvider};
 #[cfg(not(windows))]
 pub use launch::shell_arguments;
-pub use launch::{ContainerLaunch, RemoteLaunch};
+pub use launch::{ContainerLaunch, HostLaunch, RemoteLaunch};
 pub use route::{HostRoute, HostRouteError};
 
 use crate::network_policy::CompiledNetworkPolicy;
@@ -120,7 +126,10 @@ pub enum SpawnCommand {
         args: Vec<String>,
     },
     /// A script for the backend's managed shell, which only the container
-    /// and SSH backends have.
+    /// and SSH backends have: a host sandbox names no shell, so spawning a
+    /// script on it fails with [`SpawnError::Unsupported`]. A caller that
+    /// wants a script on the host spawns its shell as a program, or runs it
+    /// through a [`Shell`](crate::Shell).
     ///
     /// A script is one level of quoting for a server's login shell, which
     /// parses the command line first; a program that runs the shell would
@@ -158,6 +167,8 @@ pub struct SpawnSpec {
     pub(crate) ipc: Option<heel::IpcRouter>,
     /// Whether the backend ends the processes the top-level one leaves.
     pub(crate) lifetime: TreeLifetime,
+    /// What the launch is, for the sandbox's [`EnvSource`] to read.
+    pub(crate) info: LaunchInfo,
 }
 
 impl std::fmt::Debug for SpawnSpec {
@@ -199,7 +210,16 @@ impl SpawnSpec {
             grants: Vec::new(),
             ipc: None,
             lifetime: TreeLifetime::Background,
+            info: LaunchInfo::default(),
         }
+    }
+
+    /// Says what this launch is, for the sandbox's [`EnvSource`] to read:
+    /// the job, the call and the mode it runs in.
+    #[must_use]
+    pub fn launch_info(mut self, info: LaunchInfo) -> Self {
+        self.info = info;
+        self
     }
 
     /// Appends arguments.
@@ -461,23 +481,6 @@ impl Sandbox {
     #[must_use]
     pub fn with_backend(self, backend: Backend) -> Self {
         self.edit(|inner| inner.backend = backend)
-    }
-
-    /// The sandbox with what a tool session adds for the programs it
-    /// prepared: grants that lead the embedder's fixed ones, environment the
-    /// embedder's own and its source's override, and the write denylist unless
-    /// the embedder gave one.
-    pub(crate) fn with_session(
-        self,
-        grants: Vec<heel::Grant>,
-        environment: Vec<(String, String)>,
-        write_denylist: heel::WriteDenylist,
-    ) -> Self {
-        self.edit(|inner| {
-            inner.fixed_grants.splice(0..0, grants);
-            inner.environment.splice(0..0, environment);
-            inner.write_denylist.get_or_insert(write_denylist);
-        })
     }
 
     /// The `heel` binary of a sandbox on the host.

@@ -6,14 +6,13 @@
 
 use askama::Template;
 
-use crate::command::CommandBlocked;
 use crate::job_registry::{JobRead, JobStatus};
 use crate::monitor::MonitorRefusal;
 use crate::terminal::{TerminalError, TimeoutKill};
 use crate::wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
-    JsonAsTsv, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, ReservedForMain,
-    RunFailure, ShellWording, StoredBinaryPart,
+    JsonAsTsv, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, RunFailure, ShellWording,
+    StoredBinaryPart,
 };
 use aither_core::llm::CommandStream;
 
@@ -77,22 +76,16 @@ fn terminal_failure(error: &TerminalError) -> (&'static str, String) {
         TerminalError::InvalidTarget(detail) => ("invalid target", detail.clone()),
         TerminalError::UnknownLocation(name) => ("unknown location", name.clone()),
         TerminalError::NoRemoteSandbox(name) => ("no remote sandbox", name.clone()),
+        TerminalError::SshPrepare(error) => ("ssh prepare", error.to_string()),
         TerminalError::Denied(reason) => ("denied", reason.clone()),
         TerminalError::NoApprover(kind) => ("no approver", kind.to_string()),
         TerminalError::SandboxSetup(detail) => ("sandbox setup failed", detail.clone()),
         TerminalError::Execution(detail) => ("execution failed", detail.clone()),
-        TerminalError::Tools(error) => ("tools", error.to_string()),
         TerminalError::Approval(error) => ("approval", error.to_string()),
         TerminalError::Io(error) => ("io", error.to_string()),
         #[cfg(all(unix, feature = "jobserver"))]
         TerminalError::Jobserver(error) => ("jobserver", error.to_string()),
     }
-}
-
-#[derive(Template)]
-#[template(path = "test_wording/command_blocked.txt")]
-struct Blocked<'a> {
-    reason: &'a str,
 }
 
 #[derive(Template)]
@@ -107,12 +100,6 @@ struct MonitorRefused<'a> {
 struct MonitorStartedText<'a> {
     task_id: &'a str,
     interval_secs: u64,
-}
-
-#[derive(Template)]
-#[template(path = "test_wording/reserved_for_main.txt", escape = "none")]
-struct Reserved<'a> {
-    name: &'a str,
 }
 
 #[derive(Template)]
@@ -308,12 +295,6 @@ impl ShellWording for TestWording {
         })
     }
 
-    fn command_blocked(&self, blocked: &CommandBlocked) -> String {
-        rendered(&Blocked {
-            reason: &blocked.reason,
-        })
-    }
-
     fn monitor_refusal(&self, refusal: &MonitorRefusal) -> String {
         let max_timeout_secs = match refusal {
             MonitorRefusal::TimeoutOutOfRange { max } => max.as_secs(),
@@ -329,12 +310,6 @@ impl ShellWording for TestWording {
         rendered(&MonitorStartedText {
             task_id: started.task_id,
             interval_secs: started.interval_secs,
-        })
-    }
-
-    fn reserved_for_main(&self, reserved: &ReservedForMain<'_>) -> String {
-        rendered(&Reserved {
-            name: reserved.command,
         })
     }
 

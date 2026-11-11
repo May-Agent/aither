@@ -50,6 +50,30 @@ pub fn shell_arguments(script: &str) -> Vec<String> {
         .into()
 }
 
+/// The shell prepared on the host, for
+/// [`Shell::builder_on_host`](crate::Shell::builder_on_host): the program a
+/// script runs under, as a path on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLaunch {
+    shell: std::sync::Arc<str>,
+}
+
+impl HostLaunch {
+    /// Scripts run under the bash at `shell`.
+    #[must_use]
+    pub fn new(shell: impl Into<std::sync::Arc<str>>) -> Self {
+        Self {
+            shell: shell.into(),
+        }
+    }
+
+    /// The bash that runs scripts.
+    #[must_use]
+    pub const fn shell(&self) -> &std::sync::Arc<str> {
+        &self.shell
+    }
+}
+
 /// The programs prepared inside a container, for
 /// [`Backend::Container`](crate::Backend::Container).
 #[derive(Debug, Clone, PartialEq, Eq)]

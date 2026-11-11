@@ -3,8 +3,8 @@
 //! The sandbox decides where a script runs and what it can reach; whether a
 //! script should run at all — a toolchain preference, a ban on killing by
 //! name, a rule against polling, an approval for a server — is the
-//! embedder's. Every [`ScriptPolicy`] registered on the
-//! [`ToolRegistryBuilder`] sees each script before it runs, parsed when it
+//! embedder's. Every [`ScriptPolicy`] given to the
+//! [`ShellBuilder`](crate::ShellBuilder) sees each script before it runs, parsed when it
 //! is shell, with the directory it starts in, the call it came from and the
 //! policy's own state for the agent that runs it, and decides [`Pass`],
 //! [`Allow`], [`Ask`] or [`Refuse`]. With no policy the sandbox refuses
@@ -15,7 +15,6 @@
 //! remote location — runs only after an [`Allow`] or an approved [`Ask`];
 //! with only [`Pass`]es it is asked.
 //!
-//! [`ToolRegistryBuilder`]: crate::ToolRegistryBuilder
 //! [`Pass`]: ScriptDecision::Pass
 //! [`Allow`]: ScriptDecision::Allow
 //! [`Ask`]: ScriptDecision::Ask
@@ -43,8 +42,8 @@ pub enum ScriptOrigin {
     Foreground,
     /// A `terminal` call that detaches the script (`background: true`).
     Background,
-    /// A [`Shell::run`](crate::Shell::run) from a
-    /// terminal-bound command: the embedder's own script, waited on.
+    /// A [`Shell::run`](crate::Shell::run): the embedder's own script,
+    /// waited on.
     Run,
 }
 
@@ -106,7 +105,8 @@ impl ScriptDir {
     }
 }
 
-/// A script about to run, as a [`ScriptPolicy`] sees it.
+/// A script about to run, as a [`ScriptPolicy`] and the shell's
+/// [`TreatOutput`](crate::TreatOutput) see it.
 #[derive(Debug, Clone, Copy)]
 pub struct ScriptCheck<'a> {
     /// The id the script's task gets when it runs; the [`ScriptEnd`] that
@@ -263,9 +263,8 @@ impl ScriptDecision {
 ///
 /// Every script of the `terminal` tool, the main agent's and every
 /// subagent's, and every [`Shell::run`](crate::Shell::run),
-/// is put to every policy of its registry ahead of the command gate and the
-/// approval it needs. The policies of one registry decide concurrently and
-/// the strictest decision wins.
+/// is put to every policy of its shell ahead of the approval it needs. The
+/// policies of one shell decide concurrently and the strictest decision wins.
 ///
 /// A policy keeps what it remembers in its [`State`](Self::State): every
 /// agent's terminal, each subagent's included, starts with a fresh one and
@@ -358,7 +357,7 @@ impl fmt::Debug for AnyScriptPolicy {
     }
 }
 
-/// A registry's policies, each bound to the state of the agent the registry
+/// A shell's policies, each bound to the state of the agent the shell
 /// serves.
 #[derive(Clone, Default)]
 pub struct ScriptPolicies {

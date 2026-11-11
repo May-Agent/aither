@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use aither_core::llm::{Tool, ToolContext, ToolResult};
+use aither_core::llm::{AgentPath, Tool, ToolContext, ToolResult};
 use executor_core::{Executor, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use crate::job_registry::{JobRegistry, JobStatus};
 use crate::limits::LiveDuration;
 use crate::output::MediaResolution;
 use crate::policy::SandboxMode;
-use crate::terminal::{Configured, Shell, ShellArgs};
+use crate::terminal::{Shell, ShellArgs};
 use crate::wording::{MonitorStarted, Refused};
 
 /// How long the watched job's own `timeout` bound outlasts the monitor's
@@ -91,11 +91,18 @@ pub enum MonitorSource {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MonitorIncrement {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) lines: Vec<String>,
 }
 
 impl MonitorIncrement {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task id of the watched job.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -113,11 +120,18 @@ impl MonitorIncrement {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MonitorStalled {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) stall_secs: u64,
 }
 
 impl MonitorStalled {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task id of the watched job.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -135,11 +149,18 @@ impl MonitorStalled {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MonitorEnded {
+    pub(crate) agent: AgentPath,
     pub(crate) task_id: String,
     pub(crate) end: MonitorEnd,
 }
 
 impl MonitorEnded {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task id of the watched job.
     #[must_use]
     pub fn task_id(&self) -> &str {
@@ -227,7 +248,7 @@ struct Watch {
 /// The native `monitor` tool: starts the watched source as a background job
 /// and a pump that raises its increments as [`ShellEvent`]s.
 pub struct MonitorTool<E> {
-    terminal: Shell<E, Configured>,
+    terminal: Shell<E>,
     settings: MonitorSettings,
 }
 
@@ -249,7 +270,7 @@ impl<E> MonitorTool<E> {
     /// Creates the tool bound to `terminal`, the configured terminal whose
     /// jobs it watches.
     #[must_use]
-    pub const fn new(terminal: Shell<E, Configured>, settings: MonitorSettings) -> Self {
+    pub const fn new(terminal: Shell<E>, settings: MonitorSettings) -> Self {
         Self { terminal, settings }
     }
 }
@@ -450,6 +471,7 @@ async fn send(alerts: &EventSender, alert: ShellEvent) {
     let _ = alerts.send(alert).await;
 }
 
+#[allow(clippy::too_many_lines)]
 async fn watch_task(watch: Watch) {
     let Watch {
         task_id,
@@ -494,6 +516,7 @@ async fn watch_task(watch: Watch) {
                     send(
                         &alerts,
                         ShellEvent::MonitorIncrement(MonitorIncrement {
+                            agent: alerts.agent().clone(),
                             task_id: task_id.clone(),
                             lines,
                         }),
@@ -528,7 +551,11 @@ async fn watch_task(watch: Watch) {
         if let Some(end) = end {
             send(
                 &alerts,
-                ShellEvent::MonitorEnded(MonitorEnded { task_id, end }),
+                ShellEvent::MonitorEnded(MonitorEnded {
+                    agent: alerts.agent().clone(),
+                    task_id,
+                    end,
+                }),
             )
             .await;
             return;
@@ -538,6 +565,7 @@ async fn watch_task(watch: Watch) {
             send(
                 &alerts,
                 ShellEvent::MonitorStalled(MonitorStalled {
+                    agent: alerts.agent().clone(),
                     task_id: task_id.clone(),
                     stall_secs: stall.map_or(0, |s| s.as_secs()),
                 }),

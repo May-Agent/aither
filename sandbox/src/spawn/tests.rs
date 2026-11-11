@@ -22,10 +22,17 @@ fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
 }
 
 async fn host_sandbox(working_dir: &Path) -> Sandbox {
-    let heel = crate::test_heel::pinned()
+    let heel = crate::test_heel::binary()
         .await
-        .expect("the pinned heel is available");
+        .expect("a heel is available to the tests");
     Sandbox::new(Backend::Host { heel }, TokioGlobal, working_dir)
+}
+
+/// The programs of a container whose image the embedder prepared.
+fn container_launch() -> crate::ContainerLaunch {
+    let bin_dir = crate::ContainerPath::new("/opt/tools/bin").expect("an absolute path");
+    let shell = bin_dir.join("bash");
+    crate::ContainerLaunch::new(bin_dir, shell)
 }
 
 /// Everything a stream carried until it closed.
@@ -312,12 +319,10 @@ fn container_sandbox(scripts: &Arc<Mutex<Vec<String>>>, working_dir: &Path) -> S
             scripts: scripts.clone(),
         })),
     );
-    let tools =
-        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
     Sandbox::new(
         Backend::Container {
             runtime,
-            launch: tools.container_launch(),
+            launch: container_launch(),
         },
         TokioGlobal,
         working_dir,
@@ -427,12 +432,10 @@ fn reporting_sandbox(
     if let Some(mount) = mount {
         runtime = runtime.with_workspace_mount(mount);
     }
-    let tools =
-        crate::tool_runtime::tests::container_tools(&crate::tool_runtime::tests::image_tools());
     Sandbox::new(
         Backend::Container {
             runtime,
-            launch: tools.container_launch(),
+            launch: container_launch(),
         },
         TokioGlobal,
         working_dir,
@@ -539,7 +542,12 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
 
     let script = started.lock().unwrap()[0].0.clone();
     assert!(script.starts_with("AITHER_IPC_BIN="), "{script}");
-    assert!(script.contains("for cmd in 'probe'; do"), "{script}");
+    assert!(
+        script.contains(
+            r#"--commands '{"probe":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+        ),
+        "{script}"
+    );
     assert!(
         script.contains("run --working-dir '/workspace' "),
         "{script}"

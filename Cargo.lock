@@ -104,6 +104,7 @@ dependencies = [
  "aither-webfetch",
  "aither-websearch",
  "anyhow",
+ "arc-swap",
  "askama 0.16.1",
  "async-channel",
  "async-fs",
@@ -414,7 +415,6 @@ name = "aither-mcp"
 version = "0.30.0"
 dependencies = [
  "aither-core",
- "aither-sandbox",
  "arc-swap",
  "askama 0.16.1",
  "async-channel",
@@ -425,6 +425,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "mime",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -555,7 +556,6 @@ dependencies = [
  "brush-parser",
  "dunce",
  "executor-core",
- "fd-lock",
  "flate2",
  "futures",
  "futures-lite",
@@ -565,23 +565,18 @@ dependencies = [
  "image",
  "jiff",
  "libc",
- "lzma-rust2 0.24.0",
  "magika",
  "ort",
- "percent-encoding",
  "polling",
  "regex",
  "rmp-serde",
  "rs-tree-sitter-languages",
  "rustix",
  "schemars 1.2.3",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "shell-words",
- "strsim",
- "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -589,12 +584,10 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "typed-path",
- "url",
  "uuid",
  "vte",
  "windows-sys 0.61.2",
  "zenwave",
- "zip",
 ]
 
 [[package]]
@@ -3560,33 +3553,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
-name = "fd-lock"
-version = "4.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
-dependencies = [
- "cfg-if",
- "rustix",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "fdeflate"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
-]
-
-[[package]]
-name = "filetime"
-version = "0.2.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
-dependencies = [
- "cfg-if",
- "libc",
 ]
 
 [[package]]
@@ -4055,9 +4027,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44aee3e64342927784c4d19609382aebd125baf3080b7ca6c00c1d081a6c0c40"
+checksum = "ddad4d8fba11b64ecaf2265fdf4b0330da314c92ac5c249d4ffe33afa3e9d0bf"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -5924,15 +5896,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e20f57f9918e5bd7bc58c22cdd70a6afc7375d4dd9683af5f2b34bd3d2bba619"
 
 [[package]]
-name = "lzma-rust2"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490750560fa7851fbbf5d3ab1a8750f09350ed361ed8aed85b1e1e40587812ee"
-dependencies = [
- "sha2 0.11.1",
-]
-
-[[package]]
 name = "macro_rules_attribute"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6675,7 +6638,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7b497d21a8b6fbb4b5a544f8fadb77e801a09ae0add9e411d31c6f89e3c1e90"
 dependencies = [
  "hmac-sha256",
- "lzma-rust2 0.15.8",
+ "lzma-rust2",
  "ureq",
 ]
 
@@ -7944,10 +7907,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-dependencies = [
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "seq-macro"
@@ -8592,16 +8551,6 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
-
-[[package]]
-name = "tar"
-version = "0.4.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
-dependencies = [
- "filetime",
- "libc",
-]
 
 [[package]]
 name = "tempfile"
@@ -10163,20 +10112,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "zip"
-version = "9.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap 2.14.2",
- "memchr",
- "nix 0.31.3",
- "typed-path",
 ]
 
 [[package]]

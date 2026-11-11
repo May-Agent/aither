@@ -392,6 +392,16 @@ enum StateCommand {
         task_id: IdLease,
         timeout: Duration,
     },
+    /// The process of task `task_id` is about to start: its output can be
+    /// appended to from here on, ahead of the job's registration.
+    Launching {
+        task_id: IdLease,
+    },
+    /// The launch of task `task_id` ended; a job that never registered is
+    /// forgotten and what waited for it is released.
+    Abandon {
+        task_id: IdLease,
+    },
     AttachTerminalInput {
         pid: u32,
         input_tx: TerminalInputSender,
@@ -447,11 +457,18 @@ enum JobRequest {
         reply: Sender<Option<JobInfo>>,
     },
     /// Appends `chunk` to the stdout of task `task_id`, replying once it is
-    /// in; a task not registered yet gets it when it registers.
+    /// in, with whether it went in: a task not registered yet gets it when
+    /// it registers, one that no longer runs or was forgotten gets nothing.
     AppendTaskStdout {
         task_id: IdLease,
         chunk: Vec<u8>,
-        reply: Sender<()>,
+        reply: Sender<bool>,
+    },
+    /// The lease of the job `task_id` names, whether registered or still
+    /// launching, held weakly.
+    Lease {
+        task_id: String,
+        reply: Sender<Option<WeakIdLease>>,
     },
     OweCompletion {
         task_id: String,
@@ -769,14 +786,15 @@ impl JobRegistry {
     }
 
     /// Appends stdout bytes to task `task_id`, returning once they are in its
-    /// output. A task whose job is not registered yet (its process may already
-    /// be running a command) gets them as it registers, ahead of anything the
-    /// process wrote later; one the registry already forgot drops them, since
-    /// nothing can read them.
+    /// output, and whether they went in. A task whose job is not registered
+    /// yet (its process may already be running a command) gets them as it
+    /// registers, ahead of anything the process wrote later; one the
+    /// registry already forgot, or whose job no longer runs, drops them and
+    /// answers `false`.
     ///
     /// `task_id` is the job's own lease, which the bytes hold until they are
     /// in: its word cannot name a later job while they are on their way.
-    pub async fn append_task_stdout(&self, task_id: &IdLease, chunk: Vec<u8>) {
+    pub async fn append_task_stdout(&self, task_id: &IdLease, chunk: Vec<u8>) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::AppendTaskStdout {
             task_id: task_id.clone(),
@@ -784,7 +802,38 @@ impl JobRegistry {
             reply: reply_tx,
         })
         .await;
-        Self::recv_reply(reply_rx).await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// The lease of the job `task_id` names, held weakly, while the job is
+    /// registered or its process is starting.
+    pub(crate) async fn task_lease(&self, task_id: &str) -> Option<WeakIdLease> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::Lease {
+            task_id: task_id.to_string(),
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Records that the process of task `task_id` is about to start, so its
+    /// output takes appends from before its job registers.
+    pub(crate) async fn launching(&self, task_id: &IdLease) {
+        self.send_command(StateCommand::Launching {
+            task_id: task_id.clone(),
+        })
+        .await;
+    }
+
+    /// Records that the launch of task `task_id` ended. A process that never
+    /// started leaves no job: what waited to be appended to it is released
+    /// and the task takes no more.
+    pub(crate) async fn abandon_launch(&self, task_id: &IdLease) {
+        self.send_command(StateCommand::Abandon {
+            task_id: task_id.clone(),
+        })
+        .await;
     }
 
     /// Marks stdout stream closed.
@@ -1205,6 +1254,8 @@ struct ParkedOutput {
     forgotten: Vec<WeakIdLease>,
     /// `timeout` bounds of jobs not registered yet, by task id.
     bounds: HashMap<String, (WeakIdLease, Duration)>,
+    /// Jobs whose process is starting and not registered yet, by task id.
+    launching: HashMap<String, WeakIdLease>,
 }
 
 /// The appends waiting for one job, in arrival order.
@@ -1214,13 +1265,41 @@ struct Parked {
 }
 
 /// One parked append: its bytes and the reply that releases its sender.
-type ParkedAppend = (Vec<u8>, Sender<()>);
+type ParkedAppend = (Vec<u8>, Sender<bool>);
 
 impl ParkedOutput {
+    /// Records that the process of task `task_id` is starting.
+    fn launching(&mut self, task_id: &IdLease) {
+        self.prune();
+        self.launching
+            .insert(task_id.to_string(), task_id.downgrade());
+    }
+
+    /// The lease of task `task_id` while its process starts.
+    fn launching_lease(&mut self, task_id: &str) -> Option<WeakIdLease> {
+        self.prune();
+        self.launching.get(task_id).cloned()
+    }
+
+    /// Ends the launch of task `task_id` that never registered: what waited
+    /// for its job is handed back to be released, and later appends are
+    /// dropped.
+    fn abandon(&mut self, task_id: &IdLease) -> Vec<ParkedAppend> {
+        self.launching.remove(task_id.as_str());
+        let waiting = self.take(task_id);
+        self.forgot(task_id);
+        waiting
+    }
+
     /// Parks an append to task `task_id`, whose job is not registered. Hands
     /// back the reply when the registry already forgot that job, for the
     /// sender to be released without its bytes going anywhere.
-    fn park(&mut self, task_id: &IdLease, chunk: Vec<u8>, reply: Sender<()>) -> Option<Sender<()>> {
+    fn park(
+        &mut self,
+        task_id: &IdLease,
+        chunk: Vec<u8>,
+        reply: Sender<bool>,
+    ) -> Option<Sender<bool>> {
         self.prune();
         if self
             .forgotten
@@ -1297,6 +1376,7 @@ impl ParkedOutput {
             .retain(|forgotten| forgotten.upgrade().is_some());
         self.bounds
             .retain(|_, (lease, _)| lease.upgrade().is_some());
+        self.launching.retain(|_, lease| lease.upgrade().is_some());
     }
 }
 
@@ -1359,6 +1439,7 @@ async fn handle_state_command(
             if let Some(replaced) = jobs.get(&pid) {
                 parked.forgot(&replaced.task_id);
             }
+            parked.launching.remove(task_id.as_str());
             let waiting = parked.take(&task_id);
             let timeout = parked.take_bound(&task_id);
             register_job(
@@ -1378,10 +1459,18 @@ async fn handle_state_command(
             }
             for (chunk, reply) in waiting {
                 append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
-                let _ = reply.send(()).await;
+                let _ = reply.send(true).await;
             }
         }
         StateCommand::Bound { task_id, timeout } => parked.bound(&task_id, timeout),
+        StateCommand::Launching { task_id } => parked.launching(&task_id),
+        StateCommand::Abandon { task_id } => {
+            if find_pid_by_task_id(jobs, &task_id).is_none() {
+                for (_, reply) in parked.abandon(&task_id) {
+                    let _ = reply.send(false).await;
+                }
+            }
+        }
         StateCommand::AttachTerminalInput { pid, input_tx } => {
             // A job that already finished takes no input: the sender drops here.
             if let Some(job) = jobs
@@ -1468,11 +1557,20 @@ async fn handle_job_request(
                     jobs[&pid].task_id.same_lease(&task_id),
                     "two live leases share the task id '{task_id}'"
                 );
-                append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
-                let _ = reply.send(()).await;
+                let running = matches!(jobs[&pid].info.status, JobStatus::Running);
+                if running {
+                    append_terminal_output(jobs, pid, TerminalStream::Stdout, chunk).await;
+                }
+                let _ = reply.send(running).await;
             } else if let Some(reply) = parked.park(&task_id, chunk, reply) {
-                let _ = reply.send(()).await;
+                let _ = reply.send(false).await;
             }
+        }
+        JobRequest::Lease { task_id, reply } => {
+            let lease = find_pid_by_task_id(jobs, &task_id)
+                .map(|pid| jobs[&pid].task_id.downgrade())
+                .or_else(|| parked.launching_lease(&task_id));
+            let _ = reply.send(lease).await;
         }
         JobRequest::List { reply } => {
             let items = jobs.values().map(|state| state.info.clone()).collect();

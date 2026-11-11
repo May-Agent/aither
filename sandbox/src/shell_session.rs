@@ -4,11 +4,9 @@ use async_channel::{Receiver, Sender};
 
 use askama::Template as _;
 
-use crate::ssh::{SshEnvironments, SshServer, SshServerError};
+use crate::ssh::{PrepareSsh, SshEnvironments, SshServer, SshServerError};
 use crate::stdin_watch::StdinWatchSignal;
 use crate::{ContainerPath, HostRoute};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 /// How long the processes a container command leaves running when its
 /// top-level shell exits may live.
@@ -489,30 +487,17 @@ impl<T: ContainerExec> ContainerExecImpl for T {
     }
 }
 
-/// The backend of the home environment: where a command with no `location`
-/// runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ShellBackend {
-    /// On this machine, inside the local sandbox.
-    Local,
-    /// Inside a container.
-    Container,
-}
-
-/// Tracks the tools prepared for the home environment, the SSH servers
-/// commands may run on and how to reach them.
+/// The SSH servers a shell's commands may run on, as the embedder prepared
+/// them.
 ///
 /// The home environment is the shell's [`Sandbox`](crate::Sandbox): its
-/// backend says where commands with no `location` run, and the tools are
-/// prepared for exactly that backend.
+/// backend says where commands with no `location` run.
 ///
 /// Cloning shares the SSH server set: a server added or removed through one
 /// holder is seen by every other, the terminals of subagents included.
 #[derive(Clone, Default)]
 pub struct ShellSessionRegistry {
     ssh: SshEnvironments,
-    pub(crate) prepared_tools: Option<crate::tool_environment::PreparedToolEnvironments>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -524,19 +509,25 @@ impl std::fmt::Debug for ShellSessionRegistry {
 
 impl ShellSessionRegistry {
     /// Adds `server` to the set commands may run on, for every holder of this
-    /// registry. Its name and target are trimmed. It is prepared on its first
-    /// command, which asks the terminal's permission handler first.
+    /// registry. Its name and target are trimmed.
+    ///
+    /// The server is not contacted: `prepare` runs when the first command
+    /// names it, see [`PrepareSsh`]. A [`PreparedSsh`](crate::PreparedSsh)
+    /// is a preparation already done.
     ///
     /// # Errors
     /// Rejects a blank name or target and a name another server has.
-    pub fn add_ssh_server(&self, server: SshServer) -> Result<(), SshServerError> {
-        self.ssh.add(server)
+    pub fn add_ssh_server(
+        &self,
+        server: SshServer,
+        prepare: impl PrepareSsh,
+    ) -> Result<(), SshServerError> {
+        self.ssh.add(server, prepare)
     }
 
     /// Removes the server named `name`, returning it; `None` when no server
     /// has that name. Commands already running there keep running; the next
-    /// command naming it fails, and a server added again under the name is
-    /// approved and prepared anew.
+    /// command naming it fails.
     #[must_use = "the removed server, or `None` when no server has the name"]
     pub fn remove_ssh_server(&self, name: &str) -> Option<SshServer> {
         self.ssh.remove(name)
@@ -660,6 +651,7 @@ mod disk_probe_tests {
 #[cfg(test)]
 mod tests {
     use super::{ShellSessionRegistry, SshServer};
+    use crate::{PreparedSsh, RemoteLaunch};
 
     #[test]
     fn every_clone_of_a_registry_shares_its_live_server_set() {
@@ -669,7 +661,12 @@ mod tests {
             name: "prod".to_string(),
             target: "root@example.com".to_string(),
         };
-        registry.add_ssh_server(prod.clone()).unwrap();
+        registry
+            .add_ssh_server(
+                prod.clone(),
+                PreparedSsh::new(None, RemoteLaunch::new("/opt/tools/bin", "/bin/bash")),
+            )
+            .unwrap();
         assert_eq!(subagent.ssh_servers(), std::slice::from_ref(&prod));
         assert_eq!(subagent.remove_ssh_server("prod"), Some(prod));
         assert_eq!(registry.ssh_servers(), []);
