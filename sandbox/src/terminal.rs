@@ -2731,7 +2731,7 @@ where
                 {
                     job_registry
                         .kill_timed_out(
-                            job.pid,
+                            &job.task_id,
                             TimeoutKill {
                                 timeout,
                                 started,
@@ -3121,7 +3121,7 @@ struct SshBackgroundExecution<'a, E> {
 
 struct CompletedProcessOutput<'a> {
     job_registry: &'a JobRegistry,
-    pid: u32,
+    task_id: &'a IdLease,
     output: std::process::Output,
     background_output: bool,
     outputs: &'a OutputStore,
@@ -3478,7 +3478,7 @@ where
         jobserver: &jobserver,
     })
     .await;
-    let (pid, output) = match start_result {
+    let output = match start_result {
         Ok(started) => started,
         Err(error) => {
             background_startup.report_failure(&error).await;
@@ -3488,7 +3488,7 @@ where
 
     let result = save_completed_process_output(CompletedProcessOutput {
         job_registry: &job_registry,
-        pid,
+        task_id: &task_id,
         output,
         background_output: background,
         outputs: &outputs,
@@ -3503,7 +3503,9 @@ where
     debug!(exit_code, "background script completed");
 
     let output_path = stored_path(&result.stdout);
-    job_registry.complete(pid, exit_code, output_path).await;
+    job_registry
+        .complete(&task_id, exit_code, output_path)
+        .await;
 
     // The command's directory report arrives with its end, whether the call
     // answered in the foreground window or the command promoted: the task
@@ -3532,7 +3534,7 @@ where
 #[allow(clippy::too_many_lines)]
 async fn start_standalone_execution<E>(
     request: StandaloneStart<'_, E>,
-) -> Result<(u32, std::process::Output), TerminalError>
+) -> Result<std::process::Output, TerminalError>
 where
     E: Executor + Clone + 'static,
 {
@@ -3643,7 +3645,7 @@ async fn save_completed_process_output(
 ) -> Result<CompletedCommand, TerminalError> {
     let CompletedProcessOutput {
         job_registry,
-        pid,
+        task_id,
         output,
         background_output,
         outputs,
@@ -3654,7 +3656,7 @@ async fn save_completed_process_output(
     } = request;
     let stdout = save_completed_stdout(
         job_registry,
-        pid,
+        task_id,
         &output.stdout,
         CompletedStdoutFormat {
             background_output,
@@ -3666,7 +3668,7 @@ async fn save_completed_process_output(
         },
     )
     .await?;
-    let stderr = save_completed_stderr(job_registry, pid, outputs, &output.stderr).await?;
+    let stderr = save_completed_stderr(job_registry, task_id, outputs, &output.stderr).await?;
     let exit_code = output.status.code().unwrap_or(-1);
 
     Ok(CompletedCommand {
@@ -3688,7 +3690,7 @@ struct CompletedStdoutFormat<'a> {
 
 async fn save_completed_stdout(
     job_registry: &JobRegistry,
-    pid: u32,
+    task_id: &IdLease,
     stdout: &[u8],
     format: CompletedStdoutFormat<'_>,
 ) -> Result<CommandStream, TerminalError> {
@@ -3712,7 +3714,7 @@ async fn save_completed_stdout(
     {
         Ok(entry) => Ok(entry),
         Err(err) => {
-            job_registry.fail(pid, &err.to_string(), None).await;
+            job_registry.fail(task_id, &err.to_string(), None).await;
             Err(TerminalError::Io(err))
         }
     }
@@ -3751,7 +3753,7 @@ async fn compressed_stdout_data<'a>(
 
 async fn save_completed_stderr(
     job_registry: &JobRegistry,
-    pid: u32,
+    task_id: &IdLease,
     outputs: &OutputStore,
     stderr: &[u8],
 ) -> Result<Option<CommandStream>, TerminalError> {
@@ -3769,7 +3771,7 @@ async fn save_completed_stderr(
     {
         Ok(entry) => Ok(Some(entry)),
         Err(err) => {
-            job_registry.fail(pid, &err.to_string(), None).await;
+            job_registry.fail(task_id, &err.to_string(), None).await;
             Err(TerminalError::Io(err))
         }
     }
@@ -3870,7 +3872,7 @@ pub fn job_fifo_grant(path: &Path) -> heel::Result<heel::Grant> {
 /// or with host access for an approved `unsafe` one.
 async fn execute_local_background<E: Executor + Clone + 'static>(
     context: LocalBackgroundExecution<'_, E>,
-) -> Result<(u32, std::process::Output), TerminalError> {
+) -> Result<std::process::Output, TerminalError> {
     // What this one command adds to the sandbox: its jobserver variables and
     // fifo grant, and the worktree map of a main shell.
     let mut environment = Vec::new();
@@ -3954,8 +3956,9 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
         child,
         context.executor,
         context.job_registry,
-        pid,
+        context.task_id,
         LocalJob {
+            pid,
             tree,
             lifetime: context.lifetime,
             stdin_alerts: context.stdin_alerts,
@@ -3965,7 +3968,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
     )
     .await?;
 
-    Ok((pid, output))
+    Ok(output)
 }
 
 /// How long a command's descendants may outlive its top-level shell.
@@ -4128,12 +4131,13 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     mut child: LocalChild,
     executor: E,
     job_registry: &JobRegistry,
-    pid: u32,
+    task_id: &IdLease,
     job: LocalJob,
     missing_stdout_message: &'static str,
     missing_stderr_message: &'static str,
 ) -> Result<std::process::Output, TerminalError> {
     let LocalJob {
+        pid,
         tree,
         lifetime,
         stdin_alerts,
@@ -4149,7 +4153,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
             stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
         }
         let input_tx = write_chunks(stdin, feed);
-        job_registry.attach_terminal_input(pid, input_tx).await;
+        job_registry.attach_terminal_input(task_id, input_tx).await;
     }
 
     let stdout = child
@@ -4164,7 +4168,11 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     spawn_terminal_reader(stderr, chunk_tx.clone(), true);
     drop(chunk_tx);
     executor
-        .spawn(drain_terminal_chunks(job_registry.clone(), pid, chunk_rx))
+        .spawn(drain_terminal_chunks(
+            job_registry.clone(),
+            task_id.clone(),
+            chunk_rx,
+        ))
         .detach();
 
     // The root stays unreaped until its tree is gone, so its pid and process
@@ -4173,8 +4181,8 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         Ok(exited) => exited,
         Err(error) => {
             tree.finish().await;
-            job_registry.close_stdout(pid).await;
-            job_registry.close_stderr(pid).await;
+            job_registry.close_stdout(task_id).await;
+            job_registry.close_stderr(task_id).await;
             return Err(error);
         }
     };
@@ -4210,15 +4218,15 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     let status = match (descendants, status) {
         (Ok(()), Ok(status)) => status,
         (Err(error), _) | (Ok(()), Err(error)) => {
-            job_registry.close_stdout(pid).await;
-            job_registry.close_stderr(pid).await;
-            job_registry.fail(pid, &error.detail(), None).await;
+            job_registry.close_stdout(task_id).await;
+            job_registry.close_stderr(task_id).await;
+            job_registry.fail(task_id, &error.detail(), None).await;
             return Err(error);
         }
     };
-    wait_for_terminal_stream_close(job_registry, pid).await;
-    let (stdout, stderr) = job_registry.terminal_output(pid).await.ok_or_else(|| {
-        TerminalError::Execution(format!("missing terminal output for pid {pid}"))
+    wait_for_terminal_stream_close(job_registry, task_id).await;
+    let (stdout, stderr) = job_registry.terminal_output(task_id).await.ok_or_else(|| {
+        TerminalError::Execution(format!("missing terminal output for task {task_id}"))
     })?;
     let output = std::process::Output {
         status,
@@ -4231,6 +4239,9 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
 
 /// A local job's process tree and how long its descendants may live.
 struct LocalJob {
+    /// The root process's id, for the stdin probe: the registry never
+    /// identifies the job by it.
+    pid: u32,
     tree: JobTree,
     lifetime: JobLifetime,
     stdin_alerts: Option<StdinAlerts>,
@@ -4418,7 +4429,7 @@ fn container_job_script(
 /// backend, and answers what the job produced.
 async fn execute_container_job<E: Executor + Clone + 'static>(
     context: ContainerJobExecution<'_, E>,
-) -> Result<(u32, std::process::Output), TerminalError> {
+) -> Result<std::process::Output, TerminalError> {
     let result = spawn_container_job(&context).await;
     // The exec has ended, killed or not: the relay stops feeding the fifo and
     // returns its tokens once the job's last process holding it is gone.
@@ -4429,7 +4440,7 @@ async fn execute_container_job<E: Executor + Clone + 'static>(
 
 async fn spawn_container_job<E: Executor + Clone + 'static>(
     context: &ContainerJobExecution<'_, E>,
-) -> Result<(u32, std::process::Output), TerminalError> {
+) -> Result<std::process::Output, TerminalError> {
     // The spec's variables are exported after the sandbox's source's, so they
     // win over a source variable of the same name, as they do for a local
     // command.
@@ -4546,7 +4557,7 @@ async fn forward_stream(
 /// `heel`, an `unsafe` one runs it directly.
 async fn execute_ssh_background<E: Executor + Clone + 'static>(
     context: SshBackgroundExecution<'_, E>,
-) -> Result<(u32, std::process::Output), TerminalError> {
+) -> Result<std::process::Output, TerminalError> {
     // Only what the spec names travels to a server: the sandbox's own
     // environment, source and grants never leave this machine.
     let sandbox = context
@@ -4610,7 +4621,7 @@ struct SpawnedJob<'a, E> {
 async fn run_spawned_job<E: Executor + Clone + 'static>(
     mut child: crate::SandboxedChild,
     job: SpawnedJob<'_, E>,
-) -> Result<(u32, std::process::Output), TerminalError> {
+) -> Result<std::process::Output, TerminalError> {
     let stdout = child
         .take_stdout()
         .ok_or_else(|| TerminalError::Execution("missing stdout pipe for the process".into()))?;
@@ -4634,14 +4645,18 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
         )
         .await;
     if let Some(stdin) = stdin {
-        job.job_registry.attach_terminal_input(pid, stdin).await;
+        job.job_registry
+            .attach_terminal_input(job.task_id, stdin)
+            .await;
     }
     if let (Some(signals), Some(alerts)) = (stdin_blocked, job.stdin_alerts) {
         job.executor.spawn(alerts.relay(signals)).detach();
     }
     // A kill of the job ends the whole process tree, wherever it runs.
     let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-    job.job_registry.attach_kill_switch(pid, kill_tx).await;
+    job.job_registry
+        .attach_kill_switch(job.task_id, kill_tx)
+        .await;
     let killed = Arc::clone(&child);
     job.executor
         .spawn(async move {
@@ -4664,7 +4679,7 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
     job.executor
         .spawn(drain_terminal_chunks(
             job.job_registry.clone(),
-            pid,
+            job.task_id.clone(),
             chunk_rx,
         ))
         .detach();
@@ -4675,9 +4690,9 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
         // wrote before is the job's output, and the registry knows the cause.
         crate::ChildExit::Killed => killed_exit_status(),
         crate::ChildExit::Failed(error) => {
-            job.job_registry.close_stdout(pid).await;
-            job.job_registry.close_stderr(pid).await;
-            job.job_registry.fail(pid, &error, None).await;
+            job.job_registry.close_stdout(job.task_id).await;
+            job.job_registry.close_stderr(job.task_id).await;
+            job.job_registry.fail(job.task_id, &error, None).await;
             return Err(TerminalError::Execution(error));
         }
     };
@@ -4691,18 +4706,19 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
         );
         job.lifetime.report_descendants_killed(killed).await;
     }
-    wait_for_terminal_stream_close(job.job_registry, pid).await;
-    let (stdout, stderr) = job.job_registry.terminal_output(pid).await.ok_or_else(|| {
-        TerminalError::Execution(format!("missing terminal output for pid {pid}"))
-    })?;
-    Ok((
-        pid,
-        std::process::Output {
-            status,
-            stdout,
-            stderr,
-        },
-    ))
+    wait_for_terminal_stream_close(job.job_registry, job.task_id).await;
+    let (stdout, stderr) = job
+        .job_registry
+        .terminal_output(job.task_id)
+        .await
+        .ok_or_else(|| {
+            TerminalError::Execution(format!("missing terminal output for task {}", job.task_id))
+        })?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Prepends a source's env pairs to `script` as `export` statements, for
@@ -4987,21 +5003,21 @@ where
 
 async fn drain_terminal_chunks(
     job_registry: JobRegistry,
-    pid: u32,
+    task_id: IdLease,
     rx: async_channel::Receiver<TerminalChunk>,
 ) {
     while let Ok(chunk) = rx.recv().await {
         match chunk {
-            TerminalChunk::Stdout(bytes) => job_registry.append_stdout(pid, bytes).await,
-            TerminalChunk::Stderr(bytes) => job_registry.append_stderr(pid, bytes).await,
-            TerminalChunk::StdoutClosed => job_registry.close_stdout(pid).await,
-            TerminalChunk::StderrClosed => job_registry.close_stderr(pid).await,
+            TerminalChunk::Stdout(bytes) => job_registry.append_stdout(&task_id, bytes).await,
+            TerminalChunk::Stderr(bytes) => job_registry.append_stderr(&task_id, bytes).await,
+            TerminalChunk::StdoutClosed => job_registry.close_stdout(&task_id).await,
+            TerminalChunk::StderrClosed => job_registry.close_stderr(&task_id).await,
         }
     }
 }
 
-async fn wait_for_terminal_stream_close(job_registry: &JobRegistry, pid: u32) {
-    while !job_registry.terminal_streams_closed(pid).await {
+async fn wait_for_terminal_stream_close(job_registry: &JobRegistry, task_id: &str) {
+    while !job_registry.terminal_streams_closed(task_id).await {
         async_io::Timer::after(Duration::from_millis(10)).await;
     }
 }
@@ -5176,14 +5192,18 @@ mod tests {
             .await;
         let (ended_tx, ended_rx) = async_channel::bounded::<()>(1);
         let input_tx = write_chunks(DropSignal(ended_tx), FeedCounter::default());
-        registry.attach_terminal_input(9001, input_tx).await;
+        registry
+            .attach_terminal_input(&crate::test_ids::lease("writer"), input_tx)
+            .await;
         registry
             .terminal_input("writer", b"hi\n".to_vec())
             .await
             .expect("a running job takes input");
         assert!(ended_rx.is_empty(), "the writer lives while the job runs");
 
-        registry.complete(9001, 0, None).await;
+        registry
+            .complete(&crate::test_ids::lease("writer"), 0, None)
+            .await;
 
         tokio::time::timeout(Duration::from_secs(10), ended_rx.recv())
             .await
@@ -7310,7 +7330,7 @@ mod tests {
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let alert_tx = ShellEvents::new().sender(AgentPath::main());
-        let (_pid, output) = execute_container_job(ContainerJobExecution {
+        let output = execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
             ipc: None,

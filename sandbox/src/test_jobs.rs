@@ -71,7 +71,7 @@ impl Jobs {
             )
             .await;
         if let Some(kill_switch) = kill_switch {
-            self.registry.attach_kill_switch(pid, kill_switch).await;
+            self.registry.attach_kill_switch(task_id, kill_switch).await;
         }
     }
 }
