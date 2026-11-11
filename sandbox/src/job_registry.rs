@@ -316,8 +316,9 @@ pub struct UnchangedRead {
 /// Sender used by the registry to push bytes into a running process stdin.
 pub type TerminalInputSender = Sender<Vec<u8>>;
 
+/// One of a job's two output streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalStream {
+pub enum TerminalStream {
     Stdout,
     Stderr,
 }
@@ -766,19 +767,28 @@ impl JobRegistry {
 
     /// Appends stdout bytes for a running job.
     pub async fn append_stdout(&self, task_id: &IdLease, chunk: Vec<u8>) {
-        self.send_command(StateCommand::AppendTerminalOutput {
-            task_id: task_id.clone(),
-            stream: TerminalStream::Stdout,
-            chunk,
-        })
-        .await;
+        self.append_output(task_id.clone(), TerminalStream::Stdout, chunk)
+            .await;
     }
 
     /// Appends stderr bytes for a running job.
     pub async fn append_stderr(&self, task_id: &IdLease, chunk: Vec<u8>) {
+        self.append_output(task_id.clone(), TerminalStream::Stderr, chunk)
+            .await;
+    }
+
+    /// Appends bytes to `stream` of a running job. `task_id` goes with them:
+    /// the registry drops it once they are in, so a sender holding the job's
+    /// lease only weakly keeps nothing leased once its sends are recorded.
+    pub(crate) async fn append_output(
+        &self,
+        task_id: IdLease,
+        stream: TerminalStream,
+        chunk: Vec<u8>,
+    ) {
         self.send_command(StateCommand::AppendTerminalOutput {
-            task_id: task_id.clone(),
-            stream: TerminalStream::Stderr,
+            task_id,
+            stream,
             chunk,
         })
         .await;
@@ -837,20 +847,21 @@ impl JobRegistry {
 
     /// Marks stdout stream closed.
     pub async fn close_stdout(&self, task_id: &IdLease) {
-        self.send_command(StateCommand::CloseTerminalStream {
-            task_id: task_id.clone(),
-            stream: TerminalStream::Stdout,
-        })
-        .await;
+        self.close_output(task_id.clone(), TerminalStream::Stdout)
+            .await;
     }
 
     /// Marks stderr stream closed.
     pub async fn close_stderr(&self, task_id: &IdLease) {
-        self.send_command(StateCommand::CloseTerminalStream {
-            task_id: task_id.clone(),
-            stream: TerminalStream::Stderr,
-        })
-        .await;
+        self.close_output(task_id.clone(), TerminalStream::Stderr)
+            .await;
+    }
+
+    /// Marks `stream` of a job closed, `task_id` going with the close as it
+    /// does with [`Self::append_output`].
+    pub(crate) async fn close_output(&self, task_id: IdLease, stream: TerminalStream) {
+        self.send_command(StateCommand::CloseTerminalStream { task_id, stream })
+            .await;
     }
 
     /// Sends bytes to a running task terminal stdin.
