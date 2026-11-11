@@ -42,7 +42,7 @@ use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
     ToolResult,
 };
-use aither_core::{AnyIdAllocator, IdLease, IdsExhausted};
+use aither_core::{AnyIdAllocator, IdLease, IdsExhausted, WeakIdLease};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
@@ -69,7 +69,7 @@ use crate::{
     Carry, ContainerPath, MountRoot, OutputTreatment, RemoteLaunch, SandboxMode, ScriptDecision,
     ScriptDir, ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptRefusal,
     interpreter::Interpreter,
-    job_registry::{JobRegistry, JobStatus, job_registry_channel},
+    job_registry::{JobRegistry, JobStatus, TerminalStream, job_registry_channel},
     limits::{LiveDuration, ShellLimits},
     output::{MediaResolution, OutputFormat, OutputStore, stored_path},
     process_tree::{JobProcess, JobTree},
@@ -4170,7 +4170,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     executor
         .spawn(drain_terminal_chunks(
             job_registry.clone(),
-            task_id.clone(),
+            task_id.downgrade(),
             chunk_rx,
         ))
         .detach();
@@ -4679,7 +4679,7 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
     job.executor
         .spawn(drain_terminal_chunks(
             job.job_registry.clone(),
-            job.task_id.clone(),
+            job.task_id.downgrade(),
             chunk_rx,
         ))
         .detach();
@@ -5001,17 +5001,44 @@ where
     });
 }
 
+/// Moves a job's output into its registry until the readers let go of `rx`.
+///
+/// The job's lease is held weakly, and each chunk hands the registry a strong
+/// one of its own: the readers drop their senders some time after their
+/// streams closed, and by then the job's flow, which waits only for the
+/// closes, may have answered its call, which must find the word free.
 async fn drain_terminal_chunks(
     job_registry: JobRegistry,
-    task_id: IdLease,
+    task_id: WeakIdLease,
     rx: async_channel::Receiver<TerminalChunk>,
 ) {
     while let Ok(chunk) = rx.recv().await {
+        // The flow holds the lease until both streams closed: one gone means
+        // the job ended, and its output has nowhere to go.
+        let Some(task_id) = task_id.upgrade() else {
+            return;
+        };
         match chunk {
-            TerminalChunk::Stdout(bytes) => job_registry.append_stdout(&task_id, bytes).await,
-            TerminalChunk::Stderr(bytes) => job_registry.append_stderr(&task_id, bytes).await,
-            TerminalChunk::StdoutClosed => job_registry.close_stdout(&task_id).await,
-            TerminalChunk::StderrClosed => job_registry.close_stderr(&task_id).await,
+            TerminalChunk::Stdout(bytes) => {
+                job_registry
+                    .append_output(task_id, TerminalStream::Stdout, bytes)
+                    .await;
+            }
+            TerminalChunk::Stderr(bytes) => {
+                job_registry
+                    .append_output(task_id, TerminalStream::Stderr, bytes)
+                    .await;
+            }
+            TerminalChunk::StdoutClosed => {
+                job_registry
+                    .close_output(task_id, TerminalStream::Stdout)
+                    .await;
+            }
+            TerminalChunk::StderrClosed => {
+                job_registry
+                    .close_output(task_id, TerminalStream::Stderr)
+                    .await;
+            }
         }
     }
 }
