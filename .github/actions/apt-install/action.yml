@@ -1,5 +1,5 @@
 name: Install apt packages
-description: Install Ubuntu packages on a hosted runner, falling back to a mirror outside ubuntu.com when the image's mirrors do not resolve.
+description: Install Ubuntu packages on a hosted runner, falling back to a mirror outside ubuntu.com when the image's mirrors do not resolve or stall.
 inputs:
   packages:
     description: Space-separated package names.
@@ -12,12 +12,19 @@ runs:
     # is a name under Canonical's DNS, and runners lose all of them at once
     # (actions/runner-images#6894, #7048), failing every install. The last
     # entry is kernel.org's full Ubuntu mirror, resolved through other DNS.
+    #
+    # apt's default timeouts let one stalled connection hold the job until its
+    # own timeout without ever trying the next mirror. 30 s without data fails
+    # a fetch over to the next entry, and a fetch every mirror failed is
+    # retried from the first.
     - shell: bash
       env:
         PACKAGES: ${{ inputs.packages }}
       run: |
         set -euo pipefail
         printf 'https://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' | sudo tee -a /etc/apt/apt-mirrors.txt > /dev/null
+        printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "3";\n' \
+          | sudo tee /etc/apt/apt.conf.d/99ci-timeouts > /dev/null
         sudo apt-get update
         # shellcheck disable=SC2086 # PACKAGES is a word list.
         sudo apt-get install -y --no-install-recommends ${PACKAGES}
