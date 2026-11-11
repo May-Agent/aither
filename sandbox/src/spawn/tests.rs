@@ -25,8 +25,7 @@ async fn host_sandbox(working_dir: &Path) -> Sandbox {
     let heel = crate::test_heel::binary()
         .await
         .expect("a heel is available to the tests");
-    let launch = crate::HostLaunch::new("/bin/bash");
-    Sandbox::new(Backend::Host { heel, launch }, TokioGlobal, working_dir)
+    Sandbox::new(Backend::Host { heel }, TokioGlobal, working_dir)
 }
 
 /// The programs of a container whose image the embedder prepared.
@@ -543,7 +542,12 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
 
     let script = started.lock().unwrap()[0].0.clone();
     assert!(script.starts_with("AITHER_IPC_BIN="), "{script}");
-    assert!(script.contains("for cmd in 'probe'; do"), "{script}");
+    assert!(
+        script.contains(
+            r#"--commands '{"probe":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+        ),
+        "{script}"
+    );
     assert!(
         script.contains("run --working-dir '/workspace' "),
         "{script}"

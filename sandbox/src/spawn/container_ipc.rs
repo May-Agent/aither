@@ -2,9 +2,10 @@
 //!
 //! The container reaches the host over its [host route](crate::HostRoute): a
 //! listener on the route's address answers the framed requests of the
-//! sandboxed `heel ipc` with the router's commands, and shims named after the
-//! commands, written by a prelude the exec's shell runs first, make them
-//! ordinary programs on the process's `PATH`.
+//! sandboxed `heel ipc` with the router's commands, and shims written by
+//! `heel shims` from the router's command declarations, which a prelude the
+//! exec's shell runs first invokes, make them ordinary programs on the
+//! process's `PATH`.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use async_io::Async;
 use executor_core::{AnyExecutor, Executor};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use heel::IpcRouter;
-use heel::ipc::{IpcContext, IpcRequest, IpcResponse};
+use heel::ipc::{IpcCommands, IpcContext, IpcRequest, IpcResponse};
 
 use super::SpawnError;
 use crate::terminal::shell_escape;
@@ -44,22 +45,10 @@ pub struct ExecSetup {
 
 /// The setup that makes `commands` programs in a container and points them at
 /// the listener on `host:port`.
-pub fn exec_setup(commands: &[String], host: &str, port: u16) -> Result<ExecSetup, SpawnError> {
-    for name in commands {
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(SpawnError::Setup(format!(
-                "the command name {name} cannot be a shim in a container"
-            )));
-        }
-    }
-    let escaped_commands = commands
-        .iter()
-        .map(|name| shell_escape(name))
-        .collect::<Vec<_>>()
-        .join(" ");
+pub fn exec_setup(commands: &IpcCommands, host: &str, port: u16) -> Result<ExecSetup, SpawnError> {
+    let commands = serde_json::to_string(commands)
+        .map_err(|e| SpawnError::Setup(format!("cannot serialize the IPC commands: {e}")))?;
+    let escaped_commands = shell_escape(&commands);
     let script = PreludeTemplate {
         escaped_commands: &escaped_commands,
         ipc_host: host,
@@ -104,10 +93,6 @@ impl ContainerIpc {
         let failed = |what: &str, error: &dyn std::fmt::Display| {
             SpawnError::Setup(format!("{what}: {error}"))
         };
-        let commands = router
-            .methods()
-            .map(|(name, _)| name.to_owned())
-            .collect::<Vec<_>>();
         // The listener executes the router's commands for whoever connects,
         // so it binds only the address the container route names, never a
         // wildcard.
@@ -123,7 +108,7 @@ impl ContainerIpc {
         let listener = Async::new(listener)
             .map_err(|e| failed("cannot register the container IPC listener", &e))?;
 
-        let setup = exec_setup(&commands, runtime.host_route().name(), port)?;
+        let setup = exec_setup(router.commands(), runtime.host_route().name(), port)?;
 
         let (shutdown, stop) = async_channel::bounded::<()>(1);
         let workspace = runtime.workspace_mount().cloned();

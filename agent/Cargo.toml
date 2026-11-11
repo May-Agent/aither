@@ -15,6 +15,7 @@ categories = ["api-bindings"]
 aither-core.workspace = true
 aither-attachments.workspace = true
 anyhow = "1.0.104"
+arc-swap.workspace = true
 askama = "0.16"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -52,7 +53,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-executor-core = "0.7"
+executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 # An in-process MCP server drives the command table through a real connection.

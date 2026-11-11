@@ -18,8 +18,8 @@
 //! ```rust,ignore
 //! use aither_sandbox::{Backend, Sandbox, Shell};
 //!
-//! let sandbox = Sandbox::new(Backend::Host { heel, launch }, executor, working_dir);
-//! let shell = Shell::builder(sandbox)
+//! let sandbox = Sandbox::new(Backend::Host { heel }, executor, working_dir);
+//! let shell = Shell::builder_on_host(sandbox, host_shell)
 //!     .interpreters(interpreters)
 //!     .limits(limits)
 //!     .output(output)
@@ -48,6 +48,7 @@ mod outage;
 mod output;
 mod output_compress;
 mod output_policy;
+mod output_treatment;
 mod policy;
 mod process_tree;
 mod shell_session;
@@ -85,6 +86,11 @@ pub mod test_budgets;
 /// The wording tests read, shared through the `test-budgets` feature.
 #[cfg(any(test, feature = "test-budgets"))]
 pub mod test_wording;
+
+/// Jobs placed in a container or on a remote host for tests, shared with
+/// dependent crates through the `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_jobs;
 
 /// Id allocators for tests, shared with dependent crates through the
 /// `test-ids` feature.
@@ -138,6 +144,7 @@ pub use network_policy::{
 };
 pub use output::{MediaResolution, OutputFormat, OutputStore};
 pub use output_policy::{MediaBounds, OutputLimits, OutputPolicy};
+pub use output_treatment::{OutputTreatment, TreatOutput};
 pub use policy::{
     AnyScriptPolicy, Carry, SandboxMode, ScriptCheck, ScriptDecision, ScriptDir, ScriptEnd,
     ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptPolicy, ScriptRefusal,

@@ -84,7 +84,7 @@ pub enum JobWaitError {
 /// Cloning shares the shell's jobs.
 #[derive(Debug, Clone)]
 pub struct Jobs {
-    registry: JobRegistry,
+    pub(crate) registry: JobRegistry,
     events: ShellEvents,
     outputs: OutputStore,
 }

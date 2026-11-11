@@ -5,9 +5,10 @@ use std::sync::Arc;
 use executor_core::AnyExecutor;
 
 use super::{Interpreter, Shell, ShellToolSettings, TerminalError};
+use crate::output_treatment::AnyTreatOutput;
 use crate::{
-    AnyIpcProvider, AnyScriptPolicy, AnyShellWording, IpcProvider, OutputPolicy, Sandbox,
-    ScriptPolicy, ShellEvents, ShellLimits, ShellWording,
+    AnyIpcProvider, AnyScriptPolicy, AnyShellWording, HostLaunch, IpcProvider, OutputPolicy,
+    Sandbox, ScriptPolicy, ShellEvents, ShellLimits, ShellWording, TreatOutput,
 };
 
 /// A value the builder has not been given yet.
@@ -28,6 +29,8 @@ pub struct ShellParts {
     pub(crate) events: Option<ShellEvents>,
     pub(crate) policies: Vec<AnyScriptPolicy>,
     pub(crate) ipc: Option<AnyIpcProvider>,
+    pub(crate) treat_output: Option<AnyTreatOutput>,
+    pub(crate) host_shell: Option<HostLaunch>,
 }
 
 /// Builds a [`Shell`] on the [`Sandbox`] its scripts run in.
@@ -45,12 +48,16 @@ pub struct ShellBuilder<I, L, O, W, T> {
     events: Option<ShellEvents>,
     policies: Vec<AnyScriptPolicy>,
     ipc: Option<AnyIpcProvider>,
+    treat_output: Option<AnyTreatOutput>,
+    host_shell: Option<HostLaunch>,
 }
 
 impl Shell<Arc<AnyExecutor>> {
-    /// Starts a shell whose scripts run in `sandbox`: its working directory,
-    /// live grants, environment source, network policy, priority and
-    /// backend are the shell's.
+    /// Starts a shell whose scripts run in `sandbox`, a sandbox on a
+    /// container: its working directory, live grants, environment source,
+    /// network policy, priority and backend are the shell's, and the shell
+    /// is the one the container's launch names. A sandbox on the host takes
+    /// [`builder_on_host`](Self::builder_on_host).
     #[must_use]
     pub const fn builder(
         sandbox: Sandbox,
@@ -65,6 +72,32 @@ impl Shell<Arc<AnyExecutor>> {
             events: None,
             policies: Vec::new(),
             ipc: None,
+            treat_output: None,
+            host_shell: None,
+        }
+    }
+
+    /// Starts a shell whose scripts run in `sandbox`, a sandbox on the host,
+    /// under the shell `host_shell` names. A host sandbox spawns programs and
+    /// names no shell of its own, so the shell is an input of the shell that
+    /// needs one.
+    #[must_use]
+    pub const fn builder_on_host(
+        sandbox: Sandbox,
+        host_shell: HostLaunch,
+    ) -> ShellBuilder<Missing, Missing, Missing, Missing, Missing> {
+        ShellBuilder {
+            sandbox,
+            interpreters: Missing,
+            limits: Missing,
+            output: Missing,
+            wording: Missing,
+            tools: Missing,
+            events: None,
+            policies: Vec::new(),
+            ipc: None,
+            treat_output: None,
+            host_shell: Some(host_shell),
         }
     }
 }
@@ -88,6 +121,17 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
     #[must_use]
     pub fn policy(mut self, policy: impl ScriptPolicy) -> Self {
         self.policies.push(AnyScriptPolicy::new(policy));
+        self
+    }
+
+    /// Lets `treat` choose, before each script of the shell and of the
+    /// subagent shells it launches runs, whether its output reaches the model
+    /// verbatim or cleaned as command output; it replaces one given before.
+    /// Without it every script's output is cleaned as command output, see
+    /// [`OutputTreatment`](crate::OutputTreatment).
+    #[must_use]
+    pub fn treat_output(mut self, treat: impl TreatOutput) -> Self {
+        self.treat_output = Some(AnyTreatOutput::new(treat));
         self
     }
 
@@ -117,6 +161,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            treat_output: self.treat_output,
+            host_shell: self.host_shell,
         }
     }
 
@@ -133,6 +179,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            treat_output: self.treat_output,
+            host_shell: self.host_shell,
         }
     }
 
@@ -149,6 +197,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            treat_output: self.treat_output,
+            host_shell: self.host_shell,
         }
     }
 
@@ -168,6 +218,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            treat_output: self.treat_output,
+            host_shell: self.host_shell,
         }
     }
 
@@ -188,6 +240,8 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             events: self.events,
             policies: self.policies,
             ipc: self.ipc,
+            treat_output: self.treat_output,
+            host_shell: self.host_shell,
         }
     }
 }
@@ -206,7 +260,10 @@ impl
     /// # Errors
     /// Returns an error when the working directory or the output store cannot
     /// be created, when the sandbox runs its processes on an SSH server (a
-    /// server is a location a script names, not a shell's home).
+    /// server is a location a script names, not a shell's home), or when the
+    /// constructor does not fit the sandbox's backend: a host sandbox built
+    /// with [`Shell::builder`], or a container sandbox built with
+    /// [`Shell::builder_on_host`].
     pub async fn build(self) -> Result<Shell<Arc<AnyExecutor>>, TerminalError> {
         let Self {
             sandbox,
@@ -218,6 +275,8 @@ impl
             events,
             policies,
             ipc,
+            treat_output,
+            host_shell,
         } = self;
         let executor = sandbox.executor();
         Shell::from_parts(
@@ -232,6 +291,8 @@ impl
                 events,
                 policies,
                 ipc,
+                treat_output,
+                host_shell,
             },
         )
         .await
@@ -253,15 +314,12 @@ mod tests {
     ) -> Shell<Arc<AnyExecutor>> {
         let heel = crate::test_heel::binary().await.expect("a heel for tests");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new("/bin/bash"),
-            },
+            Backend::Host { heel },
             executor_core::tokio::TokioGlobal,
             directory,
         )
         .with_grants(grants);
-        Shell::builder(sandbox)
+        Shell::builder_on_host(sandbox, HostLaunch::new("/bin/bash"))
             .interpreters(interpreters.iter().copied())
             .limits(test_budgets::limits())
             .output(test_budgets::output_policy())
@@ -278,14 +336,11 @@ mod tests {
     ) -> Shell<Arc<AnyExecutor>> {
         let heel = crate::test_heel::binary().await.expect("a heel for tests");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new("/bin/bash"),
-            },
+            Backend::Host { heel },
             executor_core::tokio::TokioGlobal,
             directory,
         );
-        Shell::builder(sandbox)
+        Shell::builder_on_host(sandbox, HostLaunch::new("/bin/bash"))
             .interpreters([Interpreter::Shell])
             .limits(test_budgets::limits())
             .output(test_budgets::output_policy())
@@ -295,6 +350,127 @@ mod tests {
             .build()
             .await
             .expect("the shell builds")
+    }
+
+    /// Keeps the output of a script that reads a file with `cat` verbatim.
+    struct CatIsVerbatim;
+
+    impl TreatOutput for CatIsVerbatim {
+        fn treatment(&self, script: &crate::ScriptCheck<'_>) -> crate::OutputTreatment {
+            if script.script.starts_with("cat ") {
+                crate::OutputTreatment::Verbatim
+            } else {
+                crate::OutputTreatment::Command
+            }
+        }
+    }
+
+    async fn treated_shell(
+        directory: &std::path::Path,
+        treat: Option<CatIsVerbatim>,
+    ) -> Shell<Arc<AnyExecutor>> {
+        let heel = crate::test_heel::binary().await.expect("a heel for tests");
+        let sandbox = Sandbox::new(
+            Backend::Host { heel },
+            executor_core::tokio::TokioGlobal,
+            directory,
+        );
+        let builder = Shell::builder_on_host(sandbox, HostLaunch::new("/bin/bash"))
+            .interpreters([Interpreter::Shell])
+            .limits(test_budgets::limits())
+            .output(test_budgets::output_policy())
+            .wording(test_wording::TestWording)
+            .tools(test_wording::job_tools());
+        let builder = match treat {
+            Some(treat) => builder.treat_output(treat),
+            None => builder,
+        };
+        builder.build().await.expect("the shell builds")
+    }
+
+    async fn run_in(
+        shell: &Shell<Arc<AnyExecutor>>,
+        dir: &std::path::Path,
+        script: &str,
+    ) -> crate::ScriptResult {
+        let result = shell
+            .run(crate::Script::new(
+                script,
+                dir,
+                std::time::Duration::from_secs(30),
+            ))
+            .await
+            .expect("the script runs");
+        assert!(
+            matches!(result.outcome, crate::RunOutcome::Exited { code: 0 }),
+            "{result:?}"
+        );
+        result
+    }
+
+    /// A file whose blank-line runs command-output cleaning collapses.
+    const NOTES: &str = "# Notes\n\n\n\nfirst\n\n\nsecond\n";
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shell_without_a_treatment_cleans_every_output_as_command_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = directory.path().canonicalize().unwrap();
+        std::fs::write(start.join("notes.md"), NOTES).unwrap();
+        let shell = treated_shell(&start, None).await;
+        let read = run_in(&shell, &start, "cat notes.md").await;
+        assert_ne!(stdout_of(&read), NOTES, "the blank runs collapse");
+        assert!(
+            stdout_of(&read).contains("blank lines collapsed"),
+            "{read:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_treatment_keeps_a_read_verbatim_and_cleans_command_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = directory.path().canonicalize().unwrap();
+        std::fs::write(start.join("notes.md"), NOTES).unwrap();
+        let shell = treated_shell(&start, Some(CatIsVerbatim)).await;
+
+        let read = run_in(&shell, &start, "cat notes.md").await;
+        assert_eq!(
+            stdout_of(&read),
+            NOTES,
+            "the file reaches the model as it is"
+        );
+
+        let command = run_in(&shell, &start, "printf '# Notes\\n\\n\\n\\nfirst\\n'").await;
+        assert!(
+            stdout_of(&command).contains("blank lines collapsed"),
+            "{command:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verbatim_output_over_the_budget_stores_the_whole_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = directory.path().canonicalize().unwrap();
+        let lines = test_budgets::output_policy().lines(None) * 2;
+        let long = (0..lines)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n\n\n");
+        std::fs::write(start.join("long.md"), &long).unwrap();
+        let shell = treated_shell(&start, Some(CatIsVerbatim)).await;
+
+        let read = run_in(&shell, &start, "cat long.md").await;
+        let aither_core::llm::CommandStream::Stored { file, preview, .. } = &read.stdout else {
+            panic!("output over the line budget is stored: {read:?}");
+        };
+        assert!(!preview.is_empty(), "the model reads a preview");
+        assert_eq!(
+            std::fs::read_to_string(&file.path).unwrap(),
+            long,
+            "the stored file holds the whole text, blank runs included"
+        );
     }
 
     fn stdout_of(result: &crate::ScriptResult) -> &str {
@@ -336,17 +512,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let start = directory.path().canonicalize().unwrap();
         let shell = shell(&start, Grants::new(), &[Interpreter::Shell]).await;
+        // The `;` makes the script one the managed shell runs: a bare
+        // `probe` is a direct command, which Linux's supervisor refuses to
+        // start at all and macOS reports as an exit.
         let result = shell
             .run(crate::Script::new(
-                "probe",
+                "probe;",
                 &start,
                 std::time::Duration::from_secs(30),
             ))
             .await
             .expect("the script runs");
         assert!(
-            !matches!(result.outcome, crate::RunOutcome::Exited { code: 0 }),
-            "{result:?}"
+            matches!(result.outcome, crate::RunOutcome::Exited { code: 127 }),
+            "the shell finds no `probe`: {result:?}"
         );
     }
 
@@ -425,5 +604,49 @@ mod tests {
             .await
             .expect_err("python is not configured");
         assert!(error.to_string().contains("not configured"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_host_sandbox_built_without_its_host_shell_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let heel = crate::test_heel::binary().await.expect("a heel for tests");
+        let sandbox = Sandbox::new(
+            Backend::Host { heel },
+            executor_core::tokio::TokioGlobal,
+            directory.path(),
+        );
+        let error = Shell::builder(sandbox)
+            .interpreters([Interpreter::Shell])
+            .limits(test_budgets::limits())
+            .output(test_budgets::output_policy())
+            .wording(test_wording::TestWording)
+            .tools(test_wording::job_tools())
+            .build()
+            .await
+            .expect_err("a host shell needs its program");
+        assert!(error.to_string().contains("host shell"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shells_sandbox_spawns_a_program_in_the_shells_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let shell = shell(directory.path(), Grants::new(), &[Interpreter::Shell]).await;
+        let mut child = shell
+            .sandbox()
+            .spawn(crate::SpawnSpec::new("/bin/pwd"))
+            .await
+            .expect("the process starts");
+        let stdout = child.take_stdout().expect("stdout is piped");
+        let mut printed = Vec::new();
+        while let Ok(chunk) = stdout.recv().await {
+            printed.extend(chunk);
+        }
+        child.wait().await;
+        let printed = String::from_utf8(printed).unwrap();
+        assert_eq!(
+            std::path::Path::new(printed.trim()),
+            shell.sandbox().working_dir()
+        );
     }
 }

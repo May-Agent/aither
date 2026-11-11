@@ -20,7 +20,7 @@ arc-swap.workspace = true
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.9.4"
+heel = "0.9.5"
 
 # Executor for tokio integration
 executor-core = { version = "0.7", features = ["tokio"] }
@@ -83,6 +83,9 @@ blocking = "1.7.0"
 futures = "0.3.34"
 tempfile = "3.27.0"
 typed-path = "0.12.3"
+# The digest naming an SSH control socket, and the pinned `heel` of `test_heel`.
+sha2 = { version = "0.11", default-features = false }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 
 # Outage intervals reported to the model; see the `connectivity` feature.
 aither-connectivity = { workspace = true, optional = true }
@@ -90,8 +93,6 @@ jiff = { version = "0.2.39", default-features = false, features = ["std"] }
 
 # The pinned `heel` of `test_heel`: downloaded and verified when `HEEL_BIN` is unset.
 zenwave = { workspace = true, optional = true, features = ["hyper-backend", "rustls"] }
-sha2 = { version = "0.11", optional = true }
-hex = { version = "0.4.3", optional = true }
 
 # Job memory footprints on Windows.
 [target.'cfg(windows)'.dependencies]
@@ -109,11 +110,14 @@ default = []
 test-git = []
 # Expose `test_heel`, the `heel` binary tests run under (`HEEL_BIN`, else the
 # pinned release), to dependents' tests.
-test-heel = ["dep:zenwave", "dep:sha2", "dep:hex"]
+test-heel = ["dep:zenwave"]
 # Expose `test_ids`, id allocators for tests, to dependents' tests.
 test-ids = []
 # Expose `test_budgets`, time and output budgets for tests, to dependents' tests.
 test-budgets = []
+# Expose `test_jobs`, jobs placed in a container or on a remote host, to
+# dependents' tests.
+test-util = ["test-ids", "test-budgets"]
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
 code-folding = ["dep:magika", "dep:ort", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]
@@ -127,8 +131,6 @@ magika = { version = "1", features = ["_test"] }
 rmp-serde = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 flate2 = "1.1.10"
-hex = "0.4.3"
-sha2 = "0.11"
 zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 

@@ -37,7 +37,7 @@ use crate::spawn::container_ipc::ExecSetup;
 use aither_core::llm::tool::{
     AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
 };
-use aither_core::llm::{CallIdentity, ToolContext};
+use aither_core::llm::{AgentPath, CallIdentity, ToolContext};
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
     ToolResult,
@@ -48,7 +48,7 @@ use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
 #[cfg(target_os = "linux")]
 use heel::supervisor::{TreeControl, TreeReport};
-use heel::{Access, CpuPriority, Grant, IoPriority, NetworkAuditLog, ProcessPriority};
+use heel::{CpuPriority, IoPriority, NetworkAuditLog, ProcessPriority};
 /// On platforms without `heel supervise` a wait produces no report.
 #[cfg(not(target_os = "linux"))]
 pub struct TreeReport;
@@ -66,7 +66,7 @@ use crate::jobs::Jobs;
 #[cfg(all(unix, feature = "jobserver"))]
 use crate::jobserver::{JobBroker, JobPool, job_broker_channel};
 use crate::{
-    Carry, ContainerLaunch, ContainerPath, MountRoot, RemoteLaunch, SandboxMode, ScriptDecision,
+    Carry, ContainerPath, MountRoot, OutputTreatment, RemoteLaunch, SandboxMode, ScriptDecision,
     ScriptDir, ScriptOrigin, ScriptOutcome, ScriptPolicies, ScriptRefusal,
     interpreter::Interpreter,
     job_registry::{JobRegistry, JobStatus, job_registry_channel},
@@ -598,9 +598,54 @@ impl ShellRunError {
     }
 }
 
+/// Kills the running jobs of a registry when dropped.
+///
+/// `Drop` cannot await, so the kill runs as a task the terminal's executor
+/// spawns.
+struct KillJobsOnDrop {
+    registry: JobRegistry,
+    /// Spawns the kill of the registry's jobs on the terminal's executor.
+    spawn_kill: Box<dyn Fn(JobRegistry) + Send + Sync>,
+}
+
+impl KillJobsOnDrop {
+    fn new<E>(registry: JobRegistry, executor: E) -> Self
+    where
+        E: Executor + 'static,
+    {
+        Self {
+            registry,
+            spawn_kill: Box::new(move |registry| {
+                executor
+                    .spawn(async move {
+                        registry.kill_running().await;
+                    })
+                    .detach();
+            }),
+        }
+    }
+}
+
+impl Drop for KillJobsOnDrop {
+    fn drop(&mut self) {
+        (self.spawn_kill)(self.registry.clone());
+    }
+}
+
+impl std::fmt::Debug for KillJobsOnDrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KillJobsOnDrop").finish_non_exhaustive()
+    }
+}
+
 /// What a subagent's terminal holds that the main agent's does not.
 #[derive(Clone, Debug)]
 struct SubagentAuthority {
+    /// Kills the subagent's running jobs when the last handle of its terminal
+    /// goes. Only a subagent's terminal holds one: the main agent's jobs
+    /// outlive its terminal, so an embedder can rebuild it with its
+    /// background commands still running.
+    _jobs: Arc<KillJobsOnDrop>,
     /// Keeps the word naming its space leased while the terminal lives.
     _space_name: IdLease,
     /// The worktrees it may commit in, with their git data; it hands on no
@@ -741,6 +786,10 @@ pub struct Shell<E> {
     /// The script policies every script of this shell is put to, bound to
     /// the state of the agent the shell serves.
     policies: ScriptPolicies,
+    /// Chooses each script's output treatment, shared with every subagent
+    /// shell derived from this one; without it every output is command
+    /// output.
+    treat_output: Option<crate::output_treatment::AnyTreatOutput>,
     /// The commands the embedder serves to this shell's scripts, shared with
     /// every subagent shell derived from this one.
     ipc: Option<crate::AnyIpcProvider>,
@@ -751,6 +800,9 @@ pub struct Shell<E> {
     /// What this shell handed its subagents, so no grant exceeds an earlier
     /// one's claim; launches resolve one at a time.
     launches: Arc<async_lock::Mutex<LaunchHistory>>,
+    /// The shell scripts run under when the sandbox runs on the host; `None`
+    /// on a container, whose launch names it.
+    host_launch: Option<crate::HostLaunch>,
 }
 
 impl<E: Clone> Clone for Shell<E> {
@@ -777,9 +829,11 @@ impl<E: Clone> Clone for Shell<E> {
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.clone(),
+            treat_output: self.treat_output.clone(),
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: self.launches.clone(),
+            host_launch: self.host_launch.clone(),
         }
     }
 }
@@ -843,11 +897,26 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         executor: E,
         parts: builder::ShellParts,
     ) -> Result<Self, TerminalError> {
-        if let Backend::Ssh { server, .. } = sandbox.backend() {
-            return Err(TerminalError::SandboxSetup(format!(
-                "the sandbox runs on the SSH server {}: a server is a location, not a shell's home",
-                server.name
-            )));
+        match (sandbox.backend(), &parts.host_shell) {
+            (Backend::Ssh { server, .. }, _) => {
+                return Err(TerminalError::SandboxSetup(format!(
+                    "the sandbox runs on the SSH server {}: a server is a location, not a shell's home",
+                    server.name
+                )));
+            }
+            (Backend::Host { .. }, None) => {
+                return Err(TerminalError::SandboxSetup(
+                    "a shell on the host needs its host shell: build it with `Shell::builder_on_host`"
+                        .into(),
+                ));
+            }
+            (Backend::Container { .. }, Some(_)) => {
+                return Err(TerminalError::SandboxSetup(
+                    "a host shell was given to a shell on a container, which runs the shell its launch names"
+                        .into(),
+                ));
+            }
+            (Backend::Host { .. }, Some(_)) | (Backend::Container { .. }, None) => {}
         }
         // Ensure working directory exists, then resolve it once: heel and the
         // directory report both use this spelling, and a symlink in the given
@@ -874,7 +943,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             .detach();
 
         let events_rx = parts.events.unwrap_or_default();
-        let events_tx = events_rx.sender();
+        let events_tx = events_rx.sender(AgentPath::main());
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let sandbox = sandbox
             .with_working_dir(working_dir_path.clone())
@@ -902,9 +971,11 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             outages: Outages::none(),
             subagent_spaces: None,
             policies: ScriptPolicies::new(parts.policies),
+            treat_output: parts.treat_output,
             ipc: parts.ipc,
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
+            host_launch: parts.host_shell,
         })
     }
 
@@ -921,10 +992,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
     ) -> Result<Self, TerminalError> {
         let heel = crate::test_heel::binary().await.expect("a test heel");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
-            },
+            Backend::Host { heel },
             executor.clone(),
             working_dir.as_ref(),
         );
@@ -941,6 +1009,8 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         wording: AnyShellWording,
         tools: ShellToolSettings,
     ) -> Result<Self, TerminalError> {
+        let host_shell = matches!(sandbox.backend(), Backend::Host { .. })
+            .then(|| crate::HostLaunch::new(TEST_HOST_SHELL));
         Self::from_parts(
             sandbox,
             executor,
@@ -953,9 +1023,19 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 events: None,
                 policies: Vec::new(),
                 ipc: None,
+                treat_output: None,
+                host_shell,
             },
         )
         .await
+    }
+
+    /// The sandbox this shell's scripts run in, so an embedder that built the
+    /// shell spawns its own processes in the same sandbox: the same live
+    /// grants, environment source, network policy and backend.
+    #[must_use]
+    pub const fn sandbox(&self) -> &Sandbox {
+        &self.sandbox
     }
 }
 
@@ -977,7 +1057,7 @@ where
 
     /// A subagent terminal with an empty grant.
     async fn subagent_without_grant(&self) -> Result<Self, SubagentGrantError> {
-        self.subagent(SubagentGrant::new(), None).await
+        self.subagent(SubagentGrant::new(), None, "worker").await
     }
 }
 
@@ -1210,6 +1290,12 @@ where
     /// shell shares this shell's approver, output store, events and
     /// policies' definitions, with state of its own, and its own jobs.
     ///
+    /// `name` is the subagent's name beneath this shell's agent: every event
+    /// its shell raises carries that [`AgentPath`], where the main shell's
+    /// carry [`AgentPath::main`]. The subagent's running jobs are killed when
+    /// the last handle of its shell is dropped, which a main shell never
+    /// does.
+    ///
     /// # Errors
     /// Returns an error when `grant` names a path this shell cannot write or
     /// a commit it cannot grant, when a container shell has no workspace
@@ -1218,12 +1304,13 @@ where
         &self,
         grant: SubagentGrant,
         caller: Option<&Path>,
+        name: impl Into<String>,
     ) -> Result<Self, SubagentGrantError> {
         let resolved = {
             let mut history = self.launches.lock().await;
             self.resolve_launch(&mut history, grant).await?
         };
-        self.launch_resolved(resolved, caller).await
+        self.launch_resolved(resolved, caller, name.into()).await
     }
 
     /// Resolves the grant of a subagent this terminal launches: it never
@@ -1304,6 +1391,7 @@ where
             granted,
         }: ResolvedLaunch,
         caller: Option<&Path>,
+        name: String,
     ) -> Result<Self, SubagentGrantError> {
         async_fs::create_dir_all(&spaces_root)
             .await
@@ -1364,9 +1452,11 @@ where
             None => None,
         };
 
-        // The subagent's jobs raise their facts on the parent's handle.
+        // The subagent's jobs raise their facts on the parent's handle, as
+        // the agent named beneath this shell's.
+        let agent = self.events_tx.agent().child(name);
         let events_rx = self.events_rx.clone();
-        let events_tx = events_rx.sender();
+        let events_tx = events_rx.sender(agent);
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (job_registry, job_registry_service) =
             job_registry_channel(self.output_store.policy().clone());
@@ -1382,6 +1472,10 @@ where
             })
             .with_working_dir(space.clone())
             .with_scanner(job_registry.scanner());
+        let jobs = Arc::new(KillJobsOnDrop::new(
+            job_registry.clone(),
+            self.executor.clone(),
+        ));
         let readable_paths = sandbox.grants().snapshot().readable.clone();
         let git = match (&container, mount, self.sandbox.backend()) {
             (Some(confinement), Some(mount), Backend::Container { runtime, launch }) => {
@@ -1424,6 +1518,7 @@ where
             running_tasks,
             sandbox,
             subagent: Some(SubagentAuthority {
+                _jobs: jobs,
                 _space_name: space_name,
                 committing: granted.committing,
                 git,
@@ -1435,9 +1530,11 @@ where
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.for_agent(),
+            treat_output: self.treat_output.clone(),
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: Arc::default(),
+            host_launch: self.host_launch.clone(),
         })
     }
 
@@ -1552,10 +1649,20 @@ where
 
     fn resolve_home_target(&self, mode: SandboxMode) -> Result<ExecutionTarget, TerminalError> {
         let backend = match self.sandbox.backend() {
-            Backend::Host { launch, .. } => ExecutionBackend::Local {
-                shell: launch.shell().clone(),
+            Backend::Host { .. } => ExecutionBackend::Local {
+                shell: self
+                    .host_launch
+                    .as_ref()
+                    .expect("a shell on the host is built with its host shell")
+                    .shell()
+                    .clone(),
             },
-            Backend::Container { runtime, launch } => {
+            Backend::Container {
+                runtime,
+                #[cfg(all(unix, feature = "jobserver"))]
+                launch,
+                ..
+            } => {
                 if mode == SandboxMode::Unsandboxed {
                     return Err(TerminalError::InvalidTarget(
                         "unsafe mode is only available in heel local runtime".into(),
@@ -1563,6 +1670,7 @@ where
                 }
                 ExecutionBackend::Container {
                     runtime: runtime.clone(),
+                    #[cfg(all(unix, feature = "jobserver"))]
                     launch: launch.clone(),
                 }
             }
@@ -1621,7 +1729,7 @@ where
             expect,
             resolution,
             max_lines,
-            raw,
+            stdout,
             background,
             timeout,
             carry,
@@ -1685,7 +1793,7 @@ where
                 resolution,
                 outputs: self.output_store.clone(),
                 max_lines,
-                raw,
+                stdout,
                 result_tx,
                 taken: taken_rx,
                 completed_tx,
@@ -1846,7 +1954,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             expect: OutputFormat::Auto,
             resolution: arguments.resolution,
             max_lines: prepared.max_lines,
-            raw: arguments.raw,
+            stdout: StdoutTreatment::of_call(arguments.raw, prepared.treatment),
             background: arguments.background,
             timeout,
             carry: carry.clone(),
@@ -2365,12 +2473,12 @@ where
                 &own,
             ),
         };
-        let clearance = self
-            .check_policies(&task_id, &admission, &start)
+        let checked = self
+            .check_script(&task_id, &admission, &start)
             .await
             .map_err(ShellRunError::Refused);
-        let clearance = match clearance {
-            Ok(clearance) => clearance,
+        let (clearance, treatment) = match checked {
+            Ok(checked) => checked,
             Err(refusal) => {
                 self.end_unrun(&task_id).await;
                 return Err(refusal);
@@ -2389,6 +2497,7 @@ where
             task_id,
             outputs: self.output_store.clone(),
             max_lines,
+            treatment,
             carried_start,
         })
     }
@@ -2407,18 +2516,18 @@ where
             .await;
     }
 
-    /// Puts the script to the shell's script policies, the shell parsed
-    /// once for all of them, and folds their decisions into what admission
-    /// does next.
-    async fn check_policies(
+    /// Puts the script to the shell's script policies and its output
+    /// treatment, the shell parsed once for all of them, and folds the
+    /// policies' decisions into what admission does next.
+    async fn check_script(
         &self,
         task_id: &str,
         admission: &Admission<'_>,
         start: &ScriptDir,
-    ) -> Result<Clearance, ScriptRefusal> {
+    ) -> Result<(Clearance, OutputTreatment), ScriptRefusal> {
         let policies = &self.policies;
-        if policies.is_empty() {
-            return Ok(Clearance::Pass);
+        if policies.is_empty() && self.treat_output.is_none() {
+            return Ok((Clearance::Pass, OutputTreatment::default()));
         }
         let shell = (admission.interpreter == Interpreter::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
@@ -2433,12 +2542,17 @@ where
             start,
             call: admission.call(),
         };
-        match policies.check(&check).await {
-            ScriptDecision::Pass => Ok(Clearance::Pass),
-            ScriptDecision::Allow => Ok(Clearance::Allow),
-            ScriptDecision::Ask(request) => Ok(Clearance::Ask(request)),
-            ScriptDecision::Refuse(refusal) => Err(refusal),
-        }
+        let treatment = self
+            .treat_output
+            .as_ref()
+            .map_or_else(OutputTreatment::default, |treat| treat.treatment(&check));
+        let clearance = match policies.check(&check).await {
+            ScriptDecision::Pass => Clearance::Pass,
+            ScriptDecision::Allow => Clearance::Allow,
+            ScriptDecision::Ask(request) => Clearance::Ask(request),
+            ScriptDecision::Refuse(refusal) => return Err(refusal),
+        };
+        Ok((clearance, treatment))
     }
 
     /// The rest of admission once the policies did not refuse the script.
@@ -2564,7 +2678,7 @@ where
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
             max_lines: prepared.max_lines,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(prepared.treatment),
             background: false,
             timeout: run.timeout,
             carry: Some(start),
@@ -2649,6 +2763,7 @@ where
                 {
                     let _ = alert_tx
                         .send(ShellEvent::LongRunning(LongRunning {
+                            agent: alert_tx.agent().clone(),
                             task_id: task_id.to_string(),
                             script: job.script,
                             after: job.started_at.elapsed(),
@@ -2722,9 +2837,34 @@ struct ExecutionPreparation {
     execution_id: String,
     outputs: OutputStore,
     max_lines: usize,
+    /// How the script's output is cleaned, as the shell's
+    /// [`TreatOutput`](crate::TreatOutput) chose.
+    treatment: OutputTreatment,
     /// The carried directory a foreground command starts in, when the
     /// terminal carries one and it still exists.
     carried_start: Option<PathBuf>,
+}
+
+/// What the output pipeline does to a foreground script's stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdoutTreatment {
+    /// The call asked for the bytes as written (`raw`): no stage applies,
+    /// not even rendering.
+    Raw,
+    /// The pipeline runs under the script's output treatment.
+    Cleaned(OutputTreatment),
+}
+
+impl StdoutTreatment {
+    /// The treatment of a `terminal` call's stdout: `raw` wins over the
+    /// shell's choice.
+    const fn of_call(raw: bool, treatment: OutputTreatment) -> Self {
+        if raw {
+            Self::Raw
+        } else {
+            Self::Cleaned(treatment)
+        }
+    }
 }
 
 /// Where a run starts: `dir` on the host, mapped through the workspace
@@ -2808,6 +2948,7 @@ async fn detach_job(
         start_background_output_redirect(job_registry, outputs, task_id, max_lines).await?;
     let _ = started_tx
         .send(ShellEvent::JobStarted(JobStarted {
+            agent: started_tx.agent().clone(),
             task_id: task_id.to_string(),
             output_preview: redirect.preview.clone(),
             output_file: redirect.file.clone(),
@@ -2892,7 +3033,7 @@ struct StandaloneExecution<E> {
     resolution: MediaResolution,
     outputs: OutputStore,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
 }
 
 struct StandaloneStart<'a, E> {
@@ -2987,7 +3128,7 @@ struct CompletedProcessOutput<'a> {
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
 }
 
 /// Where a command runs, with the programs the embedder prepared for exactly
@@ -3001,7 +3142,9 @@ enum ExecutionBackend {
     /// A container, whose programs its backend's launch names.
     Container {
         runtime: ContainerShellRuntime,
-        launch: ContainerLaunch,
+        /// Read only to open a command's jobserver fifo in the container.
+        #[cfg(all(unix, feature = "jobserver"))]
+        launch: crate::ContainerLaunch,
     },
     /// A remote host over SSH.
     Ssh {
@@ -3028,7 +3171,7 @@ struct TerminalSpawnRequest {
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
     background: bool,
     timeout: Duration,
     carry: Option<CwdCarry>,
@@ -3085,7 +3228,7 @@ struct SpawnedTerminalTask<E> {
     resolution: MediaResolution,
     outputs: OutputStore,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
     result_tx: Sender<Result<CompletedCommand, String>>,
     /// Whether the call took the result: see [`SpawnedTerminal::took_result`].
     taken: Receiver<Sender<()>>,
@@ -3126,7 +3269,7 @@ where
         resolution,
         outputs,
         max_lines,
-        raw,
+        stdout,
         result_tx,
         taken,
         completed_tx,
@@ -3175,7 +3318,7 @@ where
         resolution,
         outputs,
         max_lines,
-        raw,
+        stdout,
     })
     .await;
     // A process that never started leaves no job to register.
@@ -3256,6 +3399,7 @@ where
         };
         let _ = completed_tx
             .send(ShellEvent::JobEnded(Box::new(JobEnded {
+                agent: completed_tx.agent().clone(),
                 info,
                 result,
                 timeout_kill,
@@ -3304,7 +3448,7 @@ where
         resolution,
         outputs,
         max_lines,
-        raw,
+        stdout,
     } = request;
 
     info!(
@@ -3351,7 +3495,7 @@ where
         expect,
         resolution,
         max_lines,
-        raw,
+        stdout,
     })
     .await?;
     let exit_code = result.exit_code;
@@ -3396,7 +3540,12 @@ where
 {
     let shell = match request.backend {
         ExecutionBackend::Local { shell } => shell.as_ref(),
-        ExecutionBackend::Container { runtime, launch } => {
+        ExecutionBackend::Container {
+            runtime,
+            #[cfg(all(unix, feature = "jobserver"))]
+            launch,
+            ..
+        } => {
             // The command's fifo lives in the container's kernel, brokered
             // by a relay run with the `python3` the launch's programs hold.
             #[cfg(all(unix, feature = "jobserver"))]
@@ -3503,7 +3652,7 @@ async fn save_completed_process_output(
         expect,
         resolution,
         max_lines,
-        raw,
+        stdout,
     } = request;
     let stdout = save_completed_stdout(
         job_registry,
@@ -3515,7 +3664,7 @@ async fn save_completed_process_output(
             expect,
             resolution,
             max_lines,
-            raw,
+            stdout,
         },
     )
     .await?;
@@ -3536,7 +3685,7 @@ struct CompletedStdoutFormat<'a> {
     expect: OutputFormat,
     resolution: MediaResolution,
     max_lines: usize,
-    raw: bool,
+    stdout: StdoutTreatment,
 }
 
 async fn save_completed_stdout(
@@ -3549,7 +3698,7 @@ async fn save_completed_stdout(
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
     } else {
-        compressed_stdout_data(format.outputs, stdout, format.expect, format.raw).await?
+        compressed_stdout_data(format.outputs, stdout, format.expect, format.stdout).await?
     };
 
     match format
@@ -3571,25 +3720,30 @@ async fn save_completed_stdout(
     }
 }
 
-/// Runs the output cleaning pipeline over a completed command's stdout.
+/// Runs the output cleaning pipeline over a completed command's stdout,
+/// under the script's output treatment.
 ///
-/// `raw: true` bypasses it entirely, as do non-text formats and output that
-/// is not valid UTF-8, so the model sees exactly the bytes the command wrote.
+/// [`StdoutTreatment::Raw`] bypasses it entirely, as do non-text formats and
+/// output that is not valid UTF-8, so the model sees exactly the bytes the
+/// command wrote.
 async fn compressed_stdout_data<'a>(
     outputs: &OutputStore,
     stdout: &'a [u8],
     expect: OutputFormat,
-    raw: bool,
+    treatment: StdoutTreatment,
 ) -> Result<Cow<'a, [u8]>, TerminalError> {
     let is_text = matches!(expect, OutputFormat::Text | OutputFormat::Auto);
-    if raw || !is_text || stdout.is_empty() {
+    let StdoutTreatment::Cleaned(treatment) = treatment else {
+        return Ok(Cow::Borrowed(stdout));
+    };
+    if !is_text || stdout.is_empty() {
         return Ok(Cow::Borrowed(stdout));
     }
     let Ok(text) = std::str::from_utf8(stdout) else {
         return Ok(Cow::Borrowed(stdout));
     };
 
-    let cleaned = crate::output_compress::compress_text(outputs, text)
+    let cleaned = crate::output_compress::compress_text(outputs, text, treatment)
         .await
         .map_err(TerminalError::Io)?;
     Ok(cleaned.map_or(Cow::Borrowed(stdout), |cleaned| {
@@ -3705,12 +3859,13 @@ fn committed_git_environment(
     Ok(())
 }
 
-use crate::spawn::resolved;
-
 /// The grant a command's jobserver fifo needs: it writes tokens back to it.
 #[cfg(all(unix, feature = "jobserver"))]
-pub fn job_fifo_grant(path: &Path) -> heel::Result<Grant> {
-    Ok(Grant::new(resolved(path)?, Access::WRITE))
+pub fn job_fifo_grant(path: &Path) -> heel::Result<heel::Grant> {
+    Ok(heel::Grant::new(
+        crate::spawn::resolved(path)?,
+        heel::Access::WRITE,
+    ))
 }
 
 /// Runs a command on the host: sandboxed through the terminal's [`Sandbox`],
@@ -3844,6 +3999,7 @@ impl JobLifetime {
         };
         let _ = alerts
             .send(ShellEvent::DescendantsKilled(DescendantsKilled {
+                agent: alerts.agent().clone(),
                 task_id: task_id.clone(),
                 call: call.clone(),
                 processes: killed,
@@ -3880,6 +4036,7 @@ impl StdinAlerts {
         let _ = self
             .tx
             .send(ShellEvent::StdinBlocked(StdinBlocked {
+                agent: self.tx.agent().clone(),
                 task_id: self.task_id.clone(),
                 script: self.script.clone(),
             }))
@@ -3893,6 +4050,7 @@ impl StdinAlerts {
         let _ = self
             .tx
             .send(ShellEvent::StdinWatchFailed(StdinWatchFailed {
+                agent: self.tx.agent().clone(),
                 task_id: self.task_id.clone(),
                 script: self.script.clone(),
                 error,
@@ -4299,7 +4457,7 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
         // The build tools write tokens back to the fifo.
         grants.push(crate::SpawnGrant::Container {
             path: fifo.path().clone(),
-            access: Access::WRITE,
+            access: heel::Access::WRITE,
         });
     }
     let runtime = context.container_runtime;
@@ -4961,6 +5119,7 @@ impl<E> std::fmt::Debug for Shell<E> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ContainerLaunch;
     use std::io::Write;
     use std::time::Duration;
 
@@ -5332,10 +5491,25 @@ mod tests {
         test_container_launch().bin_dir().clone()
     }
 
+    /// The commands of a router that serves each of `names`, taking no
+    /// positional arguments.
+    fn ipc_commands(names: &[&str]) -> heel::ipc::IpcCommands {
+        let declarations = names
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    serde_json::json!({"positional_args": [], "stdin_arg": null}),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        serde_json::from_value(serde_json::json!(declarations)).expect("valid IPC commands")
+    }
+
     /// `script` wrapped with the IPC setup for `commands` at `host:port`.
     fn wrap_with_ipc(
         script: &str,
-        commands: &[String],
+        commands: &heel::ipc::IpcCommands,
         endpoint: (&str, u16),
         priority: ProcessPriority,
     ) -> Result<String, TerminalError> {
@@ -5354,7 +5528,7 @@ mod tests {
     fn wrap_container_script_refreshes_command_hash_table() {
         let wrapped = wrap_with_ipc(
             "websearch \"gold price\"",
-            &[String::from("websearch")],
+            &ipc_commands(&["websearch"]),
             ("host.docker.internal", 9000),
             ProcessPriority::default(),
         )
@@ -5369,7 +5543,7 @@ mod tests {
         let script = "echo '$5,040' && subagent art_direction --prompt-file tmp/prompt.md";
         let wrapped = wrap_with_ipc(
             script,
-            &[String::from("subagent")],
+            &ipc_commands(&["subagent"]),
             ("host.docker.internal", 9000),
             ProcessPriority::default(),
         )
@@ -5379,32 +5553,39 @@ mod tests {
     }
 
     #[test]
-    fn wrap_container_script_rejects_invalid_ipc_command_names() {
-        let error = wrap_with_ipc(
-            "echo ok",
-            &[String::from("bad name")],
-            ("host.docker.internal", 9000),
-            ProcessPriority::default(),
-        )
-        .expect_err("invalid command name must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("cannot be a shim in a container")
-        );
-    }
-
-    #[test]
     fn wrap_container_script_renders_expected_endpoint() {
         let wrapped = wrap_with_ipc(
             "environment --query deployment",
-            &[String::from("environment"), String::from("session")],
+            &ipc_commands(&["environment", "session"]),
             ("host.containers.internal", 43123),
             ProcessPriority::default(),
         )
         .expect("wrap script");
         assert!(wrapped.contains("tcp://host.containers.internal:43123"));
-        assert!(wrapped.contains("for cmd in 'environment' 'session'; do"));
+        assert!(wrapped.contains(
+            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"stdin_arg":null,"raw_args":false},"session":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+        ));
+    }
+
+    /// The shims are written from the declarations, so a command's
+    /// positional and stdin arguments reach the container, where a shim
+    /// that knew only the name would pass neither.
+    #[test]
+    fn wrap_container_script_carries_the_commands_declarations() {
+        let commands: heel::ipc::IpcCommands =
+            serde_json::from_str(r#"{"issue":{"positional_args":["number"],"stdin_arg":"body"}}"#)
+                .expect("valid IPC commands");
+        let wrapped = wrap_with_ipc(
+            "issue",
+            &commands,
+            ("host.docker.internal", 9000),
+            ProcessPriority::default(),
+        )
+        .expect("wrap script");
+        assert!(wrapped.contains(
+            r#"--commands '{"issue":{"positional_args":["number"],"stdin_arg":"body","raw_args":false}}'"#
+        ));
+        assert!(!wrapped.contains("printf"));
     }
 
     /// Approves every request, and records what it was asked.
@@ -5648,6 +5829,116 @@ mod tests {
         assert_eq!(tool.job_registry().list().await.len(), 1);
     }
 
+    /// A subagent's events name its path and the main shell's the root, on
+    /// the one handle the two share.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn events_name_the_agent_whose_shell_raised_them() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = fresh_terminal(dir.path()).await;
+        let events = tool.background_receiver();
+        let child = tool
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        let grandchild = child
+            .subagent(SubagentGrant::new(), None, "reviewer")
+            .await
+            .expect("an empty grant is always given");
+
+        for shell in [&tool, &child, &grandchild] {
+            shell
+                .run_background(background_args("a job", "sleep 60"))
+                .await
+                .expect("the job starts");
+        }
+        let started = events.take_started();
+        let paths: Vec<_> = started.iter().map(|event| event.agent().clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                AgentPath::main(),
+                AgentPath::main().child("worker"),
+                AgentPath::main().child("worker").child("reviewer"),
+            ]
+        );
+
+        for shell in [&tool, &child, &grandchild] {
+            shell.jobs().kill_all().await;
+        }
+        let mut ended: Vec<_> = Vec::new();
+        for _ in 0..3 {
+            ended.push(ShellEvent::JobEnded(Box::new(
+                events.recv_completed().await,
+            )));
+        }
+        let mut paths: Vec<_> = ended
+            .iter()
+            .map(|event| event.agent().to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["main", "worker", "worker/reviewer"]);
+    }
+
+    /// The last handle of a subagent's shell going kills its running jobs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_last_handle_of_a_subagent_shell_ends_its_job() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = fresh_terminal(dir.path()).await;
+        let child = tool
+            .subagent_without_grant()
+            .await
+            .expect("an empty grant is always given");
+        let job = child
+            .run_background(background_args("a job", "sleep 60"))
+            .await
+            .expect("the job starts");
+
+        // A clone keeps the jobs: only the last handle's drop kills them.
+        let clone = child.clone();
+        drop(child);
+        async_io::Timer::after(Duration::from_millis(300)).await;
+        assert!(matches!(job.info().await.status, crate::JobStatus::Running));
+        drop(clone);
+
+        let result = tokio::time::timeout(Duration::from_secs(30), job.wait())
+            .await
+            .expect("the job ends once its shell is gone")
+            .expect("the job reports its end");
+        assert!(
+            !matches!(result.outcome, crate::RunOutcome::Exited { code: 0 }),
+            "the job was killed, not run to its end: {result:?}"
+        );
+    }
+
+    /// A main shell's jobs outlive its handles, so an embedder can rebuild it
+    /// with its background commands running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_main_shell_leaves_its_job_running() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = fresh_terminal(dir.path()).await;
+        let events = tool.background_receiver();
+        let jobs = tool.jobs();
+        tool.run_background(background_args("a job", "sleep 60"))
+            .await
+            .expect("the job starts");
+        let task_id = started_task_id(&events);
+        drop(tool);
+
+        async_io::Timer::after(Duration::from_millis(500)).await;
+        let listed = jobs.list().await;
+        assert!(
+            matches!(
+                listed.as_slice(),
+                [job] if job.task_id == task_id && matches!(job.status, crate::JobStatus::Running)
+            ),
+            "the job keeps running: {listed:?}"
+        );
+        jobs.kill_all().await;
+    }
+
     /// Background terminal arguments for `script`.
     #[cfg(unix)]
     fn background_args(description: &str, script: &str) -> ShellArgs {
@@ -5864,7 +6155,7 @@ mod tests {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
             stdin_alerts: None,
-            lifetime: foreground_lifetime(ShellEvents::new().sender()),
+            lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -5872,7 +6163,7 @@ mod tests {
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
             max_lines: 50,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(OutputTreatment::Command),
         })
         .await;
         match result {
@@ -5934,7 +6225,7 @@ mod tests {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
             stdin_alerts: None,
-            lifetime: foreground_lifetime(ShellEvents::new().sender()),
+            lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -5942,7 +6233,7 @@ mod tests {
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
             max_lines: 50,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(OutputTreatment::Command),
         })
         .await
         .expect("the sandboxed script runs");
@@ -6048,7 +6339,7 @@ mod tests {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
             stdin_alerts: None,
-            lifetime: foreground_lifetime(ShellEvents::new().sender()),
+            lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
             jobserver: None,
@@ -6056,7 +6347,7 @@ mod tests {
             resolution: MediaResolution::Auto,
             outputs: tool.output_store().clone(),
             max_lines: 200,
-            raw: false,
+            stdout: StdoutTreatment::Cleaned(OutputTreatment::Command),
         })
         .await
         .expect("the sandboxed script runs");
@@ -7038,7 +7329,7 @@ mod tests {
             crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
         );
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let alert_tx = ShellEvents::new().sender();
+        let alert_tx = ShellEvents::new().sender(AgentPath::main());
         let output = execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
@@ -7131,7 +7422,7 @@ mod tests {
         let erased = crate::AnyIpcProvider::new(provider.clone());
         let info = crate::LaunchInfo::new("probe", None, SandboxMode::Sandboxed);
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let alert_tx = ShellEvents::new().sender();
+        let alert_tx = ShellEvents::new().sender(AgentPath::main());
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
@@ -7155,7 +7446,7 @@ mod tests {
         .await
         .expect("the exec completes");
         let script = scripts.recv().await.expect("the exec ran a script");
-        assert!(script.contains("for cmd in 'probe'; do"), "{script}");
+        assert!(script.contains(r#"--commands '{"probe":"#), "{script}");
         let launches = provider.launches.lock().unwrap();
         assert_eq!(launches.len(), 1);
         assert_eq!(launches[0].task_id.as_deref(), Some("probe"));
@@ -7265,7 +7556,7 @@ mod tests {
         .expect("the relay reports ready");
         let fifo_path = job_fifo.path().clone();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let alert_tx = ShellEvents::new().sender();
+        let alert_tx = ShellEvents::new().sender(AgentPath::main());
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
@@ -8248,7 +8539,6 @@ mod tests {
         let sandbox = Sandbox::new(
             Backend::Host {
                 heel: crate::test_heel::binary().await.expect("a test heel"),
-                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
             },
             executor_core::tokio::TokioGlobal,
             dir,
@@ -8462,7 +8752,7 @@ mod tests {
         let tools_dir = container_tools_dir();
         let executable = format!("--executable {}", shell_escape(tools_dir.as_str()));
         let setup = crate::spawn::container_ipc::exec_setup(
-            &[String::from("websearch")],
+            &ipc_commands(&["websearch"]),
             "host.docker.internal",
             9000,
         )
@@ -8719,10 +9009,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let heel = crate::test_heel::binary().await.expect("a test heel");
         let sandbox = Sandbox::new(
-            Backend::Host {
-                heel,
-                launch: crate::HostLaunch::new(TEST_HOST_SHELL),
-            },
+            Backend::Host { heel },
             executor_core::tokio::TokioGlobal,
             dir.path(),
         )
@@ -8851,14 +9138,18 @@ mod tests {
         let resolved = parent
             .resolve_launch(&mut LaunchHistory::default(), grant)
             .await?;
-        parent.launch_resolved(resolved, None).await
+        parent
+            .launch_resolved(resolved, None, "worker".to_owned())
+            .await
     }
 
     /// What a [`CloneSpaces`] was asked to prepare, as `(space, launcher,
     /// caller)`.
+    #[cfg(unix)]
     type SeenSpace = (PathBuf, PathBuf, PathBuf);
 
     /// How a test's [`SubagentSpaces`] fills a space.
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     enum Filling {
         /// Clones the source repository into `repo` and names it.
@@ -8869,18 +9160,21 @@ mod tests {
         Outside,
     }
 
+    #[cfg(unix)]
     #[derive(Debug, thiserror::Error)]
     #[error("the session has no clone to give")]
     struct NoClone;
 
     /// Prepares each space from `source`, the launcher's repository, and
     /// records what it was asked.
+    #[cfg(unix)]
     struct CloneSpaces {
         source: PathBuf,
         filling: Filling,
         seen: async_channel::Sender<SeenSpace>,
     }
 
+    #[cfg(unix)]
     impl SubagentSpaces for CloneSpaces {
         type Error = NoClone;
 
@@ -8919,6 +9213,7 @@ mod tests {
 
     /// A terminal in `dir` whose subagents' spaces `filling` prepares from
     /// the repository `dir/repo`, with the receiver of what it is asked.
+    #[cfg(unix)]
     async fn spaced_terminal(
         dir: &Path,
         filling: Filling,
@@ -8956,7 +9251,7 @@ mod tests {
         let (parent, seen) = spaced_terminal(dir.path(), Filling::Clone).await;
         let caller = dir.path().join("repo");
         let child = parent
-            .subagent(SubagentGrant::new(), Some(&caller))
+            .subagent(SubagentGrant::new(), Some(&caller), "worker")
             .await
             .expect("the space is prepared");
 
@@ -9003,7 +9298,7 @@ mod tests {
         ));
 
         let nested = child
-            .subagent(SubagentGrant::new(), None)
+            .subagent(SubagentGrant::new(), None, "worker")
             .await
             .expect("a nested space is prepared");
         let (nested_space, nested_launcher, nested_caller) = seen.try_recv().unwrap();

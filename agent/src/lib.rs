@@ -71,7 +71,7 @@ pub use aither_websearch as websearch;
 pub use agent::{Agent, CancelHandle, CompactResult, Run};
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
-pub use checkpoint::AgentCheckpoint;
+pub use checkpoint::{AgentCheckpoint, Checkpoints};
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
 pub use config::AgentConfig;
 pub use context::{

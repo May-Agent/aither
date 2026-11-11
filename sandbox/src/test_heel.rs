@@ -99,10 +99,23 @@ async fn pinned() -> anyhow::Result<PathBuf> {
     blocking::unblock(move || store(&directory, &path, &bytes)).await
 }
 
+/// Whether `path` holds exactly `bytes`.
+fn holds(path: &Path, bytes: &[u8]) -> bool {
+    std::fs::read(path).is_ok_and(|have| have == bytes)
+}
+
 /// Writes `bytes` as an executable at `path` through a file of its own, so
 /// processes preparing it at once never see a partial file.
+///
+/// A file already at `path` with these bytes is used as it is and never
+/// replaced: another process may be running it, and Windows refuses to
+/// replace an executable in use. A rename that loses the race to an identical
+/// file is success.
 fn store(directory: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(directory)?;
+    if holds(path, bytes) {
+        return Ok(path.to_path_buf());
+    }
     let partial = directory.join(format!("partial-{}", std::process::id()));
     std::fs::write(&partial, bytes)?;
     #[cfg(unix)]
@@ -110,7 +123,16 @@ fn store(directory: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf>
         &partial,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )?;
-    std::fs::rename(&partial, path)?;
+    let renamed = std::fs::rename(&partial, path);
+    if let Err(error) = renamed {
+        let identical = holds(path, bytes);
+        std::fs::remove_file(&partial)?;
+        anyhow::ensure!(
+            identical,
+            "cannot place the pinned heel at {}: {error}",
+            path.display()
+        );
+    }
     Ok(path.to_path_buf())
 }
 

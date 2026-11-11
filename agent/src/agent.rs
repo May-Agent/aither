@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "skills")]
 use crate::context::SkillCatalogEntry;
 use crate::{
-    checkpoint::AgentCheckpoint,
+    checkpoint::{AgentCheckpoint, Checkpoints},
     compaction_state::CompactionState,
     config::AgentConfig,
     context::{
@@ -115,6 +115,8 @@ struct EventSink {
     sender: async_channel::Sender<TimedEvent>,
     /// The agent the sink emits for, stamped on every event.
     agent: AgentPath,
+    /// Where the run records its checkpoints for [`Run::checkpoints`].
+    checkpoints: Checkpoints,
 }
 
 /// What the loop waits on while tools run.
@@ -179,6 +181,7 @@ pub struct Run<F> {
     body: Pin<Box<F>>,
     events: async_channel::Receiver<TimedEvent>,
     cancel: CancelHandle,
+    checkpoints: Checkpoints,
 }
 
 impl<F> std::fmt::Debug for Run<F> {
@@ -197,12 +200,32 @@ where
     fn new(agent: AgentPath, start: impl FnOnce(EventSink, CancelSignal) -> F) -> Self {
         let (sender, events) = async_channel::unbounded();
         let cancel = CancelHandle::default();
+        let checkpoints = Checkpoints::default();
         // The run owns the sink and drops it as it finishes.
+        let sink = EventSink {
+            sender,
+            agent,
+            checkpoints: checkpoints.clone(),
+        };
         Self {
-            body: Box::pin(start(EventSink { sender, agent }, cancel.signal())),
+            body: Box::pin(start(sink, cancel.signal())),
             events,
             cancel,
+            checkpoints,
         }
+    }
+
+    /// A handle to the run's checkpoints, usable after [`drive`](Self::drive)
+    /// took the run.
+    ///
+    /// The run holds the agent, so the embedder cannot export from it
+    /// mid-run; the run records a checkpoint at every
+    /// [`AgentEvent::Checkpoint`] it emits, before the event is queued, and
+    /// the handle reads the newest from the event handler. An embedder
+    /// persists it there, so a crash mid-run loses no completed turn.
+    #[must_use]
+    pub fn checkpoints(&self) -> Checkpoints {
+        self.checkpoints.clone()
     }
 
     /// Cancels the run. Driving a cancelled run ends it at once with
@@ -259,6 +282,7 @@ where
             body: mut run,
             events,
             cancel,
+            ..
         } = self;
         futures_lite::pin!(events);
         futures_lite::pin!(stop);
@@ -3229,11 +3253,19 @@ where
     /// with [`export_checkpoint`](Self::export_checkpoint).
     fn emit_checkpoint(&self, cx: &RunCx<'_>, reason: CheckpointReason, turn: usize) {
         let window = self.context_window_snapshot(&self.last_tail);
+        let phase = window.phase;
+        // Recorded before the event is queued, so a handler that sees the
+        // event reads this checkpoint or a newer one.
+        cx.events.checkpoints.record(AgentCheckpoint {
+            context: self.context.checkpoint(),
+            tool_surface_hash: self.tool_surface_hash(),
+            context_window: window,
+        });
         cx.events.emit(AgentEvent::Checkpoint {
             run: cx.run.clone(),
             reason,
             turn,
-            phase: window.phase,
+            phase,
             message_count: self.context.len_recent(),
         });
     }

@@ -50,8 +50,9 @@ pub fn shell_arguments(script: &str) -> Vec<String> {
         .into()
 }
 
-/// The shell prepared on the host, for [`Backend::Host`](crate::Backend::Host):
-/// the program a script runs under, as a path on this machine.
+/// The shell prepared on the host, for
+/// [`Shell::builder_on_host`](crate::Shell::builder_on_host): the program a
+/// script runs under, as a path on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLaunch {
     shell: std::sync::Arc<str>,
