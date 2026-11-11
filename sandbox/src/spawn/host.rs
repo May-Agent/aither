@@ -119,19 +119,28 @@ impl Sandbox {
             .unwrap_or_else(|_| self.inner.working_dir.clone())
     }
 
-    /// The environment of a host spawn: the sandbox's own, its source's, then
-    /// the spec's, each overriding the one before.
+    /// The environment of a host spawn: the sandbox's own, its source's, its
+    /// space's, then the spec's, each overriding the one before.
     fn host_environment(
         &self,
         spec_env: Vec<(String, String)>,
         info: &LaunchInfo,
-    ) -> Vec<(String, String)> {
+    ) -> Result<Vec<(String, String)>, SpawnError> {
         let mut env = self.inner.environment.clone();
         if let Some(source) = &self.inner.env_source {
             env.extend(source.env(info));
         }
+        for (name, path) in &self.inner.space_environment {
+            let value = path.to_str().ok_or_else(|| {
+                SpawnError::Setup(format!(
+                    "{} is not UTF-8, so the variable {name} cannot name it",
+                    path.display()
+                ))
+            })?;
+            env.push((name.clone(), value.to_owned()));
+        }
         env.extend(spec_env);
-        env
+        Ok(env)
     }
 
     /// The grants a confined spawn carries: the embedder's fixed ones, every
@@ -268,7 +277,7 @@ impl Sandbox {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let marker = JobMarker::new();
-        let mut env = self.host_environment(env, &info);
+        let mut env = self.host_environment(env, &info)?;
         env.push(marker.entry());
         let launch = Launch {
             program,

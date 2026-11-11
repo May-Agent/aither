@@ -269,6 +269,49 @@ async fn environment_layers_resolve_spec_over_source_over_sandbox() {
     assert_eq!(out, "sandbox source spec\n");
 }
 
+/// A space's variables lead the source's and the sandbox's and yield to the
+/// spec's, and a sandbox derived from the space's carries none of them.
+#[tokio::test]
+async fn the_space_environment_leads_the_source_and_yields_to_the_spec() {
+    let (_work, work) = canonical_tempdir();
+    let (tmp, cache) = (work.join("tmp"), work.join("cache"));
+    let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+    let parent = host_sandbox(&work)
+        .await
+        .with_environment(vec![
+            pair("SPACE_TMP", "sandbox"),
+            pair("SPACE_CACHE", "sandbox"),
+            pair("SPACE_HOME", "sandbox"),
+        ])
+        .with_env_source(vec![
+            pair("SPACE_CACHE", "source"),
+            pair("SPACE_HOME", "source"),
+        ]);
+    let child = parent
+        .derived(GrantSnapshot::default())
+        .with_space_environment(vec![
+            ("SPACE_TMP".to_string(), tmp.clone()),
+            ("SPACE_CACHE".to_string(), cache.clone()),
+            ("SPACE_HOME".to_string(), work.join("home")),
+        ]);
+    let spec = || {
+        SpawnSpec::new("/bin/sh")
+            .args(["-c", "echo $SPACE_TMP $SPACE_CACHE $SPACE_HOME"])
+            .env([pair("SPACE_HOME", "spec")])
+    };
+    let (exit, out, _) = run_spec(&child, spec()).await;
+    assert!(exit.success(), "{exit:?}");
+    assert_eq!(out, format!("{} {} spec\n", tmp.display(), cache.display()));
+
+    let nested = child.derived(GrantSnapshot::default());
+    let (exit, out, _) = run_spec(&nested, spec()).await;
+    assert!(exit.success(), "{exit:?}");
+    assert_eq!(
+        out, "sandbox source spec\n",
+        "a derived sandbox has no space variables of its parent's"
+    );
+}
+
 /// A container exec that records its script, prints once and then waits for
 /// the kill switch.
 struct HangingExec {
@@ -597,6 +640,85 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
     assert!(
         script.contains(" --grant \"$AITHER_IPC_DIR=rx\" --nice 5 "),
         "{script}"
+    );
+}
+
+/// A container child exports its space's variables with each directory as
+/// the container spells it, after the source's exports and before the
+/// spec's, and a sandbox derived from it exports none of them.
+#[tokio::test]
+async fn a_container_child_exports_its_space_environment_through_the_mount() {
+    let (_work, work) = canonical_tempdir();
+    let space = work.join("space");
+    let inner = space.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let started = Arc::new(Mutex::new(Vec::new()));
+    let mount = crate::MountRoot::new(
+        work.clone(),
+        crate::ContainerPath::new("/workspace").unwrap(),
+    );
+    let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+    let parent = reporting_sandbox(
+        ReportingExec {
+            started: started.clone(),
+            killed: Vec::new(),
+        },
+        &work,
+        Some(mount),
+    )
+    .with_env_source(vec![pair("TMPDIR", "source-tmp")]);
+    let child = parent
+        .derived(GrantSnapshot {
+            writable: vec![space.clone()],
+            ..GrantSnapshot::default()
+        })
+        .with_working_dir(&space)
+        .with_space_environment(vec![
+            ("TMPDIR".to_string(), space.join("tmp")),
+            ("XDG_CACHE_HOME".to_string(), space.join("cache")),
+        ]);
+    let spec = || SpawnSpec::script("make").env([pair("TMPDIR", "spec-tmp")]);
+    let process = child.spawn(spec()).await.expect("the exec starts");
+    assert!(process.wait().await.success());
+    let nested = child
+        .derived(GrantSnapshot {
+            writable: vec![inner.clone()],
+            ..GrantSnapshot::default()
+        })
+        .with_working_dir(&inner);
+    let process = nested.spawn(spec()).await.expect("the exec starts");
+    assert!(process.wait().await.success());
+
+    let scripts: Vec<String> = started
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(script, _)| script.clone())
+        .collect();
+    let script = &scripts[0];
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is exported: {script}"))
+    };
+    assert!(
+        at("source-tmp") < at("/workspace/space/tmp")
+            && at("/workspace/space/tmp") < at("spec-tmp"),
+        "the space's exports follow the source's and precede the spec's: {script}"
+    );
+    assert!(
+        script.contains("export XDG_CACHE_HOME=") && script.contains("/workspace/space/cache"),
+        "{script}"
+    );
+    assert!(
+        !script.contains(&space.join("cache").display().to_string()),
+        "the container sees no host spelling: {script}"
+    );
+    let nested_script = &scripts[1];
+    assert!(
+        !nested_script.contains("XDG_CACHE_HOME")
+            && !nested_script.contains("/workspace/space/tmp"),
+        "a derived sandbox exports no space variables of its parent's: {nested_script}"
     );
 }
 

@@ -81,19 +81,38 @@ impl Sandbox {
         }))
     }
 
+    /// The sandbox's space environment as the container spells each
+    /// directory, through the workspace mount.
+    fn container_space_environment(
+        &self,
+        runtime: &ContainerShellRuntime,
+    ) -> Result<Vec<(String, String)>, SpawnError> {
+        self.inner
+            .space_environment
+            .iter()
+            .map(|(name, path)| {
+                let path = Self::container_path(runtime, path)?;
+                Ok((name.clone(), path.as_str().to_owned()))
+            })
+            .collect()
+    }
+
     /// `script` as the container's managed shell runs it: the source's
-    /// environment exported, then the spec's, ahead of it, the programs'
-    /// directory first on its `PATH`.
+    /// environment exported, then the space's, then the spec's, ahead of
+    /// it, the programs' directory first on its `PATH`.
     fn exec_script(
         &self,
         launch: &ContainerLaunch,
         script: String,
+        space_env: Vec<(String, String)>,
         env: Vec<(String, String)>,
         info: &LaunchInfo,
     ) -> Result<String, SpawnError> {
         let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
+        let space_env: Arc<dyn EnvSource> = Arc::new(space_env);
         let script = inject_env_exports(script, Some(&spec_env), info).map_err(|e| failed(&e))?;
+        let script = inject_env_exports(script, Some(&space_env), info).map_err(|e| failed(&e))?;
         let script = inject_env_exports(script, self.inner.env_source.as_ref(), info)
             .map_err(|e| failed(&e))?;
         let script = launch.wrap_script(&script).map_err(|e| failed(&e))?;
@@ -241,7 +260,8 @@ impl Sandbox {
         let confinement = self.container_confinement(runtime, container_grants)?;
 
         // The exec channel accepts only a script, so the environment travels
-        // as exports ahead of it; the source's come first, so the spec's win.
+        // as exports ahead of it; the source's come first, then the space's,
+        // so the spec's win.
         let script = match command {
             SpawnCommand::Script(script) => script,
             SpawnCommand::Program { program, args } => {
@@ -249,7 +269,8 @@ impl Sandbox {
             }
         };
         let script = script_reading(stdin, script)?;
-        let script = self.exec_script(launch, script, env, info)?;
+        let space_env = self.container_space_environment(runtime)?;
+        let script = self.exec_script(launch, script, space_env, env, info)?;
         // A confined process runs in a sandbox rooted at the sandbox's own
         // directory; the directory it was asked to start in is entered inside.
         let script = match (&confinement, cwd.is_some()) {
