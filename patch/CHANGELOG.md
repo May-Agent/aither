@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/patch-v0.30.0...patch-v0.31.0) - 2026-11-11
+
+### Added
+
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+
+### Other
+
+- *(sandbox)* upgrade heel to 0.9.5
+- *(patch)* name the test that checks a heel pin in pin-heel.sh
+- drop the container-acceptance and verify-tools jobs and the tool cache nothing reads, and install fish on Linux
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+
 ## [0.30.0](https://github.com/May-Agent/aither/compare/patch-v0.29.0...patch-v0.30.0) - 2026-11-10
 
 ### Fixed

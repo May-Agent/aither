@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/agent-v0.30.0...agent-v0.31.0) - 2026-11-11
+
+### Added
+
+- *(agent)* [**breaking**] let an embedder read a run's checkpoint between its events
+- *(sandbox)* [**breaking**] name the agent behind every shell event and reap a subagent shell's jobs
+- *(acp)* [**breaking**] map the new event set and run an ACP session as a subagent
+- *(agent)* [**breaking**] serialize the event types behind a serde feature
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+- *(agent)* run subagents as a mechanism with a registry and forwarded events
+- *(agent)* [**breaking**] events, hooks, approval and cancellation for the loop
+- *(agent)* [**breaking**] remove the terminal-first assembly and product policy from aither-agent
+
+### Fixed
+
+- build and test every crate on its own, warning-free per feature set
+- *(agent)* turn a panicking tool into a failed result for its call
+- *(agent)* [**breaking**] preview the request the next run would send
+
+### Other
+
+- *(agent)* delete the unreferenced test_baseline_tool template
+- Merge remote-tracking branch 'origin/dev' into feat/718-bridge-leaves
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- *(agent)* cover keep-warm, idle compaction and call identity on the loop
+- *(agent)* cover the new loop surface and drop tests of the removed assembly
+
 ## [0.30.0](https://github.com/May-Agent/aither/compare/agent-v0.29.0...agent-v0.30.0) - 2026-11-10
 
 ### Added

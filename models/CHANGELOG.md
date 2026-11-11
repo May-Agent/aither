@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/models-v0.30.0...models-v0.31.0) - 2026-11-11
+
+### Added
+
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+
+### Other
+
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+
 ## [0.23.0](https://github.com/May-Agent/aither/compare/models-v0.22.0...models-v0.23.0) - 2026-11-07
 
 ### Fixed

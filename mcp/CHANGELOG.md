@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/mcp-v0.30.0...mcp-v0.31.0) - 2026-11-11
+
+### Added
+
+- *(sandbox)* [**breaking**] render every model-facing text through ShellWording
+- *(sandbox)* [**breaking**] supply every output and time budget through OutputPolicy and ShellLimits
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+
+### Other
+
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- *(mcp)* [**breaking**] the server's tools are ordinary tools, not a sandbox command set
+- Merge feat/709-shell-surface into feat/717-shell
+
 ## [0.24.0](https://github.com/May-Agent/aither/compare/mcp-v0.23.0...mcp-v0.24.0) - 2026-11-08
 
 ### Added
