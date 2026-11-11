@@ -15,6 +15,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 jobs:
   update-heel:
@@ -70,6 +71,7 @@ jobs:
         run: cargo test --locked -p aither-sandbox --lib -- --exact terminal::builder::tests::the_shell_is_built_on_the_sandboxs_directory_and_live_grants
 
       - name: Create pull request
+        id: pr
         if: steps.release.outputs.version
         uses: peter-evans/create-pull-request@v8
         with:
@@ -85,3 +87,10 @@ jobs:
             sandbox/Cargo.toml
             Cargo.lock
             patch/third-party-tools.json
+
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved, and the required
+      # `CI result` reports on the pull request only from those runs.
+      - name: Approve the pull request's CI
+        if: steps.pr.outputs.pull-request-number
+        run: bash .github/scripts/approve-held-runs.sh "${{ steps.pr.outputs.pull-request-number }}"
