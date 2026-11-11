@@ -38,6 +38,7 @@ mod tests;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use askama::Template;
 use executor_core::{AnyExecutor, Executor};
 
 pub use backend::Backend;
@@ -86,7 +87,10 @@ pub enum SpawnError {
 /// Whether a standard stream of a spawned process is piped to its handle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Pipe {
-    /// Connected to the null device: no input, or output dropped.
+    /// Connected to the null device: no input, or output dropped. A stdin of
+    /// the null device is the same on every backend, so a program that picks
+    /// its input by what its stdin is — `rg` searching the directory rather
+    /// than a pipe — behaves alike on all of them.
     #[default]
     Null,
     /// Connected to the [`SandboxedChild`]'s channel for the stream.
@@ -112,6 +116,28 @@ impl Default for Stdio {
             stdout: Pipe::Piped,
             stderr: Pipe::Piped,
         }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "null_stdin.sh", escape = "none")]
+struct NullStdinTemplate<'a> {
+    script: &'a str,
+}
+
+/// `script` for a backend whose processes always start on a stdin pipe —
+/// a container exec's attached stream, an SSH session's channel — reading
+/// `stdin`: a script whose stdin is [`Pipe::Null`] reads the null device, as
+/// a process on the host does.
+///
+/// # Errors
+/// Fails when the redirect cannot render.
+pub fn script_reading(stdin: Pipe, script: String) -> Result<String, SpawnError> {
+    match stdin {
+        Pipe::Piped => Ok(script),
+        Pipe::Null => NullStdinTemplate { script: &script }
+            .render()
+            .map_err(|error| SpawnError::Setup(error.to_string())),
     }
 }
 

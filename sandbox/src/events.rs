@@ -153,8 +153,11 @@ impl LongRunning {
     }
 }
 
-/// A job whose stdin has a reader waiting for input; raised once per
+/// A job whose stdin pipe has a reader waiting for input; raised once per
 /// blocking episode, so again only after the job was fed and blocks anew.
+///
+/// Only a job started in the background has a stdin pipe: a foreground
+/// command reads the null device, and keeps it when it is promoted.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct StdinBlocked {

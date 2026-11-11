@@ -11,7 +11,7 @@ use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, 
 use super::container_ipc::ContainerIpc;
 use super::{
     EnvSource, LaunchInfo, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec,
-    TreeLifetime,
+    TreeLifetime, script_reading,
 };
 use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
 use crate::terminal::{
@@ -122,6 +122,7 @@ impl Sandbox {
             command,
             env,
             cwd.as_deref(),
+            stdio.stdin,
             grants,
             ipc,
             &info,
@@ -132,7 +133,8 @@ impl Sandbox {
         let (stdout_tx, stdout_rx) = async_channel::bounded::<Vec<u8>>(OUTPUT_BACKLOG);
         let (stderr_tx, stderr_rx) = async_channel::unbounded::<Vec<u8>>();
         let mut streams = Streams::default();
-        // A dropped stdin sender is the EOF the process reads.
+        // The exec's attached stream closes with a dropped sender; the script
+        // of an unpiped stdin reads the null device instead.
         if stdio.stdin == Pipe::Piped {
             streams.stdin = Some(stdin_tx);
         }
@@ -202,8 +204,9 @@ impl Sandbox {
         ))
     }
 
-    /// The script a container exec runs for the spec's command, the
-    /// directory it runs in, and the listener serving its commands.
+    /// The script a container exec runs for the spec's command reading
+    /// `stdin`, the directory it runs in, and the listener serving its
+    /// commands.
     #[allow(clippy::too_many_arguments)]
     fn exec_command(
         &self,
@@ -212,6 +215,7 @@ impl Sandbox {
         command: SpawnCommand,
         env: Vec<(String, String)>,
         cwd: Option<&std::path::Path>,
+        stdin: Pipe,
         grants: Vec<SpawnGrant>,
         ipc: Option<heel::IpcRouter>,
         info: &LaunchInfo,
@@ -244,6 +248,7 @@ impl Sandbox {
                 shell_words::join(std::iter::once(&program).chain(&args))
             }
         };
+        let script = script_reading(stdin, script)?;
         let script = self.exec_script(launch, script, env, info)?;
         // A confined process runs in a sandbox rooted at the sandbox's own
         // directory; the directory it was asked to start in is entered inside.
