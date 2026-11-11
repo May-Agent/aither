@@ -1313,16 +1313,22 @@ mod platform {
     /// parentheses and may itself contain spaces and parentheses, so the other
     /// fields are read after the last `") "`.
     #[allow(clippy::similar_names)] // `ppid` and `pgid` are the kernel's names
-    pub(super) fn parse_stat(pid: u32, line: &str) -> Option<Proc> {
+    pub(super) fn parse_stat(pid: u32, line: &str) -> Option<Stat> {
         let (head, rest) = line.rsplit_once(") ")?;
         let name = head.split_once('(')?.1.to_string();
         let mut fields = rest.split_whitespace();
         let state = fields.next()?;
+        // `X` (dead) is a task already reaped and on its way out of /proc: it
+        // reports ppid 0 and process group and session -1, and it is no
+        // longer a member of any tree, unlike a zombie.
+        if state == "X" {
+            return Some(Stat::Reaped);
+        }
         let ppid = fields.next()?.parse().ok()?;
         let pgid = fields.next()?.parse().ok()?;
         // Field 22, `starttime`, is the 20th after the state (field 3).
         let starttime = fields.nth(16)?.parse().ok()?;
-        Some(Proc {
+        Some(Stat::Listed(Proc {
             identity: Identity {
                 pid,
                 birth: Birth::Ticks(starttime),
@@ -1330,10 +1336,18 @@ mod platform {
             ppid,
             parent_unique: None,
             pgid,
-            zombie: matches!(state, "Z" | "X"),
+            zombie: state == "Z",
             name,
             marker: None,
-        })
+        }))
+    }
+
+    /// A parsed `/proc/<pid>/stat` line.
+    pub(super) enum Stat {
+        /// A process the table lists, a zombie included.
+        Listed(Proc),
+        /// A task already reaped, which the table treats as gone.
+        Reaped,
     }
 
     /// The value of the job marker in the environment of `pid`. A process
@@ -1373,8 +1387,15 @@ mod platform {
                 Err(error) if gone(&error) => continue,
                 Err(error) => return Err(error),
             };
-            let mut process = parse_stat(pid, &line)
-                .ok_or_else(|| io::Error::other(format!("malformed /proc/{pid}/stat: {line:?}")))?;
+            let mut process = match parse_stat(pid, &line) {
+                Some(Stat::Listed(process)) => process,
+                Some(Stat::Reaped) => continue,
+                None => {
+                    return Err(io::Error::other(format!(
+                        "malformed /proc/{pid}/stat: {line:?}"
+                    )));
+                }
+            };
             if uid == me && !process.zombie {
                 process.marker = marker_of(pid);
             }
@@ -1391,10 +1412,10 @@ mod platform {
     /// Whether `identity` is the process that has its pid now.
     pub(super) fn is_same(identity: Identity) -> io::Result<bool> {
         match fs::read_to_string(format!("/proc/{}/stat", identity.pid)) {
-            Ok(line) => {
-                Ok(parse_stat(identity.pid, &line)
-                    .is_some_and(|process| process.identity == identity))
-            }
+            Ok(line) => Ok(matches!(
+                parse_stat(identity.pid, &line),
+                Some(Stat::Listed(process)) if process.identity == identity
+            )),
             Err(error) if gone(&error) => Ok(false),
             Err(error) => Err(error),
         }
@@ -1471,7 +1492,7 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{Birth, parse_stat};
+        use super::{Birth, Stat, parse_stat};
 
         /// The name may hold spaces and parentheses; the identity is field 22,
         /// the start time.
@@ -1479,12 +1500,23 @@ mod platform {
         fn stat_lines_yield_group_state_and_start_time() {
             let line = "4242 (my (odd) cmd) Z 1 4243 4242 0 -1 4194560 1000 0 0 0 5 6 0 0 20 0 3 0 \
                         987654 12345678 100 18446744073709551615";
-            let process = parse_stat(4242, line).expect("a valid stat line");
+            let Some(Stat::Listed(process)) = parse_stat(4242, line) else {
+                panic!("a valid stat line");
+            };
             assert_eq!(process.name, "my (odd) cmd");
             assert_eq!((process.ppid, process.pgid), (1, 4243));
             assert!(process.zombie);
             assert_eq!(process.identity.birth, Birth::Ticks(987_654));
             assert!(parse_stat(1, "1 (init) S 0").is_none());
+        }
+
+        /// A dead task's line, as CI read it while the kill test's process
+        /// was being reaped: no group, and not a member of any tree.
+        #[test]
+        fn a_reaped_task_is_not_listed() {
+            let line = "10865 (aither_sandbox-) X 0 -1 -1 0 -1 4227084 1198 0 0 0 0 0 0 0 20 0 0 0 \
+                        111813 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+            assert!(matches!(parse_stat(10865, line), Some(Stat::Reaped)));
         }
     }
 }
