@@ -397,7 +397,9 @@ jobs:
       # The fish login shell case of the sandbox's SSH tests runs only where
       # fish is installed.
       - name: Install fish
-        run: sudo apt-get install -y --no-install-recommends fish
+        uses: ./.github/actions/apt-install
+        with:
+          packages: fish
       # `full` would re-enable llama and ort, and --exclude only skips testing
       # a package, not building it as a dependency. So the set is spelled out.
       # Narrowed by filterset like the test jobs, so the build keeps the
