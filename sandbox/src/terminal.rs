@@ -146,8 +146,10 @@ fn script_requires_shell(script: &str) -> bool {
             '\\' if !in_single => escaped = true,
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
-            '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '['
-            | ']' | '{' | '}' | '!' | '~'
+            // Double quotes keep parameter, command and arithmetic expansion.
+            '$' | '`' if !in_single => return true,
+            '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{'
+            | '}' | '!' | '~'
                 if !in_single && !in_double =>
             {
                 return true;
@@ -5327,6 +5329,27 @@ mod tests {
             assert_eq!(
                 direct_command(&format!("{name} x")).unwrap(),
                 Some((name.to_string(), vec!["x".to_string()]))
+            );
+        }
+    }
+
+    /// A shell expands `$` and backquotes inside double quotes, so a script
+    /// using them there runs in one; single quotes and a backslash keep them
+    /// literal, so such a script still runs directly.
+    #[test]
+    fn an_expansion_inside_double_quotes_runs_in_a_shell() {
+        for script in [
+            "echo \"$TMPDIR|$HOME\"",
+            "echo \"${HOME-unset}\"",
+            "echo \"`pwd`\"",
+        ] {
+            assert_eq!(direct_command(script).unwrap(), None, "{script}");
+        }
+        for (script, arg) in [("echo '$HOME'", "$HOME"), ("echo \"\\$HOME\"", "$HOME")] {
+            assert_eq!(
+                direct_command(script).unwrap(),
+                Some(("echo".to_string(), vec![arg.to_string()])),
+                "{script}"
             );
         }
     }
