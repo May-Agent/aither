@@ -7,14 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aither_agent::{Agent, AgentEvent};
+use aither_agent::Agent;
 use aither_core::LanguageModel;
 use uuid::Uuid;
 
-use crate::protocol::{
-    ContentBlock, ContentChunk, McpServer, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate,
-};
+use crate::SessionUpdateMapper;
+use crate::protocol::{McpServer, SessionUpdate};
 
 /// A session's cancellation request, shared between the session and the
 /// server's `session/cancel` handler.
@@ -68,18 +66,20 @@ pub struct AcpSession<LLM: LanguageModel + 'static> {
     cwd: PathBuf,
     mcp_servers: Vec<McpServer>,
     cancelled: Cancellation,
-    agent: Agent<LLM, LLM, LLM>,
+    mapper: SessionUpdateMapper,
+    agent: Agent<LLM>,
 }
 
 impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
     /// Create a new session that drives the given agent.
     #[must_use]
-    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>, agent: Agent<LLM, LLM, LLM>) -> Self {
+    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>, agent: Agent<LLM>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             cwd,
             mcp_servers,
             cancelled: Cancellation::new(),
+            mapper: SessionUpdateMapper::default(),
             agent,
         }
     }
@@ -149,88 +149,19 @@ impl<LLM: LanguageModel + 'static> AcpSession<LLM> {
             .agent
             .run(prompt, [])
             .drive(
-                &mut on_update,
+                (&mut self.mapper, &mut on_update),
                 cancelled.requested(),
-                |on_update, timed| async move {
-                    report_event(timed.event, on_update);
-                    ControlFlow::Continue(on_update)
+                |(mapper, on_update), timed| async move {
+                    if let Some(update) = mapper.map(&timed) {
+                        on_update(update);
+                    }
+                    ControlFlow::Continue((mapper, on_update))
                 },
             )
             .await
             .map_err(|err| err.to_string())?;
 
         Ok(())
-    }
-}
-
-/// Reports one agent event to the client as the matching ACP session update.
-fn report_event(event: AgentEvent, on_update: &mut impl FnMut(SessionUpdate)) {
-    match event {
-        AgentEvent::Text(text) => {
-            on_update(SessionUpdate::AgentMessageChunk(text_chunk(text)));
-        }
-        AgentEvent::Reasoning(text) => {
-            on_update(SessionUpdate::AgentThoughtChunk(text_chunk(text)));
-        }
-        AgentEvent::ToolCallStart {
-            id,
-            name,
-            arguments,
-        } => {
-            on_update(SessionUpdate::ToolCall(ToolCall {
-                tool_call_id: id,
-                title: name,
-                kind: None,
-                status: Some(ToolCallStatus::InProgress),
-                content: Vec::new(),
-                locations: Vec::new(),
-                raw_input: serde_json::from_str(&arguments).ok(),
-                raw_output: None,
-                meta: None,
-            }));
-        }
-        AgentEvent::ToolCallEnd { id, result, .. } => {
-            // The agent reports a typed ToolResult; ACP wants a status
-            // and the text a reader should see.
-            let status = if result.is_error() {
-                ToolCallStatus::Failed
-            } else {
-                ToolCallStatus::Completed
-            };
-            let text = result.render_for_model();
-            on_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                tool_call_id: id,
-                status: Some(status),
-                content: Some(vec![ToolCallContent::Content {
-                    content: ContentBlock::Text(TextContent {
-                        text,
-                        annotations: None,
-                        meta: None,
-                    }),
-                }]),
-                title: None,
-                kind: None,
-                locations: None,
-                raw_input: None,
-                raw_output: None,
-                meta: None,
-            }));
-        }
-        // Remaining events carry no ACP equivalent.
-        _ => {}
-    }
-}
-
-/// Wraps plain text in the content-chunk shape ACP expects.
-const fn text_chunk(text: String) -> ContentChunk {
-    ContentChunk {
-        content: ContentBlock::Text(TextContent {
-            text,
-            annotations: None,
-            meta: None,
-        }),
-        message_id: None,
-        meta: None,
     }
 }
 

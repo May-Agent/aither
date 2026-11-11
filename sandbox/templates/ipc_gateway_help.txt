@@ -1,2 +1,0 @@
-Usage: ipc <tool> [args ...]
-Available tools: {{ tool_names }}

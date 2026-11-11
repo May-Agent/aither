@@ -1,18 +1,8 @@
-//! Built-in sandbox tools.
+//! The control tools of a shell's jobs.
 
-mod ask;
 mod terminal;
 
-pub use ask::{AskCommand, AskModelTier};
 pub use terminal::{
-    InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool,
-    ReadTerminalDeltaArgs, ReadTerminalDeltaTool,
+    JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
+    ShellToolSettings, ToolIdentity,
 };
-
-use heel::IpcRouter;
-
-/// Creates an IPC router with built-in commands (excluding ask, which needs LLM).
-#[must_use]
-pub fn builtin_router() -> IpcRouter {
-    IpcRouter::new()
-}

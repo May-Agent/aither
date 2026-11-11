@@ -1,6 +1,6 @@
 //! Blank-run collapsing stage.
 
-use askama::Template;
+use crate::wording::ShellWording;
 
 /// A line counts as blank only when it has no characters at all.
 ///
@@ -10,12 +10,6 @@ use askama::Template;
 /// the patch would stop applying.
 const fn is_blank(line: &str) -> bool {
     line.is_empty()
-}
-
-#[derive(Template)]
-#[template(path = "blank_lines_marker.txt", escape = "none")]
-struct BlankLinesMarker {
-    count: usize,
 }
 
 /// Replaces every run of two or more blank lines with one marker line that
@@ -29,18 +23,14 @@ struct BlankLinesMarker {
 /// terminator is preserved: lines keep the newline they arrived with, and
 /// none is added to a last line that had none.
 #[must_use]
-pub fn collapse_blank_runs(text: &str) -> String {
+pub fn collapse_blank_runs(text: &str, wording: &dyn ShellWording) -> String {
     let mut out = String::with_capacity(text.len());
     let mut run = 0_usize;
     let flush = |out: &mut String, run: usize| match run {
         0 => {}
         1 => out.push('\n'),
         count => {
-            out.push_str(
-                &BlankLinesMarker { count }
-                    .render()
-                    .expect("blank lines marker template must render"),
-            );
+            out.push_str(&wording.blank_lines(count));
             out.push('\n');
         }
     };
@@ -59,7 +49,11 @@ pub fn collapse_blank_runs(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::test_wording::TestWording;
+
+    fn collapse_blank_runs(text: &str) -> String {
+        super::collapse_blank_runs(text, &TestWording)
+    }
 
     #[test]
     fn collapses_a_run_to_one_marker_naming_its_count() {

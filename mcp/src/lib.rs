@@ -151,8 +151,8 @@ pub mod transport;
 // Re-export main types
 #[cfg(feature = "client")]
 pub use client::{
-    McpClient, McpConnection, McpHandler, McpServerConfig, McpServersConfig, McpToolService,
-    ServerNotification, call_result_to_tool_result,
+    McpClient, McpConnection, McpHandler, McpServerConfig, McpServersConfig, McpTool,
+    McpToolService, ServerNotification, call_result_to_tool_result,
 };
 pub use protocol::{CallToolResult, Content, McpError, McpToolDefinition};
 #[cfg(feature = "server")]

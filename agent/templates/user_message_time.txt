@@ -1,3 +1,0 @@
-{{ prompt }}
-
-Sent at {{ utc }} UTC.

@@ -1622,8 +1622,30 @@ async fn every_question_to_the_subagents_repository_is_bounded_in_time_and_its_p
 #[cfg(unix)]
 #[tokio::test]
 async fn the_tidying_after_an_import_is_bounded_in_time() {
+    // The time bound covers each step of the import, so the real steps need
+    // room under whatever slows this process (instrumentation, a loaded
+    // host) while the stalled one waits out all of it. The same import
+    // without a stall shows what the real work costs here; the bound is a
+    // multiple of that.
+    let control = Fixture::with("psi-control", TestGit::new(), limits()).await;
+    let control_mark = control.ledger.mark().await.unwrap();
+    control.commit("imported without a stall");
+    let started = std::time::Instant::now();
+    finishes_within(20, control.ledger.since(&control_mark))
+        .await
+        .expect("an import without a stall succeeds");
+    let bound = (started.elapsed() * 10).max(Duration::from_millis(700));
+
     let stub = TestGit::new().replying("prune-packed", Reply::Hang);
-    let fixture = Fixture::with("psi", stub, quick(700)).await;
+    let fixture = Fixture::with(
+        "psi",
+        stub,
+        ImportLimits {
+            bytes: ImportBudget::new(256 * ONE_MIB),
+            time: bound,
+        },
+    )
+    .await;
     let mark = fixture.ledger.mark().await.unwrap();
     let commit = fixture.commit("imported before the tidying hangs");
     let listed = finishes_within(20, fixture.ledger.since(&mark))

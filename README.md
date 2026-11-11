@@ -32,7 +32,7 @@ Unified Rust traits for building AI applications across providers
 ## Highlights
 
 - 🎯 **Provider-agnostic traits** – swap between OpenAI, Claude, Gemini, Copilot, Codex, Apple Intelligence, ONNX Runtime, local `llama.cpp`, or your own backend.
-- 🤖 **Agent & Sandbox Runtime (`aither-agent`, `aither-sandbox`)** – terminal-first agent loop, context compaction, subagent orchestration, skills, and isolated command execution with IPC CLI tool bridging via [`heel`](https://github.com/lexoliu/heel) or containers.
+- 🤖 **Agent & Sandbox Runtime (`aither-agent`, `aither-sandbox`)** – terminal-first agent loop, context compaction, subagent orchestration, skills, and isolated command execution via [`heel`](https://github.com/lexoliu/heel) or containers.
 - 🔌 **MCP & ACP Protocols (`aither-mcp`, `aither-acp`)** – first-class Model Context Protocol and Agent Client Protocol support with streaming progress notifications.
 - ⚡ **Streaming-first** – every `LanguageModel::respond` returns a stream of [`Event`]s: visible text deltas, reasoning updates, and tool calls.
 - 🧠 **Reasoning controls** – request chain-of-thought summaries, budgets, or effort tiers without macros.
@@ -202,8 +202,8 @@ async fn generate_image(generator: impl ImageGenerator) -> aither::Result<Vec<u8
 |-------|-------------|
 | `aither` | Entry crate re-exporting everything from `aither-core` + derive macros |
 | `aither-core` | `#![no_std]` traits (`LanguageModel`, `Event`, `LLMRequest`, `Tool`, embedders, moderation, …) |
-| `aither-agent` | Agent loop, `TerminalAgentBuilder`, context compaction, subagents, hooks, and event streaming |
-| `aither-sandbox` | Sandboxed terminal tool execution, IPC CLI command registry, and container/SSH routing |
+| `aither-agent` | Agent loop, context compaction, subagent runs, hooks, approvals, and event streaming |
+| `aither-sandbox` | Sandboxed terminal tool execution and container/SSH routing |
 | `aither-cloud` | Unified multi-provider router across Anthropic, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, etc. |
 | `aither-claude` | Native Anthropic Claude provider bindings with prompt caching and extended thinking |
 | `aither-openai` | Provider bindings for OpenAI-compatible chat, Responses API, images, audio, and moderation |

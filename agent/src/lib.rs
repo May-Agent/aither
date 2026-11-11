@@ -15,7 +15,7 @@
 //! // With tools and hooks
 //! let agent = Agent::builder(llm)
 //!     .tool(FileSystemTool::read_only("."))
-//!     .hook(LoggingHook)
+//!     .hooks(ReadOnly)
 //!     .build();
 //!
 //! let response = agent.query("List all Rust files").await?;
@@ -28,69 +28,34 @@
 //! - **Trait-based Hooks**: Intercept operations at compile time
 //! - **Context Management**: One policy, a cache-aware window, async compaction
 //! - **Generic over LLM**: Works with any `LanguageModel` implementation
+//!
+//! The crate carries no product policy: no default system prompt, no terminal
+//! tool and no built-in subagent types. The embedder supplies its own
+//! instructions, tools and policies.
 
 // Core modules
 mod agent;
-pub mod ask_user;
-mod browser_backend;
 mod builder;
 mod cache_stats;
-#[cfg(test)]
-mod call_identity_tests;
 mod checkpoint;
 mod clock;
-mod command_catalog;
-#[cfg(test)]
-mod command_table_tests;
-mod compact_tool;
 mod compaction_state;
 mod config;
 mod connectivity;
 pub mod context;
 mod context_window;
-mod disk;
 mod effort;
 mod error;
 mod event;
-pub mod external_hook;
 mod fork;
-mod fs_util;
 mod hook;
-mod host_load;
-#[cfg(test)]
-mod idle_compaction_tests;
-mod judgment;
-#[cfg(feature = "languages")]
-pub mod language;
 #[cfg(test)]
 mod midstream_retry_tests;
 mod model_group;
-pub mod notices;
-mod output_urls;
-#[cfg(test)]
-mod poll_park_tests;
-mod pressure;
 mod request_parameters;
-mod runaway;
-pub mod secret_guard;
-mod subagent_file;
-mod terminal_agent;
-#[cfg(test)]
-mod test_support;
-pub mod tool_request;
+mod subagent;
 mod tools;
 mod warmth;
-pub mod working_document;
-pub mod workspace_request;
-
-// Specialized agents
-pub mod specialized;
-
-// Subagent definitions
-pub use subagent_file::{
-    DefinitionError, LOCAL_SUBAGENTS_DIR, RESERVED_SUBAGENT_NAMES, ResolveError, SubagentAccess,
-    SubagentDefinition, validate_subagent_name,
-};
 
 // Re-export tool crates
 #[cfg(feature = "command")]
@@ -102,97 +67,42 @@ pub use aither_webfetch as webfetch;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
-// Sandbox is always available (terminal-first design)
-pub use aither_sandbox as sandbox;
-
 // Public API
-pub use agent::{Agent, BackgroundWake, CompactResult, Run};
-pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
-pub use builder::{AgentBuilder, AgentOptions, AgentSettings};
+pub use agent::{Agent, CancelHandle, CompactResult, Run};
+pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
-pub use checkpoint::AgentCheckpoint;
+pub use checkpoint::{AgentCheckpoint, Checkpoints};
 pub use clock::{AnyClock, Clock, Instant, ManualClock, SystemClock};
-pub use compact_tool::{CompactArgs, CompactRequest, CompactSignal, CompactTool};
-pub use config::{AgentConfig, AgentKind, BackgroundJobPolicy, CacheKeepAlive};
-#[cfg(feature = "skills")]
-pub use context::ActiveSkills;
+pub use config::AgentConfig;
 pub use context::{
-    AnyContextSource, AnyEventSource, AnyLiveSource, AnyStateSource, AttachmentCatalogEntry,
-    AttachmentRef, BackgroundJobs, Block, CompactionError, CompletedCompaction, Context,
-    ContextBudget, ContextCheckpoint, ContextFile, ContextItem, ContextPolicy, ContextSource,
-    EventSource, ExternalContent, ExternalSlot, Handoff, HandoffDocument, HandoffPrompt,
-    HandoffSchema, InstructionSlot, InvalidHandoff, KeptAttachment, LineRange, LiveChange,
-    LiveContent, LiveSource, LiveUpdate, PrefixBlock, PrefixChain, PrefixRewrites, PromptCache,
-    PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, Sourced, SourcedSlot,
-    StateChange, StateSource, SystemLayout,
+    AnyContextSource, AnyFileReferences, AnyLiveSource, AttachmentCatalogEntry, AttachmentRef,
+    Block, CompactionError, CompletedCompaction, Context, ContextBlock, ContextBudget,
+    ContextCheckpoint, ContextFile, ContextItem, ContextPolicy, ContextSource, ExternalContent,
+    ExternalSlot, FileReferences, Handoff, HandoffDocument, HandoffPrompt, HandoffSchema,
+    InstructionSlot, InvalidHandoff, KeptAttachment, LineRange, LiveChange, LiveContent,
+    LiveSource, LiveUpdate, Moment, Placement, PrefixBlock, PrefixChain, PrefixRewrites,
+    PromptCache, PromptPrefix, ReassemblyReport, Restoration, SkillCatalogEntry, SourceId, Sourced,
+    SourcedSlot, SystemLayout,
 };
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
-pub use disk::{
-    AnyDiskReader, ContainerDisk, DiskPressure, DiskReader, DiskReaderImpl, DiskThresholds,
-    SystemDisk,
-};
-pub use error::AgentError;
-pub use event::{AgentEvent, CompactionOutcome, TimedEvent};
-pub use external_hook::{
-    ExternalHooks, HookTestTool, HooksConfig, InjectedContext, LifecycleHookConfig, LiveHooks,
-    ReviewedPermission, ReviewerConfig,
+pub use error::{AgentError, ToolPanic};
+pub use event::{
+    AgentEvent, AgentPath, BlockId, CheckpointReason, CompactionOutcome, CompactionTrigger,
+    InjectionKind, OutputKind, PauseId, RequestId, RequestOutcome, RunId, RunOutcome, RunPause,
+    TimedEvent, ToolOrigin, ToolVerdict,
 };
 pub use fork::{ForkSnapshot, ForkSource};
 pub use hook::{
-    AnyStopHook, CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction,
-    StopContext, StopDecision, StopHook, StopReason, ToolResultContext, ToolUseContext,
+    AfterTool, Hooks, RequestCx, StopCx, StopDecision, ToolDecision, ToolInvocation, ToolOutcome,
     TurnBoundaryAction, TurnBoundaryContext,
 };
-pub use host_load::{
-    AnyHostReader, HostCondition, HostLevel, HostLoadConfig, HostLoadEvent, HostLoadMonitor,
-    HostReader, HostSample, MachineLoad, MemoryPressure, ReadError, SystemReader, UnwatchedHost,
-};
-pub use judgment::{JudgmentError, judge};
-#[cfg(feature = "languages")]
-pub use language::{
-    Language, LanguageAlert, LanguageGuard, LanguageRefusal, Languages, WorkingText,
-};
-pub use notices::{
-    AnyNotices, CancelledToolCall, CommandHookRefusal, DefaultNotices, DocumentAlert,
-    DocumentShown, ForkToolRefusal, Notices, PreCompaction, ReviewerDenial,
-};
-pub use output_urls::{extract_referenced_urls, is_valid_output_filename};
-pub use runaway::RunawayGuard;
-pub use secret_guard::{
-    Guarded, SecretFinding, SecretGuard, SecretKind, SecretRefusal, SecretShape,
-};
-pub use terminal_agent::{Prepared, TerminalAgentBuilder, Unprepared};
+pub use subagent::{ChildAgent, ChildEvents, SubagentRun, SubagentRunInfo, SubagentRuns};
 pub use tools::AgentTools;
 pub use warmth::{CacheState, CacheWarmth};
-pub use working_document::{
-    AnyBlockerResolver, AnyDocumentSchema, AnyWorkTracker, BlockerError, BlockerResolver,
-    DocumentAlertItem, DocumentCheckpoint, DocumentReview, DocumentRow, DocumentSchema,
-    DocumentSpec, ParsedDocument, WorkEvent, WorkEvents, WorkItem, WorkRef, WorkState, WorkTracker,
-    WorkTrackerError, WorkingDocument,
-};
 
 // Model groups for budget tracking and fallback
-pub use model_group::{
-    Budget, BudgetedModel, ModelGroup, ModelGroupError, ModelTier, TieredModels,
-};
+pub use model_group::{Budget, BudgetedModel, ModelGroup, ModelGroupError};
 
 // Re-export core tool trait for convenience
 pub use aither_attachments::{CacheEntry, FileCache};
 pub use aither_core::llm::Tool;
-
-/// Default system prompt for terminal-first agents.
-///
-/// This prompt teaches the LLM to use `terminal` as the primary tool interface,
-/// with all capabilities exposed as CLI commands that can be piped and composed.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use aither_agent::{Agent, TERMINAL_SYSTEM_PROMPT};
-///
-/// let agent = Agent::builder(llm)
-///     .system_prompt(TERMINAL_SYSTEM_PROMPT)
-///     .terminal(permission_handler, config, output_store)
-///     .build();
-/// ```
-pub const TERMINAL_SYSTEM_PROMPT: &str = include_str!("prompts/system.md");

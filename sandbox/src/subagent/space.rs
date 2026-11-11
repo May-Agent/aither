@@ -22,7 +22,7 @@ use futures::future::BoxFuture;
 /// Prepares the space each subagent run works in.
 ///
 /// Given to a terminal with
-/// [`TerminalTool::with_subagent_spaces`](crate::TerminalTool::with_subagent_spaces),
+/// [`Shell::with_subagent_spaces`](crate::Shell::with_subagent_spaces),
 /// it serves every subagent launched from that terminal and, at any depth,
 /// from theirs.
 pub trait SubagentSpaces: Send + Sync + 'static {

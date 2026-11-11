@@ -4,107 +4,174 @@
 //! Following a running command or a growing log used to mean polling: sleep,
 //! read, sleep, read. `monitor` runs the source as an ordinary background
 //! job — same sandbox, same PID-only kills, `terminal_kill` reaches it — and
-//! a pump feeds its new output to the agent through [`JobAlert`], which
-//! merges increments into the next turn boundary and wakes an idle agent.
+//! a pump raises its new output as [`ShellEvent::MonitorIncrement`] facts,
+//! which the embedder merges into its agent's next turn boundary.
 
 use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use aither_core::llm::{CommandOutcome, Tool, ToolContext, ToolResult};
+use aither_core::llm::{AgentPath, Tool, ToolContext, ToolResult};
 use executor_core::{Executor, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::events::{EventSender, ShellEvent};
+use crate::interpreter::Interpreter;
 use crate::job_registry::{JobRegistry, JobStatus};
-use crate::notices::{MonitorStarted, Refused};
-use crate::output::{MediaResolution, OutputFormat};
-use crate::permission::PermissionHandler;
-use crate::script_language::ScriptLanguage;
-use crate::terminal::{Configured, JobAlert, TerminalArgs, TerminalExecutionMode, TerminalTool};
+use crate::limits::LiveDuration;
+use crate::output::MediaResolution;
+use crate::policy::SandboxMode;
+use crate::terminal::{Shell, ShellArgs};
+use crate::wording::{MonitorStarted, Refused};
 
-/// The longest a monitor may run: two hours, the same cap `terminal` has.
-pub(crate) const MAX_TIMEOUT_SECS: u64 = 7200;
+/// How long the watched job's own `timeout` bound outlasts the monitor's
+/// deadline.
+const JOB_MARGIN: Duration = Duration::from_secs(60);
 
-const fn default_interval_secs() -> u64 {
-    10
+/// What an embedder decides about monitoring: the tool's name and description
+/// and the bounds of a watch. The bounds are live, so changing one reaches
+/// the tools already running.
+#[derive(Debug, Clone)]
+pub struct MonitorSettings {
+    /// The tool's name, description and argument descriptions.
+    pub identity: crate::ToolIdentity,
+    /// The longest a monitor may run.
+    pub max_timeout: LiveDuration,
+    /// The interval between output collections of a call that states none.
+    pub default_interval: LiveDuration,
 }
 
-/// `monitor` arguments.
+// The arguments of the monitor tool, described by its `ToolIdentity`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct MonitorArgs {
-    /// What to watch: `{"command": "<source>", "language": "shell"|"python"}`
-    /// runs the source inside the sandbox; `{"file": "<path>"}` follows a
-    /// file's appended lines inside the sandbox, across rotation and
-    /// truncation.
+    // What to watch.
     pub source: MonitorSource,
-    /// Seconds between output collections; only non-empty increments are
-    /// delivered. Default 10.
-    #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
-    /// Optional regex — only matching new lines are delivered.
+    // Seconds between output collections.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    // Only lines matching it are delivered.
     #[serde(default)]
     pub filter: Option<String>,
-    /// Optional regex — the first matching new line ends the monitor.
+    // The first line matching it ends the monitor.
     #[serde(default)]
     pub stop_on: Option<String>,
-    /// With `stop_on`, also kill the watched process on the match. Default
-    /// false: the command keeps running detached.
+    // Whether the watched process is killed when `stop_on` matches.
     #[serde(default)]
     pub kill_on_stop: bool,
-    /// Report the run as stuck once if no new output arrives for this many
-    /// seconds.
+    // Seconds without new output after which the run is reported stuck.
     #[serde(default)]
     pub stall_secs: Option<u64>,
-    /// Maximum lifetime in seconds. Required, at most 7200: at the deadline
-    /// the process tree is killed and the end reported as a timeout.
+    // The monitor's maximum lifetime in seconds.
     pub timeout_secs: u64,
 }
 
-/// The `monitor` source: a command's source text or a file path.
+// The `monitor` source: a command's source text or a file path.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
+#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub enum MonitorSource {
-    /// Source text run inside the sandbox.
+    // Source text run inside the sandbox.
     Command {
-        /// The source to run.
+        // The source to run.
         command: String,
-        /// Its language: `shell` or `python`. Default `shell`.
+        // Its interpreter.
         #[serde(default)]
-        language: ScriptLanguage,
+        interpreter: Interpreter,
     },
-    /// A file whose appended lines are followed inside the sandbox.
+    // A file whose appended lines are followed inside the sandbox.
     File {
-        /// The path, resolved against the working directory when relative.
+        // The path, resolved against the working directory when relative.
         file: String,
     },
 }
 
 /// New output a monitor collected since the last delivery.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MonitorIncrement {
+    pub(crate) agent: AgentPath,
+    pub(crate) task_id: String,
+    pub(crate) lines: Vec<String>,
+}
+
+impl MonitorIncrement {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task id of the watched job.
-    pub task_id: String,
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
     /// The new lines (filtered when the monitor has a `filter`).
-    pub lines: Vec<String>,
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
 }
 
 /// A monitor saw no new output for `stall_secs`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MonitorStalled {
+    pub(crate) agent: AgentPath,
+    pub(crate) task_id: String,
+    pub(crate) stall_secs: u64,
+}
+
+impl MonitorStalled {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task id of the watched job.
-    pub task_id: String,
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
     /// How long it has produced nothing.
-    pub stall_secs: u64,
+    #[must_use]
+    pub const fn stall_secs(&self) -> u64 {
+        self.stall_secs
+    }
 }
 
 /// A monitor ended, and why.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MonitorEnded {
+    pub(crate) agent: AgentPath,
+    pub(crate) task_id: String,
+    pub(crate) end: MonitorEnd,
+}
+
+impl MonitorEnded {
+    /// The agent whose shell raised the event.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentPath {
+        &self.agent
+    }
+
     /// Task id of the watched job.
-    pub task_id: String,
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
     /// What ended it.
-    pub end: MonitorEnd,
+    #[must_use]
+    pub const fn end(&self) -> &MonitorEnd {
+        &self.end
+    }
 }
 
 /// What ended a monitor.
@@ -136,8 +203,11 @@ pub enum MonitorEnd {
 /// Why a `monitor` call was refused before anything started.
 #[derive(Debug)]
 pub enum MonitorRefusal {
-    /// `timeout_secs` was 0 or above the 120-minute cap.
-    TimeoutOutOfRange,
+    /// `timeout_secs` was 0 or above the cap.
+    TimeoutOutOfRange {
+        /// The cap in force.
+        max: Duration,
+    },
     /// `interval_secs` was 0.
     IntervalTooSmall,
     /// `filter` or `stop_on` is not a valid regex.
@@ -164,9 +234,9 @@ struct Watch {
     task_id: String,
     /// Keeps the job, and its word, until the pump reports its end, so a
     /// completion the agent took first still leaves the pump its status.
-    held: Option<crate::job_registry::JobWatch>,
+    _job: crate::Job,
     registry: JobRegistry,
-    alerts: async_channel::Sender<JobAlert>,
+    alerts: EventSender,
     interval: Duration,
     deadline: Instant,
     stall: Option<Duration>,
@@ -176,21 +246,36 @@ struct Watch {
 }
 
 /// The native `monitor` tool: starts the watched source as a background job
-/// and a pump that delivers its increments through [`JobAlert`].
-pub struct MonitorTool<P, E> {
-    terminal: TerminalTool<P, E, Configured>,
+/// and a pump that raises its increments as [`ShellEvent`]s.
+pub struct MonitorTool<E> {
+    terminal: Shell<E>,
+    settings: MonitorSettings,
 }
 
-impl<P, E> MonitorTool<P, E> {
-    /// Creates the tool bound to `terminal`, the configured terminal whose
-    /// jobs it watches.
-    #[must_use]
-    pub const fn new(terminal: TerminalTool<P, E, Configured>) -> Self {
-        Self { terminal }
+/// Settings for tests, whose values stand for nothing.
+#[cfg(any(test, feature = "test-budgets"))]
+pub(crate) fn fixture_settings() -> MonitorSettings {
+    MonitorSettings {
+        identity: crate::ToolIdentity {
+            name: "monitor".into(),
+            description: "Watches a source.".into(),
+            arguments: crate::test_wording::argument_descriptions(),
+        },
+        max_timeout: LiveDuration::new(Duration::from_secs(7200)),
+        default_interval: LiveDuration::new(Duration::from_secs(10)),
     }
 }
 
-impl<P, E> std::fmt::Debug for MonitorTool<P, E> {
+impl<E> MonitorTool<E> {
+    /// Creates the tool bound to `terminal`, the configured terminal whose
+    /// jobs it watches.
+    #[must_use]
+    pub const fn new(terminal: Shell<E>, settings: MonitorSettings) -> Self {
+        Self { terminal, settings }
+    }
+}
+
+impl<E> std::fmt::Debug for MonitorTool<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("MonitorTool")
     }
@@ -201,21 +286,28 @@ fn single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
-    /// The script the monitored job runs for `source` and its language; an
+impl<E: Executor + Clone + 'static> MonitorTool<E> {
+    /// The seconds between collections a call asks for, the embedder's
+    /// default when it states none.
+    fn interval_secs(&self, args: &MonitorArgs) -> u64 {
+        args.interval_secs
+            .unwrap_or_else(|| self.settings.default_interval.get().as_secs())
+    }
+
+    /// The script the monitored job runs for `source` and its interpreter; an
     /// unreadable file is refused before anything spawns.
-    fn job_script(
-        &self,
-        source: &MonitorSource,
-    ) -> Result<(String, ScriptLanguage), MonitorRefusal> {
+    fn job_script(&self, source: &MonitorSource) -> Result<(String, Interpreter), MonitorRefusal> {
         match source {
-            MonitorSource::Command { command, language } => {
+            MonitorSource::Command {
+                command,
+                interpreter,
+            } => {
                 if command.trim().is_empty() {
                     return Err(MonitorRefusal::StartFailed {
                         reason: "command must not be empty".to_string(),
                     });
                 }
-                Ok((command.clone(), *language))
+                Ok((command.clone(), *interpreter))
             }
             MonitorSource::File { file } => {
                 let mut path = std::path::PathBuf::from(file);
@@ -238,31 +330,29 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
                 // (the name is reopened) and truncation.
                 Ok((
                     format!("tail -Fn0 {}", single_quote(&path.to_string_lossy())),
-                    ScriptLanguage::Shell,
+                    Interpreter::Shell,
                 ))
             }
         }
     }
 }
 
-impl<P, E> Tool for MonitorTool<P, E>
+impl<E> Tool for MonitorTool<E>
 where
-    P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
-        "monitor".into()
+        self.settings.identity.name.clone()
     }
 
     fn description(&self) -> Cow<'static, str> {
-        "Watch a command or a file and receive its new output as it arrives. \
-         The source runs as a background job under the same sandbox as `terminal`; \
-         non-empty increments are delivered at turn boundaries or wake an idle agent. \
-         `source` is `{\"command\": <source>, \"language\": \"shell\"|\"python\"}` or \
-         `{\"file\": <path>}`. `timeout_secs` is required (max 7200). Options: \
-         `interval_secs` (default 10), `filter` regex, `stop_on` regex, `kill_on_stop`, \
-         `stall_secs`."
-            .into()
+        self.settings.identity.description.clone()
+    }
+
+    fn arguments_schema(&self) -> schemars::Schema {
+        self.settings
+            .identity
+            .describe(schemars::schema_for!(MonitorArgs))
     }
 
     type Arguments = MonitorArgs;
@@ -273,8 +363,8 @@ where
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let notices = self.terminal.notices();
-        let interval_secs = args.interval_secs;
+        let notices = self.terminal.wording();
+        let interval_secs = self.interval_secs(&args);
         match self.start(args).await {
             Ok(task_id) => Ok(ToolResult::text(notices.monitor_started(&MonitorStarted {
                 task_id: &task_id,
@@ -287,13 +377,22 @@ where
     }
 }
 
-impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<P, E> {
+impl<E: Executor + Clone + 'static> MonitorTool<E> {
     /// Starts the watched job and its pump; returns the job's task id.
     async fn start(&self, args: MonitorArgs) -> Result<String, MonitorRefusal> {
-        if args.timeout_secs == 0 || args.timeout_secs > MAX_TIMEOUT_SECS {
-            return Err(MonitorRefusal::TimeoutOutOfRange);
+        // The pump owns the deadline and the job's own bound stays a margin
+        // past it, so a monitor is accepted only when the shell accepts that
+        // bound too.
+        let max_timeout = self
+            .settings
+            .max_timeout
+            .get()
+            .min(self.terminal.timeout_cap().saturating_sub(JOB_MARGIN));
+        if args.timeout_secs == 0 || args.timeout_secs > max_timeout.as_secs() {
+            return Err(MonitorRefusal::TimeoutOutOfRange { max: max_timeout });
         }
-        if args.interval_secs == 0 {
+        let interval_secs = self.interval_secs(&args);
+        if interval_secs == 0 {
             return Err(MonitorRefusal::IntervalTooSmall);
         }
         let compile = |argument: &'static str, pattern: &Option<String>| {
@@ -309,48 +408,39 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> MonitorTool<
         };
         let filter = compile("filter", &args.filter)?;
         let stop_on = compile("stop_on", &args.stop_on)?;
-        let (script, language) = self.job_script(&args.source)?;
+        let (script, interpreter) = self.job_script(&args.source)?;
         let description = match &args.source {
             MonitorSource::Command { .. } => "monitored command".to_string(),
             MonitorSource::File { file } => format!("monitor file {file}"),
         };
-        let result = self
+        let job = self
             .terminal
-            .run_background(TerminalArgs {
+            .run_background(ShellArgs {
                 description,
                 script,
-                language,
-                mode: TerminalExecutionMode::Default,
+                interpreter,
+                sandbox: SandboxMode::Sandboxed,
                 location: None,
-                expect: OutputFormat::Text,
                 resolution: MediaResolution::Auto,
-                max_lines: 1,
+                max_lines: Some(1),
                 raw: true,
-                // The job's own watchdog stays a minute past the monitor's
+                // The job's own watchdog stays a margin past the monitor's
                 // deadline, so the pump's kill — not the watchdog's — ends a
                 // timed-out run and the end reports `TimedOut`.
-                timeout: (args.timeout_secs + 60).min(MAX_TIMEOUT_SECS),
+                timeout: args.timeout_secs + JOB_MARGIN.as_secs(),
                 background: true,
             })
             .await
             .map_err(|error| MonitorRefusal::StartFailed {
                 reason: error.to_string(),
             })?;
-        let task_id = match result.command().map(|command| &command.outcome) {
-            Some(CommandOutcome::Running { task_id, .. }) => task_id.clone(),
-            _ => {
-                return Err(MonitorRefusal::StartFailed {
-                    reason: "the monitored job did not start detached".to_string(),
-                });
-            }
-        };
-        let registry = self.terminal.job_registry();
+        let task_id = job.task_id().to_owned();
         let watch = Watch {
-            held: registry.watch(&task_id).await,
+            _job: job,
             task_id: task_id.clone(),
-            registry,
-            alerts: self.terminal.job_alert_sender(),
-            interval: Duration::from_secs(args.interval_secs),
+            registry: self.terminal.job_registry(),
+            alerts: self.terminal.event_sender(),
+            interval: Duration::from_secs(interval_secs),
             deadline: Instant::now() + Duration::from_secs(args.timeout_secs),
             stall: args.stall_secs.map(Duration::from_secs),
             filter,
@@ -377,14 +467,15 @@ fn drain_lines(buffer: &mut Vec<u8>) -> Vec<String> {
         .collect()
 }
 
-async fn send(alerts: &async_channel::Sender<JobAlert>, alert: JobAlert) {
+async fn send(alerts: &EventSender, alert: ShellEvent) {
     let _ = alerts.send(alert).await;
 }
 
+#[allow(clippy::too_many_lines)]
 async fn watch_task(watch: Watch) {
     let Watch {
         task_id,
-        held: _held,
+        _job,
         registry,
         alerts,
         interval,
@@ -424,7 +515,8 @@ async fn watch_task(watch: Watch) {
                     last_output = now;
                     send(
                         &alerts,
-                        JobAlert::MonitorIncrement(MonitorIncrement {
+                        ShellEvent::MonitorIncrement(MonitorIncrement {
+                            agent: alerts.agent().clone(),
                             task_id: task_id.clone(),
                             lines,
                         }),
@@ -459,7 +551,11 @@ async fn watch_task(watch: Watch) {
         if let Some(end) = end {
             send(
                 &alerts,
-                JobAlert::MonitorEnded(MonitorEnded { task_id, end }),
+                ShellEvent::MonitorEnded(MonitorEnded {
+                    agent: alerts.agent().clone(),
+                    task_id,
+                    end,
+                }),
             )
             .await;
             return;
@@ -468,7 +564,8 @@ async fn watch_task(watch: Watch) {
             stalled = true;
             send(
                 &alerts,
-                JobAlert::MonitorStalled(MonitorStalled {
+                ShellEvent::MonitorStalled(MonitorStalled {
+                    agent: alerts.agent().clone(),
                     task_id: task_id.clone(),
                     stall_secs: stall.map_or(0, |s| s.as_secs()),
                 }),

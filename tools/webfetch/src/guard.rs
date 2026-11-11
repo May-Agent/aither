@@ -234,7 +234,9 @@ pub async fn resolve_checked<R: Resolver, P: AddressPolicy>(
 /// A resolver and a policy tests control.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{AddressPolicy, Resolver, UrlPolicyError};
+    use super::Resolver;
+    #[cfg(feature = "headless")]
+    use super::{AddressPolicy, UrlPolicyError};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
@@ -283,9 +285,11 @@ pub(crate) mod testing {
     }
 
     /// Allows exactly one address, which stands in for a public one.
+    #[cfg(feature = "headless")]
     #[derive(Clone)]
     pub(crate) struct Only(pub(crate) SocketAddr);
 
+    #[cfg(feature = "headless")]
     impl AddressPolicy for Only {
         fn check(&self, host: &str, addr: SocketAddr) -> Result<(), UrlPolicyError> {
             if addr == self.0 {

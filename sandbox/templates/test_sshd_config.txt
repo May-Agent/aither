@@ -8,3 +8,6 @@ UsePAM no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 SetEnv HOME={{ home }}
+{% if let Some(shell) = login_shell -%}
+ForceCommand exec {{ shell }} -c "$SSH_ORIGINAL_COMMAND"
+{%- endif %}

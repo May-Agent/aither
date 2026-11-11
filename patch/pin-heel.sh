@@ -13,9 +13,10 @@
 # then replaced by one entry per asset, with its URL, SHA-256 and size.
 # `gh` authenticates through GH_TOKEN.
 #
-# The pinned version must be the version of the `heel` library in Cargo.lock;
-# the aither-sandbox test `tool_distribution_pins_heel_at_the_linked_version`
-# fails otherwise, so a heel upgrade moves the library and this pin together.
+# The pinned version must be the version of the `heel` library in Cargo.lock:
+# aither-sandbox's tests run the pinned heel through `HeelBinary::verify`, so
+# `terminal::builder::tests::the_shell_is_built_on_the_sandboxs_directory_and_live_grants`
+# fails otherwise, and a heel upgrade moves the library and this pin together.
 set -euo pipefail
 
 version="${1:?usage: pin-heel.sh <version>}"

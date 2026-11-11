@@ -1,1 +1,0 @@
-The command hook {{ hook }} did not answer ({{ failure }}), so this command was refused. Commands stay refused until the hook works.

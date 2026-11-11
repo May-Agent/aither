@@ -16,7 +16,7 @@ use heel::{
 
 use super::{ContainerConfinement, prioritized_container_script};
 use crate::MountRoot;
-use crate::shell_session::{ContainerExecOutcome, ShellSessionRegistry};
+use crate::shell_session::ContainerExecOutcome;
 use crate::subagent::{
     CommittingWorktree, ExportError, SandboxedExit, SandboxedGitImpl, SandboxedRun,
 };
@@ -59,8 +59,8 @@ pub(super) struct LocalGit<E> {
     /// repository answers to.
     pub committing: Vec<CommittingWorktree>,
     pub priority: ProcessPriority,
-    /// The parent terminal's verified `heel` binary.
-    pub heel: crate::heel_binary::SharedHeelBinary,
+    /// The parent terminal's `heel` binary.
+    pub heel: heel::HeelBinary,
 }
 
 /// The host's own `git` as an absolute path, so a sandboxed git does not
@@ -209,13 +209,8 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                 )
                 .collect::<heel::Result<_>>()
                 .map_err(|error| ExportError::Launch(error.to_string()))?;
-        let heel_binary = self
-            .heel
-            .get()
-            .await
-            .map_err(|error| ExportError::Launch(error.to_string()))?;
         let config = SandboxConfig::builder()
-            .heel_binary(heel_binary)
+            .heel_binary(self.heel.clone())
             .network(DenyAll)
             .working_dir(canonical(&working_dir))
             .grants(grants)
@@ -342,7 +337,8 @@ impl<E: Executor + Clone + 'static> SandboxedGitImpl for LocalGit<E> {
 /// Git in the per-command sandbox of a subagent inside a container.
 pub(super) struct ContainerGit<E> {
     pub executor: E,
-    pub shell_sessions: ShellSessionRegistry,
+    pub launch: crate::ContainerLaunch,
+    pub runtime: crate::ContainerShellRuntime,
     pub confinement: ContainerConfinement,
     pub mount: MountRoot,
     pub priority: ProcessPriority,
@@ -350,15 +346,7 @@ pub(super) struct ContainerGit<E> {
 
 impl<E: Executor + Clone + 'static> ContainerGit<E> {
     async fn run_in_container(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
-        let runtime = self
-            .shell_sessions
-            .container_runtime()
-            .cloned()
-            .ok_or_else(|| ExportError::Launch("no container runtime".to_string()))?;
-        let tools = self
-            .shell_sessions
-            .container_tools()
-            .map_err(|error| ExportError::Launch(error.to_string()))?;
+        let runtime = self.runtime.clone();
         let repository = self
             .mount
             .container_path(run.repository)
@@ -371,7 +359,7 @@ impl<E: Executor + Clone + 'static> ContainerGit<E> {
         let wrapped = prioritized_container_script(
             &script,
             self.priority,
-            tools.bin_dir(),
+            self.launch.bin_dir(),
             self.confinement.working_dir.as_str(),
             Some(&self.confinement),
         )
@@ -402,6 +390,7 @@ impl<E: Executor + Clone + 'static> ContainerGit<E> {
                         kill_rx,
                         stdin_rx,
                         stdout,
+                        crate::ExecLifetime::Foreground,
                     )
                     .await;
                 let _ = done_tx.send(outcome).await;

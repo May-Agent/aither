@@ -4,11 +4,9 @@ use async_channel::{Receiver, Sender};
 
 use askama::Template as _;
 
-use crate::ContainerPath;
-use crate::ssh::{SshEnvironments, SshServer, SshServerError};
+use crate::ssh::{PrepareSsh, SshEnvironments, SshServer, SshServerError};
 use crate::stdin_watch::StdinWatchSignal;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use crate::{ContainerPath, HostRoute};
 
 /// How long the processes a container command leaves running when its
 /// top-level shell exits may live.
@@ -76,6 +74,8 @@ pub trait ContainerExec: Send + Sync {
     /// empty. `stdout` is bounded, so a consumer that stops reading holds the
     /// command back. The command is killed, as when `kill_rx` fires, once
     /// `kill_rx` fires or closes, or once `stdout` has no receiver left.
+    /// `lifetime` is [`Self::exec`]'s.
+    #[allow(clippy::too_many_arguments)]
     fn exec_streamed(
         &self,
         container_id: &str,
@@ -84,6 +84,7 @@ pub trait ContainerExec: Send + Sync {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
@@ -103,6 +104,7 @@ pub trait ContainerExecImpl: Send + Sync {
 
     /// Execute a command inside a container, streaming its stdout, through a
     /// boxed future.
+    #[allow(clippy::too_many_arguments)]
     fn exec_streamed_boxed<'a>(
         &'a self,
         container_id: &'a str,
@@ -111,6 +113,7 @@ pub trait ContainerExecImpl: Send + Sync {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
 
@@ -178,6 +181,7 @@ impl ContainerExec for AnyContainerExec {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let inner = Arc::clone(&self.inner);
         let container_id = container_id.to_string();
@@ -193,99 +197,10 @@ impl ContainerExec for AnyContainerExec {
                     kill_rx,
                     stdin_rx,
                     stdout,
+                    lifetime,
                 )
                 .await
         }
-    }
-}
-
-/// An address the container IPC bridge may listen on.
-///
-/// The bridge executes host IPC commands for whoever connects, so it is bound
-/// only to an address the container network alone reaches — never the
-/// unspecified (`0.0.0.0`, `::`) address, which would expose it on every
-/// interface including the LAN, nor a multicast address, which cannot serve a
-/// listener. Docker Desktop and `OrbStack` forward `host.docker.internal` to the
-/// host's loopback, so the bridge binds `127.0.0.1`; native Linux Docker
-/// routes the name to the container network's gateway the host owns (`docker0`
-/// or the docker `bridge` network gateway, e.g. `172.17.0.1`), so the bridge
-/// binds that address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BridgeAddress(std::net::IpAddr);
-
-/// Why an address cannot bind the container IPC bridge.
-#[derive(Debug, thiserror::Error)]
-pub enum BridgeAddressError {
-    /// The unspecified wildcard address would listen on every interface.
-    #[error("the unspecified address {0} would expose the container IPC bridge on every interface")]
-    Unspecified(std::net::IpAddr),
-    /// A multicast address cannot serve a listener.
-    #[error("the multicast address {0} cannot bind the container IPC bridge")]
-    Multicast(std::net::IpAddr),
-}
-
-impl TryFrom<std::net::IpAddr> for BridgeAddress {
-    type Error = BridgeAddressError;
-
-    fn try_from(address: std::net::IpAddr) -> Result<Self, Self::Error> {
-        if address.is_unspecified() {
-            return Err(BridgeAddressError::Unspecified(address));
-        }
-        if address.is_multicast() {
-            return Err(BridgeAddressError::Multicast(address));
-        }
-        Ok(Self(address))
-    }
-}
-
-impl BridgeAddress {
-    /// The address the bridge listens on.
-    #[must_use]
-    pub const fn ip(&self) -> std::net::IpAddr {
-        self.0
-    }
-}
-
-/// How a container reaches the host's IPC bridge.
-///
-/// `host` is the name the container dials (`host.docker.internal` on Docker —
-/// made resolvable through `--add-host=host.docker.internal:host-gateway` —
-/// `host.containers.internal` on Podman), and `bind` is the host address the
-/// bridge listens on: `127.0.0.1` on Docker Desktop and `OrbStack`, which
-/// forward the name to host loopback, or the container network's gateway
-/// address on native Linux Docker. The two belong to the same route, and only
-/// the caller — which knows the container runtime — can pair them correctly.
-#[derive(Clone, Debug)]
-pub struct ContainerIpcRoute {
-    host: String,
-    bind: BridgeAddress,
-}
-
-impl ContainerIpcRoute {
-    /// Creates the route a container uses to reach the host's IPC bridge.
-    ///
-    /// # Panics
-    /// Panics if `host` is empty after trimming.
-    #[must_use]
-    pub fn new(host: impl Into<String>, bind: BridgeAddress) -> Self {
-        let host = host.into();
-        assert!(
-            !host.trim().is_empty(),
-            "container IPC route requires a non-empty host"
-        );
-        Self { host, bind }
-    }
-
-    /// The name the container dials to reach the bridge.
-    #[must_use]
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    /// The host address the bridge listens on.
-    #[must_use]
-    pub const fn bind(&self) -> BridgeAddress {
-        self.bind
     }
 }
 
@@ -294,7 +209,7 @@ impl ContainerIpcRoute {
 pub struct ContainerShellRuntime {
     exec: Arc<dyn ContainerExecImpl>,
     container_id: String,
-    ipc_route: ContainerIpcRoute,
+    host_route: HostRoute,
     /// The host directory the container mounts as its workspace, declared by
     /// whoever mounts it.
     workspace_mount: Option<crate::MountRoot>,
@@ -304,7 +219,7 @@ impl std::fmt::Debug for ContainerShellRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContainerShellRuntime")
             .field("container_id", &self.container_id)
-            .field("ipc_route", &self.ipc_route)
+            .field("host_route", &self.host_route)
             .field("workspace_mount", &self.workspace_mount)
             .finish_non_exhaustive()
     }
@@ -318,7 +233,7 @@ impl ContainerShellRuntime {
     #[must_use]
     pub fn new(
         container_id: impl Into<String>,
-        ipc_route: ContainerIpcRoute,
+        host_route: HostRoute,
         exec: AnyContainerExec,
     ) -> Self {
         let container_id = container_id.into();
@@ -329,7 +244,7 @@ impl ContainerShellRuntime {
         Self {
             exec: exec.inner,
             container_id,
-            ipc_route,
+            host_route,
             workspace_mount: None,
         }
     }
@@ -356,10 +271,10 @@ impl ContainerShellRuntime {
         &self.container_id
     }
 
-    /// Returns the route the container uses to reach the host's IPC bridge.
+    /// Returns where the host is reachable from inside the container.
     #[must_use]
-    pub const fn ipc_route(&self) -> &ContainerIpcRoute {
-        &self.ipc_route
+    pub const fn host_route(&self) -> &HostRoute {
+        &self.host_route
     }
 
     pub(crate) fn exec(&self) -> Arc<dyn ContainerExecImpl> {
@@ -558,54 +473,31 @@ impl<T: ContainerExec> ContainerExecImpl for T {
         kill_rx: Receiver<()>,
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
+        lifetime: ExecLifetime,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
-        Box::pin(self.exec_streamed(container_id, script, working_dir, kill_rx, stdin_rx, stdout))
+        Box::pin(self.exec_streamed(
+            container_id,
+            script,
+            working_dir,
+            kill_rx,
+            stdin_rx,
+            stdout,
+            lifetime,
+        ))
     }
 }
 
-/// The backend of the home environment: where a command with no `location`
-/// runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ShellBackend {
-    /// On this machine, inside the local sandbox.
-    Local,
-    /// Inside a container.
-    Container,
-}
-
-/// Which home backends are usable in the current deployment.
+/// The SSH servers a shell's commands may run on, as the embedder prepared
+/// them.
 ///
-/// SSH servers are never a home environment; they are the registry's server
-/// set, which changes while it lives.
-#[derive(Debug, Clone, Serialize)]
-pub struct ShellRuntimeAvailability {
-    /// Whether local execution is available. Always true in practice.
-    pub local: bool,
-    /// Whether a container runtime has been wired up.
-    pub container: bool,
-}
-
-impl Default for ShellRuntimeAvailability {
-    fn default() -> Self {
-        Self {
-            local: true,
-            container: false,
-        }
-    }
-}
-
-/// Tracks the home backend, the SSH servers commands may run on and how to
-/// reach them.
+/// The home environment is the shell's [`Sandbox`](crate::Sandbox): its
+/// backend says where commands with no `location` run.
 ///
 /// Cloning shares the SSH server set: a server added or removed through one
 /// holder is seen by every other, the terminals of subagents included.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ShellSessionRegistry {
-    availability: ShellRuntimeAvailability,
     ssh: SshEnvironments,
-    container_runtime: Option<ContainerShellRuntime>,
-    pub(crate) prepared_tools: Option<crate::tool_environment::PreparedToolEnvironments>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -616,51 +508,26 @@ impl std::fmt::Debug for ShellSessionRegistry {
 }
 
 impl ShellSessionRegistry {
-    /// Creates a registry advertising the given backends, with no SSH server.
-    #[must_use]
-    pub fn new(availability: ShellRuntimeAvailability) -> Self {
-        Self {
-            availability,
-            ssh: SshEnvironments::default(),
-            container_runtime: None,
-            prepared_tools: None,
-        }
-    }
-
-    /// Replaces runtime availability.
-    #[must_use]
-    pub const fn with_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
-        self.availability = availability;
-        self
-    }
-
-    /// Sets the container runtime.
-    #[must_use]
-    pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
-        self.container_runtime = Some(runtime);
-        self
-    }
-
-    #[must_use]
-    /// Returns runtime availability.
-    pub fn availability(&self) -> ShellRuntimeAvailability {
-        self.availability.clone()
-    }
-
     /// Adds `server` to the set commands may run on, for every holder of this
-    /// registry. Its name and target are trimmed. It is prepared on its first
-    /// command, which asks the terminal's permission handler first.
+    /// registry. Its name and target are trimmed.
+    ///
+    /// The server is not contacted: `prepare` runs when the first command
+    /// names it, see [`PrepareSsh`]. A [`PreparedSsh`](crate::PreparedSsh)
+    /// is a preparation already done.
     ///
     /// # Errors
     /// Rejects a blank name or target and a name another server has.
-    pub fn add_ssh_server(&self, server: SshServer) -> Result<(), SshServerError> {
-        self.ssh.add(server)
+    pub fn add_ssh_server(
+        &self,
+        server: SshServer,
+        prepare: impl PrepareSsh,
+    ) -> Result<(), SshServerError> {
+        self.ssh.add(server, prepare)
     }
 
     /// Removes the server named `name`, returning it; `None` when no server
     /// has that name. Commands already running there keep running; the next
-    /// command naming it fails, and a server added again under the name is
-    /// approved and prepared anew.
+    /// command naming it fails.
     #[must_use = "the removed server, or `None` when no server has the name"]
     pub fn remove_ssh_server(&self, name: &str) -> Option<SshServer> {
         self.ssh.remove(name)
@@ -681,29 +548,6 @@ impl ShellSessionRegistry {
     pub(crate) fn with_ssh_client(mut self, client: crate::ssh::SshClient) -> Self {
         self.ssh = self.ssh.with_client(client);
         self
-    }
-
-    pub(crate) const fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
-        self.container_runtime.as_ref()
-    }
-
-    /// Picks the backend to use for a command that did not name one.
-    ///
-    /// Prefers a container when one is configured, since it isolates better
-    /// than running on the host.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if neither a container nor local execution is available.
-    pub fn resolve_local_backend(&self) -> Result<ShellBackend, String> {
-        let availability = self.availability();
-        if availability.container {
-            return Ok(ShellBackend::Container);
-        }
-        if availability.local {
-            return Ok(ShellBackend::Local);
-        }
-        Err("no local backend available".to_string())
     }
 }
 
@@ -755,6 +599,7 @@ mod disk_probe_tests {
             _kill_rx: Receiver<()>,
             _stdin_rx: Receiver<Vec<u8>>,
             _stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
         ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
             std::future::ready(Err("a probe is never streamed".to_string()))
         }
@@ -805,61 +650,25 @@ mod disk_probe_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellRuntimeAvailability, ShellSessionRegistry, SshServer};
+    use super::{ShellSessionRegistry, SshServer};
+    use crate::{PreparedSsh, RemoteLaunch};
 
     #[test]
     fn every_clone_of_a_registry_shares_its_live_server_set() {
-        let registry = ShellSessionRegistry::new(ShellRuntimeAvailability::default());
+        let registry = ShellSessionRegistry::default();
         let subagent = registry.clone();
         let prod = SshServer {
             name: "prod".to_string(),
             target: "root@example.com".to_string(),
         };
-        registry.add_ssh_server(prod.clone()).unwrap();
+        registry
+            .add_ssh_server(
+                prod.clone(),
+                PreparedSsh::new(None, RemoteLaunch::new("/opt/tools/bin", "/bin/bash")),
+            )
+            .unwrap();
         assert_eq!(subagent.ssh_servers(), std::slice::from_ref(&prod));
         assert_eq!(subagent.remove_ssh_server("prod"), Some(prod));
         assert_eq!(registry.ssh_servers(), []);
-    }
-
-    #[test]
-    fn bridge_address_rejects_the_unspecified_and_multicast_addresses() {
-        use super::{BridgeAddress, BridgeAddressError};
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-        for address in [
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        ] {
-            assert!(
-                matches!(
-                    BridgeAddress::try_from(address),
-                    Err(BridgeAddressError::Unspecified(_))
-                ),
-                "{address} must be rejected as unspecified"
-            );
-        }
-        for address in [
-            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
-            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
-        ] {
-            assert!(
-                matches!(
-                    BridgeAddress::try_from(address),
-                    Err(BridgeAddressError::Multicast(_))
-                ),
-                "{address} must be rejected as multicast"
-            );
-        }
-        for address in [
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)),
-        ] {
-            assert_eq!(
-                BridgeAddress::try_from(address)
-                    .expect("a concrete host address should be accepted")
-                    .ip(),
-                address
-            );
-        }
     }
 }

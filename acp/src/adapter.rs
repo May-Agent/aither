@@ -1,174 +1,305 @@
 //! Adapter for converting aither agent events to ACP session updates.
 
-use aither_agent::AgentEvent;
+use std::collections::HashMap;
+
+use aither_agent::{
+    AgentEvent, AgentPath, OutputKind, RequestOutcome, RunOutcome, TimedEvent, ToolOrigin,
+    ToolVerdict,
+};
 use aither_core::llm::ToolResult;
+use aither_core::llm::tool::Progress;
 
 use crate::protocol::{
-    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
-    ToolCallUpdate, ToolKind,
+    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 
-/// Converts a stream of [`AgentEvent`]s into ACP [`SessionUpdate`]s.
+/// Converts a stream of [`TimedEvent`]s into ACP [`SessionUpdate`]s.
+///
+/// The mapping, event by event:
+///
+/// | Event | ACP update |
+/// | --- | --- |
+/// | `BlockDelta` | `agent_message_chunk`, or `agent_thought_chunk` for reasoning |
+/// | `ToolCallStarted` | `tool_call`, pending; a hosted call's detail is its title |
+/// | `ToolCallDelta` | `tool_call_update` carrying the arguments received so far |
+/// | `ToolCallDecided` | `tool_call_update`: in progress when the call runs, failed with the reason when denied |
+/// | `ToolProgress` | `tool_call_update`, in progress, with the report as content |
+/// | `ToolCallEnded` | `tool_call_update`, completed or failed, with the result as raw output |
+/// | `SubagentStarted` | `tool_call` standing for the child |
+/// | `SubagentEnded` | `tool_call_update` completing or failing it |
+///
+/// These events have no ACP update: `RunStarted`, `RunEnded`, `TurnStarted`,
+/// `TurnEnded`, `RequestStarted`, `BlockEnded` (ACP chunks have no end),
+/// `Paused` and `Resumed` (ACP's permission request is the client's own
+/// channel), `CompactionStarted`, `CompactionEnded`, `CompactionRecovery`,
+/// `ContextInjected` and `Checkpoint`. `RequestEnded` has none either, but a
+/// retrying one clears the retried request's tool arguments; ACP cannot
+/// withdraw chunks already sent, which is a protocol limitation.
+///
+/// Events are mapped by the agent that emitted them. A child's tool calls
+/// are reported under ids and titles that name its path, so they never
+/// collide with the parent's; its message and reasoning chunks are dropped,
+/// since ACP would show them as part of the parent's reply.
 ///
 /// `AgentEvent::ToolCallDelta` carries incremental argument fragments; the
 /// mapper accumulates them per call so each emitted `ToolCallUpdate` reports
 /// the arguments received so far.
 #[derive(Debug, Default)]
 pub struct SessionUpdateMapper {
-    /// Arguments accumulated per tool call, keyed by call id.
-    tool_arguments: std::collections::HashMap<String, String>,
+    /// Arguments accumulated per tool call, keyed by the agent and call id.
+    tool_arguments: HashMap<(AgentPath, String), String>,
 }
 
 impl SessionUpdateMapper {
-    /// Convert an `AgentEvent` to an ACP `SessionUpdate`.
+    /// Convert a `TimedEvent` to an ACP `SessionUpdate`.
     ///
-    /// Returns `None` for events that don't have a direct ACP mapping
-    /// (like `TurnComplete` and `Complete`, which are handled separately).
+    /// Returns `None` for events that have no ACP mapping; see the type's
+    /// documentation for which.
     #[must_use]
-    pub fn map(&mut self, event: &AgentEvent) -> Option<SessionUpdate> {
-        match event {
-            AgentEvent::Text(text) => Some(SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent {
-                    text: text.clone(),
-                    annotations: None,
-                    meta: None,
-                }),
-                message_id: None,
-                meta: None,
-            })),
+    pub fn map(&mut self, timed: &TimedEvent) -> Option<SessionUpdate> {
+        let agent = &timed.agent;
+        match &timed.event {
+            AgentEvent::BlockDelta { kind, text, .. } => {
+                if !agent.is_main() {
+                    return None;
+                }
+                let chunk = text_chunk(text.clone());
+                Some(match kind {
+                    OutputKind::Reasoning => SessionUpdate::AgentThoughtChunk(chunk),
+                    _ => SessionUpdate::AgentMessageChunk(chunk),
+                })
+            }
 
-            AgentEvent::Reasoning(text) => Some(SessionUpdate::AgentThoughtChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent {
-                    text: text.clone(),
-                    annotations: None,
-                    meta: None,
-                }),
-                message_id: None,
-                meta: None,
-            })),
-
-            AgentEvent::ToolCallStart {
-                id,
+            AgentEvent::ToolCallStarted {
+                call,
                 name,
                 arguments,
+                origin,
+                ..
             } => {
-                self.tool_arguments.insert(id.clone(), arguments.clone());
-                Some(SessionUpdate::ToolCall(ToolCall {
-                    tool_call_id: id.clone(),
-                    title: format_tool_title(name, arguments),
-                    kind: Some(infer_tool_kind(name)),
-                    status: Some(ToolCallStatus::Pending),
-                    content: vec![],
-                    locations: vec![],
-                    raw_input: serde_json::from_str(arguments).ok(),
-                    raw_output: None,
-                    meta: None,
-                }))
+                // A hosted call reports its detail as a string, not JSON
+                // arguments.
+                let (title_arguments, raw_input) = match origin {
+                    ToolOrigin::Hosted => {
+                        (arguments.as_str().unwrap_or_default().to_string(), None)
+                    }
+                    _ => (arguments.to_string(), Some(arguments.clone())),
+                };
+                self.tool_arguments.insert(
+                    (agent.clone(), call.as_str().to_string()),
+                    title_arguments.clone(),
+                );
+                Some(tool_call_pending(
+                    call_id(agent, call.as_str()),
+                    format_tool_title(agent, name, &title_arguments),
+                    infer_tool_kind(name),
+                    raw_input,
+                ))
             }
 
             AgentEvent::ToolCallDelta {
-                id,
+                call,
                 name,
                 arguments_fragment,
+                ..
             } => {
-                let arguments = self.tool_arguments.entry(id.clone()).or_default();
+                let arguments = self
+                    .tool_arguments
+                    .entry((agent.clone(), call.as_str().to_string()))
+                    .or_default();
                 arguments.push_str(arguments_fragment);
                 let arguments = arguments.as_str();
                 Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    tool_call_id: id.clone(),
                     status: Some(ToolCallStatus::Pending),
-                    content: None,
-                    title: Some(format_tool_title(name, arguments)),
+                    title: Some(format_tool_title(agent, name, arguments)),
                     kind: Some(infer_tool_kind(name)),
-                    locations: None,
                     raw_input: Some(serde_json::Value::String(arguments.to_string())),
-                    raw_output: None,
-                    meta: None,
+                    ..update(call_id(agent, call.as_str()))
                 }))
             }
 
-            AgentEvent::ToolCallEnd {
-                id,
-                name: _,
-                result,
-            } => {
-                self.tool_arguments.remove(id);
+            AgentEvent::ToolCallDecided { call, decision, .. } => {
+                let (status, content) = decision_update(decision)?;
                 Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    tool_call_id: id.clone(),
-                    status: Some(tool_result_status(result)),
-                    content: None,
-                    title: None,
-                    kind: None,
-                    locations: None,
-                    raw_input: None,
-                    raw_output: Some(tool_result_raw_output(result)),
-                    meta: None,
+                    status: Some(status),
+                    content,
+                    ..update(call_id(agent, call.as_str()))
                 }))
             }
 
-            AgentEvent::BuiltInToolCall { .. } | AgentEvent::BuiltInToolResult { .. } => {
-                map_builtin(event)
+            AgentEvent::ToolProgress { call, progress, .. } => {
+                Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    status: Some(ToolCallStatus::InProgress),
+                    content: Some(vec![text_content(progress_text(progress))]),
+                    ..update(call_id(agent, call.as_str()))
+                }))
+            }
+
+            AgentEvent::ToolCallEnded { call, result, .. } => {
+                self.tool_arguments
+                    .remove(&(agent.clone(), call.as_str().to_string()));
+                Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                    status: Some(tool_result_status(result)),
+                    content: Some(vec![text_content(result.render_for_model())]),
+                    raw_output: Some(tool_result_raw_output(result)),
+                    ..update(call_id(agent, call.as_str()))
+                }))
             }
 
             // The broken attempt's calls never run and the replacement
-            // streams its own, so their accumulated arguments are dropped.
-            // ACP has no update that withdraws streamed message chunks.
-            AgentEvent::ResponseRetry { .. } => {
-                self.tool_arguments.clear();
+            // streams its own, so the arguments this agent accumulated are
+            // dropped. ACP has no update that withdraws streamed message
+            // chunks.
+            AgentEvent::RequestEnded {
+                outcome: RequestOutcome::Retrying { .. },
+                ..
+            } => {
+                self.tool_arguments.retain(|(owner, _), _| owner != agent);
                 None
             }
 
-            AgentEvent::RunStart { .. }
-            | AgentEvent::Checkpoint { .. }
-            | AgentEvent::BackgroundTaskStarted { .. }
-            | AgentEvent::BackgroundTaskCompleted { .. }
-            | AgentEvent::RunPaused { .. }
-            | AgentEvent::RunResumed { .. }
-            | AgentEvent::CompactionStarted
-            | AgentEvent::CompactionFinished { .. }
-            | AgentEvent::CompactionRecovery { .. }
-            | AgentEvent::SkillActivated { .. }
-            | AgentEvent::TurnComplete { .. }
-            | AgentEvent::Complete { .. }
-            | AgentEvent::Error(_)
-            | AgentEvent::PromptPrefix(_)
-            | AgentEvent::Usage(_)
-            | AgentEvent::ReplyTranslated { .. } => None,
+            AgentEvent::SubagentStarted {
+                child,
+                name,
+                prompt,
+                ..
+            } => Some(subagent_started(child, name, prompt)),
+
+            AgentEvent::SubagentEnded { child, outcome, .. } => {
+                Some(subagent_ended(child, outcome))
+            }
+
+            _ => None,
         }
     }
 }
 
-/// Map a provider-hosted tool call or result onto the tool-call updates —
-/// the provider executes these, but they render like any other tool call.
-fn map_builtin(event: &AgentEvent) -> Option<SessionUpdate> {
-    match event {
-        AgentEvent::BuiltInToolCall { id, tool, detail } => {
-            Some(SessionUpdate::ToolCall(ToolCall {
-                tool_call_id: id.clone(),
-                title: format_tool_title(tool, detail),
-                kind: Some(infer_tool_kind(tool)),
-                status: Some(ToolCallStatus::Pending),
-                content: vec![],
-                locations: vec![],
-                raw_input: None,
-                raw_output: None,
-                meta: None,
-            }))
-        }
-        AgentEvent::BuiltInToolResult { id, result, .. } => {
-            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                tool_call_id: id.clone(),
-                status: Some(ToolCallStatus::Completed),
-                content: None,
-                title: None,
-                kind: None,
-                locations: None,
-                raw_input: None,
-                raw_output: Some(serde_json::Value::String(result.clone())),
-                meta: None,
-            }))
-        }
+/// A tool call that has been made and not yet decided.
+const fn tool_call_pending(
+    tool_call_id: String,
+    title: String,
+    kind: ToolKind,
+    raw_input: Option<serde_json::Value>,
+) -> SessionUpdate {
+    SessionUpdate::ToolCall(ToolCall {
+        tool_call_id,
+        title,
+        kind: Some(kind),
+        status: Some(ToolCallStatus::Pending),
+        content: vec![],
+        locations: vec![],
+        raw_input,
+        raw_output: None,
+        meta: None,
+    })
+}
+
+/// A subagent's start, as the tool call that stands for it.
+fn subagent_started(child: &AgentPath, name: &str, prompt: &str) -> SessionUpdate {
+    SessionUpdate::ToolCall(ToolCall {
+        tool_call_id: subagent_call_id(child),
+        title: format!("Subagent {name}"),
+        kind: Some(ToolKind::Other),
+        status: Some(ToolCallStatus::InProgress),
+        content: vec![],
+        locations: vec![],
+        raw_input: Some(serde_json::Value::String(prompt.to_string())),
+        raw_output: None,
+        meta: None,
+    })
+}
+
+/// A subagent's end, as the update that completes or fails its tool call.
+fn subagent_ended(child: &AgentPath, outcome: &RunOutcome) -> SessionUpdate {
+    let status = match outcome {
+        RunOutcome::Completed { .. } => ToolCallStatus::Completed,
+        _ => ToolCallStatus::Failed,
+    };
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+        status: Some(status),
+        ..update(subagent_call_id(child))
+    })
+}
+
+/// What a decision about a call changes in its tool call; `None` while it
+/// stays pending.
+fn decision_update(
+    verdict: &ToolVerdict,
+) -> Option<(ToolCallStatus, Option<Vec<ToolCallContent>>)> {
+    match verdict {
+        ToolVerdict::Allowed | ToolVerdict::Rewritten => Some((ToolCallStatus::InProgress, None)),
+        ToolVerdict::Denied { reason } => Some((
+            ToolCallStatus::Failed,
+            Some(vec![text_content(reason.clone())]),
+        )),
+        // The call stays pending until the answer arrives as another
+        // decision.
         _ => None,
+    }
+}
+
+/// An update to `tool_call_id` that changes nothing yet.
+const fn update(tool_call_id: String) -> ToolCallUpdate {
+    ToolCallUpdate {
+        tool_call_id,
+        status: None,
+        content: None,
+        title: None,
+        kind: None,
+        locations: None,
+        raw_input: None,
+        raw_output: None,
+        meta: None,
+    }
+}
+
+/// The id a call is reported under: the provider's own for the main agent,
+/// qualified by the agent's path for a child, whose provider may reuse it.
+fn call_id(agent: &AgentPath, call: &str) -> String {
+    if agent.is_main() {
+        call.to_string()
+    } else {
+        format!("{agent}:{call}")
+    }
+}
+
+fn subagent_call_id(child: &AgentPath) -> String {
+    format!("subagent:{child}")
+}
+
+/// A text block as tool-call content.
+const fn text_content(text: String) -> ToolCallContent {
+    ToolCallContent::Content {
+        content: ContentBlock::Text(TextContent {
+            text,
+            annotations: None,
+            meta: None,
+        }),
+    }
+}
+
+/// What a progress report says, for a reader.
+fn progress_text(progress: &Progress) -> String {
+    if let Some(message) = progress.message() {
+        return message.to_string();
+    }
+    progress.total().map_or_else(
+        || progress.progress().to_string(),
+        |total| format!("{} of {total}", progress.progress()),
+    )
+}
+
+/// Wraps plain text in the content-chunk shape ACP expects.
+const fn text_chunk(text: String) -> ContentChunk {
+    ContentChunk {
+        content: ContentBlock::Text(TextContent {
+            text,
+            annotations: None,
+            meta: None,
+        }),
+        message_id: None,
+        meta: None,
     }
 }
 
@@ -203,79 +334,23 @@ fn truncate_title(text: &str) -> String {
 
 /// Format a human-readable title for a tool call.
 ///
-/// Covers `terminal` and its control tools (`terminal_kill`,
-/// `terminal_input`, `terminal_read`), the host-mediated `ask_user` and `request_workspace`
-/// tools, and `subagent`. Every other capability is a CLI command executed
-/// through `terminal` and gets the generic title.
-fn format_tool_title(name: &str, arguments: &str) -> String {
-    match name {
-        "terminal" => {
-            if let Ok(args) = serde_json::from_str::<aither_agent::sandbox::TerminalArgs>(arguments)
-                && !args.description.is_empty()
-            {
-                // `description` is the UI-facing explanation the model writes
-                // for the command; `script` is the shell payload.
-                return truncate_title(&args.description);
-            }
-            "Running command".to_string()
-        }
-        "terminal_kill" => {
-            if let Ok(args) =
-                serde_json::from_str::<aither_agent::sandbox::builtin::KillTerminalArgs>(arguments)
-            {
-                return format!("Stopping task {}", args.task_id);
-            }
-            "Stopping task".to_string()
-        }
-        "terminal_input" => {
-            if let Ok(args) =
-                serde_json::from_str::<aither_agent::sandbox::builtin::InputTerminalArgs>(arguments)
-            {
-                return format!("Sending input to task {}", args.task_id);
-            }
-            "Sending input to task".to_string()
-        }
-        "terminal_read" => {
-            if let Ok(args) = serde_json::from_str::<
-                aither_agent::sandbox::builtin::ReadTerminalDeltaArgs,
-            >(arguments)
-            {
-                return format!("Reading output of task {}", args.task_id);
-            }
-            "Reading task output".to_string()
-        }
-        "ask_user" => {
-            if let Ok(args) = serde_json::from_str::<aither_agent::ask_user::AskUserArgs>(arguments)
-                && let Some(question) = args
-                    .into_questions()
-                    .into_iter()
-                    .map(|question| question.question)
-                    .find(|question| !question.is_empty())
-            {
-                return format!("Asking: {}", truncate_title(&question));
-            }
-            "Asking user".to_string()
-        }
-        "request_workspace" => {
-            if let Ok(args) = serde_json::from_str::<
-                aither_agent::workspace_request::RequestWorkspaceArgs,
-            >(arguments)
-            {
-                return format!("Requesting access to {}", truncate_title(&args.path));
-            }
-            "Requesting workspace access".to_string()
-        }
-        "subagent" => {
-            use aither_agent::specialized::SubagentArgs;
-            if let Ok(args) = serde_json::from_str::<SubagentArgs>(arguments) {
-                return args.subagent().map_or_else(
-                    || "Continuing subagent".to_string(),
-                    |subagent| format!("Running {} subagent", truncate_title(subagent)),
-                );
-            }
-            "Running subagent".to_string()
-        }
+/// A call whose arguments carry a non-empty `description` is titled by it:
+/// that is the UI-facing explanation a model writes for what it runs.
+/// Every other call gets the generic title. A child's calls are prefixed
+/// with the child's path.
+fn format_tool_title(agent: &AgentPath, name: &str, arguments: &str) -> String {
+    let title = match serde_json::from_str(arguments) {
+        Ok(serde_json::Value::Object(arguments)) => arguments
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .filter(|description| !description.is_empty())
+            .map_or_else(|| format!("Running {name}"), truncate_title),
         _ => format!("Running {name}"),
+    };
+    if agent.is_main() {
+        title
+    } else {
+        format!("[{agent}] {title}")
     }
 }
 
@@ -289,232 +364,5 @@ fn infer_tool_kind(name: &str) -> ToolKind {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_text_event_conversion() {
-        let event = AgentEvent::Text("Hello".to_string());
-        let update = SessionUpdateMapper::default().map(&event).unwrap();
-
-        if let SessionUpdate::AgentMessageChunk(chunk) = update {
-            if let ContentBlock::Text(text) = chunk.content {
-                assert_eq!(text.text, "Hello");
-            } else {
-                panic!("Expected text content");
-            }
-        } else {
-            panic!("Expected AgentMessageChunk");
-        }
-    }
-
-    #[test]
-    fn test_tool_call_conversion() {
-        let event = AgentEvent::ToolCallStart {
-            id: "123".to_string(),
-            name: "terminal".to_string(),
-            arguments: r#"{"description":"List files","script":"ls -la","timeout":0}"#.to_string(),
-        };
-        let update = SessionUpdateMapper::default().map(&event).unwrap();
-
-        if let SessionUpdate::ToolCall(call) = update {
-            assert_eq!(call.tool_call_id, "123");
-            assert_eq!(call.title, "List files");
-            assert_eq!(call.kind, Some(ToolKind::Execute));
-            assert_eq!(call.status, Some(ToolCallStatus::Pending));
-        } else {
-            panic!("Expected ToolCall");
-        }
-    }
-
-    /// `ToolCallDelta` fragments are incremental; the mapper must accumulate
-    /// them so every `ToolCallUpdate` still carries the arguments so far.
-    #[test]
-    fn test_tool_call_deltas_accumulate() {
-        let mut mapper = SessionUpdateMapper::default();
-        let first = AgentEvent::ToolCallDelta {
-            id: "call-1".to_string(),
-            name: "terminal".to_string(),
-            arguments_fragment: r#"{"description""#.to_string(),
-        };
-        let second = AgentEvent::ToolCallDelta {
-            id: "call-1".to_string(),
-            name: "terminal".to_string(),
-            arguments_fragment: r#":"List files","script":"ls -la","timeout":0}"#.to_string(),
-        };
-
-        let _ = mapper.map(&first);
-        let update = mapper.map(&second).unwrap();
-
-        if let SessionUpdate::ToolCallUpdate(update) = update {
-            assert_eq!(
-                update.raw_input,
-                Some(serde_json::Value::String(
-                    r#"{"description":"List files","script":"ls -la","timeout":0}"#.to_string()
-                ))
-            );
-            assert_eq!(update.title.as_deref(), Some("List files"));
-        } else {
-            panic!("Expected ToolCallUpdate");
-        }
-    }
-
-    #[test]
-    fn a_response_retry_drops_the_broken_attempts_arguments() {
-        let mut mapper = SessionUpdateMapper::default();
-        let delta = |fragment: &str| AgentEvent::ToolCallDelta {
-            id: "call-1".to_string(),
-            name: "terminal".to_string(),
-            arguments_fragment: fragment.to_string(),
-        };
-        let _ = mapper.map(&delta(r#"{"description":"bro"#));
-        let retry = AgentEvent::ResponseRetry {
-            error: aither_agent::AgentError::llm_local("stream broke"),
-            retry: 1,
-            max_retries: 3,
-            delay: std::time::Duration::ZERO,
-        };
-        assert!(mapper.map(&retry).is_none());
-
-        let update = mapper.map(&delta(r#"{"description":"whole"}"#)).unwrap();
-        let SessionUpdate::ToolCallUpdate(update) = update else {
-            panic!("Expected ToolCallUpdate");
-        };
-        assert_eq!(
-            update.raw_input,
-            Some(serde_json::Value::String(
-                r#"{"description":"whole"}"#.to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn test_terminal_control_tool_titles() {
-        let cases = [
-            (
-                "terminal_kill",
-                r#"{"task_id":"task-7"}"#,
-                "Stopping task task-7",
-                ToolKind::Execute,
-            ),
-            (
-                "terminal_input",
-                r#"{"task_id":"task-7","input":"yes"}"#,
-                "Sending input to task task-7",
-                ToolKind::Execute,
-            ),
-            (
-                "terminal_read",
-                r#"{"task_id":"task-7"}"#,
-                "Reading output of task task-7",
-                ToolKind::Read,
-            ),
-        ];
-        for (name, arguments, title, kind) in cases {
-            assert_eq!(format_tool_title(name, arguments), title, "{name}");
-            assert_eq!(infer_tool_kind(name), kind, "{name}");
-        }
-    }
-
-    #[test]
-    fn test_host_mediated_tool_titles() {
-        let cases = [
-            (
-                "ask_user",
-                r#"{"question":"Which database?","option":["PostgreSQL","SQLite"]}"#,
-                "Asking: Which database?",
-                ToolKind::Other,
-            ),
-            (
-                "ask_user",
-                r#"{"questions":[{"section":"db","question":"Which database?","option":[]}]}"#,
-                "Asking: Which database?",
-                ToolKind::Other,
-            ),
-            (
-                "request_workspace",
-                r#"{"path":"/home/user/project"}"#,
-                "Requesting access to /home/user/project",
-                ToolKind::Other,
-            ),
-            (
-                "subagent",
-                r#"{"name":"explore","prompt_file":"tmp/prompt.md"}"#,
-                "Running explore subagent",
-                ToolKind::Other,
-            ),
-            (
-                "subagent",
-                r#"{"name":"resume","id":"river","prompt_file":"tmp/follow-up.md"}"#,
-                "Continuing subagent",
-                ToolKind::Other,
-            ),
-        ];
-        for (name, arguments, title, kind) in cases {
-            assert_eq!(format_tool_title(name, arguments), title, "{name}");
-            assert_eq!(infer_tool_kind(name), kind, "{name}");
-        }
-    }
-
-    /// Arguments that cannot be deserialized fall back to a generic title.
-    #[test]
-    fn test_tool_title_fallbacks() {
-        assert_eq!(format_tool_title("terminal", "{}"), "Running command");
-        assert_eq!(
-            format_tool_title(
-                "terminal",
-                r#"{"description":"","script":"true","timeout":0}"#
-            ),
-            "Running command"
-        );
-        assert_eq!(format_tool_title("terminal", "not json"), "Running command");
-        assert_eq!(format_tool_title("terminal_kill", "{}"), "Stopping task");
-        assert_eq!(
-            format_tool_title("terminal_input", "{}"),
-            "Sending input to task"
-        );
-        assert_eq!(
-            format_tool_title("terminal_read", "{}"),
-            "Reading task output"
-        );
-        assert_eq!(format_tool_title("ask_user", "{}"), "Asking user");
-        assert_eq!(
-            format_tool_title("request_workspace", "{}"),
-            "Requesting workspace access"
-        );
-        assert_eq!(format_tool_title("subagent", "{}"), "Running subagent");
-        assert_eq!(
-            format_tool_title("unknown_tool", "{}"),
-            "Running unknown_tool"
-        );
-        assert_eq!(infer_tool_kind("unknown_tool"), ToolKind::Other);
-    }
-
-    /// Titles are cut on a char boundary: a multi-byte description longer than
-    /// the limit must not panic on byte slicing.
-    #[test]
-    fn test_tool_title_truncates_on_char_boundary() {
-        let description = "あ".repeat(TOOL_TITLE_MAX_CHARS + 10);
-        let arguments = serde_json::json!({
-            "description": description,
-            "script": "true",
-            "timeout": 0,
-        })
-        .to_string();
-        let title = format_tool_title("terminal", &arguments);
-        assert_eq!(title, format!("{}...", "あ".repeat(TOOL_TITLE_MAX_CHARS)));
-
-        // A description that lands mid-character at the old byte cut (47)
-        // must not panic.
-        let boundary_case = serde_json::json!({
-            "description": format!("{:46}é{}", "x", "y".repeat(20)),
-            "script": "true",
-            "timeout": 0,
-        })
-        .to_string();
-        let title = format_tool_title("terminal", &boundary_case);
-        assert!(title.contains('é'));
-        assert_eq!(title.chars().count(), TOOL_TITLE_MAX_CHARS + 3);
-        assert!(title.ends_with("..."));
-    }
-}
+#[path = "adapter_tests.rs"]
+mod tests;

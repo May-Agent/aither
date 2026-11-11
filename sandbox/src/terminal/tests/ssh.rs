@@ -1,82 +1,44 @@
-//! Commands on SSH servers: the `location` argument, first-use approval
-//! through the permission handler, lazy preparation, both modes, the live
-//! server set and the OS probe, against a private `sshd` on loopback.
+//! Commands on SSH servers: the `location` argument, the approval a script
+//! on a server is asked for, lazy preparation, both modes, the live server
+//! set and the OS probe, against a private `sshd` on loopback.
 
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::process::Stdio;
 
-use crate::permission::LocationApproval;
 use crate::ssh::SshClient;
-use crate::{CommandRole, SshPlatform, SshProbeError, SshServer};
+use crate::{PreparedSsh, SshPlatform, SshProbeError, SshServer};
 
 use super::*;
 
-/// Records the location requests it answers and approves `unsafe`
-/// commands; it says it waits on someone for every location.
-#[derive(Default)]
-struct LocationHandler {
-    deny: AtomicBool,
-    /// Approve for one command only; otherwise for the session.
-    once: AtomicBool,
-    asked: Mutex<Vec<(String, CommandRole)>>,
-    unsafe_checks: AtomicUsize,
-    /// The server each `unsafe` command was located on; `None` is the home.
-    unsafe_locations: Mutex<Vec<Option<String>>>,
-}
+/// Records the directory and location every script it checks starts in.
+#[derive(Clone, Default)]
+struct RecordStarts(Arc<Mutex<Vec<Start>>>);
 
-impl LocationHandler {
-    fn asked(&self) -> Vec<(String, CommandRole)> {
-        self.asked.lock().unwrap().clone()
-    }
+/// The location and starting directory of one checked script.
+type Start = (Option<String>, ScriptDir);
 
-    fn unsafe_locations(&self) -> Vec<Option<String>> {
-        self.unsafe_locations.lock().unwrap().clone()
+impl RecordStarts {
+    fn seen(&self) -> Vec<Start> {
+        self.0.lock().unwrap().clone()
     }
 }
 
-impl PermissionHandler for LocationHandler {
+impl crate::ScriptPolicy for RecordStarts {
+    type State = ();
+
     fn check(
         &self,
-        mode: TerminalMode,
-        _script: &str,
-        _language: ScriptLanguage,
-        location: CommandLocation<'_>,
-    ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
-        if mode == TerminalMode::Unsafe {
-            self.unsafe_checks.fetch_add(1, AtomicOrdering::SeqCst);
-            self.unsafe_locations
-                .lock()
-                .unwrap()
-                .push(location.server().map(str::to_string));
-        }
-        std::future::ready(Ok(true))
-    }
-
-    fn check_location(
-        &self,
-        server: &SshServer,
-        role: CommandRole,
-    ) -> impl std::future::Future<Output = Result<LocationApproval, PermissionError>> + Send {
-        self.asked.lock().unwrap().push((server.name.clone(), role));
-        std::future::ready(Ok(if self.deny.load(AtomicOrdering::SeqCst) {
-            LocationApproval::Refused
-        } else if self.once.load(AtomicOrdering::SeqCst) {
-            LocationApproval::Once
-        } else {
-            LocationApproval::Session
-        }))
-    }
-
-    fn will_wait_for_location(
-        &self,
-        _server: &SshServer,
-        _role: CommandRole,
-    ) -> impl std::future::Future<Output = bool> + Send {
-        std::future::ready(true)
+        script: &crate::ScriptCheck<'_>,
+        (): &(),
+    ) -> impl Future<Output = ScriptDecision> + Send {
+        self.0
+            .lock()
+            .unwrap()
+            .push((script.location.map(str::to_string), script.start.clone()));
+        std::future::ready(ScriptDecision::Pass)
     }
 }
 
-type Terminal = TerminalTool<LocationHandler, executor_core::tokio::TokioGlobal, Configured>;
+type Terminal = Shell<executor_core::tokio::TokioGlobal>;
 
 #[derive(Template)]
 #[template(path = "test_sshd_config.txt", escape = "none")]
@@ -86,6 +48,7 @@ struct SshdConfig<'a> {
     authorized_keys: &'a str,
     pid_file: &'a str,
     home: &'a str,
+    login_shell: Option<&'a str>,
 }
 
 #[derive(Template)]
@@ -164,6 +127,16 @@ impl Sshd {
     }
 
     async fn start_with_heel(has_heel: bool) -> Self {
+        Self::start_with(has_heel, None).await
+    }
+
+    /// A server whose every command line is parsed by `login_shell`, a
+    /// program path, instead of the shell of this user's account.
+    async fn start_with_login_shell(login_shell: &str) -> Self {
+        Self::start_with(false, Some(login_shell)).await
+    }
+
+    async fn start_with(has_heel: bool, login_shell: Option<&str>) -> Self {
         let sshd = Path::new("/usr/sbin/sshd");
         assert!(
             sshd.is_file(),
@@ -177,7 +150,7 @@ impl Sshd {
         let home = root.join("home");
         std::fs::create_dir_all(home.join(".local/bin")).unwrap();
         if has_heel {
-            let heel = crate::test_heel::pinned().await.unwrap();
+            let heel = crate::test_heel::binary().await.unwrap();
             std::os::unix::fs::symlink(heel.as_path(), home.join(".local/bin/heel")).unwrap();
         }
 
@@ -188,6 +161,7 @@ impl Sshd {
             authorized_keys: text(&root.join("authorized_keys")),
             pid_file: text(&root.join("sshd.pid")),
             home: text(&home),
+            login_shell,
         }
         .render()
         .unwrap();
@@ -226,6 +200,17 @@ impl Sshd {
             target: ALIAS.to_string(),
         }
     }
+
+    /// How many connections the server has authenticated so far, read from
+    /// its own log: `sshd` records each accepted connection at its default
+    /// verbosity.
+    fn accepted_connections(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("sshd.log"))
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("Accepted publickey"))
+            .count()
+    }
 }
 
 impl Drop for Sshd {
@@ -235,50 +220,55 @@ impl Drop for Sshd {
     }
 }
 
-async fn terminal(dir: &Path, registry: ShellSessionRegistry, role: CommandRole) -> Terminal {
-    let tool = TerminalTool::new_exact(
-        dir,
-        LocationHandler::default(),
-        executor_core::tokio::TokioGlobal,
-    )
-    .await
-    .expect("terminal tool should initialize")
-    .adopt_prepared_tools(registry)
-    .await
-    .expect("prepared tools should be adopted");
-    let commands = ToolRegistryBuilder::new().build(tool.output_store().clone());
-    let commands = match role {
-        CommandRole::Main => commands,
-        CommandRole::Subagent => commands.for_subagent(None, None),
-    };
-    tool.with_registry(Arc::new(commands))
+/// What the embedder prepared on the fixture server: the `heel` its home
+/// holds, when it has one, and the programs the server's scripts run with.
+fn prepared(sshd: &Sshd, has_heel: bool) -> PreparedSsh {
+    let heel = has_heel.then(|| text(&sshd.home().join(".local/bin/heel")).to_string());
+    PreparedSsh::new(heel, remote_launch())
 }
 
-fn args(script: &str, mode: TerminalExecutionMode, location: &str) -> TerminalArgs {
-    TerminalArgs {
+/// The programs a script on the fixture server runs with.
+fn remote_launch() -> crate::RemoteLaunch {
+    crate::RemoteLaunch::new("/usr/bin", "/bin/bash")
+}
+
+/// A registry reaching its servers through `client`.
+fn home_registry(client: SshClient) -> ShellSessionRegistry {
+    ShellSessionRegistry::default().with_ssh_client(client)
+}
+
+/// A terminal in `dir` over `registry` that asks `approver` for what needs
+/// approval.
+async fn terminal(dir: &Path, registry: ShellSessionRegistry, approver: &Approvals) -> Terminal {
+    terminal_with(dir, registry, approver, RecordStarts::default()).await
+}
+
+async fn terminal_with(
+    dir: &Path,
+    registry: ShellSessionRegistry,
+    approver: &Approvals,
+    policy: RecordStarts,
+) -> Terminal {
+    fresh_terminal(dir)
+        .await
+        .with_approver(approver.clone())
+        .with_shell_sessions(registry)
+        .with_test_policies(vec![crate::AnyScriptPolicy::new(policy)])
+}
+
+fn args(script: &str, mode: SandboxMode, location: &str) -> ShellArgs {
+    ShellArgs {
         description: "run on the server".to_string(),
         script: script.to_string(),
-        language: ScriptLanguage::Shell,
-        mode,
+        interpreter: Interpreter::Shell,
+        sandbox: mode,
         location: Some(location.to_string()),
-        expect: OutputFormat::Text,
         resolution: MediaResolution::Auto,
-        max_lines: 50,
+        max_lines: Some(50),
         raw: true,
         timeout: 60,
         background: false,
     }
-}
-
-/// A local home prepared by hand, reaching servers through `client`.
-async fn home_registry(
-    client: SshClient,
-) -> (
-    crate::tool_runtime::tests::UnlockingTempDir,
-    ShellSessionRegistry,
-) {
-    let (cache, registry) = prepared_test_registry().await;
-    (cache, registry.with_ssh_client(client))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -302,76 +292,57 @@ async fn the_probe_reports_the_servers_platform_without_preparing_it() {
         refusing_client(unreachable.path())
             .probe_os(&Sshd::server())
             .await,
-        Err(SshProbeError::Failed { .. })
+        Err(SshProbeError::Upload(_))
     ));
 }
 
-/// The first command on a server added to a live registry asks once and
-/// prepares the server; later commands, `unsafe` ones included, run there
-/// without asking again; a removed server is no location.
+/// A command on a server added to a live registry is asked about, as every
+/// command on a server is; the policy sees it start on the server, and both
+/// modes run there.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_server_added_live_is_approved_once_prepared_lazily_and_runs_both_modes() {
+async fn a_server_added_live_is_asked_and_runs_both_modes() {
     let sshd = Sshd::start().await;
-    let artifacts = tempfile::tempdir().unwrap();
-    let distribution = script_distribution(artifacts.path()).await;
-    let cache = crate::tool_runtime::tests::unlocking_tempdir();
-    let registry = local_registry()
-        .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
-        .await
-        .expect("the home prepares without touching any server");
+    let registry = home_registry(sshd.client.clone());
     let dir = tempfile::tempdir().unwrap();
-    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
+    let approvals = Approvals::default();
+    let starts = RecordStarts::default();
+    let terminal = terminal_with(dir.path(), registry, &approvals, starts.clone()).await;
     terminal
         .shell_sessions()
-        .add_ssh_server(Sshd::server())
+        .add_ssh_server(Sshd::server(), prepared(&sshd, true))
         .unwrap();
-    assert!(
-        !sshd.home().join(".cache/aither").exists(),
-        "added, not prepared"
-    );
 
-    let script = "echo \"remote=$AITHER_FIXTURE_BASH\"";
+    let script = "echo remote=ok";
     let sandboxed = terminal
         .call(
-            args(script, TerminalExecutionMode::Default, "fixture"),
+            args(script, SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
         .expect("a default-mode command runs on the server");
     let sandboxed = render_terminal_result(&sandboxed);
     assert!(!sandboxed.contains("Exit code:"), "{sandboxed}");
-    // The managed bash ran, from the tools its first command prepared there.
-    assert!(sandboxed.contains("remote=1.0.0"), "{sandboxed}");
-    assert!(
-        sshd.home().join(".cache/aither/tools").is_dir(),
-        "prepared on the server"
-    );
+    assert!(sandboxed.contains("remote=ok"), "{sandboxed}");
+    // Only the policy's pass was given, so the shell asked its approver.
+    let asked = approvals.asked();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].kind().as_str(), "remote");
+    assert_eq!(asked[0].subject(), script);
     assert_eq!(
-        terminal.permission_handler.asked(),
-        [("fixture".to_string(), CommandRole::Main)]
-    );
-    let events = terminal.permission_receiver().take_pending();
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| (
-                event.stage,
-                event.location.as_deref(),
-                event.script.as_str()
-            ))
-            .collect::<Vec<_>>(),
-        [
-            (PermissionEventStage::Waiting, Some("fixture"), script),
-            (PermissionEventStage::Resolved, Some("fixture"), script),
-        ]
+        starts.seen(),
+        [(
+            Some("fixture".to_string()),
+            ScriptDir::Remote {
+                server: "fixture".to_string()
+            }
+        )]
     );
 
     let direct = terminal
         .call(
             args(
-                "echo \"direct=$AITHER_FIXTURE_BASH home=$HOME\"",
-                TerminalExecutionMode::Unsafe,
+                "echo \"direct=ok home=$HOME\"",
+                SandboxMode::Unsandboxed,
                 " fixture ",
             ),
             ToolContext::new(),
@@ -379,28 +350,18 @@ async fn a_server_added_live_is_approved_once_prepared_lazily_and_runs_both_mode
         .await
         .expect("an unsafe command runs on the server");
     let direct = render_terminal_result(&direct);
-    // Outside `heel`, the session's environment reaches the command.
+    // Outside `heel`, the server's login environment reaches the command.
     assert!(
-        direct.contains(&format!("direct=1.0.0 home={}", sshd.home().display())),
+        direct.contains(&format!("direct=ok home={}", sshd.home().display())),
         "{direct}"
     );
-    assert_eq!(terminal.permission_handler.asked().len(), 1, "asked once");
-    assert_eq!(
-        terminal
-            .permission_handler
-            .unsafe_checks
-            .load(AtomicOrdering::SeqCst),
-        1,
-        "unsafe still passes its own admission"
-    );
+    let asked = approvals.asked();
+    assert_eq!(asked.len(), 2, "no approval is remembered between scripts");
+    assert_eq!(asked[1].kind().as_str(), "unsandboxed");
     // A server's command is a remote job: its local `ssh` process stands for
     // work whose memory is never judged here.
     terminal
-        .run_background(args(
-            "echo remote-job",
-            TerminalExecutionMode::Default,
-            "fixture",
-        ))
+        .run_background(args("echo remote-job", SandboxMode::Sandboxed, "fixture"))
         .await
         .expect("a background command starts on the server");
     let places = terminal
@@ -417,202 +378,154 @@ async fn a_server_added_live_is_approved_once_prepared_lazily_and_runs_both_mode
     terminal.job_registry().kill_running().await;
 }
 
-/// A server without `heel` gets the distribution's pinned one for its own
-/// target on its first command, which then runs in default mode.
+/// A denied script on a server is asked again by the next one, never
+/// connects to the server, and the reason the approver gave reaches the
+/// caller.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_server_without_heel_gets_the_pinned_one_installed() {
-    let sshd = Sshd::start_with_heel(false).await;
-    let artifacts = tempfile::tempdir().unwrap();
-    let distribution = script_distribution(artifacts.path()).await;
-    let cache = crate::tool_runtime::tests::unlocking_tempdir();
-    let registry = local_registry()
-        .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
-        .await
-        .expect("the home prepares without touching any server");
-    let dir = tempfile::tempdir().unwrap();
-    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
-    terminal
-        .shell_sessions()
-        .add_ssh_server(Sshd::server())
-        .unwrap();
-    let installed = sshd.home().join(".local/bin/heel");
-    assert!(!installed.exists());
-
-    let output = terminal
-        .call(
-            args("echo installed", TerminalExecutionMode::Default, "fixture"),
-            ToolContext::new(),
-        )
-        .await
-        .expect("a default-mode command runs under the installed heel");
-    assert!(render_terminal_result(&output).contains("installed"));
-    assert!(installed.is_file(), "heel was installed on the server");
-}
-
-/// A refused first command is asked again by the next one and never
-/// connects to the server.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_denied_server_is_asked_again_and_never_prepared() {
+async fn a_denied_script_on_a_server_carries_the_reason() {
     let unreachable = tempfile::tempdir().unwrap();
-    let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
-    registry.add_ssh_server(Sshd::server()).unwrap();
-    let environment = registry.ssh_environments().get("fixture").unwrap();
+    let registry = home_registry(refusing_client(unreachable.path()));
+    registry
+        .add_ssh_server(
+            Sshd::server(),
+            PreparedSsh::new(Some("/opt/heel".into()), remote_launch()),
+        )
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
-    terminal
-        .permission_handler
-        .deny
-        .store(true, AtomicOrdering::SeqCst);
+    let approvals = Approvals::denying("fixture is off limits");
+    let terminal = terminal(dir.path(), registry, &approvals).await;
     for _ in 0..2 {
         let denied = terminal
             .call(
-                args("true", TerminalExecutionMode::Default, "fixture"),
+                args("true", SandboxMode::Sandboxed, "fixture"),
                 ToolContext::new(),
             )
             .await
-            .expect_err("a denied server runs nothing");
+            .expect_err("a denied script runs nothing");
         assert!(
-            denied
-                .to_string()
-                .contains("running commands on `fixture` was not approved"),
+            denied.to_string().contains("fixture is off limits"),
             "{denied}"
         );
     }
-    assert_eq!(terminal.permission_handler.asked().len(), 2);
-    assert!(!environment.is_approved());
-    assert!(!environment.is_prepared());
+    assert_eq!(approvals.asked().len(), 2);
 }
 
-/// A once-only approval is not kept, so every command asks; a session
-/// approval is asked for once.
+/// A script on a server that only passes the policies needs an approver,
+/// and one a policy allows asks nobody.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_once_only_approval_asks_again_and_a_session_approval_does_not() {
-    for (once, expected_asks) in [(true, 2), (false, 1)] {
-        let unreachable = tempfile::tempdir().unwrap();
-        let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
-        let tools = registry.local_tools().unwrap().clone();
-        let registry = registry.with_test_ssh(Sshd::server(), Some("/opt/heel".into()), tools);
-        let environment = registry.ssh_environments().get("fixture").unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
-        terminal
-            .permission_handler
-            .once
-            .store(once, AtomicOrdering::SeqCst);
-        for _ in 0..2 {
-            // The connection is refused; only the questions put matter here.
-            let result = terminal
-                .call(
-                    args("true", TerminalExecutionMode::Default, "fixture"),
-                    ToolContext::new(),
-                )
-                .await;
-            assert!(
-                result
-                    .as_ref()
-                    .err()
-                    .is_none_or(|error| !error.to_string().contains("was not approved")),
-                "the command was approved: {result:?}"
-            );
-        }
-        assert_eq!(terminal.permission_handler.asked().len(), expected_asks);
-        assert_eq!(environment.is_approved(), !once);
-    }
-}
-
-/// A subagent's first command reaches the handler as the subagent's, and
-/// the approval holds for the main agent sharing the registry.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_subagent_asks_as_a_subagent_and_its_approval_is_shared() {
+async fn a_remote_script_with_only_passes_needs_an_approver_and_an_allow_asks_nobody() {
     let unreachable = tempfile::tempdir().unwrap();
-    let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
-    let tools = registry.local_tools().unwrap().clone();
-    let registry = registry.with_test_ssh(Sshd::server(), Some("/opt/heel".into()), tools);
+    let registry = home_registry(refusing_client(unreachable.path()));
+    registry
+        .add_ssh_server(
+            Sshd::server(),
+            PreparedSsh::new(Some("/opt/heel".into()), remote_launch()),
+        )
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let subagent = terminal(dir.path(), registry.clone(), CommandRole::Subagent).await;
-    let main = terminal(dir.path(), registry, CommandRole::Main).await;
-    // The connection is refused; only the questions put matter here.
-    let _ = subagent
+
+    // No policy decided, and no approver exists: the script is not run.
+    let tool = fresh_terminal(dir.path())
+        .await
+        .with_shell_sessions(registry.clone());
+    let error = tool
         .call(
-            args("true", TerminalExecutionMode::Default, "fixture"),
+            args("true", SandboxMode::Sandboxed, "fixture"),
+            ToolContext::new(),
+        )
+        .await
+        .expect_err("a remote script with only passes needs an approver");
+    assert!(error.to_string().contains("no approver"), "{error}");
+
+    // A policy's allow settles it without the approver; the connection is
+    // refused, so the call fails later, and not for want of approval.
+    let tool = fresh_terminal(dir.path())
+        .await
+        .with_shell_sessions(registry)
+        .with_test_policies(vec![crate::AnyScriptPolicy::new(Decide(
+            ScriptDecision::Allow,
+        ))]);
+    let result = tool
+        .call(
+            args("true", SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await;
-    let _ = main
-        .call(
-            args("true", TerminalExecutionMode::Default, "fixture"),
-            ToolContext::new(),
-        )
-        .await;
-    assert_eq!(
-        subagent.permission_handler.asked(),
-        [("fixture".to_string(), CommandRole::Subagent)]
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_none_or(|error| !error.to_string().contains("no approver")),
+        "{result:?}"
     );
-    assert_eq!(main.permission_handler.asked(), []);
 }
 
-/// An `unsafe` command reaches the handler with the server it is located
-/// on, or the home when it names none.
+/// A policy sees the server an `unsafe` command is located on, or the home
+/// when it names none.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unsafe_command_reaches_the_handler_with_its_location() {
+async fn a_policy_sees_the_location_of_an_unsafe_command() {
     let unreachable = tempfile::tempdir().unwrap();
-    let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
-    let tools = registry.local_tools().unwrap().clone();
-    let registry = registry.with_test_ssh(Sshd::server(), None, tools);
+    let registry = home_registry(refusing_client(unreachable.path()));
+    registry
+        .add_ssh_server(Sshd::server(), PreparedSsh::new(None, remote_launch()))
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
-    // The connection is refused; only the question put matters here.
+    let starts = RecordStarts::default();
+    let terminal = terminal_with(dir.path(), registry, &Approvals::default(), starts.clone()).await;
+    // The connection is refused; only the policy's view matters here.
     let _ = terminal
         .call(
-            args("true", TerminalExecutionMode::Unsafe, "fixture"),
+            args("true", SandboxMode::Unsandboxed, "fixture"),
             ToolContext::new(),
         )
         .await;
     terminal
         .call(
-            args("true", TerminalExecutionMode::Unsafe, ""),
+            args("true", SandboxMode::Unsandboxed, ""),
             ToolContext::new(),
         )
         .await
         .expect("an unsafe command runs at home");
-    assert_eq!(
-        terminal.permission_handler.unsafe_locations(),
-        [Some("fixture".to_string()), None]
-    );
+    let locations = starts
+        .seen()
+        .into_iter()
+        .map(|(location, _)| location)
+        .collect::<Vec<_>>();
+    assert_eq!(locations, [Some("fixture".to_string()), None]);
 }
 
 /// A server without `heel` runs `unsafe` commands only.
 #[tokio::test(flavor = "multi_thread")]
 async fn default_mode_needs_the_servers_heel() {
     let unreachable = tempfile::tempdir().unwrap();
-    let (_cache, registry) = home_registry(refusing_client(unreachable.path())).await;
-    let tools = registry.local_tools().unwrap().clone();
-    let registry = registry.with_test_ssh(Sshd::server(), None, tools);
+    let registry = home_registry(refusing_client(unreachable.path()));
+    registry
+        .add_ssh_server(Sshd::server(), PreparedSsh::new(None, remote_launch()))
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
+    let terminal = terminal(dir.path(), registry, &Approvals::default()).await;
     let refused = terminal
         .call(
-            args("true", TerminalExecutionMode::Default, "fixture"),
+            args("true", SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
         .expect_err("no sandbox there");
-    assert!(
-        refused
-            .to_string()
-            .contains("default mode runs under `heel`, which `fixture` does not have"),
-        "{refused}"
-    );
+    assert_eq!(refused.to_string(), "no remote sandbox: fixture");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_or_unknown_location_is_refused_and_an_empty_one_is_home() {
-    let (_cache, registry) = prepared_test_registry().await;
-    let tools = registry.local_tools().unwrap().clone();
-    let registry = registry.with_test_ssh(Sshd::server(), Some("/opt/heel".into()), tools);
+    let registry = ShellSessionRegistry::default();
+    registry
+        .add_ssh_server(
+            Sshd::server(),
+            PreparedSsh::new(Some("/opt/heel".into()), remote_launch()),
+        )
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let terminal = terminal(dir.path(), registry, CommandRole::Main).await;
+    let approvals = Approvals::default();
+    let terminal = terminal(dir.path(), registry, &approvals).await;
     assert_eq!(
         terminal.shell_sessions().remove_ssh_server("fixture"),
         Some(Sshd::server())
@@ -620,27 +533,26 @@ async fn a_removed_or_unknown_location_is_refused_and_an_empty_one_is_home() {
     for name in ["fixture", "staging"] {
         let refused = terminal
             .call(
-                args("true", TerminalExecutionMode::Default, name),
+                args("true", SandboxMode::Sandboxed, name),
                 ToolContext::new(),
             )
             .await
             .expect_err("no such server");
-        assert!(
-            refused
-                .to_string()
-                .contains(&format!("no SSH server named `{name}` is configured")),
-            "{refused}"
-        );
+        assert_eq!(refused.to_string(), format!("unknown location: {name}"));
     }
     let home = terminal
         .call(
-            args("echo home", TerminalExecutionMode::Default, ""),
+            args("echo home", SandboxMode::Sandboxed, ""),
             ToolContext::new(),
         )
         .await
         .expect("an empty location is the home environment");
     assert!(render_terminal_result(&home).contains("home"));
-    assert_eq!(terminal.permission_handler.asked(), []);
+    assert_eq!(
+        approvals.asked(),
+        [],
+        "the home environment needs no approval"
+    );
 }
 
 #[tokio::test]
@@ -651,7 +563,7 @@ async fn the_public_probe_reports_an_unreachable_server() {
     })
     .await
     .expect_err("nothing answers");
-    assert!(matches!(error, SshProbeError::Failed { .. }), "{error}");
+    assert!(matches!(error, SshProbeError::Upload(_)), "{error}");
 }
 
 /// The pool bounds this machine's jobs: a server's command runs outside it,
@@ -660,31 +572,24 @@ async fn the_public_probe_reports_an_unreachable_server() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
     let sshd = Sshd::start().await;
-    let artifacts = tempfile::tempdir().unwrap();
-    let distribution = script_distribution(artifacts.path()).await;
-    let cache = crate::tool_runtime::tests::unlocking_tempdir();
-    let registry = local_registry()
-        .with_ssh_client(sshd.client.clone())
-        .initialize_tools(&distribution, cache.path())
-        .await
-        .expect("the home prepares");
+    let registry = home_registry(sshd.client.clone());
     let dir = tempfile::tempdir().unwrap();
     let pool_dir = tempfile::tempdir().unwrap();
     let pool = crate::jobserver::JobPool::create_fifo(pool_dir.path().join("pool.fifo"), 2)
         .expect("a pool");
-    let terminal = terminal(dir.path(), registry, CommandRole::Main)
+    let terminal = terminal(dir.path(), registry, &Approvals::default())
         .await
         .with_jobserver_pool(pool, pool_dir.path().join("commands"))
         .expect("the pool attaches");
     terminal
         .shell_sessions()
-        .add_ssh_server(Sshd::server())
+        .add_ssh_server(Sshd::server(), prepared(&sshd, true))
         .unwrap();
     let script = "printenv MAKEFLAGS || echo jobs=none";
 
     let remote = terminal
         .call(
-            args(script, TerminalExecutionMode::Default, "fixture"),
+            args(script, SandboxMode::Sandboxed, "fixture"),
             ToolContext::new(),
         )
         .await
@@ -692,7 +597,7 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
     let remote = render_terminal_result(&remote);
     assert!(remote.contains("jobs=none"), "{remote}");
 
-    let mut local = args(script, TerminalExecutionMode::Default, "fixture");
+    let mut local = args(script, SandboxMode::Sandboxed, "fixture");
     local.location = None;
     let local = terminal
         .call(local, ToolContext::new())
@@ -700,4 +605,330 @@ async fn a_servers_command_runs_outside_the_job_pool_and_a_local_one_inside() {
         .expect("a local command runs");
     let local = render_terminal_result(&local);
     assert!(local.contains("--jobserver-auth=fifo:"), "{local}");
+}
+
+/// A process spawned on a server streams its output under the server's
+/// `heel`, and `kill` ends the remote tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_on_a_server_streams_output_and_kill_ends_the_remote_tree() {
+    use crate::SpawnSpec;
+
+    let sshd = Sshd::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let heel = sshd.home().join(".local/bin/heel");
+    let sandbox = Sandbox::new(
+        crate::Backend::Ssh {
+            server: Sshd::server(),
+            heel: Some(text(&heel).to_string()),
+            launch: remote_launch(),
+        },
+        executor_core::tokio::TokioGlobal,
+        dir.path(),
+    )
+    .with_ssh_client(sshd.client.clone());
+
+    let mut child = sandbox
+        .spawn(SpawnSpec::new("/bin/echo").args(["from-the-server"]))
+        .await
+        .expect("the process starts under the server's heel");
+    let stdout = child.take_stdout().unwrap();
+    let stderr = child.take_stderr().unwrap();
+    let mut printed = Vec::new();
+    while let Ok(chunk) = stdout.recv().await {
+        printed.extend(chunk);
+    }
+    let mut failed = Vec::new();
+    while let Ok(chunk) = stderr.recv().await {
+        failed.extend(chunk);
+    }
+    let exit = child.wait().await;
+    assert_eq!(
+        String::from_utf8_lossy(&printed),
+        "from-the-server\n",
+        "{exit:?}: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert!(exit.success());
+
+    // The server's login shell parses the command line first, so the job is
+    // a file rather than a quoted argument.
+    let job = sshd.home().join("job.sh");
+    std::fs::write(&job, "sleep 300 &\necho $!\nwait\n").unwrap();
+    let unconfined = sandbox.unconfined();
+    let mut child = unconfined
+        .spawn(SpawnSpec::new("/bin/sh").args([text(&job)]))
+        .await
+        .expect("the process starts");
+    let stdout = child.take_stdout().unwrap();
+    let remote = tokio::time::timeout(Duration::from_secs(60), stdout.recv())
+        .await
+        .expect("the descendant reports its id")
+        .expect("stdout is open");
+    let remote = String::from_utf8(remote).unwrap().trim().to_string();
+    let alive = |pid: &str| {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(&remote), "the remote descendant runs");
+    child.kill().await.expect("the tree is killed");
+    tokio::time::timeout(Duration::from_secs(60), child.wait())
+        .await
+        .expect("the killed process is waited for");
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while alive(&remote) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the remote descendant ends with the client");
+}
+
+/// A script spawned on a server is quoted once for its login shell, which
+/// parses the command line first: a double-quoted script survives a login
+/// shell that does not read single quotes the way POSIX does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_spawned_on_a_server_runs_in_the_managed_shell() {
+    use crate::SpawnSpec;
+
+    let sshd = Sshd::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let heel = sshd.home().join(".local/bin/heel");
+    let sandbox = Sandbox::new(
+        crate::Backend::Ssh {
+            server: Sshd::server(),
+            heel: Some(text(&heel).to_string()),
+            launch: remote_launch(),
+        },
+        executor_core::tokio::TokioGlobal,
+        dir.path(),
+    )
+    .with_ssh_client(sshd.client.clone());
+
+    let mut child = sandbox
+        .spawn(SpawnSpec::script("echo \"from-the-script\""))
+        .await
+        .expect("the script starts under the server's heel");
+    let stdout = child.take_stdout().unwrap();
+    let stderr = child.take_stderr().unwrap();
+    let mut printed = Vec::new();
+    while let Ok(chunk) = stdout.recv().await {
+        printed.extend(chunk);
+    }
+    let mut failed = Vec::new();
+    while let Ok(chunk) = stderr.recv().await {
+        failed.extend(chunk);
+    }
+    let exit = child.wait().await;
+    assert_eq!(
+        String::from_utf8_lossy(&printed),
+        "from-the-script\n",
+        "{exit:?}: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert!(exit.success());
+    // The processes on the server are out of sight, and its stdin has no watch.
+    assert_eq!(
+        child.descendants_killed().await,
+        crate::Descendants::Unobserved
+    );
+    assert!(child.take_stdin_blocked().is_none());
+}
+
+/// Text every quoting convention treats differently, in the scripts of the
+/// login-shell tests: spaces, both quotes, backslashes, `$`, command
+/// substitution, newlines and Chinese, Japanese and Korean.
+const AWKWARD: &str = "a b 'single' \"double\" \\back\\\\slash \\' $HOME ${x} $(id) `id` !! ;|&<>\n\
+    \tindented\n\n中文：你好，世界\n日本語：こんにちは、世界\n한국어: 안녕하세요, 세계";
+
+/// Runs a script that prints its own path, then [`AWKWARD`] from a quoted
+/// here-document, through a server whose login shell is `login_shell`: the
+/// text must arrive unchanged and the script's file must be gone.
+async fn assert_script_arrives_unchanged(login_shell: &str) {
+    let sshd = Sshd::start_with_login_shell(login_shell).await;
+    let script = format!("printf '%s\\n' \"$0\"\ncat <<'AITHER_END'\n{AWKWARD}\nAITHER_END\n");
+    let command = sshd.client.command(&Sshd::server(), &script).await.unwrap();
+    let output = async_process::Command::from(command)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{login_shell}: {stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (path, body) = stdout.split_once('\n').unwrap();
+    assert_eq!(body, format!("{AWKWARD}\n"), "{login_shell}");
+    assert!(
+        !Path::new(path).exists(),
+        "{login_shell}: the script deletes its own file {path}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reaches_sh_unchanged_under_a_posix_login_shell() {
+    assert_script_arrives_unchanged("/bin/sh").await;
+}
+
+/// Needs `fish` installed: skipped, loudly, where it is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reaches_sh_unchanged_under_a_fish_login_shell() {
+    let fish = [
+        "/opt/homebrew/bin/fish",
+        "/usr/local/bin/fish",
+        "/usr/bin/fish",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).is_file());
+    let Some(fish) = fish else {
+        eprintln!("SKIPPED: fish is not installed, so the fish login shell case did not run");
+        return;
+    };
+    assert_script_arrives_unchanged(fish).await;
+}
+
+/// The job's standard input is its own: the script travels another way.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_commands_stdin_is_free_for_the_scripts_input() {
+    let sshd = Sshd::start().await;
+    let command = sshd.client.command(&Sshd::server(), "cat").await.unwrap();
+    let mut child = async_process::Command::from(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    futures_lite::io::AsyncWriteExt::write_all(&mut stdin, "输入 'x'\n".as_bytes())
+        .await
+        .unwrap();
+    drop(stdin);
+    let output = child.output().await.unwrap();
+    assert_eq!(output.stdout, "输入 'x'\n".as_bytes());
+}
+
+async fn run_script(client: &SshClient, script: &str) -> String {
+    let command = client.command(&Sshd::server(), script).await.unwrap();
+    let output = async_process::Command::from(command)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// The server's own log counts the connections: one script is an upload and
+/// a run, and none of them, sequential or concurrent, opens a second one.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_command_to_a_server_shares_one_connection() {
+    let sshd = Sshd::start().await;
+    assert_eq!(run_script(&sshd.client, "echo one").await, "one\n");
+    assert_eq!(
+        sshd.accepted_connections(),
+        1,
+        "the upload and the run of one script share a connection"
+    );
+    assert_eq!(run_script(&sshd.client, "echo two").await, "two\n");
+    assert_eq!(sshd.accepted_connections(), 1);
+
+    let fresh = Sshd::start().await;
+    let scripts = ["echo a", "echo b", "echo c", "echo d", "echo e", "echo f"];
+    let outputs = futures::future::join_all(
+        scripts
+            .iter()
+            .map(|script| run_script(&fresh.client, script)),
+    )
+    .await;
+    assert_eq!(outputs, ["a\n", "b\n", "c\n", "d\n", "e\n", "f\n"]);
+    assert_eq!(
+        fresh.accepted_connections(),
+        1,
+        "concurrent first uses start one master"
+    );
+}
+
+/// A server that accepts a connection and never speaks keeps its master
+/// opening in flight; commands to another server must not wait for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_master_still_opening_holds_up_no_other_server() {
+    let sshd = Sshd::start().await;
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = sshd.dir.path().join("two_servers_config");
+    let fixture = std::fs::read_to_string(sshd.dir.path().join("ssh_config")).unwrap();
+    let port = stalled.local_addr().unwrap().port();
+    std::fs::write(
+        &config,
+        format!("Host stalled\n  HostName 127.0.0.1\n  Port {port}\n\n{fixture}"),
+    )
+    .unwrap();
+    let client = SshClient::with_config(config);
+    let stalled_server = SshServer {
+        name: "stalled".to_string(),
+        target: "stalled".to_string(),
+    };
+
+    let opening = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .command(&stalled_server, "echo never")
+                .await
+                .map(drop)
+        })
+    };
+    async_io::Timer::after(Duration::from_millis(500)).await;
+    assert!(!opening.is_finished(), "the stalled opening is in flight");
+
+    let started = std::time::Instant::now();
+    assert_eq!(run_script(&client, "echo other").await, "other\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the other server's command did not wait for the stalled opening"
+    );
+    assert!(
+        !opening.is_finished(),
+        "the stalled opening is still in flight"
+    );
+    opening.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_client_ends_its_master_and_removes_its_sockets() {
+    let sshd = Sshd::start().await;
+    let command = sshd
+        .client
+        .command(&Sshd::server(), "echo up")
+        .await
+        .unwrap();
+    drop(command);
+    let socket_dir = {
+        let ssh = sshd.client.ssh(&Sshd::server(), "true");
+        let path = ssh
+            .get_args()
+            .find_map(|arg| arg.to_str()?.strip_prefix("ControlPath="))
+            .unwrap()
+            .to_string();
+        PathBuf::from(path).parent().unwrap().to_path_buf()
+    };
+    assert!(socket_dir.is_dir());
+    let Sshd { client, .. } = &sshd;
+    let client = client.clone();
+    drop(sshd);
+    drop(client);
+    assert!(!socket_dir.exists(), "the socket directory is removed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_that_cannot_be_uploaded_runs_nothing_and_says_why() {
+    let unreachable = tempfile::tempdir().unwrap();
+    let error = refusing_client(unreachable.path())
+        .command(&Sshd::server(), "echo ran")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::ssh::SshUploadError::Failed { .. }),
+        "{error}"
+    );
 }

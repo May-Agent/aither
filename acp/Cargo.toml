@@ -28,7 +28,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 executor-core = { version = "0.7", features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]

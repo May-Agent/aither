@@ -89,8 +89,7 @@ const KILL_ROUND_PAUSE: Duration = Duration::from_millis(10);
 /// Why a process tree could not be killed.
 #[derive(Debug, thiserror::Error)]
 pub enum KillTreeError {
-    /// The signal to the process group failed.
-    #[cfg(unix)]
+    /// The signal to the process group failed, locally or on a server.
     #[error("failed to signal the process group: {0}")]
     Signal(#[source] std::io::Error),
     /// The descendants of the job could not be found or killed.
@@ -2493,7 +2492,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_env_cleaned_setsid_descendant_is_still_killed() {
         let config = heel::SandboxConfig::builder()
-            .heel_binary(crate::test_heel::pinned().await.unwrap())
+            .heel_binary(crate::test_heel::binary().await.unwrap())
             .network(heel::DenyAll)
             .security(heel::SecurityConfig::interactive())
             .supervised_spawn(true)

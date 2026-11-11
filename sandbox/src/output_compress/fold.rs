@@ -5,13 +5,16 @@
 //! This stage is lossy, so the orchestrator only applies it when it can store
 //! the unfolded text and name it in the text the model reads.
 
+#[cfg(not(feature = "code-folding"))]
+use crate::wording::ShellWording;
+
 /// Folds `text` when it is recognisable source code and folding makes it
 /// smaller.
 ///
 /// Without the `code-folding` feature there is no content detector, so output
 /// is passed through rather than folded against a guessed grammar.
 #[cfg(not(feature = "code-folding"))]
-pub const fn fold_source_code(_text: &str) -> Option<String> {
+pub fn fold_source_code(_text: &str, _wording: &dyn ShellWording) -> Option<String> {
     None
 }
 
@@ -20,20 +23,12 @@ pub use enabled::fold_source_code;
 
 #[cfg(feature = "code-folding")]
 mod enabled {
-    use askama::Template;
     use tracing::debug;
+
+    use crate::wording::{FoldedLines, LineRange, ShellWording};
 
     /// Minimum number of lines a foldable block must span to be worth folding.
     const MIN_FOLD_LINES: usize = 4;
-
-    #[derive(Template)]
-    #[template(path = "folded_lines_marker.txt", escape = "none")]
-    struct FoldedLinesMarker<'a> {
-        indent: &'a str,
-        count: usize,
-        first: usize,
-        last: usize,
-    }
 
     /// Maps a magika content-type label to a tree-sitter grammar.
     fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
@@ -100,7 +95,7 @@ mod enabled {
     /// Every emitted line carries its 1-based number in `text`, and each fold
     /// marker names the range it replaced, so the result lines up with the
     /// unfolded copy the orchestrator stores.
-    pub fn fold_source_code(text: &str) -> Option<String> {
+    pub fn fold_source_code(text: &str, wording: &dyn ShellWording) -> Option<String> {
         let mut session = magika::Session::new().ok()?;
         let result = session.identify_content_sync(text.as_bytes()).ok()?;
         let label = result.info().label;
@@ -146,14 +141,14 @@ mod enabled {
             let inner_end = fold_end + 1;
             let folded_count = inner_end.saturating_sub(cursor);
             if folded_count > 0 {
-                let marker = FoldedLinesMarker {
+                let marker = wording.folded_lines(&FoldedLines {
                     indent: &indent,
                     count: folded_count,
-                    first: cursor + 1,
-                    last: inner_end,
-                }
-                .render()
-                .expect("folded lines marker template must render");
+                    range: LineRange {
+                        first: cursor + 1,
+                        last: inner_end,
+                    },
+                });
                 output.push_str(&marker);
                 output.push('\n');
                 cursor = inner_end;
@@ -219,6 +214,11 @@ mod enabled {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::test_wording::TestWording;
+
+        fn fold_source_code(text: &str) -> Option<String> {
+            super::fold_source_code(text, &TestWording)
+        }
 
         #[test]
         fn folds_python_function_bodies() {

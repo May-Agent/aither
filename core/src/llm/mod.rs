@@ -119,9 +119,10 @@ pub use retry::RetryPolicy;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::{
-    AgentIdentity, CallIdentity, CommandOutcome, CommandResult, CommandStream, Interruption,
-    InterruptionCause, IntoToolResult, StoredFile, SubagentIdentity, Tool, ToolCallId, ToolContext,
-    ToolResult, render_interruptions,
+    AgentIdentity, AgentPath, AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest,
+    Approver, ApproverFailure, CallIdentity, CancelSignal, Canceller, CommandOutcome,
+    CommandResult, CommandStream, Interruption, InterruptionCause, IntoToolResult, StoredFile,
+    SubagentIdentity, Tool, ToolCallId, ToolContext, ToolResult, render_interruptions,
 };
 
 use crate::llm::model::Profile;

@@ -121,7 +121,15 @@ pub async fn open_container_job_fifo<E: Executor + Clone + 'static>(
     executor
         .spawn(async move {
             let outcome = exec
-                .exec_streamed_boxed(&container_id, &script, "/", kill_rx, stdin_rx, stdout_tx)
+                .exec_streamed_boxed(
+                    &container_id,
+                    &script,
+                    "/",
+                    kill_rx,
+                    stdin_rx,
+                    stdout_tx,
+                    crate::ExecLifetime::Foreground,
+                )
                 .await;
             let _ = outcome_tx.send(outcome).await;
         })
@@ -345,10 +353,11 @@ mod tests {
         fn runtime(exec: impl crate::ContainerExec + 'static) -> ContainerShellRuntime {
             ContainerShellRuntime::new(
                 "aither-test-jobserver",
-                crate::ContainerIpcRoute::new(
+                crate::HostRoute::new(
                     "host.docker.internal",
-                    crate::BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1])).unwrap(),
-                ),
+                    std::net::IpAddr::from([127, 0, 0, 1]),
+                )
+                .unwrap(),
                 crate::AnyContainerExec::new(Arc::new(exec)),
             )
         }
@@ -439,6 +448,7 @@ mod tests {
             _kill_rx: Receiver<()>,
             stdin_rx: Receiver<Vec<u8>>,
             stdout: Sender<Vec<u8>>,
+            _lifetime: crate::ExecLifetime,
         ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
             let (exit, outcome) = async_channel::bounded(1);
             self.0
@@ -604,6 +614,7 @@ mod tests {
             kill_rx: Receiver<()>,
             stdin_rx: Receiver<Vec<u8>>,
             stdout: Sender<Vec<u8>>,
+            _lifetime: crate::ExecLifetime,
         ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
             use futures_lite::{AsyncReadExt as _, AsyncWriteExt as _};
             let script = script.to_string();

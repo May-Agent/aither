@@ -1,17 +1,23 @@
 //! SSH servers as execution locations: the server set a registry holds while
-//! it lives, the client every connection goes through, the first-use state of
-//! each server and the OS probe an embedder runs when a server is added.
+//! it lives, the client every connection goes through, the lazily prepared
+//! state of each server and the OS probe an embedder runs when a server is
+//! added.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
-use async_lock::{Mutex, OnceCell};
+use async_lock::OnceCell;
+use futures_lite::io::AsyncWriteExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::tool_runtime::PreparedTools;
+use crate::RemoteLaunch;
 
 /// A named SSH destination commands may run on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -42,6 +48,27 @@ pub enum SshServerError {
     Duplicate(String),
 }
 
+/// Why a script could not be written to a server, so that nothing ran.
+#[derive(Debug, thiserror::Error)]
+pub enum SshUploadError {
+    /// `ssh` could not be started or waited for.
+    #[error("could not start ssh: {0}")]
+    Spawn(std::io::Error),
+    /// The script could not be sent to `ssh`.
+    #[error("could not send the script to ssh: {0}")]
+    Write(std::io::Error),
+    /// The connection failed or the server could not store the script.
+    #[error("writing the script to `{target}` failed ({status}): {stderr}")]
+    Failed {
+        /// The SSH target written to.
+        target: String,
+        /// The exit status `ssh` returned.
+        status: std::process::ExitStatus,
+        /// What it wrote to its standard error.
+        stderr: String,
+    },
+}
+
 /// The operating system and architecture a server reports, as `uname -s`
 /// and `uname -m` print them (for example `Linux` and `x86_64`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -58,6 +85,9 @@ pub enum SshProbeError {
     /// `ssh` could not be started.
     #[error("could not start ssh: {0}")]
     Spawn(#[from] std::io::Error),
+    /// The probe script could not be written to the server.
+    #[error(transparent)]
+    Upload(#[from] SshUploadError),
     /// The connection or the remote command failed.
     #[error("the probe of `{target}` exited with {status}: {stderr}")]
     Failed {
@@ -85,39 +115,189 @@ pub async fn probe_ssh_os(server: &SshServer) -> Result<SshPlatform, SshProbeErr
     SshClient::default().probe_os(server).await
 }
 
+/// The private directory holding the control sockets of the master
+/// connections a client owns, one per server. It exists from the client's
+/// first connection until its last clone drops, which ends every master.
+#[derive(Debug, Default)]
+struct Masters {
+    dir: OnceLock<tempfile::TempDir>,
+    /// Each target's once-only opening of its master; the map is locked only
+    /// to find the cell.
+    opened: std::sync::Mutex<HashMap<String, Arc<OnceCell<()>>>>,
+}
+
+impl Masters {
+    /// The control socket of the master to `target`. The name is a short
+    /// digest because a unix socket path is limited to about a hundred bytes
+    /// and `ssh` appends a suffix of its own while binding.
+    fn socket(&self, target: &str) -> PathBuf {
+        let dir = self.dir.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("ssh-")
+                .tempdir()
+                .expect("the private directory of the SSH control sockets can be created")
+        });
+        let digest = Sha256::digest(target.as_bytes());
+        dir.path().join(hex::encode(&digest[..6]))
+    }
+}
+
+impl Drop for Masters {
+    fn drop(&mut self) {
+        let Some(dir) = self.dir.get() else { return };
+        let Ok(sockets) = std::fs::read_dir(dir.path()) else {
+            return;
+        };
+        for socket in sockets.flatten() {
+            let _ = std::process::Command::new("ssh")
+                .args(["-O", "exit", "-o"])
+                .arg(format!("ControlPath={}", socket.path().display()))
+                .args(["--", "master"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
 /// How every SSH connection is made: `ssh` in batch mode with a bounded
 /// connect time, the remote command run by `sh` whatever the login shell.
+/// Every command to a server shares one master connection the client opens on
+/// the first and ends when its last clone drops.
 #[derive(Debug, Clone, Default)]
 pub struct SshClient {
     /// An `ssh_config(5)` file read instead of the user's; only tests set
     /// one, to reach their own server.
     config: Option<PathBuf>,
+    masters: Arc<Masters>,
 }
 
 impl SshClient {
     #[cfg(test)]
-    pub(crate) const fn with_config(config: PathBuf) -> Self {
+    pub(crate) fn with_config(config: PathBuf) -> Self {
         Self {
             config: Some(config),
+            masters: Arc::default(),
         }
     }
 
-    /// `ssh` running `script` under `sh -c` on `server`.
-    pub(crate) fn command(&self, server: &SshServer, script: &str) -> std::process::Command {
+    /// `ssh` to `server` with `line` as the remote command line.
+    ///
+    /// The remote login shell parses `line` before anything else runs, and
+    /// shells disagree on quoting, so every line this client sends is made
+    /// only of letters, digits and `-`, `.`, `/`, `;`, `>` and spaces.
+    pub(crate) fn ssh(&self, server: &SshServer, line: &str) -> std::process::Command {
+        let mut command = self.options(server);
+        command.arg("--").arg(&server.target).arg(line);
+        command
+    }
+
+    /// `ssh` with every option of this client, before the target.
+    fn options(&self, server: &SshServer) -> std::process::Command {
         let mut command = std::process::Command::new("ssh");
         command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
+        // `ControlPersist` keeps the master the first command starts alive
+        // for the next ones; the timeout only reaps a master whose client
+        // died without ending it.
+        command
+            .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"])
+            .arg("-o")
+            .arg(format!(
+                "ControlPath={}",
+                self.masters.socket(&server.target).display()
+            ));
         if let Some(config) = &self.config {
             command.arg("-F").arg(config);
         }
         command
-            .arg("--")
-            .arg(&server.target)
-            .arg(shell_words::join(["sh", "-c", script]));
-        command
+    }
+
+    /// Makes sure the master connection to `server` is up, opening it when
+    /// it is not. A server's master opens once, under that server's own cell:
+    /// `ControlMaster=auto` makes a second `ssh` that finds the socket still
+    /// being bound give up multiplexing and open a connection of its own, so
+    /// concurrent first commands to one server wait for the one opening and
+    /// commands to other servers wait for nothing. A failed opening is not
+    /// remembered. Once opened, a master that later dies is re-created by
+    /// the next command's `ControlMaster=auto`.
+    async fn ensure_master(&self, server: &SshServer) -> Result<(), SshUploadError> {
+        let opened = Arc::clone(
+            self.masters
+                .opened
+                .lock()
+                .expect("the map of opened masters is never held across a panic")
+                .entry(server.target.clone())
+                .or_default(),
+        );
+        opened
+            .get_or_try_init(|| async {
+                let output = async_process::Command::from(self.ssh(server, "true"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .map_err(SshUploadError::Spawn)?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                Err(SshUploadError::Failed {
+                    target: server.target.clone(),
+                    status: output.status,
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                })
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// `ssh` running `script` under `sh` on `server`, with the command's
+    /// standard input free for the script's own input.
+    ///
+    /// The script never appears on the remote command line: one `ssh` writes
+    /// it to a private file on the server through its standard input, and the
+    /// command returned runs that file with `sh`, which reads it byte for
+    /// byte. The script deletes its own file as its first action.
+    ///
+    /// # Errors
+    ///
+    /// Fails, running nothing, when the script cannot be written to the
+    /// server.
+    pub(crate) async fn command(
+        &self,
+        server: &SshServer,
+        script: &str,
+    ) -> Result<std::process::Command, SshUploadError> {
+        self.ensure_master(server).await?;
+        let path = format!("/tmp/aither-{}.sh", uuid::Uuid::new_v4().simple());
+        let upload = |error: std::io::Error| SshUploadError::Spawn(error);
+        let mut child =
+            async_process::Command::from(self.ssh(server, &format!("umask 077; cat > {path}")))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(upload)?;
+        let mut stdin = child.stdin.take().expect("the upload's stdin is piped");
+        let body = format!("rm -f \"$0\"\n{script}");
+        let written = stdin.write_all(body.as_bytes()).await;
+        drop(stdin);
+        let output = child.output().await.map_err(upload)?;
+        if !output.status.success() {
+            return Err(SshUploadError::Failed {
+                target: server.target.clone(),
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        written.map_err(SshUploadError::Write)?;
+        Ok(self.ssh(server, &format!("sh {path}")))
     }
 
     pub(crate) async fn probe_os(&self, server: &SshServer) -> Result<SshPlatform, SshProbeError> {
-        let output = async_process::Command::from(self.command(server, "uname -s -m"))
+        let output = async_process::Command::from(self.command(server, "uname -s -m").await?)
             .stdin(Stdio::null())
             .output()
             .await?;
@@ -140,34 +320,117 @@ impl SshClient {
     }
 }
 
-/// A server prepared on its first command.
+/// What the embedder prepared on a server: its `heel` and the programs its
+/// scripts run with.
 #[derive(Debug, Clone)]
 pub struct PreparedSsh {
     /// The `heel` binary on the server, when it has one; a default-mode
     /// command needs it, an `unsafe` one does not.
     pub(crate) heel: Option<String>,
-    pub(crate) tools: PreparedTools<PathBuf>,
+    pub(crate) launch: RemoteLaunch,
 }
 
-/// One server of a registry's set and what its first use settled: whether
-/// commands may run there and the tools prepared there. Removing the server
-/// drops both; adding it again starts over.
+impl PreparedSsh {
+    /// The preparation of a server whose `heel` is at the path `heel` on the
+    /// server, if it has one, and whose programs `launch` describes.
+    #[must_use]
+    pub const fn new(heel: Option<String>, launch: RemoteLaunch) -> Self {
+        Self { heel, launch }
+    }
+}
+
+/// Why a server could not be prepared. The server stays in the set, and the
+/// next command naming it prepares it again.
+#[derive(Debug, thiserror::Error)]
+#[error("preparing the SSH server `{server}` failed: {source}")]
+pub struct SshPrepareError {
+    /// The name of the server.
+    pub server: String,
+    /// What the embedder's [`PrepareSsh`] reported.
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// Prepares a server for the shell's scripts: finds or installs its `heel`
+/// and the programs scripts run with.
+///
+/// It runs when the first command names the server, not when the server is
+/// added, so adding a server never waits on it and an unreachable server
+/// fails only the commands that name it. Commands that name the server
+/// together share the one preparation; a preparation that fails fails the
+/// commands waiting on it and is not remembered, so the next command
+/// prepares again. A [`PreparedSsh`] is a preparation already done.
+pub trait PrepareSsh: Send + Sync + 'static {
+    /// Why the preparation failed.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Prepares `server`.
+    fn prepare(
+        &self,
+        server: &SshServer,
+    ) -> impl Future<Output = Result<PreparedSsh, Self::Error>> + Send;
+}
+
+impl PrepareSsh for PreparedSsh {
+    type Error = std::convert::Infallible;
+
+    fn prepare(
+        &self,
+        _server: &SshServer,
+    ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        std::future::ready(Ok(self.clone()))
+    }
+}
+
+/// Object-safe twin of [`PrepareSsh`].
+trait PrepareSshImpl: Send + Sync {
+    fn prepare<'a>(
+        &'a self,
+        server: &'a SshServer,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedSsh, SshPrepareError>> + Send + 'a>>;
+}
+
+impl<T: PrepareSsh> PrepareSshImpl for T {
+    fn prepare<'a>(
+        &'a self,
+        server: &'a SshServer,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedSsh, SshPrepareError>> + Send + 'a>> {
+        Box::pin(async move {
+            PrepareSsh::prepare(self, server)
+                .await
+                .map_err(|error| SshPrepareError {
+                    server: server.name.clone(),
+                    source: Box::new(error),
+                })
+        })
+    }
+}
+
+/// A type-erased [`PrepareSsh`].
+#[derive(Clone)]
+pub struct AnyPrepareSsh(Arc<dyn PrepareSshImpl>);
+
+impl AnyPrepareSsh {
+    /// Erases `prepare`.
+    #[must_use]
+    pub fn new(prepare: impl PrepareSsh) -> Self {
+        Self(Arc::new(prepare))
+    }
+}
+
+impl std::fmt::Debug for AnyPrepareSsh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnyPrepareSsh")
+    }
+}
+
+/// One server of a registry's set and what the embedder prepared on it.
+/// Removing the server drops them.
 #[derive(Debug)]
 pub struct SshEnvironment {
     server: SshServer,
-    /// Whether a session approval was given. Held while a request is
-    /// asked, so concurrent commands wait for it.
-    approved: Mutex<bool>,
+    prepare: AnyPrepareSsh,
     prepared: OnceCell<PreparedSsh>,
-}
-
-/// How far an approval that let a command run on a server reaches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalReach {
-    /// The command that asked.
-    Once,
-    /// Every command on the server while it stays in the registry.
-    Session,
 }
 
 impl SshEnvironment {
@@ -175,51 +438,16 @@ impl SshEnvironment {
         &self.server
     }
 
-    /// Settles approval: a session approval is asked once and kept, with
-    /// concurrent commands waiting for the one request; a once-only or a
-    /// refused request leaves the next command to ask again.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the guard is held across the request so concurrent commands wait for it"
-    )]
-    pub(crate) async fn approve<F, Fut, E>(&self, ask: F) -> Result<(), E>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<ApprovalReach, E>>,
-    {
-        let mut approved = self.approved.lock().await;
-        if !*approved {
-            let reach = ask().await?;
-            *approved = reach == ApprovalReach::Session;
-        }
-        Ok(())
-    }
-
-    /// The server's prepared state, produced by `prepare` the first time.
-    pub(crate) async fn prepared<F, Fut, E>(&self, prepare: F) -> Result<&PreparedSsh, E>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<PreparedSsh, E>>,
-    {
-        self.prepared.get_or_try_init(prepare).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_prepared(&self, prepared: PreparedSsh) {
-        assert!(
-            self.prepared.set_blocking(prepared).is_ok(),
-            "a test server is prepared once"
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_approved(&self) -> bool {
-        *self.approved.lock_blocking()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_prepared(&self) -> bool {
-        self.prepared.is_initialized()
+    /// What the embedder prepared on the server, preparing it first when no
+    /// command has yet. Concurrent callers share one preparation.
+    ///
+    /// # Errors
+    /// Fails with what the preparation reported; the next call prepares
+    /// again.
+    pub(crate) async fn prepared(&self) -> Result<&PreparedSsh, SshPrepareError> {
+        self.prepared
+            .get_or_try_init(|| self.prepare.0.prepare(&self.server))
+            .await
     }
 }
 
@@ -242,7 +470,11 @@ impl SshEnvironments {
         &self.client
     }
 
-    pub(crate) fn add(&self, server: SshServer) -> Result<(), SshServerError> {
+    pub(crate) fn add(
+        &self,
+        server: SshServer,
+        prepare: impl PrepareSsh,
+    ) -> Result<(), SshServerError> {
         let SshServer { name, target } = server;
         let server = SshServer {
             name: name.trim().to_string(),
@@ -253,7 +485,7 @@ impl SshEnvironments {
         }
         let environment = Arc::new(SshEnvironment {
             server,
-            approved: Mutex::new(false),
+            prepare: AnyPrepareSsh::new(prepare),
             prepared: OnceCell::new(),
         });
         let mut duplicate = false;
@@ -314,11 +546,18 @@ mod tests {
         }
     }
 
+    fn prepared() -> PreparedSsh {
+        PreparedSsh::new(
+            None,
+            RemoteLaunch::new("/opt/tools/bin", "/opt/tools/bin/bash"),
+        )
+    }
+
     #[test]
     fn servers_join_and_leave_a_live_set_every_clone_sees() {
         let set = SshEnvironments::default();
         let clone = set.clone();
-        set.add(server(" build ", " builder@build.internal "))
+        set.add(server(" build ", " builder@build.internal "), prepared())
             .unwrap();
         assert_eq!(
             clone.list(),
@@ -326,11 +565,11 @@ mod tests {
             "names and targets are trimmed and the clone sees the addition"
         );
         assert!(matches!(
-            clone.add(server("build", "other@build.internal")),
+            clone.add(server("build", "other@build.internal"), prepared()),
             Err(SshServerError::Duplicate(name)) if name == "build"
         ));
         assert!(matches!(
-            set.add(server("staging", "  ")),
+            set.add(server("staging", "  "), prepared()),
             Err(SshServerError::Blank)
         ));
         assert_eq!(
@@ -341,52 +580,77 @@ mod tests {
         assert_eq!(set.remove("build"), None);
     }
 
-    #[tokio::test]
-    async fn a_server_added_again_starts_its_first_use_over() {
+    /// Counts its preparations, takes its time over each and fails the first
+    /// `failures` of them.
+    struct Counting {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        failures: usize,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the server is unreachable")]
+    struct Unreachable;
+
+    impl PrepareSsh for Counting {
+        type Error = Unreachable;
+
+        async fn prepare(&self, _server: &SshServer) -> Result<PreparedSsh, Unreachable> {
+            let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            if run < self.failures {
+                Err(Unreachable)
+            } else {
+                Ok(prepared())
+            }
+        }
+    }
+
+    fn environment(failures: usize) -> (Arc<SshEnvironment>, Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let set = SshEnvironments::default();
-        set.add(server("build", "builder@build.internal")).unwrap();
-        let first = set.get("build").unwrap();
-        first
-            .approve(|| async { Ok::<_, ()>(ApprovalReach::Session) })
-            .await
-            .unwrap();
-        assert!(first.is_approved());
-        set.remove("build");
-        set.add(server("build", "builder@build.internal")).unwrap();
-        assert!(!set.get("build").unwrap().is_approved());
+        set.add(
+            server("build", "builder@build.internal"),
+            Counting {
+                runs: Arc::clone(&runs),
+                failures,
+            },
+        )
+        .unwrap();
+        (set.get("build").unwrap(), runs)
     }
 
     #[tokio::test]
-    async fn a_refused_approval_is_asked_again() {
-        let set = SshEnvironments::default();
-        set.add(server("build", "builder@build.internal")).unwrap();
-        let environment = set.get("build").unwrap();
-        assert_eq!(environment.approve(|| async { Err("no") }).await, Err("no"));
-        assert!(!environment.is_approved());
-        environment
-            .approve(|| async { Ok::<_, &str>(ApprovalReach::Session) })
-            .await
-            .unwrap();
-        // Settled: a later ask is never made.
-        environment
-            .approve(|| async { Err("asked again") })
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_once_only_approval_is_not_kept() {
-        let set = SshEnvironments::default();
-        set.add(server("build", "builder@build.internal")).unwrap();
-        let environment = set.get("build").unwrap();
-        environment
-            .approve(|| async { Ok::<_, &str>(ApprovalReach::Once) })
-            .await
-            .unwrap();
-        assert!(!environment.is_approved());
+    async fn a_server_is_prepared_on_its_first_use_and_only_once() {
+        let (environment, runs) = environment(0);
         assert_eq!(
-            environment.approve(|| async { Err("asked again") }).await,
-            Err("asked again")
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "adding the server prepares nothing"
         );
+        let (first, second) = tokio::join!(environment.prepared(), environment.prepared());
+        first.unwrap();
+        second.unwrap();
+        environment.prepared().await.unwrap();
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two concurrent first commands and a later one share one preparation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_preparation_is_reported_and_retried_by_the_next_command() {
+        let (environment, runs) = environment(1);
+        let error = environment.prepared().await.unwrap_err();
+        assert_eq!(error.server, "build");
+        assert!(error.source.to_string().contains("unreachable"), "{error}");
+        environment
+            .prepared()
+            .await
+            .expect("the next command prepares again");
+        environment.prepared().await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
