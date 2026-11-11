@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [dev]
+    branches: [main]
   pull_request:
   merge_group:
+  # A pull request pushed with GITHUB_TOKEN (release-plz's) starts no
+  # pull_request run, so CI is started on its branch by hand.
+  workflow_dispatch:
 
 # Keyed per event, so a branch with a pull request open runs the suite twice --
 # once for the push, once for the pull request. Keying on the head branch
@@ -13,13 +16,13 @@ on:
 # reads as broken when it is fine, and how much of the run got cancelled
 # decides how red it looks. Minutes are free on a public repository; a red tick
 # on a release branch is not. Within a single event a run still cancels the one
-# it supersedes, which is the case that actually wastes a runner. A dev push
-# run is the only one that saves the Rust caches, so dev runs queue instead:
+# it supersedes, which is the case that actually wastes a runner. A main push
+# run is the only one that saves the Rust caches, so main runs queue instead:
 # cancelling one mid-build leaves no cache for the runs after it. A newer
-# push still replaces a dev run that has not started.
+# push still replaces a main run that has not started.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,19 +30,15 @@ env:
 jobs:
   # ---------------------------------------------------------------------- scope
   # Which crates this change can reach: the changed crates plus everything that
-  # depends on them. A pull request measures against its base branch; a push to
-  # dev has no base, so the tool selects the whole workspace and the full suite
-  # runs unchanged. Workflows, the toolchain, the lockfile, cargo and nextest
-  # configuration, and any path the rules do not name select the whole
-  # workspace; prose selects nothing (.github/affected-rules.toml). A merge
-  # group has no base either, so the queue runs the full suite on the exact
-  # commit that lands on dev.
+  # depends on them. A pull request measures against its base branch; every
+  # other event (a push to main, a merge group, a dispatch) names no base, so
+  # the tool selects the whole workspace and the full suite runs: the queue
+  # tests the exact commit that lands on main. Workflows, the toolchain, the
+  # lockfile, cargo and nextest configuration, and any path the rules do not
+  # name select the whole workspace; prose selects nothing
+  # (.github/affected-rules.toml).
   #
-  # A pull request from dev into main proposes a commit dev's merge queue
-  # already tested, so it selects nothing and only the feature checks, which
-  # the queue does not run, still run on it.
-  #
-  # Scoped runs keep dev's cache-saved feature resolution where they can: build
+  # Scoped runs keep main's cache-saved feature resolution where they can: build
   # commands keep their `--workspace` / `--all-features` flags, and the test
   # jobs narrow only which tests run, with a nextest filterset. A cargo `-p` or
   # `--exclude` list changes which packages' features are unified into the
@@ -50,7 +49,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      queued: ${{ steps.jobs.outputs.queued }}
       workspace: ${{ steps.jobs.outputs.workspace }}
       packages: ${{ steps.scope.outputs.packages }}
       package-args: ${{ steps.scope.outputs.package-args }}
@@ -76,23 +74,15 @@ jobs:
       # are true when a crate the matching job builds is affected, which
       # a changed dependency of it also makes true. `filterset` narrows nextest
       # to the affected packages and is empty for the whole workspace.
-      # `features` is `rust` on a pull request into main; `queued` (a pull
-      # request from dev into main) then clears every other output.
+      # `features` is `rust`: every change lands on main, so every change gets
+      # the feature checks.
       - id: jobs
         env:
           WORKSPACE: ${{ steps.scope.outputs.workspace }}
           PACKAGES: ${{ steps.scope.outputs.packages }}
-          INTO_MAIN: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
-          QUEUED: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'dev' }}
         run: |
           set -euo pipefail
           rust=$([ "${WORKSPACE}" = true ] || [ -n "${PACKAGES}" ] && echo true || echo false)
-          features=$([ "${INTO_MAIN}" = true ] && [ "${rust}" = true ] && echo true || echo false)
-          if [ "${QUEUED}" = true ]; then
-            WORKSPACE=false
-            PACKAGES=""
-            rust=false
-          fi
           has() {
             [ "${WORKSPACE}" = true ] && return 0
             for want in "$@"; do
@@ -108,9 +98,8 @@ jobs:
             done
           fi
           {
-            echo "queued=${QUEUED}"
             echo "workspace=${WORKSPACE}"
-            echo "features=${features}"
+            echo "features=${rust}"
             echo "rust=${rust}"
             echo "wasm=$(flag has aither-core aither-openai aither-gemini aither-claude)"
             echo "apple=$(flag has aither-apple)"
@@ -194,13 +183,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Only dev saves caches. A pull request restores dev's and saves none:
+      # Only main saves caches. A pull request restores main's and saves none:
       # its copy would be reachable from that pull request alone, and those
-      # copies push dev's caches past the repository limit, where they are
+      # copies push main's caches past the repository limit, where they are
       # evicted and every job compiles from scratch.
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-ubuntu
       - uses: ./.github/actions/install-protoc
       - run: cargo clippy --all-targets --all-features --timings -- -D warnings
@@ -224,7 +213,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-wasm
       # `aither` itself is not wasm-buildable: the agent, sandbox, and CLI need
       # a filesystem and processes. Build the crates that are meant to run in a
@@ -285,7 +274,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-apple
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --locked -p aither-apple --features test --run-ignored all --timings
@@ -316,8 +305,6 @@ jobs:
   # `--partition k/8` cuts each invocation's command list into eight
   # contiguous slices of equal length, so every job runs slice k of every
   # invocation below and the eight jobs together run each command once.
-  # Feature-pair coverage is a release-grade gate: it runs only on pull
-  # requests bound for main, not on routine dev pushes and PRs.
   feature-checks:
     name: Features (${{ matrix.part }}/8)
     needs: scope
@@ -347,7 +334,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # Each partition gets its own cache: eight jobs sharing one key
           # would evict each other's artifacts on every save.
           shared-key: ci-features-${{ matrix.part }}
@@ -401,7 +388,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -413,7 +400,7 @@ jobs:
       # `full` would re-enable llama and ort, and --exclude only skips testing
       # a package, not building it as a dependency. So the set is spelled out.
       # Narrowed by filterset like the test jobs, so the build keeps the
-      # `--workspace` resolution dev's cache holds; a scoped report covers only
+      # `--workspace` resolution main's cache holds; a scoped report covers only
       # the affected crates.
       - shell: bash
         env:
@@ -438,3 +425,36 @@ jobs:
           # A coverage upload outage is not a reason to fail a build that
           # otherwise passed.
           fail_ci_if_error: false
+
+  # ------------------------------------------------------------------- result
+  result:
+    # The one required check on `main`: green when every job it needs succeeded
+    # or was skipped by the scope.
+    name: CI result
+    if: always()
+    needs:
+      - scope
+      - audit
+      - format
+      - workflow-gates
+      - unused-deps
+      - lint
+      - wasm
+      - test-portability
+      - test-apple
+      - test-full
+      - feature-checks
+      - coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" = failure ] || [ "$result" = cancelled ]; then
+              echo "::error::a needed job ended $result"
+              exit 1
+            fi
+          done
