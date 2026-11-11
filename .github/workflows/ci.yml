@@ -5,8 +5,8 @@ on:
     branches: [main]
   pull_request:
   merge_group:
-  # A pull request pushed with GITHUB_TOKEN (release-plz's) starts no
-  # pull_request run, so CI is started on its branch by hand.
+  # A push whose webhook is dropped leaves a commit with no run; this makes CI
+  # startable by hand for any ref.
   workflow_dispatch:
 
 # Keyed per event, so a branch with a pull request open runs the suite twice --
@@ -74,12 +74,13 @@ jobs:
       # are true when a crate the matching job builds is affected, which
       # a changed dependency of it also makes true. `filterset` narrows nextest
       # to the affected packages and is empty for the whole workspace.
-      # `features` is `rust`: every change lands on main, so every change gets
-      # the feature checks.
+      # `features` is `rust` everywhere but a pull request: the merge queue
+      # runs the feature checks on what lands, as the promotion into main did.
       - id: jobs
         env:
           WORKSPACE: ${{ steps.scope.outputs.workspace }}
           PACKAGES: ${{ steps.scope.outputs.packages }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           rust=$([ "${WORKSPACE}" = true ] || [ -n "${PACKAGES}" ] && echo true || echo false)
@@ -99,7 +100,7 @@ jobs:
           fi
           {
             echo "workspace=${WORKSPACE}"
-            echo "features=${rust}"
+            echo "features=$([ "${EVENT}" != pull_request ] && echo "${rust}" || echo false)"
             echo "rust=${rust}"
             echo "wasm=$(flag has aither-core aither-openai aither-gemini aither-claude)"
             echo "apple=$(flag has aither-apple)"

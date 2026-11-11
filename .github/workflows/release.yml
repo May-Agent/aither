@@ -76,17 +76,18 @@ jobs:
           --forge github
           --output json
           | tee "${RUNNER_TEMP}/release-pr.json"
-      # A PR pushed with GITHUB_TOKEN triggers no pull_request workflows, so
-      # the required `CI result` runs through workflow_dispatch on the PR's
-      # head. Merging the PR stays a person's step.
-      - name: Run CI on the release PR
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved, and the required
+      # `CI result` reports on the pull request only from those runs.
+      # Merging the PR stays a person's step.
+      - name: Approve the release PR's CI
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          head="$(jq -r '.prs[0].head_branch // empty' "${RUNNER_TEMP}/release-pr.json")"
-          if [ -n "${head}" ]; then
-            gh workflow run ci.yml --repo "${GITHUB_REPOSITORY}" --ref "${head}"
+          number="$(jq -r '.prs[0].number // empty' "${RUNNER_TEMP}/release-pr.json")"
+          if [ -n "${number}" ]; then
+            bash .github/scripts/approve-held-runs.sh "${number}"
           fi
       # main takes changes only through pull requests that are up to date with
       # it, so the pushed tree is the one CI tested on the pull request whose
