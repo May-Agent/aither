@@ -7,7 +7,9 @@ use aither_core::WeakIdLease;
 use aither_core::llm::{CommandOutcome, CommandResult, CommandStream, Interruption};
 
 use crate::events::ShellEvents;
-use crate::job_registry::{JobInfo, JobRead, JobRegistry, JobStatus, JobWatch, KillCause};
+use crate::job_registry::{
+    JobInfo, JobInputError, JobRead, JobRegistry, JobStatus, JobWatch, KillCause,
+};
 use crate::output::{MediaResolution, OutputFormat, OutputStore};
 use crate::wording::CommandKilled;
 
@@ -314,8 +316,9 @@ impl Job {
     /// Writes `bytes` to the job's stdin.
     ///
     /// # Errors
-    /// Returns an error when the job is not running or takes no input.
-    pub async fn input(&self, bytes: Vec<u8>) -> Result<(), String> {
+    /// Returns an error when the job is not running or takes no input: one
+    /// started in the foreground has no stdin pipe, promoted or not.
+    pub async fn input(&self, bytes: Vec<u8>) -> Result<(), JobInputError> {
         self.jobs
             .registry
             .terminal_input(&self.task_id, bytes)

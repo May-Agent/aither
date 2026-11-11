@@ -11,7 +11,7 @@ use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::job_registry::{JobRead, UnchangedRead};
+use crate::job_registry::{JobInputError, JobRead, UnchangedRead};
 use crate::jobs::Jobs;
 use crate::wording::{AnyShellWording, CallRefusal, JobInputSent, JobKillAsked, Refused};
 
@@ -232,7 +232,16 @@ impl Tool for JobInputTool {
         if args.append_newline {
             bytes.push(b'\n');
         }
-        job.input(bytes).await.map_err(anyhow::Error::msg)?;
+        match job.input(bytes).await {
+            Ok(()) => {}
+            Err(JobInputError::NoStdin { task_id }) => {
+                return Err(Refused::call(
+                    &*self.wording,
+                    CallRefusal::NoStdin { task_id },
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
 
         Ok(ToolResult::text(
             self.wording.job_input(&JobInputSent { task_id }),

@@ -1,0 +1,2 @@
+exec </dev/null
+{{ script }}

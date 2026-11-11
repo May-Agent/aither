@@ -1739,21 +1739,19 @@ where
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (taken_tx, taken_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
-        // Every job gets a real stdin pipe: a foreground command that blocks
-        // on it promotes to a background task the model can feed through
-        // `terminal_input`, and a blocked episode raises an alert.
-        let stdin_alerts = Some(StdinAlerts {
-            tx: self.events_tx.clone(),
-            task_id: task_id.to_string(),
-            script: script.clone(),
-        });
         let background_startup = BackgroundStartup::new(startup_tx);
         self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
         self.spawn_long_job_alert(&task_id);
 
         let info = crate::LaunchInfo::new(task_id.to_string(), call.clone(), mode);
         let lifetime = if background {
-            JobLifetime::Background
+            JobLifetime::Background {
+                stdin: StdinAlerts {
+                    tx: self.events_tx.clone(),
+                    task_id: task_id.to_string(),
+                    script: script.clone(),
+                },
+            }
         } else {
             JobLifetime::Foreground {
                 alerts: self.events_tx.clone(),
@@ -1786,7 +1784,6 @@ where
                 interpreter,
                 mode,
                 backend,
-                stdin_alerts,
                 lifetime,
                 background_startup,
                 expect,
@@ -1960,9 +1957,10 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
-        // Registration precedes `report_ready` on every backend, so once
-        // startup returns the job is killable through the registry and the
-        // foreground clock only measures the command's own runtime.
+        // Registration, and a background job's stdin pipe, precede
+        // `report_ready` on every backend, so once startup returns the job
+        // is killable through the registry, takes input when it has a pipe,
+        // and the foreground clock only measures the command's own runtime.
         wait_for_background_startup(&spawned.startup, &**self.wording()).await?;
         if arguments.background {
             return detach_job(
@@ -3024,7 +3022,6 @@ struct StandaloneExecution<E> {
     interpreter: Interpreter,
     mode: SandboxMode,
     backend: ExecutionBackend,
-    stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: BackgroundStartup,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -3050,7 +3047,6 @@ struct StandaloneStart<'a, E> {
     interpreter: Interpreter,
     mode: SandboxMode,
     backend: &'a ExecutionBackend,
-    stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -3072,7 +3068,6 @@ struct LocalBackgroundExecution<'a, E> {
     interpreter: Interpreter,
     mode: SandboxMode,
     job_registry: &'a JobRegistry,
-    stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     #[cfg(all(unix, feature = "jobserver"))]
@@ -3093,7 +3088,6 @@ struct ContainerJobExecution<'a, E> {
     container_runtime: &'a ContainerShellRuntime,
     carry: Option<&'a CwdCarry>,
     job_registry: &'a JobRegistry,
-    stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
     /// The command's jobserver fifo inside the container, held until its
@@ -3116,6 +3110,7 @@ struct SshBackgroundExecution<'a, E> {
     server: &'a SshServer,
     heel: Option<&'a str>,
     job_registry: &'a JobRegistry,
+    lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
 }
 
@@ -3221,7 +3216,6 @@ struct SpawnedTerminalTask<E> {
     interpreter: Interpreter,
     mode: SandboxMode,
     backend: ExecutionBackend,
-    stdin_alerts: Option<StdinAlerts>,
     lifetime: JobLifetime,
     background_startup: BackgroundStartup,
     expect: OutputFormat,
@@ -3262,7 +3256,6 @@ where
         interpreter,
         mode,
         backend,
-        stdin_alerts,
         lifetime,
         background_startup,
         expect,
@@ -3309,7 +3302,6 @@ where
         interpreter,
         mode,
         backend,
-        stdin_alerts,
         lifetime,
         background_startup,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -3439,7 +3431,6 @@ where
         interpreter,
         mode,
         backend,
-        stdin_alerts,
         lifetime,
         background_startup,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -3471,7 +3462,6 @@ where
         interpreter,
         mode,
         backend: &backend,
-        stdin_alerts,
         lifetime,
         background_startup: &background_startup,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -3575,7 +3565,6 @@ where
                 container_runtime: runtime,
                 carry: request.carry,
                 job_registry: request.job_registry,
-                stdin_alerts: request.stdin_alerts,
                 lifetime: request.lifetime,
                 background_startup: request.background_startup,
                 #[cfg(all(unix, feature = "jobserver"))]
@@ -3605,6 +3594,7 @@ where
                 server,
                 heel: heel.as_deref(),
                 job_registry: request.job_registry,
+                lifetime: request.lifetime,
                 background_startup: request.background_startup,
             })
             .await;
@@ -3629,7 +3619,6 @@ where
         interpreter: request.interpreter,
         mode: request.mode,
         job_registry: request.job_registry,
-        stdin_alerts: request.stdin_alerts,
         lifetime: request.lifetime,
         background_startup: request.background_startup,
         #[cfg(all(unix, feature = "jobserver"))]
@@ -3906,29 +3895,18 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
         }
     };
 
-    let mut spec = SpawnSpec::new(program)
-        .args(args)
-        .env(environment)
-        .launch_info(context.info.clone())
-        .stdio(SpawnStdio {
-            // A background job's stdin is watched; any other reads EOF.
-            stdin: if context.stdin_alerts.is_some() {
-                Pipe::Piped
-            } else {
-                Pipe::Null
-            },
-            ..SpawnStdio::default()
-        });
+    let mut spec = context.lifetime.applied_to(
+        SpawnSpec::new(program)
+            .args(args)
+            .env(environment)
+            .launch_info(context.info.clone()),
+    );
     spec = spec
         .grants(grants.into_iter().map(crate::SpawnGrant::Host))
         .ipc(context.ipc.and_then(|ipc| ipc.router(&context.info)));
     if let Some(start) = context.carry.and_then(|carry| carry.start.as_deref()) {
         spec = spec.cwd(start);
     }
-    let spec = spec.lifetime(match context.lifetime {
-        JobLifetime::Foreground { .. } => TreeLifetime::Foreground,
-        JobLifetime::Background => TreeLifetime::Background,
-    });
     let LocalSpawn {
         child,
         tree,
@@ -3950,7 +3928,6 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             crate::JobPlace::Host,
         )
         .await;
-    context.background_startup.report_ready().await;
 
     let output = collect_local_process_output(
         child,
@@ -3961,7 +3938,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             pid,
             tree,
             lifetime: context.lifetime,
-            stdin_alerts: context.stdin_alerts,
+            startup: context.background_startup,
         },
         "missing stdout pipe for local process",
         "missing stderr pipe for local process",
@@ -3971,21 +3948,54 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
     Ok(output)
 }
 
-/// How long a command's descendants may outlive its top-level shell.
+/// How long a command's descendants may outlive its top-level shell, and
+/// what the command reads on stdin.
+///
+/// Both follow from whether the call waits for the command: nothing feeds a
+/// call that waits, so its stdin is the null device, and a background job's
+/// is a pipe the agent feeds through the input tool. [`Self::applied_to`] is
+/// the one place a spawn takes them from, on every backend.
 #[derive(Clone)]
 enum JobLifetime {
     /// None: the survivors are killed and reported on `alerts`, as those of
-    /// the command `task_id` that the tool call `call` ran.
+    /// the command `task_id` that the tool call `call` ran. Its stdin reads
+    /// EOF at once, and still does once the call promotes it to a job past
+    /// the foreground window.
     Foreground {
         alerts: EventSender,
         task_id: String,
         call: Option<CallIdentity>,
     },
-    /// All of them: the job runs until its whole tree has exited.
-    Background,
+    /// All of them: the job runs until its whole tree has exited. Its stdin
+    /// is a pipe, and a reader blocked on it is reported through `stdin`
+    /// where the backend can watch it.
+    Background { stdin: StdinAlerts },
 }
 
 impl JobLifetime {
+    /// `spec` spawned under this lifetime: what the backend does with the
+    /// descendants its top-level process leaves, and its stdin.
+    const fn applied_to(&self, spec: SpawnSpec) -> SpawnSpec {
+        let (tree, stdin) = match self {
+            Self::Foreground { .. } => (TreeLifetime::Foreground, Pipe::Null),
+            Self::Background { .. } => (TreeLifetime::Background, Pipe::Piped),
+        };
+        spec.lifetime(tree).stdio(SpawnStdio {
+            stdin,
+            stdout: Pipe::Piped,
+            stderr: Pipe::Piped,
+        })
+    }
+
+    /// Where a reader blocked on the job's stdin pipe is reported; `None` for
+    /// a foreground command, which has no pipe.
+    const fn stdin_alerts(&self) -> Option<&StdinAlerts> {
+        match self {
+            Self::Foreground { .. } => None,
+            Self::Background { stdin } => Some(stdin),
+        }
+    }
+
     /// Reports `killed` as the descendants a foreground command left; a
     /// background job's are never killed, so it reports nothing.
     async fn report_descendants_killed(&self, killed: Vec<JobProcess>) {
@@ -4008,10 +4018,8 @@ impl JobLifetime {
     }
 }
 
-/// Where a background job's stdin alerts go.
-///
-/// Its presence is what makes a command a background job: a command without
-/// one reads EOF from a null stdin.
+/// Where a background job's stdin alerts go: the job of `task_id`, running
+/// `script`.
 #[derive(Clone)]
 struct StdinAlerts {
     tx: EventSender,
@@ -4132,7 +4140,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     executor: E,
     job_registry: &JobRegistry,
     task_id: &IdLease,
-    job: LocalJob,
+    job: LocalJob<'_>,
     missing_stdout_message: &'static str,
     missing_stderr_message: &'static str,
 ) -> Result<std::process::Output, TerminalError> {
@@ -4140,21 +4148,28 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         pid,
         tree,
         lifetime,
-        stdin_alerts,
+        startup,
     } = job;
+    // A background job's stdin pipe is fed through the registry and watched;
+    // a foreground command reads the null device and has none.
     let mut stdin_watch = None;
-    if let Some(stdin) = child.take_stdin() {
+    if let Some(alerts) = lifetime.stdin_alerts() {
+        let stdin = child.take_stdin().ok_or_else(|| {
+            TerminalError::Execution("missing stdin pipe for local process".into())
+        })?;
         let feed = FeedCounter::default();
-        if let Some(alerts) = stdin_alerts {
-            let probe = LocalStdinProbe::new(pid, &stdin)
-                .map_err(|error| TerminalError::Execution(format!("stdin probe: {error}")))?;
-            let (signal_tx, signal_rx) = async_channel::unbounded();
-            executor.spawn(alerts.relay(signal_rx)).detach();
-            stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
-        }
-        let input_tx = write_chunks(stdin, feed);
-        job_registry.attach_terminal_input(task_id, input_tx).await;
+        let probe = LocalStdinProbe::new(pid, &stdin)
+            .map_err(|error| TerminalError::Execution(format!("stdin probe: {error}")))?;
+        let (signal_tx, signal_rx) = async_channel::unbounded();
+        executor.spawn(alerts.clone().relay(signal_rx)).detach();
+        stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
+        job_registry
+            .attach_terminal_input(task_id, write_chunks(stdin, feed))
+            .await;
     }
+    // Only now: a job that has a pipe takes input from the moment its call
+    // can name it.
+    startup.report_ready().await;
 
     let stdout = child
         .take_stdout()
@@ -4237,14 +4252,15 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     Ok(output)
 }
 
-/// A local job's process tree and how long its descendants may live.
-struct LocalJob {
+/// A local job's process tree, how long its descendants may live, and where
+/// its start is reported once it takes input.
+struct LocalJob<'a> {
     /// The root process's id, for the stdin probe: the registry never
     /// identifies the job by it.
     pid: u32,
     tree: JobTree,
     lifetime: JobLifetime,
-    stdin_alerts: Option<StdinAlerts>,
+    startup: &'a BackgroundStartup,
 }
 
 /// The teardown budget a job's supervisor gives its kills: the time to
@@ -4366,7 +4382,7 @@ async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), T
             }
             Ok(())
         }
-        JobLifetime::Background => tree
+        JobLifetime::Background { .. } => tree
             .wait_descendants_exit()
             .await
             .map_err(|error| TerminalError::Execution(error.to_string())),
@@ -4472,22 +4488,13 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
             .and_then(|container| container.report.as_ref()),
         &launch_script(context.interpreter, context.script, context.task_id)?,
     )?;
-    let foreground = matches!(context.lifetime, JobLifetime::Foreground { .. });
-    let mut spec = SpawnSpec::script(script)
-        .env(environment)
-        .launch_info(context.info.clone())
-        .grants(grants)
-        .ipc(context.ipc.and_then(|ipc| ipc.router(&context.info)))
-        .lifetime(if foreground {
-            TreeLifetime::Foreground
-        } else {
-            TreeLifetime::Background
-        })
-        // A foreground command gets no input channel: its stdin reads EOF.
-        .stdio(SpawnStdio {
-            stdin: if foreground { Pipe::Null } else { Pipe::Piped },
-            ..SpawnStdio::default()
-        });
+    let mut spec = context.lifetime.applied_to(
+        SpawnSpec::script(script)
+            .env(environment)
+            .launch_info(context.info.clone())
+            .grants(grants)
+            .ipc(context.ipc.and_then(|ipc| ipc.router(&context.info))),
+    );
     if let Some(carry) = carry.filter(|carry| carry.container.is_some())
         && let Some(start) = &carry.start
     {
@@ -4506,7 +4513,6 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
             script: context.script,
             interpreter: context.interpreter,
             mode: context.mode,
-            stdin_alerts: context.stdin_alerts.clone(),
             lifetime: context.lifetime.clone(),
         },
     )
@@ -4577,7 +4583,11 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
     // No `.ipc(..)`: a server has no way back to this machine, and its
     // backend refuses a router with `SpawnError::Unsupported`.
     let child = sandbox
-        .spawn(SpawnSpec::script(script).launch_info(context.info.clone()))
+        .spawn(
+            context
+                .lifetime
+                .applied_to(SpawnSpec::script(script).launch_info(context.info.clone())),
+        )
         .await?;
     run_spawned_job(
         child,
@@ -4593,8 +4603,7 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
             script: context.script,
             interpreter: context.interpreter,
             mode: context.mode,
-            stdin_alerts: None,
-            lifetime: JobLifetime::Background,
+            lifetime: context.lifetime,
         },
     )
     .await
@@ -4611,8 +4620,8 @@ struct SpawnedJob<'a, E> {
     script: &'a str,
     interpreter: Interpreter,
     mode: SandboxMode,
-    /// Where a blocked stdin is alerted, for a child that watches its stdin.
-    stdin_alerts: Option<StdinAlerts>,
+    /// How long its descendants live, and where a reader blocked on its
+    /// stdin pipe is alerted, for a child whose backend watches it.
     lifetime: JobLifetime,
 }
 
@@ -4649,8 +4658,8 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
             .attach_terminal_input(job.task_id, stdin)
             .await;
     }
-    if let (Some(signals), Some(alerts)) = (stdin_blocked, job.stdin_alerts) {
-        job.executor.spawn(alerts.relay(signals)).detach();
+    if let (Some(signals), Some(alerts)) = (stdin_blocked, job.lifetime.stdin_alerts()) {
+        job.executor.spawn(alerts.clone().relay(signals)).detach();
     }
     // A kill of the job ends the whole process tree, wherever it runs.
     let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
@@ -6181,7 +6190,6 @@ mod tests {
             backend: ExecutionBackend::Local {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
-            stdin_alerts: None,
             lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -6251,7 +6259,6 @@ mod tests {
             backend: ExecutionBackend::Local {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
-            stdin_alerts: None,
             lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -6365,7 +6372,6 @@ mod tests {
             backend: ExecutionBackend::Local {
                 shell: Arc::from(TEST_HOST_SHELL),
             },
-            stdin_alerts: None,
             lifetime: foreground_lifetime(ShellEvents::new().sender(AgentPath::main())),
             background_startup: BackgroundStartup::new(startup_tx),
             #[cfg(all(unix, feature = "jobserver"))]
@@ -7050,45 +7056,6 @@ mod tests {
         panic!("descendant process {child_pid} survived terminal cancellation");
     }
 
-    /// A foreground command blocked on stdin sees no EOF: every job owns a
-    /// live stdin pipe, so at the foreground window the call promotes it to
-    /// a background task the model feeds through `terminal_input`.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn foreground_command_blocked_on_stdin_promotes_at_the_window() {
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let tool = configured_test_terminal(
-            dir.path(),
-            Duration::from_secs(1),
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        )
-        .await;
-        let background_receiver = tool.background_receiver();
-
-        let result = tool
-            .call(
-                terminal_args("read all of stdin", "cat"),
-                ToolContext::new(),
-            )
-            .await
-            .expect("terminal call should succeed");
-
-        let command = result.command().expect("terminal returns a command result");
-        let CommandOutcome::Running { task_id, .. } = &command.outcome else {
-            panic!(
-                "cat blocked on stdin must promote to a task, got {:?}",
-                command.outcome
-            );
-        };
-        assert_eq!(started_task_id(&background_receiver), *task_id);
-
-        assert!(
-            tool.job_registry().kill_by_task_id(task_id).await,
-            "the promoted task must still be running"
-        );
-    }
-
     #[cfg(unix)]
     fn terminal_args(description: &str, script: &str) -> ShellArgs {
         ShellArgs {
@@ -7288,102 +7255,338 @@ mod tests {
         alerts
     }
 
-    /// A foreground container command's stdin reads EOF at once: only a
-    /// background job's stdin is a pipe the agent feeds.
+    /// The program a [`ModelExec`] plays for every command, whatever the
+    /// script names.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn container_foreground_command_reads_eof_from_stdin() {
-        /// A container executor that asserts stdin is at EOF.
-        struct ForegroundStdinPipeExec;
+    #[derive(Debug, Clone, Copy)]
+    enum Modelled {
+        /// `cat`: copies its stdin to its stdout until EOF.
+        Cat,
+        /// `cat; sleep`: `cat`, then runs until it is killed.
+        CatThenSleep,
+        /// `read name; printf 'hello %s\n' "$name"`.
+        ReadName,
+        /// [`RG_INPUT_PROBE`]: what `rg` given no path would search.
+        RgInput,
+    }
 
-        impl crate::ContainerExec for ForegroundStdinPipeExec {
-            fn exec(
-                &self,
-                _container_id: &str,
-                _script: &str,
-                _working_dir: &str,
-                _kill_rx: Receiver<()>,
-                _stdin_rx: Receiver<Vec<u8>>,
-                _lifetime: ExecLifetime,
-            ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
-            {
-                std::future::ready(Err("a job streams its output".to_string()))
-            }
+    /// A container exec that plays its program as a container runs it: the
+    /// process's stdin is the exec's attached stream, a pipe, unless the
+    /// script reads the null device first, and a background exec reports a
+    /// read that waits on that stream as its stdin watch would.
+    #[cfg(unix)]
+    struct ModelExec(Modelled);
 
-            async fn exec_streamed(
-                &self,
-                _container_id: &str,
-                _script: &str,
-                _working_dir: &str,
-                _kill_rx: Receiver<()>,
-                stdin_rx: Receiver<Vec<u8>>,
-                _stdout: Sender<Vec<u8>>,
-                lifetime: ExecLifetime,
-            ) -> Result<ContainerExecOutcome, String> {
-                assert!(
-                    matches!(lifetime, ExecLifetime::Foreground),
-                    "a foreground command's descendants end with it"
-                );
-                let eof = futures_lite::future::or(async { Some(stdin_rx.recv().await) }, async {
-                    async_io::Timer::after(Duration::from_secs(5)).await;
-                    None
-                })
-                .await
-                .expect("a foreground exec's stdin must be EOF at once, not left open");
-                assert!(eof.is_err(), "a foreground exec's stdin must carry no data");
-                Ok(ContainerExecOutcome::Completed {
-                    output: std::process::Output {
-                        status: std::os::unix::process::ExitStatusExt::from_raw(0),
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                    },
-                    killed: Vec::new(),
-                })
-            }
+    #[cfg(unix)]
+    impl crate::ContainerExec for ModelExec {
+        fn exec(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _lifetime: ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("a job streams its output".to_string()))
         }
 
-        let dir = tempfile::tempdir().expect("temp dir should be created");
-        let (job_registry, job_registry_service) =
-            job_registry_channel(crate::output_policy::fixture::policy());
-        tokio::spawn(async move { job_registry_service.serve().await });
+        async fn exec_streamed(
+            &self,
+            _container_id: &str,
+            script: &str,
+            _working_dir: &str,
+            kill_rx: Receiver<()>,
+            stdin_rx: Receiver<Vec<u8>>,
+            stdout: Sender<Vec<u8>>,
+            lifetime: ExecLifetime,
+        ) -> Result<ContainerExecOutcome, String> {
+            let redirect = crate::spawn::script_reading(Pipe::Null, String::new())
+                .expect("the null stdin redirect renders");
+            let null_stdin = script.contains(redirect.trim_end());
+            match self.0 {
+                Modelled::Cat | Modelled::CatThenSleep => {
+                    // The null device is at its end at once.
+                    if !null_stdin {
+                        while let Ok(bytes) = stdin_rx.recv().await {
+                            let _ = stdout.send(bytes).await;
+                        }
+                    }
+                    if matches!(self.0, Modelled::CatThenSleep) {
+                        let _ = kill_rx.recv().await;
+                        return Ok(ContainerExecOutcome::Killed);
+                    }
+                }
+                Modelled::ReadName => {
+                    let name = if null_stdin {
+                        Vec::new()
+                    } else {
+                        if let ExecLifetime::Background { stdin_blocked } = &lifetime {
+                            let _ = stdin_blocked.send(StdinWatchSignal::Blocked).await;
+                        }
+                        stdin_rx.recv().await.unwrap_or_default()
+                    };
+                    let name = String::from_utf8_lossy(&name);
+                    let _ = stdout
+                        .send(format!("hello {}\n", name.trim_end()).into_bytes())
+                        .await;
+                }
+                // `rg` reads a stdin that is a file, a FIFO or a socket.
+                Modelled::RgInput => {
+                    let searched: &[u8] = if null_stdin {
+                        b"directory\n"
+                    } else {
+                        b"stdin\n"
+                    };
+                    let _ = stdout.send(searched.to_vec()).await;
+                }
+            }
+            Ok(ContainerExecOutcome::Completed {
+                output: std::process::Output {
+                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                killed: Vec::new(),
+            })
+        }
+    }
+
+    /// A shell whose home backend is a container that plays `program` for
+    /// every command, waiting `foreground_wait` in the foreground.
+    #[cfg(unix)]
+    async fn modelled_container_terminal(
+        dir: &Path,
+        program: Modelled,
+        foreground_wait: Duration,
+    ) -> Shell<executor_core::tokio::TokioGlobal> {
         let runtime = ContainerShellRuntime::new(
-            "aither-test-foreground-stdin",
+            "aither-test-stdin",
             crate::HostRoute::new(
                 "host.docker.internal",
                 std::net::IpAddr::from([127, 0, 0, 1]),
             )
             .expect("loopback is routable"),
-            crate::AnyContainerExec::new(Arc::new(ForegroundStdinPipeExec)),
+            crate::AnyContainerExec::new(Arc::new(ModelExec(program))),
         );
-        let (startup_tx, _startup_rx) = async_channel::bounded(1);
-        let alert_tx = ShellEvents::new().sender(AgentPath::main());
-        let output = execute_container_job(ContainerJobExecution {
-            executor: executor_core::tokio::TokioGlobal,
-            sandbox: &container_sandbox(&runtime, dir.path()),
-            ipc: None,
-            committed: &[],
-            task_id: &crate::test_ids::lease("probe"),
-            info: crate::LaunchInfo::default(),
-            execution_id: "exec-test",
-            script: "cat",
-            interpreter: Interpreter::Shell,
-            mode: SandboxMode::Sandboxed,
-            container_runtime: &runtime,
-            job_registry: &job_registry,
-            stdin_alerts: Some(StdinAlerts {
-                tx: alert_tx.clone(),
-                task_id: "probe".to_string(),
-                script: "cat".to_string(),
-            }),
-            lifetime: foreground_lifetime(alert_tx),
-            background_startup: &BackgroundStartup::new(startup_tx),
-            carry: None,
-            #[cfg(all(unix, feature = "jobserver"))]
-            job_fifo: None,
-        })
+        let tool = Shell::new_exact_on(
+            container_sandbox(&runtime, dir),
+            executor_core::tokio::TokioGlobal,
+            crate::limits::fixture::limits(),
+            crate::output_policy::fixture::policy(),
+            TestWording::any(),
+            crate::test_wording::job_tools(),
+        )
         .await
-        .expect("a foreground container exec should complete");
-        assert_eq!(output.status.code(), Some(0));
+        .expect("terminal tool should initialize");
+        tool.limits.foreground_wait.set_normal(foreground_wait);
+        tool.limits.timeout_cap.set(Duration::from_secs(60));
+        tool.limits.long_job_alert.set(Duration::from_secs(600));
+        tool
+    }
+
+    /// Python that prints what `rg` given no path would search, by the rule
+    /// `rg` follows: its stdin when that is a regular file, a FIFO or a
+    /// socket, otherwise the working directory.
+    #[cfg(unix)]
+    const RG_INPUT_PROBE: &str = "import os, stat; mode = os.fstat(0).st_mode; print('stdin' if stat.S_ISREG(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) else 'directory')";
+
+    /// A foreground command's stdin is the null device, so `rg` given no
+    /// path searches the working directory; a background job's is a pipe.
+    #[cfg(unix)]
+    async fn rg_searches_the_directory_only_in_the_foreground(
+        tool: &Shell<executor_core::tokio::TokioGlobal>,
+    ) {
+        let result = tool
+            .call(python_args(RG_INPUT_PROBE), ToolContext::new())
+            .await
+            .expect("the foreground probe runs");
+        let command = result.command().expect("a command result");
+        assert_eq!(command.outcome, CommandOutcome::Exited { code: 0 });
+        assert_eq!(
+            output_text(&command.stdout).map(str::trim),
+            Some("directory")
+        );
+
+        let job = tool
+            .run_background(ShellArgs {
+                background: true,
+                ..python_args(RG_INPUT_PROBE)
+            })
+            .await
+            .expect("the background probe starts");
+        let result = job.wait().await.expect("the background probe ends");
+        assert_eq!(output_text(&result.stdout).map(str::trim), Some("stdin"));
+    }
+
+    /// A foreground `cat` returns at once with empty output: nothing feeds a
+    /// call that waits, so it is never promoted for want of input.
+    #[cfg(unix)]
+    async fn a_foreground_cat_returns_at_once_with_empty_output(
+        tool: &Shell<executor_core::tokio::TokioGlobal>,
+    ) {
+        let started = std::time::Instant::now();
+        let result = tool
+            .call(
+                terminal_args("read all of stdin", "cat"),
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let command = result.command().expect("a command result");
+        assert_eq!(command.outcome, CommandOutcome::Exited { code: 0 });
+        assert!(
+            output_text(&command.stdout).is_some_and(str::is_empty) && command.stderr.is_none(),
+            "{command:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cat read EOF at once, well inside the foreground window"
+        );
+    }
+
+    /// A foreground command promoted past the window keeps the stdin it
+    /// started with: input to it is refused, saying why, and nothing alerts
+    /// that it waits for input.
+    #[cfg(unix)]
+    async fn a_promoted_foreground_job_refuses_input(
+        tool: &Shell<executor_core::tokio::TokioGlobal>,
+        script: &str,
+    ) {
+        let events = tool.background_receiver();
+        let result = tool
+            .call(
+                terminal_args("read stdin, then keep running", script),
+                ToolContext::new(),
+            )
+            .await
+            .expect("terminal call should succeed");
+        let command = result.command().expect("a command result");
+        let CommandOutcome::Running { task_id, .. } = &command.outcome else {
+            panic!(
+                "a command still running at the window is promoted, got {:?}",
+                command.outcome
+            );
+        };
+
+        let refusal = input_tool(tool.jobs())
+            .call(
+                JobInputArgs {
+                    task_id: task_id.clone(),
+                    input: "lexo".to_string(),
+                    append_newline: true,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("a promoted foreground job takes no input");
+        let refusal = refusal
+            .downcast_ref::<crate::Refused<CallRefusal>>()
+            .expect("the refusal is typed");
+        assert_eq!(
+            refusal.reason(),
+            &CallRefusal::NoStdin {
+                task_id: task_id.clone()
+            }
+        );
+        assert!(
+            refusal.text().contains("started in the foreground"),
+            "{refusal}"
+        );
+        assert!(
+            events.take_job_alerts().is_empty(),
+            "a job without a stdin pipe raises no stdin alert"
+        );
+        assert!(
+            tool.job_registry().kill_by_task_id(task_id).await,
+            "the promoted job still runs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_foreground_rg_searches_the_working_directory() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        rg_searches_the_directory_only_in_the_foreground(&tool).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_foreground_rg_searches_the_working_directory() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool =
+            modelled_container_terminal(dir.path(), Modelled::RgInput, Duration::from_secs(30))
+                .await;
+        rg_searches_the_directory_only_in_the_foreground(&tool).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_foreground_cat_returns_at_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        a_foreground_cat_returns_at_once_with_empty_output(&tool).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_foreground_cat_returns_at_once() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool =
+            modelled_container_terminal(dir.path(), Modelled::Cat, Duration::from_secs(30)).await;
+        a_foreground_cat_returns_at_once_with_empty_output(&tool).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_promoted_local_foreground_job_refuses_input() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .await;
+        a_promoted_foreground_job_refuses_input(&tool, "cat; sleep 30").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_promoted_container_foreground_job_refuses_input() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool =
+            modelled_container_terminal(dir.path(), Modelled::CatThenSleep, Duration::from_secs(1))
+                .await;
+        a_promoted_foreground_job_refuses_input(&tool, "cat; sleep 30").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_background_job_blocked_on_stdin_yields_one_alert() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool =
+            modelled_container_terminal(dir.path(), Modelled::ReadName, Duration::from_secs(10))
+                .await;
+        background_reader_alerts_once_and_resumes_when_fed(
+            &tool,
+            "read name; printf 'hello %s\\n' \"$name\"",
+        )
+        .await;
     }
 
     /// A container command's exec carries the commands the shell's provider
@@ -7463,7 +7666,6 @@ mod tests {
             mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             job_registry: &job_registry,
-            stdin_alerts: None,
             lifetime: foreground_lifetime(alert_tx),
             background_startup: &BackgroundStartup::new(startup_tx),
             carry: None,
@@ -7597,7 +7799,6 @@ mod tests {
             mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
             job_registry: &job_registry,
-            stdin_alerts: None,
             lifetime: foreground_lifetime(alert_tx),
             background_startup: &BackgroundStartup::new(startup_tx),
             carry: None,
@@ -7618,8 +7819,8 @@ mod tests {
         assert_eq!(heard.recv().await.unwrap(), b"F");
     }
 
-    /// A job whose `reader` script blocks on stdin yields exactly one alert
-    /// until it is fed, and finishes once it is.
+    /// A local background job whose `reader` script blocks on stdin yields
+    /// exactly one alert until it is fed, and finishes once it is.
     #[cfg(unix)]
     async fn stdin_reader_alerts_once_and_resumes_when_fed(reader: &str) {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -7630,8 +7831,19 @@ mod tests {
             Duration::from_secs(600),
         )
         .await;
+        background_reader_alerts_once_and_resumes_when_fed(&tool, reader).await;
+    }
+
+    /// A background job of `tool` whose `reader` script blocks on stdin
+    /// yields exactly one alert until it is fed through the input tool, and
+    /// finishes once it is.
+    #[cfg(unix)]
+    async fn background_reader_alerts_once_and_resumes_when_fed(
+        tool: &Shell<executor_core::tokio::TokioGlobal>,
+        reader: &str,
+    ) {
         let background_receiver = tool.background_receiver();
-        let task_id = start_background_job(&tool, reader).await;
+        let task_id = start_background_job(tool, reader).await;
 
         let alerts = alerts_within(&background_receiver, Duration::from_secs(8)).await;
         assert!(

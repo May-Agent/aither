@@ -932,3 +932,64 @@ async fn a_script_that_cannot_be_uploaded_runs_nothing_and_says_why() {
         "{error}"
     );
 }
+
+/// A foreground command on a server reads the null device, so a `cat`
+/// returns at once with no output; a background one reads a pipe the input
+/// tool feeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_command_reads_a_stdin_pipe_only_in_the_background() {
+    let sshd = Sshd::start_with_heel(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let terminal = terminal(
+        dir.path(),
+        home_registry(sshd.client.clone()),
+        &Approvals::default(),
+    )
+    .await;
+    terminal
+        .shell_sessions()
+        .add_ssh_server(Sshd::server(), prepared(&sshd, false))
+        .unwrap();
+
+    let foreground = terminal
+        .call(
+            args("cat", SandboxMode::Unsandboxed, "fixture"),
+            ToolContext::new(),
+        )
+        .await
+        .expect("a foreground cat runs on the server");
+    let command = foreground.command().expect("a command result");
+    assert_eq!(command.outcome, CommandOutcome::Exited { code: 0 });
+    assert!(
+        output_text(&command.stdout).is_some_and(str::is_empty),
+        "{command:?}"
+    );
+
+    let job = terminal
+        .run_background(ShellArgs {
+            background: true,
+            ..args(
+                "read name; printf 'hello %s\\n' \"$name\"",
+                SandboxMode::Unsandboxed,
+                "fixture",
+            )
+        })
+        .await
+        .expect("a background reader starts on the server");
+    input_tool(terminal.jobs())
+        .call(
+            JobInputArgs {
+                task_id: job.task_id().to_owned(),
+                input: "lexo".to_string(),
+                append_newline: true,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("a background job on a server takes input");
+    let result = job.wait().await.expect("the fed job ends");
+    assert_eq!(
+        output_text(&result.stdout).map(str::trim),
+        Some("hello lexo")
+    );
+}

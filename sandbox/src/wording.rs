@@ -50,6 +50,14 @@ pub enum CallRefusal {
     },
     /// A read asks for zero bytes.
     ZeroMaxBytes,
+    /// An input names a job that reads no input: it was started in the
+    /// foreground, whose stdin is the null device, and a job promoted past
+    /// the foreground window keeps the stdin it started with. Only a job
+    /// started with `background` has a stdin pipe.
+    NoStdin {
+        /// The task named.
+        task_id: String,
+    },
 }
 
 /// Why a foreground command the shell killed was killed.

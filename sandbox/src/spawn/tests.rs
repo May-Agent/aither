@@ -366,6 +366,39 @@ async fn a_container_process_streams_and_kill_ends_its_exec() {
     assert_eq!(child.wait().await, ChildExit::Killed);
 }
 
+/// A container process given no stdin pipe reads the null device, as a host
+/// process does: its exec's attached stream is a pipe even when nothing feeds
+/// it, so the script reads `/dev/null` first; a piped one reads the stream.
+#[tokio::test]
+async fn an_unpiped_container_stdin_is_the_null_device() {
+    let (_work, work) = canonical_tempdir();
+    let redirect =
+        super::script_reading(Pipe::Null, String::new()).expect("the null stdin redirect renders");
+    for (stdin, redirected) in [(Pipe::Null, true), (Pipe::Piped, false)] {
+        let scripts = Arc::new(Mutex::new(Vec::new()));
+        let spec = SpawnSpec::new("job").stdio(Stdio {
+            stdin,
+            ..Stdio::default()
+        });
+        let mut child = container_sandbox(&scripts, &work)
+            .spawn(spec)
+            .await
+            .expect("the exec starts");
+        let stdout = child.take_stdout().unwrap();
+        tokio::time::timeout(BOUND, stdout.recv())
+            .await
+            .expect("the exec prints")
+            .expect("stdout is open");
+        let script = scripts.lock().unwrap().join("\n");
+        assert_eq!(
+            script.contains(redirect.trim_end()),
+            redirected,
+            "{stdin:?}: {script}"
+        );
+        child.kill().await.expect("the exec is killed");
+    }
+}
+
 /// A container exec that records how it was started, reports the descendants
 /// it killed and, for a background exec, that its stdin blocked.
 struct ReportingExec {

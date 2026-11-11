@@ -157,6 +157,39 @@ impl JobStatus {
     }
 }
 
+/// Why bytes were not written to a job's stdin.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum JobInputError {
+    /// The registry holds no job of that name.
+    #[error("unknown task_id: {task_id}")]
+    UnknownTask {
+        /// The task named.
+        task_id: String,
+    },
+    /// The job no longer runs.
+    #[error("task {task_id} is not running; current status: {status:?}")]
+    NotRunning {
+        /// The job.
+        task_id: String,
+        /// How it ended.
+        status: JobStatus,
+    },
+    /// The job's stdin is the null device, not a pipe: it was started in the
+    /// foreground, and a job promoted past the foreground window keeps the
+    /// stdin it started with.
+    #[error("task {task_id} reads no input: it started in the foreground, with no stdin pipe")]
+    NoStdin {
+        /// The job.
+        task_id: String,
+    },
+    /// The job's stdin pipe is closed.
+    #[error("terminal input channel closed for task {task_id}")]
+    Closed {
+        /// The job.
+        task_id: String,
+    },
+}
+
 /// Whether a finished job's completion has reached its agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
@@ -490,7 +523,7 @@ enum JobRequest {
     InputTerminal {
         task_id: String,
         bytes: Vec<u8>,
-        reply: Sender<Result<(), String>>,
+        reply: Sender<Result<(), JobInputError>>,
     },
     StartOutputRedirect {
         task_id: String,
@@ -739,7 +772,8 @@ impl JobRegistry {
         .await;
     }
 
-    /// Attaches a stdin input channel to a running job.
+    /// Attaches a stdin input channel to a running job. A job with no channel
+    /// attached reads no input: [`JobInputError::NoStdin`].
     pub async fn attach_terminal_input(&self, task_id: &IdLease, input_tx: TerminalInputSender) {
         self.send_command(StateCommand::AttachTerminalInput {
             task_id: task_id.clone(),
@@ -867,8 +901,9 @@ impl JobRegistry {
     /// Sends bytes to a running task terminal stdin.
     ///
     /// # Errors
-    /// Returns an error when the task does not exist or no stdin channel is attached.
-    pub async fn terminal_input(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+    /// Returns an error when the task does not exist, no longer runs, has no
+    /// stdin channel attached or its channel closed.
+    pub async fn terminal_input(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), JobInputError> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::InputTerminal {
             task_id: task_id.to_string(),
@@ -2028,24 +2063,28 @@ async fn begin_kill_by_execution_key(
     plans
 }
 
-async fn input_terminal(jobs: &Jobs, task_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+async fn input_terminal(jobs: &Jobs, task_id: &str, bytes: Vec<u8>) -> Result<(), JobInputError> {
     let Some(job) = jobs.get(task_id) else {
-        return Err(format!("unknown task_id: {task_id}"));
+        return Err(JobInputError::UnknownTask {
+            task_id: task_id.to_owned(),
+        });
     };
     if !matches!(job.info.status, JobStatus::Running) {
-        return Err(format!(
-            "task {} is not running; current status: {:?}",
-            task_id, job.info.status
-        ));
+        return Err(JobInputError::NotRunning {
+            task_id: task_id.to_owned(),
+            status: job.info.status.clone(),
+        });
     }
+    // A job with a stdin pipe has its channel attached before its start is
+    // reported, so a running job without one was started without a pipe.
     let Some(tx) = &job.input_tx else {
-        return Err(format!(
-            "task {task_id} does not support terminal input in this runtime"
-        ));
+        return Err(JobInputError::NoStdin {
+            task_id: task_id.to_owned(),
+        });
     };
-    tx.send(bytes)
-        .await
-        .map_err(|_| format!("terminal input channel closed for task {task_id}"))
+    tx.send(bytes).await.map_err(|_| JobInputError::Closed {
+        task_id: task_id.to_owned(),
+    })
 }
 
 async fn redirect_task_output(
@@ -3006,7 +3045,7 @@ mod tests {
             .terminal_input("input", b"y".to_vec())
             .await
             .expect_err("a finished job refuses input");
-        assert!(error.contains("is not running"), "{error}");
+        assert!(matches!(error, JobInputError::NotRunning { .. }), "{error}");
         assert!(input_rx.is_closed(), "the registry must drop its sender");
     }
 

@@ -9,7 +9,9 @@ use executor_core::{AnyExecutor, Executor};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
-use super::{EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnCommand, SpawnError, SpawnSpec};
+use super::{
+    EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnCommand, SpawnError, SpawnSpec, script_reading,
+};
 use crate::SshServer;
 use crate::process_tree::{KillTreeError, kill_process_tree};
 use crate::ssh::SshClient;
@@ -187,6 +189,9 @@ impl Sandbox {
                 shell_words::join(std::iter::once(&program).chain(&args))
             }
         };
+        // On the server the command's stdin is its session's channel, a pipe
+        // even while the local client reads the null device.
+        let script = script_reading(stdio.stdin, script)?;
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
         let script = inject_env_exports(script, Some(&spec_env), &info).map_err(|e| failed(&e))?;
         let remote = remote_command(launch, heel, &script).map_err(|e| failed(&e))?;
