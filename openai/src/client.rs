@@ -1,8 +1,9 @@
 use crate::PROVIDER_NAME;
 use crate::{
     DEEPSEEK_BASE_URL, DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE,
-    DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
-    DEFAULT_MODEL, DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL, OPENROUTER_BASE_URL,
+    DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_IMAGE_MODEL, DEFAULT_MODEL, DEFAULT_MODERATION_MODEL, DEFAULT_TRANSCRIPTION_MODEL,
+    OPENROUTER_BASE_URL,
     error::OpenAIError,
     request::{
         ChatCompletionRequest, ChatMessagePayload, ParameterSnapshot, ResponsesInputItem,
@@ -29,26 +30,26 @@ use futures_lite::StreamExt;
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use zenwave::{Client, client, header};
 
-fn map_zenwave_error(error: zenwave::Error) -> OpenAIError {
-    if matches!(error, zenwave::Error::Timeout) {
-        OpenAIError::Timeout
-    } else {
-        OpenAIError::Http(error)
-    }
+/// Runs `fut`, failing with [`OpenAIError::IdleTimeout`] when it has not
+/// completed within `idle`.
+///
+/// Bytes that never come are the signature of a socket that died while the
+/// machine slept, so every wait on the server — for the response to start and
+/// for each stream event — goes through this.
+async fn within_idle<T>(idle: Duration, fut: impl Future<Output = T>) -> Result<T, OpenAIError> {
+    futures_lite::future::or(async move { Ok(fut.await) }, async move {
+        sleep(idle).await;
+        Err(OpenAIError::IdleTimeout { idle })
+    })
+    .await
 }
 
-async fn request_with_timeout<T>(
-    timeout: Duration,
+/// [`within_idle`] for a request future that fails with a zenwave error.
+async fn request_within_idle<T>(
+    idle: Duration,
     fut: impl Future<Output = Result<T, zenwave::Error>>,
 ) -> Result<T, OpenAIError> {
-    futures_lite::future::or(
-        async move { fut.await.map_err(map_zenwave_error) },
-        async move {
-            sleep(timeout).await;
-            Err(OpenAIError::Timeout)
-        },
-    )
-    .await
+    within_idle(idle, fut).await?.map_err(OpenAIError::Http)
 }
 
 /// Result of attempting to establish an SSE stream.
@@ -144,6 +145,13 @@ impl OpenAI {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.inner).base_url = base_url.into();
+        self
+    }
+
+    /// Override the idle timeout in-place; see [`Builder::idle_timeout`].
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        Arc::make_mut(&mut self.inner).idle_timeout = idle_timeout;
         self
     }
 
@@ -494,7 +502,7 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
             .map_err(OpenAIError::Http)?;
     }
     let response: ModelsListResponse =
-        request_with_timeout(cfg.request_timeout, builder.json()).await?;
+        request_within_idle(cfg.idle_timeout, builder.json()).await?;
 
     // Find matching model
     let mut model_found = false;
@@ -609,8 +617,8 @@ async fn chat_completions_request(
             .map_err(OpenAIError::Http)?;
     }
 
-    request_with_timeout(
-        cfg.request_timeout,
+    request_within_idle(
+        cfg.idle_timeout,
         builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
     )
     .await
@@ -650,7 +658,15 @@ fn chat_completions_stream_inner(
         let mut tool_calls: std::collections::HashMap<usize, ToolCallAccumulator> =
             std::collections::HashMap::new();
         let mut usage: Option<Usage> = None;
-        while let Some(event) = sse_stream.next().await {
+        loop {
+            let event = match within_idle(cfg.idle_timeout, sse_stream.next()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
             match event {
                 Ok(e) => {
                     if should_skip_event(&e) {
@@ -973,8 +989,8 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
             .map_err(OpenAIError::Http)?;
     }
 
-    match request_with_timeout(
-        cfg.request_timeout,
+    match request_within_idle(
+        cfg.idle_timeout,
         builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
     )
     .await
@@ -1063,7 +1079,15 @@ fn responses_stream_inner(
         let mut usage: Option<Usage> = None;
         let mut usage_emitted = false;
 
-        while let Some(event) = sse_stream.next().await {
+        loop {
+            let event = match within_idle(cfg.idle_timeout, sse_stream.next()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
             match event {
                 Ok(e) => {
                     if should_skip_event(&e) {
@@ -1627,13 +1651,267 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_timeout_is_enforced_for_sse_requests() {
-        let timeout = request_with_timeout(
+    async fn the_idle_timeout_bounds_a_wait_that_never_ends() {
+        let timeout = within_idle(
             Duration::from_millis(20),
-            futures_lite::future::pending::<Result<(), zenwave::Error>>(),
+            futures_lite::future::pending::<()>(),
         )
         .await;
-        assert!(matches!(timeout, Err(OpenAIError::Timeout)));
+        assert!(matches!(
+            timeout,
+            Err(OpenAIError::IdleTimeout { idle }) if idle == Duration::from_millis(20)
+        ));
+    }
+
+    #[test]
+    fn the_idle_timeout_defaults_to_ninety_seconds() {
+        assert_eq!(
+            OpenAI::new("key").config().idle_timeout,
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            OpenAI::builder("key")
+                .idle_timeout(Duration::from_secs(7))
+                .build()
+                .config()
+                .idle_timeout,
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            OpenAI::new("key")
+                .with_idle_timeout(Duration::from_secs(5))
+                .config()
+                .idle_timeout,
+            Duration::from_secs(5)
+        );
+    }
+
+    /// One step of a scripted server connection.
+    enum Step {
+        /// Write these bytes.
+        Send(String),
+        /// Wait before the next step.
+        Pause(Duration),
+        /// Keep the connection open without writing until the client closes it.
+        Hold,
+    }
+
+    const SSE_HEAD: &str =
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+
+    /// A server that answers its n-th connection with the n-th script, then
+    /// closes it (after the last step, unless that step is `Hold`).
+    fn serve_scripted(scripts: Vec<Vec<Step>>) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let addr = listener.local_addr().expect("stub server address");
+        std::thread::spawn(move || {
+            for script in scripts {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    // Read the headers and the declared body, so closing the
+                    // connection never resets it under unread request bytes.
+                    let body_end = loop {
+                        let Ok(n) = stream.read(&mut chunk) else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..n]);
+                        if let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                            let length = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break head_end + 4 + length;
+                        }
+                    };
+                    while request.len() < body_end {
+                        let Ok(n) = stream.read(&mut chunk) else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..n]);
+                    }
+                    for step in script {
+                        match step {
+                            Step::Send(bytes) => {
+                                if stream.write_all(bytes.as_bytes()).is_err()
+                                    || stream.flush().is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Step::Pause(duration) => std::thread::sleep(duration),
+                            Step::Hold => while stream.read(&mut chunk).is_ok_and(|n| n > 0) {},
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A client on `api` against `base_url`, with a short idle timeout.
+    fn scripted_client(api: ApiKind, base_url: String, retry: RetryPolicy) -> OpenAI {
+        OpenAI::builder("key")
+            .base_url(base_url)
+            .idle_timeout(Duration::from_millis(300))
+            .retry(retry)
+            .build()
+            .with_api(api)
+    }
+
+    /// An SSE event carrying `text`, in the wire format of `api`.
+    fn text_event(api: ApiKind, text: &str) -> String {
+        match api {
+            ApiKind::ChatCompletions => format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}}]})
+            ),
+            ApiKind::Responses => format!(
+                "data: {}\n\n",
+                serde_json::json!({"type": "response.output_text.delta", "delta": text})
+            ),
+        }
+    }
+
+    const BOTH_APIS: [ApiKind; 2] = [ApiKind::ChatCompletions, ApiKind::Responses];
+
+    fn retry_once() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+            multiplier: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_fails_the_attempt_with_idle_timeout() {
+        for api in BOTH_APIS {
+            let url = serve_scripted(vec![vec![Step::Hold]]);
+            let client = scripted_client(api, url, RetryPolicy::none());
+            let stream = client.respond(oneshot("system", "hello"));
+            futures_lite::pin!(stream);
+            let error = stream
+                .next()
+                .await
+                .expect("stream yields")
+                .expect_err("the server never answers");
+            assert!(
+                matches!(error, OpenAIError::IdleTimeout { idle } if idle == Duration::from_millis(300)),
+                "{api:?}: {error}"
+            );
+            assert_eq!(
+                error.failure().kind,
+                aither_core::llm::FailureKind::Network,
+                "{api:?}"
+            );
+            assert!(stream.next().await.is_none(), "{api:?}: the stream ends");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attempt_that_is_never_answered_is_retried() {
+        for api in BOTH_APIS {
+            let answer = vec![
+                Step::Send(SSE_HEAD.to_string()),
+                Step::Send(text_event(api, "again")),
+            ];
+            let url = serve_scripted(vec![vec![Step::Hold], answer]);
+            let client = scripted_client(api, url, retry_once());
+            let stream = client.respond(oneshot("system", "hello"));
+            futures_lite::pin!(stream);
+            let first = stream
+                .next()
+                .await
+                .expect("stream yields")
+                .expect("the retry is answered");
+            assert!(
+                matches!(&first, Event::Text(text) if text == "again"),
+                "{api:?}: {first:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_goes_silent_ends_with_idle_timeout() {
+        for api in BOTH_APIS {
+            let url = serve_scripted(vec![vec![
+                Step::Send(SSE_HEAD.to_string()),
+                Step::Send(text_event(api, "hi")),
+                Step::Hold,
+            ]]);
+            let client = scripted_client(api, url, RetryPolicy::none());
+            let stream = client.respond(oneshot("system", "hello"));
+            futures_lite::pin!(stream);
+            let first = stream
+                .next()
+                .await
+                .expect("stream yields")
+                .expect("the first event arrives");
+            assert!(
+                matches!(&first, Event::Text(text) if text == "hi"),
+                "{api:?}: {first:?}"
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("stream yields")
+                .expect_err("the stream goes silent");
+            assert!(
+                matches!(error, OpenAIError::IdleTimeout { .. }),
+                "{api:?}: {error}"
+            );
+            assert!(stream.next().await.is_none(), "{api:?}: the stream ends");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_keeps_sending_is_not_cut() {
+        const EVENTS: usize = 8;
+        for api in BOTH_APIS {
+            // 8 events 100 ms apart run well past the 300 ms idle timeout.
+            let mut script = vec![Step::Send(SSE_HEAD.to_string())];
+            for _ in 0..EVENTS {
+                script.push(Step::Send(text_event(api, "x")));
+                script.push(Step::Pause(Duration::from_millis(100)));
+            }
+            let url = serve_scripted(vec![script]);
+            let client = scripted_client(api, url, RetryPolicy::none());
+            let started = std::time::Instant::now();
+            let stream = client.respond(oneshot("system", "hello"));
+            futures_lite::pin!(stream);
+            let mut texts = 0;
+            while let Some(event) = stream.next().await {
+                if let Event::Text(_) = event.expect("a stream that keeps sending is never cut") {
+                    texts += 1;
+                }
+            }
+            assert_eq!(texts, EVENTS, "{api:?}");
+            assert!(started.elapsed() > Duration::from_millis(300), "{api:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_models_request_that_never_answers_fails_with_idle_timeout() {
+        let url = serve_scripted(vec![vec![Step::Hold]]);
+        let client = scripted_client(ApiKind::Responses, url, RetryPolicy::none());
+        let error = fetch_model_context_length(&client.config())
+            .await
+            .expect_err("the server never answers");
+        assert!(matches!(error, OpenAIError::IdleTimeout { .. }), "{error}");
     }
 
     #[test]
@@ -1710,13 +1988,10 @@ pub struct Builder {
     organization: Option<String>,
     native_abilities: Vec<Ability>,
     retry: RetryPolicy,
-    request_timeout: Duration,
+    idle_timeout: Duration,
     extra_headers: Vec<(String, String)>,
     store: Option<bool>,
 }
-
-/// Default request timeout (5 minutes - generous for long completions).
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl Builder {
     fn new(api_key: impl Into<String>) -> Self {
@@ -1737,7 +2012,7 @@ impl Builder {
             organization: None,
             native_abilities: Vec::new(),
             retry: RetryPolicy::default(),
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             extra_headers: Vec::new(),
             store: None,
         }
@@ -1918,13 +2193,15 @@ impl Builder {
         self
     }
 
-    /// Set the request timeout.
+    /// Set how long the client waits for the response to start, and then for
+    /// each next stream event, before giving up on the attempt.
     ///
-    /// Default is 5 minutes, which is generous for long completions.
-    /// The timeout applies to the entire request, including connection and response streaming.
+    /// Default is [`DEFAULT_IDLE_TIMEOUT`]. A stream that keeps sending is
+    /// never cut, however long it runs. Expiry is a transient failure that the
+    /// client's retry policy applies to.
     #[must_use]
-    pub const fn timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+    pub const fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
         self
     }
 
@@ -1951,7 +2228,7 @@ impl Builder {
                 organization: self.organization,
                 native_abilities: self.native_abilities,
                 retry: self.retry,
-                request_timeout: self.request_timeout,
+                idle_timeout: self.idle_timeout,
                 extra_headers: self.extra_headers,
                 store: self.store,
             }),
@@ -1977,7 +2254,7 @@ pub struct Config {
     pub(crate) organization: Option<String>,
     pub(crate) native_abilities: Vec<Ability>,
     pub(crate) retry: RetryPolicy,
-    pub(crate) request_timeout: Duration,
+    pub(crate) idle_timeout: Duration,
     pub(crate) extra_headers: Vec<(String, String)>,
     pub(crate) store: Option<bool>,
     /// The published vocabulary `chat_model` counts with, when it has one.

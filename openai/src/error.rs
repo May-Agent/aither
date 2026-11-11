@@ -53,8 +53,11 @@ pub enum OpenAIError {
         /// Message from the API.
         message: String,
     },
-    /// Request timed out.
-    Timeout,
+    /// The response did not start, or the response stream sent nothing, for the client's idle timeout.
+    IdleTimeout {
+        /// How long the client waited.
+        idle: Duration,
+    },
 }
 
 impl fmt::Display for OpenAIError {
@@ -82,7 +85,9 @@ impl fmt::Display for OpenAIError {
             } => {
                 write!(f, "Server error {status}: {message}")
             }
-            Self::Timeout => write!(f, "Request timed out"),
+            Self::IdleTimeout { idle } => {
+                write!(f, "the response was silent for {idle:?}")
+            }
         }
     }
 }
@@ -158,9 +163,6 @@ impl OpenAIError {
                 };
             }
         }
-        if err.is_timeout() {
-            return Self::Timeout;
-        }
         Self::Http(err)
     }
 
@@ -198,7 +200,7 @@ impl Classify for OpenAIError {
                 Failure::transient().with_retry_after(*retry_after)
             }
             Self::QuotaExceeded { .. } => Failure::quota(),
-            Self::Timeout => Failure::network(),
+            Self::IdleTimeout { .. } => Failure::network(),
             Self::StreamEvent {
                 error_type, code, ..
             } => {
