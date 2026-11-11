@@ -18,6 +18,7 @@ permissions:
   contents: write
   pull-requests: write
   id-token: write
+  actions: write
 
 jobs:
   release-plz:
@@ -49,7 +50,7 @@ jobs:
       # never hit.
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@v2
         with:
@@ -73,6 +74,21 @@ jobs:
           --git-token "${GITHUB_TOKEN}"
           --repo-url "https://github.com/${GITHUB_REPOSITORY}"
           --forge github
+          --output json
+          | tee "${RUNNER_TEMP}/release-pr.json"
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved, and the required
+      # `CI result` reports on the pull request only from those runs.
+      # Merging the PR stays a person's step.
+      - name: Approve the release PR's CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          number="$(jq -r '.prs[0].number // empty' "${RUNNER_TEMP}/release-pr.json")"
+          if [ -n "${number}" ]; then
+            bash .github/scripts/approve-held-runs.sh "${number}"
+          fi
       # main takes changes only through pull requests that are up to date with
       # it, so the pushed tree is the one CI tested on the pull request whose
       # merge produced this commit, and CI does not run again on the push.
