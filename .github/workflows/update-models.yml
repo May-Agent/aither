@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Fetch latest LiteLLM snapshot
         id: snapshot
@@ -64,6 +66,7 @@ jobs:
         if: steps.snapshot.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
+          base: main
           branch: chore/update-models-snapshot
           delete-branch: true
           # v6 committed through git with the workflow token, which leaves the

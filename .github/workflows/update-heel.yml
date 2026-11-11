@@ -26,6 +26,8 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Find a newer release
         id: release
@@ -71,6 +73,7 @@ jobs:
         if: steps.release.outputs.version
         uses: peter-evans/create-pull-request@v8
         with:
+          base: main
           branch: chore/update-heel
           delete-branch: true
           sign-commits: true

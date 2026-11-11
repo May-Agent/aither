@@ -37,7 +37,7 @@ def main():
     # the pushed commit, which always carries checks: none, or no such pull
     # request, is an error rather than something to wait for.
     release_cases = dict(cases, empty=("", 0, 1), not_merged=("Test\tsuccess\n", 0, 1))
-    for filename, file_cases in [("release.yml", release_cases), ("pr-base-gate.yml", cases)]:
+    for filename, file_cases in [("release.yml", release_cases)]:
         workflow = yaml.safe_load((ROOT / filename).read_text())
         steps = next(iter(workflow["jobs"].values()))["steps"]
         step = next(

@@ -30,5 +30,8 @@ Co-locate unit tests inside each module using `#[cfg(test)] mod tests` so traits
 ## Commit & Pull Request Guidelines
 History favors short, imperative subjects (see `Add serde support`, `Rename ai-types to aither`); follow that pattern and explain breaking changes in the body. Pull requests should provide a concise description, link to the motivating issue, paste the results of `cargo fmt`, `clippy`, and `test`, and call out any docs/examples touched. Attach logs or transcripts when altering provider behavior so reviewers can reproduce the call.
 
+## Branches & Releases
+`main` is the only long-lived branch. Topic branches start from `origin/main` and land through the merge queue, whose required check is `CI result`. release-plz keeps a release PR against `main`; merging it publishes, and that merge is a person's step.
+
 ## Security & Configuration Tips
 Never commit provider secrets; inject them via environment variables such as `OPENAI_API_KEY` when hacking on `aither-openai`. Keep `.env*` files out of Git and strip identifiers from captured responses before committing examples.
