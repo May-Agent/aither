@@ -289,8 +289,10 @@ impl Drop for JobWatch {
 /// What [`JobRegistry::owe_completion`] settled for a job.
 #[derive(Debug)]
 pub struct OwedCompletion {
-    /// Why the job was killed; `None` when it ended on its own.
-    pub kill: Option<KillCause>,
+    /// The job as it ended. A job whose completion a waiter took is
+    /// forgotten as it settles when nothing watches it, so this is the one
+    /// read of it its flow is sure of.
+    pub info: JobInfo,
     /// Keeps the completion pending until the agent takes it; `None` when a
     /// waiter ([`JobRegistry::wait_taking`]) already took it, so nothing is
     /// owed.
@@ -1095,7 +1097,8 @@ impl JobRegistry {
     /// [`Self::get_by_task_id_settled`] does. A job the registry still reads
     /// as running ends with `ending` — `Ok(exit_code)` or `Err(error)` — so
     /// no completion leaves a job running. `None` for a task the registry
-    /// never registered.
+    /// never registered. A job whose completion a waiter took
+    /// ([`Self::wait_taking`]) is forgotten here when nothing watches it.
     ///
     /// # Panics
     ///
@@ -1616,7 +1619,7 @@ async fn handle_job_request(
             task_id,
             ending,
             reply,
-        } => owe_settled_completion(jobs, &task_id, ending, reply, tx).await,
+        } => owe_settled_completion(jobs, reads, parked, &task_id, ending, reply, tx).await,
         JobRequest::BeginKillByTaskId {
             task_id,
             cause,
@@ -1639,7 +1642,7 @@ async fn handle_job_request(
             reply,
         } => {
             let result = end_kill(jobs, &task_id, killed).await;
-            release_settled_waiters(jobs, &task_id, tx).await;
+            release_settled_waiters(jobs, reads, parked, &task_id, tx).await;
             let _ = reply.send(result).await;
         }
         JobRequest::InputTerminal {
@@ -1866,9 +1869,12 @@ fn mark_taken(job: &mut JobState) {
 }
 
 /// Hands out the completion of task `task_id`, or parks the request while a
-/// kill of it is in flight.
+/// kill of it is in flight. A job a waiter claimed is then forgotten when
+/// nothing watches it.
 async fn owe_settled_completion(
     jobs: &mut Jobs,
+    reads: &mut ReadTracker,
+    parked: &mut ParkedOutput,
     task_id: &str,
     ending: Result<i32, String>,
     reply: Sender<Option<OwedCompletion>>,
@@ -1884,6 +1890,7 @@ async fn owe_settled_completion(
         return;
     }
     let owed = owe_completion(jobs, task_id, ending, tx).await;
+    forget_if_done(jobs, reads, parked, task_id);
     let _ = reply.send(Some(owed)).await;
 }
 
@@ -1919,16 +1926,16 @@ async fn owe_completion(
         job.info.status
     );
     job.completion_owed = true;
-    let kill = job.info.status.kill_cause();
+    let info = job.info.clone();
     if job.claimed {
         // A waiter read the job: nothing is owed to the agent.
         return OwedCompletion {
-            kill,
+            info,
             pending: None,
         };
     }
     OwedCompletion {
-        kill,
+        info,
         pending: Some(PendingCompletion {
             tx: tx
                 .upgrade()
@@ -2336,8 +2343,16 @@ async fn get_settled_by_task_id(jobs: &mut Jobs, task_id: &str, reply: Sender<Op
     }
 }
 
-/// Answers the callers parked on a job once its last kill in flight ended.
-async fn release_settled_waiters(jobs: &mut Jobs, task_id: &str, tx: &WeakSender<JobCommand>) {
+/// Answers the callers parked on a job once its last kill in flight ended,
+/// then forgets a job a waiter claimed whose completion they settled when
+/// nothing watches it.
+async fn release_settled_waiters(
+    jobs: &mut Jobs,
+    reads: &mut ReadTracker,
+    parked: &mut ParkedOutput,
+    task_id: &str,
+    tx: &WeakSender<JobCommand>,
+) {
     let Some(job) = jobs.get_mut(task_id) else {
         return;
     };
@@ -2355,6 +2370,7 @@ async fn release_settled_waiters(jobs: &mut Jobs, task_id: &str, tx: &WeakSender
             }
         }
     }
+    forget_if_done(jobs, reads, parked, task_id);
 }
 
 /// The start of `script`, cut at a character boundary at or below `limit`
@@ -2637,6 +2653,45 @@ mod tests {
         }
         drop(ending_watch);
         assert!(registry.get_by_task_id("ending").await.is_none());
+    }
+
+    /// A job its waiter claimed, whose watch dropped before its flow settled
+    /// it, is forgotten as the flow settles it: the flow still reads it as it
+    /// ended, and its id goes back to the allocator.
+    #[tokio::test]
+    async fn a_claimed_job_unwatched_before_its_flow_settles_is_forgotten_as_it_settles() {
+        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
+        let registry = spawn_registry();
+        let task_id = ids.lease().expect("river is free");
+        registry
+            .register(1, &task_id, "exec", "run", SandboxMode::Sandboxed, None)
+            .await;
+        let watch = registry.watch("river").await.expect("river is held");
+
+        let mut waiting = std::pin::pin!(registry.wait_taking("river"));
+        assert!(
+            futures_lite::future::poll_once(waiting.as_mut())
+                .await
+                .is_none()
+        );
+        registry.complete(&task_id, 0, None).await;
+        let taken = JobStatus::Completed {
+            exit_code: 0,
+            delivery: Delivery::Taken,
+        };
+        assert_eq!(waiting.await.unwrap().status, taken);
+        drop(watch);
+        assert!(
+            registry.terminal_output("river").await.is_some(),
+            "the flow still reads the job it has yet to settle"
+        );
+
+        let owed = registry.owe_completion("river", Ok(0)).await.unwrap();
+        assert!(owed.pending.is_none(), "the waiter took the completion");
+        assert_eq!(owed.info.status, taken);
+        drop(task_id);
+        assert!(registry.list().await.is_empty(), "the job is forgotten");
+        assert_eq!(&*ids.lease().expect("river is free again"), "river");
     }
 
     /// Once its completion is taken and nothing watches it, a finished job
@@ -3369,7 +3424,7 @@ mod tests {
             .owe_completion("owed", Ok(0))
             .await
             .expect("the job is registered");
-        assert_eq!(owed.kill, None);
+        assert_eq!(owed.info.status.kill_cause(), None);
         let jobs = registry.list().await;
         assert!(host_sees_owed_turn(&jobs), "{jobs:?}");
 
@@ -3398,7 +3453,7 @@ mod tests {
             .owe_completion("lost", Err("output could not be saved".to_string()))
             .await
             .expect("the job is registered");
-        assert_eq!(owed.kill, None);
+        assert_eq!(owed.info.status.kill_cause(), None);
         let job = registry
             .get_by_task_id("lost")
             .await
@@ -3474,7 +3529,7 @@ mod tests {
         let owed = JobRegistry::recv_reply(owed)
             .await
             .expect("the job is registered");
-        assert_eq!(owed.kill, Some(KillCause::User));
+        assert_eq!(owed.info.status.kill_cause(), Some(KillCause::User));
         assert_eq!(
             registry
                 .get_by_task_id("kill")
