@@ -3362,11 +3362,12 @@ where
         Ok(command) => Ok(command.exit_code),
         Err(error) => Err(error.detail().into_owned()),
     };
-    let owed = status_registry.owe_completion(&task_id, ending).await;
-    let kill = owed.as_ref().and_then(|owed| owed.kill);
-    // The job as it ended, read before a foreground result takes it.
-    let info = status_registry.get_by_task_id(&task_id).await;
-    let pending = owed.and_then(|owed| owed.pending);
+    // The job as it ended, settled before a foreground result takes it.
+    let (info, pending) = match status_registry.owe_completion(&task_id, ending).await {
+        Some(owed) => (Some(owed.info), owed.pending),
+        None => (None, None),
+    };
+    let kill = info.as_ref().and_then(|info| info.status.kill_cause());
     // A result the call returned leaves nothing for the agent to take: the
     // completion is taken here, so the registry forgets the job, and the end
     // is no fact to raise: the call already told it.
