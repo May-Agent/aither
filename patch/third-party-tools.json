@@ -452,78 +452,78 @@
     },
     {
       "tool": "heel",
-      "version": "0.10.0",
+      "version": "0.10.1",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.0/heel-aarch64-unknown-linux-gnu",
-      "sha256": "c570c123a4938ae352064811cd03ee352611cbc13713cc53f8d39819a52d03f1",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-aarch64-unknown-linux-gnu",
+      "sha256": "75667a4d8cb988c016494b4ca5c24ae776d58918fbd16a94ff7f42ffdae02094",
       "size": 4596960,
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "c570c123a4938ae352064811cd03ee352611cbc13713cc53f8d39819a52d03f1"
+      "executable_sha256": "75667a4d8cb988c016494b4ca5c24ae776d58918fbd16a94ff7f42ffdae02094"
     },
     {
       "tool": "heel",
-      "version": "0.10.0",
+      "version": "0.10.1",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.0/heel-x86_64-unknown-linux-gnu",
-      "sha256": "0bc9a8bca5002c98b8ba8d08d23156ca1c04e61a65419232a93fd1f8a6f43d89",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-x86_64-unknown-linux-gnu",
+      "sha256": "022684b48d70d7e986ecb8f058c791271a945b9c263968f46b0907e6cd021849",
       "size": 5132184,
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "0bc9a8bca5002c98b8ba8d08d23156ca1c04e61a65419232a93fd1f8a6f43d89"
+      "executable_sha256": "022684b48d70d7e986ecb8f058c791271a945b9c263968f46b0907e6cd021849"
     },
     {
       "tool": "heel",
-      "version": "0.10.0",
+      "version": "0.10.1",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.0/heel-aarch64-apple-darwin",
-      "sha256": "59805477c62b499c143fb8a8cd1d8ddbffaf71efc35aa296553b2d18cbfc8582",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-aarch64-apple-darwin",
+      "sha256": "74be3a57e6b597aef483a5223246d0dd173dcf599d5312c10d9ee2e13adce63c",
       "size": 4130928,
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "59805477c62b499c143fb8a8cd1d8ddbffaf71efc35aa296553b2d18cbfc8582"
+      "executable_sha256": "74be3a57e6b597aef483a5223246d0dd173dcf599d5312c10d9ee2e13adce63c"
     },
     {
       "tool": "heel",
-      "version": "0.10.0",
+      "version": "0.10.1",
       "target": {
         "os": "windows",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.0/heel-aarch64-pc-windows-msvc.exe",
-      "sha256": "cf7370f86f7d1b91556197a4b47b5a77d8ec6480b9223bc9b273c51f995ffcf5",
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-aarch64-pc-windows-msvc.exe",
+      "sha256": "428a6b3e2140b00b24740b756ce5607dffed78dd48fc8062f5eae6d5e4ebeb07",
       "size": 4672000,
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "cf7370f86f7d1b91556197a4b47b5a77d8ec6480b9223bc9b273c51f995ffcf5"
+      "executable_sha256": "428a6b3e2140b00b24740b756ce5607dffed78dd48fc8062f5eae6d5e4ebeb07"
     },
     {
       "tool": "heel",
-      "version": "0.10.0",
+      "version": "0.10.1",
       "target": {
         "os": "windows",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.0/heel-x86_64-pc-windows-msvc.exe",
-      "sha256": "48f66a0ecfeab2d2415d81265e6f176cd9208e212b3f3fe4b80783189513e502",
-      "size": 5570048,
+      "url": "https://github.com/May-Agent/heel/releases/download/heel-v0.10.1/heel-x86_64-pc-windows-msvc.exe",
+      "sha256": "721fc67c7d5f70bf487a7a21abd4aef1f6ca8d9a933202af1b6bf64908eea510",
+      "size": 5537280,
       "encoding": {
         "format": "executable"
       },
-      "executable_sha256": "48f66a0ecfeab2d2415d81265e6f176cd9208e212b3f3fe4b80783189513e502"
+      "executable_sha256": "721fc67c7d5f70bf487a7a21abd4aef1f6ca8d9a933202af1b6bf64908eea510"
     }
   ],
   "python": [
