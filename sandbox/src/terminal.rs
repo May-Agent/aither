@@ -9375,20 +9375,41 @@ mod tests {
     }
 
     /// A script the sandboxed command writes into its working directory and
-    /// chmods executes — writable space also carries EXEC.
+    /// chmods executes — writable space also carries EXEC, and nothing still
+    /// holds the file open for writing when the shell runs it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_script_written_into_the_working_dir_executes() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let tool = authority_terminal(dir.path()).await;
-        assert_eq!(
-            exit_code_of(
-                &tool,
-                "echo '#!/bin/sh\necho ok' > run.sh && chmod +x run.sh && ./run.sh",
+        let result = tool
+            .call(
+                terminal_args(
+                    "write and run a script",
+                    "echo '#!/bin/sh\necho ok' > run.sh && chmod +x run.sh && ./run.sh",
+                ),
+                ToolContext::new(),
             )
-            .await,
-            0,
-            "a script the command writes and chmods runs"
+            .await
+            .expect("terminal call should succeed");
+        let command = result.command().expect("the script runs as a command");
+        // The shell names the errno of a failed exec on stderr: `Text file
+        // busy` is a write descriptor still open at `execve`, `Permission
+        // denied` the sandbox refusing EXEC.
+        let stderr = command
+            .stderr
+            .as_ref()
+            .and_then(output_text)
+            .unwrap_or_default();
+        assert_eq!(
+            command.outcome,
+            CommandOutcome::Exited { code: 0 },
+            "a script the command writes and chmods runs; stderr: {stderr}"
+        );
+        assert_eq!(
+            output_text(&command.stdout).map(str::trim),
+            Some("ok"),
+            "stderr: {stderr}"
         );
     }
 
