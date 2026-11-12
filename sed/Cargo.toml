@@ -10,6 +10,9 @@ description = "aither-sed: the read-only sed that prints line ranges in sandboxe
 readme = "../README.md"
 keywords = ["sed", "sandbox", "agent", "tooling"]
 categories = ["command-line-utilities"]
+# Removed from crates.io: the program now ships from May (May-Agent/may#1015)
+# and is never published again.
+publish = false
 
 [dependencies]
 thiserror = "2"
