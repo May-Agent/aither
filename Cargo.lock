@@ -4027,9 +4027,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92b21e0932552edec5f468d427e6209474117e0add549585bdddc5f9051250e3"
+checksum = "e5e3c715cefcaf79c098fc7c326a4e4877a30fc00622f96ef3fff0e0d0a7bf15"
 dependencies = [
  "askama 0.12.1",
  "async-channel",

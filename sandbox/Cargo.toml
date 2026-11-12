@@ -20,7 +20,7 @@ arc-swap.workspace = true
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.10.0"
+heel = "0.10.1"
 
 # Executor for tokio integration
 executor-core = { version = "0.7", features = ["tokio"] }
