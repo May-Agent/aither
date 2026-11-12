@@ -6342,7 +6342,7 @@ mod tests {
     }
 
     /// Runs `script` in a sandboxed session with the given grants and returns
-    /// its standard output. Runs the distribution's pinned heel.
+    /// its standard output. Runs the pinned heel.
     #[cfg(unix)]
     async fn sandboxed_stdout(
         writable_paths: Vec<PathBuf>,

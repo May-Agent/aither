@@ -1,7 +1,7 @@
 //! The `heel` binary tests run under.
 //!
 //! `HEEL_BIN` names one when set. Otherwise tests take the `heel` the
-//! repository pins in `patch/third-party-tools.json`: downloaded from its
+//! repository pins in `sandbox/test-heel.json`: downloaded from its
 //! pinned location once, verified against its pinned digest and cached under
 //! the build directory.
 
@@ -63,7 +63,7 @@ fn target_dir() -> PathBuf {
 }
 
 fn pin() -> anyhow::Result<Pin> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../patch/third-party-tools.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-heel.json");
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(path)?)?;
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     let mut pins = manifest
