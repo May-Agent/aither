@@ -104,10 +104,6 @@ name = "aither-ort"
 git_tag_name = "ort-v{{ version }}"
 
 [[package]]
-name = "aither-patch"
-git_tag_name = "patch-v{{ version }}"
-
-[[package]]
 name = "aither-rag"
 git_tag_name = "rag-v{{ version }}"
 
@@ -118,10 +114,6 @@ git_tag_name = "sandbox-v{{ version }}"
 [[package]]
 name = "aither-search"
 git_tag_name = "search-v{{ version }}"
-
-[[package]]
-name = "aither-sed"
-git_tag_name = "sed-v{{ version }}"
 
 [[package]]
 name = "aither-skills"

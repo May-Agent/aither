@@ -214,7 +214,7 @@ async fn generate_image(generator: impl ImageGenerator) -> aither::Result<Vec<u8
 | `aither-mcp` / `aither-acp` | Model Context Protocol (MCP) and Agent Client Protocol (ACP) client/server implementations |
 | `aither-models` / `aither-skills` | Model capability/context-window registry and reusable agent skill loader |
 | `aither-rag` / `aither-mem0` | Retrieval-Augmented Generation vector DB and long-term memory adapters |
-| `tools/*` & `patch/` | Built-in agent tools (`browser`, `websearch`, `webfetch`, `search`, `fs`, `command`) and minimal `apply_patch` binary |
+| `tools/*` | Built-in agent tools (`browser`, `websearch`, `webfetch`, `search`, `fs`, `command`) |
 | `derive/` | Proc-macro helpers for tool schemas (`#[tool]`) |
 
 ## Development

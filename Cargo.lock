@@ -502,14 +502,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aither-patch"
-version = "0.30.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "aither-rag"
 version = "0.30.0"
 dependencies = [
@@ -614,14 +606,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
-]
-
-[[package]]
-name = "aither-sed"
-version = "0.30.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.21",
 ]
 
 [[package]]

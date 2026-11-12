@@ -4,15 +4,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      patch-tag:
-        description: >-
-          An existing patch-v<version> release to publish the tool assets and
-          the tool-distribution manifest for, built from the commit its tag
-          points at. Leave empty for a normal release run.
-        type: string
-        required: false
-        default: ''
 
 permissions:
   contents: write
@@ -23,16 +14,11 @@ permissions:
 jobs:
   release-plz:
     name: Release
-    if: github.event_name == 'push' || inputs.patch-tag == ''
     runs-on: ubuntu-latest
     # release-plz/git-config reads GITHUB_TOKEN to name the bot committer, and
     # both release-plz commands take it, so it is a job-level variable.
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    outputs:
-      patch-tag: ${{ steps.patch-release.outputs.tag }}
-      patch-version: ${{ steps.patch-release.outputs.version }}
-      patch-released: ${{ steps.patch-release.outputs.released }}
     steps:
       # Check out the branch rather than the pushed commit: release-plz runs
       # `git rev-parse @{upstream}`, which needs a branch with an upstream.
@@ -148,160 +134,3 @@ jobs:
           --forge github
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-      # release-plz tags the commit it released: this job's checkout, or, when
-      # a release pull request was merged with a merge commit, that pull
-      # request's head, a parent of the checkout. A patch-v<version> tag on
-      # either means this run cut the aither-patch release; an earlier
-      # release's tag points at the commit
-      # that cut it and does not retrigger asset publishing. The GitHub
-      # release is checked rather than assumed (release-plz creates it with
-      # the tag).
-      - name: Detect the aither-patch release
-        id: patch-release
-        run: |
-          set -euo pipefail
-          version="$(cargo metadata --locked --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "aither-patch") | .version')"
-          tag="patch-v${version}"
-          released=false
-          tagged="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq .sha 2>/dev/null || true)"
-          if [ -n "${tagged}" ] \
-              && git rev-parse "${GITHUB_SHA}" "${GITHUB_SHA}^@" | grep -qx "${tagged}" \
-              && gh release view "${tag}" --json tagName >/dev/null 2>&1; then
-            released=true
-          fi
-          {
-            echo "tag=${tag}"
-            echo "version=${version}"
-            echo "released=${released}"
-          } >> "${GITHUB_OUTPUT}"
-
-  # Rebuilt-std binaries of the aither-built tools (patch/built-tools.json) ship as assets on the patch-v<version>
-  # GitHub release, next to the tool-distribution manifest may's initializer
-  # consumes (aither #104/#113). The PR-time build+verify matrix is reused
-  # through workflow_call, restricted to the `immediate` abort variant that
-  # is the published executable.
-  # The aither-patch release whose assets to publish: the one this push cut,
-  # or the existing one a manual run names.
-  patch-release:
-    name: aither-patch release
-    needs: release-plz
-    if: >-
-      always() && !cancelled()
-      && (needs.release-plz.result == 'success' || needs.release-plz.result == 'skipped')
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      REQUESTED: ${{ inputs.patch-tag }}
-      CUT_TAG: ${{ needs.release-plz.outputs.patch-tag }}
-      CUT_VERSION: ${{ needs.release-plz.outputs.patch-version }}
-      CUT: ${{ needs.release-plz.outputs.patch-released }}
-    outputs:
-      tag: ${{ steps.target.outputs.tag }}
-      version: ${{ steps.target.outputs.version }}
-      publish: ${{ steps.target.outputs.publish }}
-    steps:
-      - name: Resolve the release
-        id: target
-        run: |
-          set -euo pipefail
-          if [ -n "${REQUESTED}" ]; then
-            [[ "${REQUESTED}" =~ ^patch-v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-              || { echo "::error::${REQUESTED} is not a patch-v<version> tag" >&2; exit 1; }
-            gh release view "${REQUESTED}" -R "${GITHUB_REPOSITORY}" --json tagName >/dev/null
-            tag="${REQUESTED}"; version="${REQUESTED#patch-v}"; publish=true
-          else
-            tag="${CUT_TAG}"; version="${CUT_VERSION}"; publish="${CUT}"
-          fi
-          {
-            echo "tag=${tag}"
-            echo "version=${version}"
-            echo "publish=${publish}"
-          } >> "${GITHUB_OUTPUT}"
-
-  # A manual run skips release-plz, which would skip every job downstream of
-  # it unless the condition checks the needed job's result itself.
-  tool-artifacts:
-    needs: patch-release
-    if: >-
-      always() && !cancelled() && needs.patch-release.result == 'success'
-      && needs.patch-release.outputs.publish == 'true'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/patch-artifacts.yml
-    with:
-      abort_variants: '["immediate"]'
-      ref: ${{ needs.patch-release.outputs.tag }}
-
-  publish-patch-assets:
-    name: Publish tool assets
-    needs: [patch-release, tool-artifacts]
-    if: >-
-      always() && !cancelled() && needs.tool-artifacts.result == 'success'
-      && needs.patch-release.outputs.publish == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      attestations: write
-      id-token: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ needs.patch-release.outputs.tag }}
-      VERSION: ${{ needs.patch-release.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.patch-release.outputs.tag }}
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: tools-*-immediate
-          path: artifacts
-          merge-multiple: true
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: bash-*
-          path: artifacts
-          merge-multiple: true
-      - name: Build the tool-distribution manifest
-        run: >-
-          patch/build-manifest.sh artifacts "${TAG}" "${GITHUB_REPOSITORY}"
-          > "tool-distribution-${VERSION}.json"
-      # Every sha256 is 64 lowercase hex, and each aither-built tool must
-      # cover exactly the targets patch/built-tools.json lists for it. Bash
-      # must span the non-Windows (os, arch) set the pinned third-party
-      # entries do — its expected targets come from that data file, not a
-      # duplicated list.
-      - name: Validate the manifest and staged assets
-        run: |
-          set -euo pipefail
-          manifest="tool-distribution-${VERSION}.json"
-          jq -e -L patch --slurpfile third_party patch/third-party-tools.json --slurpfile built patch/built-tools.json '
-            include "targets";
-            ([.artifacts[].sha256] | all(test("^[0-9a-f]{64}$"))) and
-            ([.host_programs[] | .sha256, .executable_sha256] | all(test("^[0-9a-f]{64}$"))) and
-            ([.artifacts[], .host_programs[]] | all(.size | type == "number" and . > 0 and . == floor)) and
-            (. as $manifest | $built[0].tools | all(
-              . as $listed
-              | ([$manifest.artifacts[] | select(.tool == $listed.tool) | .target] | sort)
-                == ($listed.targets | map(platform_of) | sort))) and
-            ([.artifacts[] | select(.tool == "bash") | .target] | sort
-              == ($third_party[0].artifacts | map(.target | select(.os != "windows")) | unique | sort))
-          ' "${manifest}" > /dev/null
-          tools="$(jq -r '.tools[].tool' patch/built-tools.json)"
-          for meta in $(for tool in ${tools} bash; do ls artifacts/"${tool}"-[0-9]*.json; done); do
-            file="$(jq -r .file "${meta}")"
-            [ -f "artifacts/${file}" ] && [ -f "artifacts/${file}.sha256" ] \
-              || { echo "missing staged asset for ${file}" >&2; exit 1; }
-          done
-      - name: Attest build provenance
-        uses: actions/attest@v4
-        with:
-          subject-path: |
-            artifacts/*.tar.gz
-            artifacts/*.sha256
-            tool-distribution-${{ needs.patch-release.outputs.version }}.json
-      - name: Upload release assets
-        run: >-
-          gh release upload "${TAG}" --clobber
-          artifacts/*.tar.gz artifacts/*.sha256
-          "tool-distribution-${VERSION}.json"

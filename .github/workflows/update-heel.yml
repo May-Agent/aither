@@ -1,10 +1,10 @@
 name: Update heel
 
 # A new heel release moves the `heel` library (sandbox/Cargo.toml, Cargo.lock)
-# and the pinned heel executable of the tool distribution
-# (patch/third-party-tools.json) together, in one pull request. Both must be
+# and the pinned heel executable the sandbox tests download
+# (sandbox/test-heel.json) together, in one pull request. Both must be
 # the same version, which the aither-sandbox test
-# `tool_distribution_pins_heel_at_the_linked_version` checks. A workflow rather
+# `terminal::builder::tests::the_shell_is_built_on_the_sandboxs_directory_and_live_grants` checks. A workflow rather
 # than Renovate: no dependency bot regenerates a pin from a release's assets.
 
 on:
@@ -64,7 +64,7 @@ jobs:
           set -euo pipefail
           sed -E -i "s/^heel = \"[^\"]+\"/heel = \"${VERSION}\"/" sandbox/Cargo.toml
           cargo update -p heel --precise "${VERSION}"
-          patch/pin-heel.sh "${VERSION}"
+          sandbox/pin-heel.sh "${VERSION}"
 
       - name: Validate the pin against the library
         if: steps.release.outputs.version
@@ -82,11 +82,11 @@ jobs:
           commit-message: "chore(sandbox): upgrade heel to ${{ steps.release.outputs.version }}"
           title: "chore(sandbox): upgrade heel to ${{ steps.release.outputs.version }}"
           body: |
-            Moves the `heel` library and the distribution's pinned heel executables to ${{ steps.release.outputs.version }}.
+            Moves the `heel` library and the pinned heel executables to ${{ steps.release.outputs.version }}.
           add-paths: |
             sandbox/Cargo.toml
             Cargo.lock
-            patch/third-party-tools.json
+            sandbox/test-heel.json
 
       # GitHub holds the pull request runs of a pull request the Actions bot
       # opened or pushed until they are approved, and the required

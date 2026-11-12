@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# pin-heel.sh — pin the heel executable of one release in the tool
-# distribution (aither #664).
+# pin-heel.sh — pin the heel executable of one release for aither-sandbox's
+# tests (aither #664).
 #
 # Usage:
-#   patch/pin-heel.sh <version>
+#   sandbox/pin-heel.sh <version>
 #
 # <version> is a heel release version such as 0.9.1, published as the release
 # `heel-v<version>` of May-Agent/heel. Every platform asset of the release is
 # downloaded into a fresh directory and hashed; the hash must equal the digest
 # GitHub recorded when the asset was uploaded, or nothing is written. The
-# `heel` entries of the `host_programs` in patch/third-party-tools.json are
-# then replaced by one entry per asset, with its URL, SHA-256 and size.
+# `host_programs` in sandbox/test-heel.json are then replaced by one entry per
+# asset, with its URL, SHA-256 and size.
 # `gh` authenticates through GH_TOKEN.
 #
 # The pinned version must be the version of the `heel` library in Cargo.lock:
@@ -22,7 +22,7 @@ set -euo pipefail
 version="${1:?usage: pin-heel.sh <version>}"
 repo="May-Agent/heel"
 tag="heel-v${version}"
-root="$(cd "$(dirname "$0")/.." && pwd)"
+pin_file="$(cd "$(dirname "$0")" && pwd)/test-heel.json"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -42,9 +42,15 @@ while IFS= read -r asset; do
         || { echo "$name: downloaded sha256:$sha256 differs from the release digest" >&2; exit 1; }
     [ "$size" = "$(jq -r '.size' <<<"$asset")" ] \
         || { echo "$name: downloaded $size bytes differ from the release size" >&2; exit 1; }
-    entries="$(jq -cn -L "$root/patch" --argjson all "$entries" --argjson asset "$asset" \
+    entries="$(jq -cn --argjson all "$entries" --argjson asset "$asset" \
         --arg version "$version" --arg sha256 "$sha256" '
-        include "targets";
+        # The platform a Rust target triple names: arch is the triple'"'"'s first
+        # component, os is derived from the rest.
+        def os_of: if endswith("-apple-darwin") then "macos"
+                   elif test("linux") then "linux"
+                   elif test("windows") then "windows"
+                   else error("cannot map target to an os") end;
+        def platform_of: {os: os_of, arch: split("-")[0]};
         # heel-<target triple>[.exe]
         ($asset.name | sub("^heel-"; "") | sub("\\.exe$"; "")) as $triple
         | $triple | platform_of as $platform
@@ -60,9 +66,8 @@ while IFS= read -r asset; do
         }]')"
 done < <(jq -c '.[]' "$work/assets.json")
 
-jq --argjson heel "$entries" '
-    .host_programs = ([.host_programs[] | select(.tool != "heel")]
-        + ($heel | sort_by(.target.os, .target.arch)))
-' "$root/patch/third-party-tools.json" > "$work/pinned.json"
-cp "$work/pinned.json" "$root/patch/third-party-tools.json"
+jq -n --argjson heel "$entries" '
+    {host_programs: ($heel | sort_by(.target.os, .target.arch))}
+' > "$work/pinned.json"
+cp "$work/pinned.json" "$pin_file"
 echo "pinned heel ${version} for $(jq length <<<"$entries") platforms" >&2
