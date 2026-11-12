@@ -146,8 +146,10 @@ fn script_requires_shell(script: &str) -> bool {
             '\\' if !in_single => escaped = true,
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
-            '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '['
-            | ']' | '{' | '}' | '!' | '~'
+            // Double quotes keep parameter, command and arithmetic expansion.
+            '$' | '`' if !in_single => return true,
+            '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']' | '{'
+            | '}' | '!' | '~'
                 if !in_single && !in_double =>
             {
                 return true;
@@ -5334,6 +5336,27 @@ mod tests {
             assert_eq!(
                 direct_command(&format!("{name} x")).unwrap(),
                 Some((name.to_string(), vec!["x".to_string()]))
+            );
+        }
+    }
+
+    /// A shell expands `$` and backquotes inside double quotes, so a script
+    /// using them there runs in one; single quotes and a backslash keep them
+    /// literal, so such a script still runs directly.
+    #[test]
+    fn an_expansion_inside_double_quotes_runs_in_a_shell() {
+        for script in [
+            "echo \"$TMPDIR|$HOME\"",
+            "echo \"${HOME-unset}\"",
+            "echo \"`pwd`\"",
+        ] {
+            assert_eq!(direct_command(script).unwrap(), None, "{script}");
+        }
+        for (script, arg) in [("echo '$HOME'", "$HOME"), ("echo \"\\$HOME\"", "$HOME")] {
+            assert_eq!(
+                direct_command(script).unwrap(),
+                Some(("echo".to_string(), vec![arg.to_string()])),
+                "{script}"
             );
         }
     }
@@ -12225,6 +12248,22 @@ mod tests {
             )]
         );
         assert_eq!(pwd_of(&tool).await, root);
+    }
+
+    /// A read-only grant deleted mid-session grants nothing and no longer
+    /// fails the sandbox setup of the next command.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_readable_grant_does_not_block_the_next_command() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = authority_terminal(dir.path()).await;
+        let outside = tempfile::tempdir().expect("outside dir should be created");
+        let granted = dunce::canonicalize(outside.path()).unwrap();
+        tool.grants().add_readable(&granted);
+        assert_eq!(exit_code_of(&tool, "echo test").await, 0);
+
+        std::fs::remove_dir_all(&granted).unwrap();
+        assert_eq!(exit_code_of(&tool, "echo test").await, 0);
     }
 
     /// Cloned terminals share one grant store: a grant added through the

@@ -156,19 +156,18 @@ impl Sandbox {
     ) -> Result<Vec<Grant>, SpawnError> {
         let setup = |error: heel::Error| SpawnError::Setup(error.to_string());
         let mut grants = self.inner.fixed_grants.clone();
-        for path in &snapshot.writable {
+        for (path, access) in snapshot
+            .writable
+            .iter()
+            .map(|path| (path, Access::WRITE | Access::EXEC))
+            .chain(snapshot.readable.iter().map(|path| (path, Access::READ)))
+        {
             // A grant deleted since it was made grants nothing, and the
             // sandbox cannot resolve it.
             if matches!(path.try_exists(), Ok(false)) {
                 continue;
             }
-            grants.push(Grant::new(
-                resolved(path).map_err(setup)?,
-                Access::WRITE | Access::EXEC,
-            ));
-        }
-        for path in &snapshot.readable {
-            grants.push(Grant::new(resolved(path).map_err(setup)?, Access::READ));
+            grants.push(Grant::new(resolved(path).map_err(setup)?, access));
         }
         grants.extend(
             linked_worktree_grants(&snapshot.writable, &snapshot.readable, snapshot.git_dir)
