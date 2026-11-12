@@ -1762,11 +1762,16 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// A client on `api` against `base_url`, with a short idle timeout.
+    /// The scripted client's idle timeout: short enough to keep the timeout
+    /// tests quick, long enough that a loaded CI runner never stretches a
+    /// scripted gap past it.
+    const TEST_IDLE: Duration = Duration::from_secs(1);
+
+    /// A client on `api` against `base_url`, with the [`TEST_IDLE`] timeout.
     fn scripted_client(api: ApiKind, base_url: String, retry: RetryPolicy) -> OpenAI {
         OpenAI::builder("key")
             .base_url(base_url)
-            .idle_timeout(Duration::from_millis(300))
+            .idle_timeout(TEST_IDLE)
             .retry(retry)
             .build()
             .with_api(api)
@@ -1810,7 +1815,7 @@ mod tests {
                 .expect("stream yields")
                 .expect_err("the server never answers");
             assert!(
-                matches!(error, OpenAIError::IdleTimeout { idle } if idle == Duration::from_millis(300)),
+                matches!(error, OpenAIError::IdleTimeout { idle } if idle == TEST_IDLE),
                 "{api:?}: {error}"
             );
             assert_eq!(
@@ -1880,13 +1885,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_that_keeps_sending_is_not_cut() {
-        const EVENTS: usize = 8;
+        const EVENTS: usize = 30;
+        const GAP: Duration = Duration::from_millis(50);
         for api in BOTH_APIS {
-            // 8 events 100 ms apart run well past the 300 ms idle timeout.
+            // 30 events 50 ms apart run past the idle timeout while each gap
+            // stays a twentieth of it.
             let mut script = vec![Step::Send(SSE_HEAD.to_string())];
             for _ in 0..EVENTS {
                 script.push(Step::Send(text_event(api, "x")));
-                script.push(Step::Pause(Duration::from_millis(100)));
+                script.push(Step::Pause(GAP));
             }
             let url = serve_scripted(vec![script]);
             let client = scripted_client(api, url, RetryPolicy::none());
@@ -1900,7 +1907,7 @@ mod tests {
                 }
             }
             assert_eq!(texts, EVENTS, "{api:?}");
-            assert!(started.elapsed() > Duration::from_millis(300), "{api:?}");
+            assert!(started.elapsed() > TEST_IDLE, "{api:?}");
         }
     }
 
