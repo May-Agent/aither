@@ -1465,6 +1465,12 @@ where
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
+        // The derived sandbox carries none of the launcher's space variables;
+        // the run's are those its own space was prepared with.
+        let space_environment = prepared
+            .as_ref()
+            .map(|prepared| prepared.env_dirs().to_vec())
+            .unwrap_or_default();
         let sandbox = self
             .sandbox
             .derived(GrantSnapshot {
@@ -1473,6 +1479,7 @@ where
                 ..GrantSnapshot::default()
             })
             .with_working_dir(space.clone())
+            .with_space_environment(space_environment)
             .with_scanner(job_registry.scanner());
         let jobs = Arc::new(KillJobsOnDrop::new(
             job_registry.clone(),
@@ -9421,6 +9428,8 @@ mod tests {
         Fail,
         /// Names the launcher's working directory as the working copy.
         Outside,
+        /// Names the launcher's working directory as `TMPDIR`.
+        EnvOutside,
     }
 
     #[cfg(unix)]
@@ -9470,7 +9479,39 @@ mod tests {
                     Err(NoClone)
                 }
                 Filling::Outside => Ok(PreparedSpace::new().with_working_copy(run.launcher)),
+                Filling::EnvOutside => {
+                    Ok(PreparedSpace::new().with_env_dir("TMPDIR", run.launcher))
+                }
             }
+        }
+    }
+
+    /// Gives every space a temporary directory as `TMPDIR`, and the first
+    /// space it prepares also a cache directory as `AITHER_TEST_CACHE`.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct EnvSpaces {
+        prepared: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl SubagentSpaces for EnvSpaces {
+        type Error = std::io::Error;
+
+        async fn prepare(&self, run: RunSpace<'_>) -> Result<PreparedSpace, std::io::Error> {
+            let tmp = run.space.join("tmp");
+            async_fs::create_dir(&tmp).await?;
+            let prepared = PreparedSpace::new().with_env_dir("TMPDIR", tmp);
+            if self
+                .prepared
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                > 0
+            {
+                return Ok(prepared);
+            }
+            let cache = run.space.join("cache");
+            async_fs::create_dir(&cache).await?;
+            Ok(prepared.with_env_dir("AITHER_TEST_CACHE", cache))
         }
     }
 
@@ -9635,6 +9676,137 @@ mod tests {
         };
         assert_eq!((path, space), (&launcher, &asked));
         assert!(!asked.exists(), "the refused space is removed");
+    }
+
+    /// An environment directory named outside the space fails the launch,
+    /// and the space is removed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_environment_directory_outside_the_space_fails_the_launch() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (parent, seen) = spaced_terminal(dir.path(), Filling::EnvOutside).await;
+        let error = launch(&parent, SubagentGrant::new())
+            .await
+            .expect_err("the launch fails");
+        let (asked, launcher, _) = seen.try_recv().unwrap();
+        let SubagentGrantError::PreparedOutsideSpace { path, space } = &error else {
+            panic!("the launch fails on the environment directory: {error}");
+        };
+        assert_eq!((path, space), (&launcher, &asked));
+        assert!(!asked.exists(), "the refused space is removed");
+    }
+
+    /// A subagent's commands see the directories its space was prepared with
+    /// over the launcher's environment, and write them; a subagent it
+    /// launches sees its own space's alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_sees_the_environment_directories_of_its_own_space() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let parent = authority_terminal(dir.path())
+            .await
+            .with_subagent_spaces(EnvSpaces::default());
+        let child = launch(&parent, SubagentGrant::new())
+            .await
+            .expect("the space is prepared");
+        let space = child.working_dir().to_path_buf();
+        let (tmp, cache) = (space.join("tmp"), space.join("cache"));
+        assert_eq!(
+            child.prepared_space().unwrap().env_dirs().to_vec(),
+            vec![
+                ("TMPDIR".to_owned(), tmp.clone()),
+                ("AITHER_TEST_CACHE".to_owned(), cache.clone()),
+            ]
+        );
+        assert_eq!(
+            stdout_of(&child, "echo \"$TMPDIR|$AITHER_TEST_CACHE\"").await,
+            format!("{}|{}", tmp.display(), cache.display())
+        );
+        assert_eq!(
+            exit_code_of(
+                &child,
+                "touch \"$TMPDIR/written\" \"$AITHER_TEST_CACHE/written\""
+            )
+            .await,
+            0,
+            "the subagent writes the directories its environment names"
+        );
+        assert!(tmp.join("written").exists() && cache.join("written").exists());
+        assert_ne!(
+            stdout_of(&parent, "echo \"$TMPDIR\"").await,
+            tmp.display().to_string(),
+            "the launcher keeps its own environment"
+        );
+
+        let nested = launch(&child, SubagentGrant::new())
+            .await
+            .expect("a nested space is prepared");
+        assert_eq!(
+            stdout_of(&nested, "echo \"$TMPDIR|${AITHER_TEST_CACHE-unset}\"").await,
+            format!("{}|unset", nested.working_dir().join("tmp").display()),
+            "a nested subagent carries its own space's variables alone"
+        );
+    }
+
+    /// In a container, a subagent's commands export the directories its
+    /// space was prepared with as the container spells them, and a subagent
+    /// it launches exports its own space's alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_container_subagent_exports_its_spaces_environment_through_the_mount() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let (scripts, parent) = recording_container_terminal(dir.path(), Some(dir.path())).await;
+        let parent = parent.with_subagent_spaces(EnvSpaces::default());
+        let child = launch(&parent, SubagentGrant::new())
+            .await
+            .expect("a space inside the workspace can be prepared");
+        let nested = launch(&child, SubagentGrant::new())
+            .await
+            .expect("a nested space is prepared");
+        assert_eq!(exit_code_of(&child, "echo child-env-probe").await, 0);
+        assert_eq!(exit_code_of(&nested, "echo nested-env-probe").await, 0);
+
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let in_container = |path: &Path| {
+            format!(
+                "/workspace/{}",
+                path.strip_prefix(&root).unwrap().to_str().unwrap()
+            )
+        };
+        let scripts = scripts.lock().unwrap().clone();
+        let script_of = |probe: &str| {
+            scripts
+                .iter()
+                .find(|script| script.contains(probe))
+                .unwrap_or_else(|| panic!("the {probe} command ran"))
+                .clone()
+        };
+        let child_script = script_of("child-env-probe");
+        let space = child.working_dir();
+        for (name, path) in [
+            ("TMPDIR", space.join("tmp")),
+            ("AITHER_TEST_CACHE", space.join("cache")),
+        ] {
+            assert!(
+                child_script.contains(&format!("export {name}="))
+                    && child_script.contains(&in_container(&path)),
+                "{name} is exported as the container spells it: {child_script}"
+            );
+            assert!(
+                !child_script.contains(&path.display().to_string()),
+                "the container sees no host spelling: {child_script}"
+            );
+        }
+        let nested_script = script_of("nested-env-probe");
+        assert!(
+            nested_script.contains(&in_container(&nested.working_dir().join("tmp"))),
+            "{nested_script}"
+        );
+        assert!(
+            !nested_script.contains("AITHER_TEST_CACHE")
+                && !nested_script.contains(&in_container(&space.join("tmp"))),
+            "a nested subagent exports its own space's variables alone: {nested_script}"
+        );
     }
 
     #[cfg(unix)]

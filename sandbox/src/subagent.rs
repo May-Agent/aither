@@ -215,15 +215,15 @@ pub enum SubagentGrantError {
         /// The embedder's error.
         source: SpacePreparationError,
     },
-    /// The embedder named a working copy outside the space it prepared. The
-    /// space was removed.
+    /// The embedder named a working copy or an environment directory outside
+    /// the space it prepared. The space was removed.
     #[error(
-        "the working copy {} prepared for a subagent is outside its space {}",
+        "the path {} prepared for a subagent is outside its space {}",
         .path.display(),
         .space.display()
     )]
     PreparedOutsideSpace {
-        /// The working copy.
+        /// The working copy or environment directory, by its canonical path.
         path: PathBuf,
         /// The space.
         space: PathBuf,
