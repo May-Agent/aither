@@ -1216,28 +1216,23 @@ fn responses_stream_inner(
                                         usage_emitted = true;
                                     }
                                 }
-                                ResponsesStreamEvent::ResponseFailed { error } => {
-                                    let msg = error
-                                        .and_then(|e| e.message)
-                                        .unwrap_or_else(|| "Response failed".to_string());
-                                    if msg.contains("call_id") {
-                                        yield Err(OpenAIError::Api(format!(
-                                            "{msg}\nSerialized responses request: {serialized_request}"
-                                        )));
-                                    } else {
-                                        yield Err(OpenAIError::Api(msg));
-                                    }
+                                ResponsesStreamEvent::ResponseFailed { response } => {
+                                    let (code, message) = response
+                                        .and_then(|response| response.error)
+                                        .map_or((None, None), |e| (e.code, e.message));
+                                    yield Err(responses_event_error(
+                                        code,
+                                        message.unwrap_or_else(|| "Response failed".to_string()),
+                                        &serialized_request,
+                                    ));
                                     return;
                                 }
-                                ResponsesStreamEvent::Error { message, .. } => {
-                                    let msg = message.unwrap_or_else(|| "Unknown error".to_string());
-                                    if msg.contains("call_id") {
-                                        yield Err(OpenAIError::Api(format!(
-                                            "{msg}\nSerialized responses request: {serialized_request}"
-                                        )));
-                                    } else {
-                                        yield Err(OpenAIError::Api(msg));
-                                    }
+                                ResponsesStreamEvent::Error { message, code } => {
+                                    yield Err(responses_event_error(
+                                        code,
+                                        message.unwrap_or_else(|| "Unknown error".to_string()),
+                                        &serialized_request,
+                                    ));
                                     return;
                                 }
                                 // Ignore other events
@@ -1268,6 +1263,26 @@ fn responses_stream_inner(
 
 /// Start event for a provider-executed (hosted) tool item, when the output
 /// item is one we model — the provider runs it, no consumer execution.
+/// The error a Responses `error` or `response.failed` event reports, keeping
+/// its `code` so the failure classifies (a mid-stream `rate_limit_exceeded`
+/// is transient). A `call_id` complaint carries the request that caused it.
+fn responses_event_error(
+    code: Option<String>,
+    message: String,
+    serialized_request: &str,
+) -> OpenAIError {
+    let message = if message.contains("call_id") {
+        format!("{message}\nSerialized responses request: {serialized_request}")
+    } else {
+        message
+    };
+    OpenAIError::StreamEvent {
+        error_type: None,
+        code,
+        message,
+    }
+}
+
 fn builtin_call_event(item: &ResponsesOutputItem) -> Option<Event> {
     let (id, tool, detail) = match item {
         ResponsesOutputItem::WebSearchCall { id, action, .. } => (
@@ -1908,6 +1923,62 @@ mod tests {
             }
             assert_eq!(texts, EVENTS, "{api:?}");
             assert!(started.elapsed() > TEST_IDLE, "{api:?}");
+        }
+    }
+
+    /// A rate limit reported after the stream started is transient, on every
+    /// event that can carry it: the Responses `error` and `response.failed`
+    /// events and the chat-completions error object.
+    #[tokio::test]
+    async fn a_rate_limit_reported_mid_stream_is_transient() {
+        let message = "Reached request rate limit. Your limit will reset in 4 seconds.";
+        let error = serde_json::json!({"code": "rate_limit_exceeded", "message": message});
+        let cases = [
+            (
+                ApiKind::Responses,
+                serde_json::json!({"type": "error", "code": "rate_limit_exceeded", "message": message}),
+            ),
+            (
+                ApiKind::Responses,
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {"status": "failed", "error": error},
+                }),
+            ),
+            (
+                ApiKind::ChatCompletions,
+                serde_json::json!({"error": error}),
+            ),
+        ];
+        for (api, event) in cases {
+            let url = serve_scripted(vec![vec![
+                Step::Send(SSE_HEAD.to_string()),
+                Step::Send(text_event(api, "hi")),
+                Step::Send(format!("data: {event}\n\n")),
+            ]]);
+            let client = scripted_client(api, url, RetryPolicy::none());
+            let stream = client.respond(oneshot("system", "hello"));
+            futures_lite::pin!(stream);
+            let first = stream
+                .next()
+                .await
+                .expect("stream yields")
+                .expect("the first event arrives");
+            assert!(
+                matches!(&first, Event::Text(text) if text == "hi"),
+                "{event}"
+            );
+            let error = stream
+                .next()
+                .await
+                .expect("stream yields")
+                .expect_err("the stream reports the rate limit");
+            assert_eq!(
+                error.failure().kind,
+                aither_core::llm::FailureKind::Transient,
+                "{event}: {error}"
+            );
+            assert!(error.to_string().contains(message), "{event}: {error}");
         }
     }
 
