@@ -4,8 +4,9 @@
 //! launcher's working directory that it alone can write. An embedder that
 //! gives its terminal [`SubagentSpaces`] fills each new space before the
 //! subagent's terminal exists, typically with a clone of the repository the
-//! launcher works in, and names the working copies it made there. The run
-//! fails with the embedder's error when that fails.
+//! launcher works in, and names the working copies it made there and the
+//! directories its commands' environment points at. The run fails with the
+//! embedder's error when that fails.
 //!
 //! The space belongs to the launcher: it lies inside the launcher's working
 //! directory, stays when the run ends so the launcher can review and take
@@ -18,6 +19,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use futures::{StreamExt as _, TryStreamExt as _};
+
+/// How many prepared paths are resolved at once. Each resolution is one
+/// filesystem call on the blocking pool, and an embedder names a handful, so
+/// the bound matches the import's ref checks rather than any measurement.
+const RESOLUTIONS_IN_FLIGHT: usize = 8;
 
 /// Prepares the space each subagent run works in.
 ///
@@ -29,8 +36,8 @@ pub trait SubagentSpaces: Send + Sync + 'static {
     /// Why a space could not be prepared.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Fills `run.space` for the run and names the working copies made in
-    /// it. Each must lie inside the space.
+    /// Fills `run.space` for the run and names the working copies and
+    /// environment directories made in it. Each must lie inside the space.
     fn prepare(
         &self,
         run: RunSpace<'_>,
@@ -57,6 +64,7 @@ pub struct RunSpace<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PreparedSpace {
     working_copies: Vec<PathBuf>,
+    env_dirs: Vec<(String, PathBuf)>,
 }
 
 impl PreparedSpace {
@@ -73,6 +81,20 @@ impl PreparedSpace {
         self
     }
 
+    /// Records the environment variable `name` as `path`, a directory inside
+    /// the space, for every command the run executes: the temporary, home or
+    /// cache directory a launcher's environment would otherwise point at a
+    /// directory the run cannot write. It overrides the launcher's sandbox
+    /// environment and [`EnvSource`](crate::EnvSource), never a command's own
+    /// variables, and reaches no subagent the run launches, whose space is
+    /// prepared on its own. A container sees `path` as it spells it through
+    /// the workspace mount.
+    #[must_use]
+    pub fn with_env_dir(mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        self.env_dirs.push((name.into(), path.into()));
+        self
+    }
+
     /// The working copies the run works in, by their canonical paths once
     /// the terminal has accepted the space.
     #[must_use]
@@ -80,22 +102,44 @@ impl PreparedSpace {
         &self.working_copies
     }
 
-    /// Resolves every working copy and confirms it lies inside `space`, which
-    /// is canonical.
-    pub(crate) async fn confine(self, space: &Path) -> Result<Self, super::SubagentGrantError> {
-        let mut working_copies = Vec::with_capacity(self.working_copies.len());
-        for path in self.working_copies {
-            let canonical = super::canonical(&path).await?;
-            if !canonical.starts_with(space) {
-                return Err(super::SubagentGrantError::PreparedOutsideSpace {
-                    path: canonical,
-                    space: space.to_path_buf(),
-                });
-            }
-            working_copies.push(canonical);
-        }
-        Ok(Self { working_copies })
+    /// The environment directories, by their canonical paths once the
+    /// terminal has accepted the space.
+    pub(crate) fn env_dirs(&self) -> &[(String, PathBuf)] {
+        &self.env_dirs
     }
+
+    /// Resolves every working copy and environment directory and confirms it
+    /// lies inside `space`, which is canonical.
+    pub(crate) async fn confine(self, space: &Path) -> Result<Self, super::SubagentGrantError> {
+        let working_copies = futures::stream::iter(self.working_copies)
+            .map(|path| inside(path, space))
+            .buffered(RESOLUTIONS_IN_FLIGHT)
+            .try_collect::<Vec<_>>();
+        let env_dirs = futures::stream::iter(self.env_dirs)
+            .map(|(name, path)| async move {
+                Ok::<_, super::SubagentGrantError>((name, inside(path, space).await?))
+            })
+            .buffered(RESOLUTIONS_IN_FLIGHT)
+            .try_collect::<Vec<_>>();
+        let (working_copies, env_dirs) =
+            futures::future::try_join(working_copies, env_dirs).await?;
+        Ok(Self {
+            working_copies,
+            env_dirs,
+        })
+    }
+}
+
+/// `path` by its canonical path, refused unless it lies inside `space`.
+async fn inside(path: PathBuf, space: &Path) -> Result<PathBuf, super::SubagentGrantError> {
+    let canonical = super::canonical(&path).await?;
+    if !canonical.starts_with(space) {
+        return Err(super::SubagentGrantError::PreparedOutsideSpace {
+            path: canonical,
+            space: space.to_path_buf(),
+        });
+    }
+    Ok(canonical)
 }
 
 /// An embedder's failure to prepare a space, whatever its own error type.

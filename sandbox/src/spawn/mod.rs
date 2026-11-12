@@ -326,6 +326,9 @@ struct SandboxInner {
     fixed_grants: Vec<heel::Grant>,
     environment: Vec<(String, String)>,
     env_source: Option<Arc<dyn EnvSource>>,
+    /// Variables naming directories inside a subagent's own space, by their
+    /// host paths: the layer between the source and a spec's own variables.
+    space_environment: Vec<(String, PathBuf)>,
     write_denylist: Option<heel::WriteDenylist>,
     network: Option<CompiledNetworkPolicy>,
     approver: Option<AnyDomainApprover>,
@@ -377,6 +380,7 @@ impl Sandbox {
                 fixed_grants: Vec::new(),
                 environment: Vec::new(),
                 env_source: None,
+                space_environment: Vec::new(),
                 write_denylist: None,
                 network: None,
                 approver: None,
@@ -427,6 +431,14 @@ impl Sandbox {
         self.edit(|inner| inner.env_source = Some(Arc::new(source)))
     }
 
+    /// The variables of a subagent's space: each names a directory inside
+    /// it, by its host path. They override the environment and its source
+    /// and yield to a spec's own variables; a container sees each directory
+    /// through its workspace mount, and an SSH server none.
+    pub(crate) fn with_space_environment(self, environment: Vec<(String, PathBuf)>) -> Self {
+        self.edit(|inner| inner.space_environment = environment)
+    }
+
     /// The paths a spawn on the host must not write, however they are
     /// granted. Not supported on Windows, whose backend refuses a denylist
     /// rather than run weaker, so it is not applied there.
@@ -474,13 +486,16 @@ impl Sandbox {
     /// grants [derived](Grants::derived) from this sandbox's with `own`, and
     /// no agent label until [`with_agent`](Self::with_agent) gives one. It
     /// cannot widen this sandbox: its grants never reach it, and a container
-    /// confines its processes to its own writable grants.
+    /// confines its processes to its own writable grants. The variables of
+    /// this sandbox's space are not the child's, which has a space of its
+    /// own.
     #[must_use]
     pub fn derived(&self, own: GrantSnapshot) -> Self {
         let grants = self.inner.grants.derived(own);
         self.clone().edit(|inner| {
             inner.grants = grants;
             inner.agent = None;
+            inner.space_environment = Vec::new();
         })
     }
 

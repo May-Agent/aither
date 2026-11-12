@@ -77,6 +77,16 @@ const JINA_STAGE_BUDGET: Duration = Duration::from_millis(2500);
 const STATIC_STAGE_BUDGET: Duration = Duration::from_millis(2000);
 #[cfg(feature = "headless")]
 const HEADLESS_STAGE_BUDGET: Duration = Duration::from_millis(1500);
+/// How long Chrome may take to print its DevTools address. A Chrome that
+/// exits is reported at once, so this only bounds one that is alive but slow.
+/// Its first start on a machine is the slow one: on a GitHub-hosted runner the
+/// test that holds it took 9.7-13.3 s when it passed and went past
+/// chromiumoxide's default of 20 s when it failed, while every later start
+/// takes under 0.5 s. 60 s is about 4.5x the slowest first start that
+/// finished, and lies between Puppeteer's 30 s and Playwright's 180 s launch
+/// timeouts.
+#[cfg(feature = "headless")]
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 const JINA_API_BASE: &str = "https://r.jina.ai/";
 const JINA_API_KEY_ENV: &str = "JINA_API_KEY";
@@ -1245,6 +1255,7 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
         .map_err(|e| anyhow!("Failed to create the browser profile: {e}"))?;
 
     let config = BrowserConfig::builder()
+        .launch_timeout(BROWSER_LAUNCH_TIMEOUT)
         .user_data_dir(profile.path())
         .viewport(Some(Viewport {
             width: 1920,
