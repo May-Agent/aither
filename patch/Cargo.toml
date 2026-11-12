@@ -10,6 +10,9 @@ description = "apply_patch: sandbox-executed compact contextual patch utility"
 readme = "../README.md"
 keywords = ["patch", "diff", "sandbox", "agent", "tooling"]
 categories = ["command-line-utilities"]
+# Removed from crates.io: the program now ships from May (May-Agent/may#1015)
+# and is never published again.
+publish = false
 
 [dependencies]
 thiserror = "2"
