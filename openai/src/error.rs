@@ -123,6 +123,7 @@ impl ErrorObject {
         if is(&["insufficient_quota", "billing_hard_limit_reached"]) {
             Some(FailureKind::Quota)
         } else if is(&[
+            "rate_limit_exceeded",
             "server_error",
             "service_unavailable_error",
             "overloaded_error",

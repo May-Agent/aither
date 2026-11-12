@@ -31,7 +31,7 @@ pub enum ResponsesStreamEvent {
     #[serde(rename = "response.failed")]
     ResponseFailed {
         #[serde(default)]
-        error: Option<ResponsesError>,
+        response: Option<ResponsesStreamResponse>,
     },
     /// Output item added
     #[serde(rename = "response.output_item.added")]
@@ -128,6 +128,9 @@ pub struct ResponsesStreamResponse {
     pub output: Vec<ResponsesOutputItem>,
     #[serde(default)]
     pub usage: Option<ResponsesUsage>,
+    /// Why the response failed, on `response.failed`.
+    #[serde(default)]
+    pub error: Option<ResponsesError>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
