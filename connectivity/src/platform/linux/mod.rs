@@ -82,7 +82,15 @@ fn run(
             }
         };
         let _ = ready.send(Ok(())).await;
-        let watchers = future::zip(routes.watch(sink), logind.watch(sink));
+        let power = async {
+            if let Some(logind) = logind {
+                logind.watch(sink).await;
+            } else {
+                tracing::info!("no system bus on this machine, sleep and wake are not tracked");
+                future::pending::<()>().await;
+            }
+        };
+        let watchers = future::zip(routes.watch(sink), power);
         // `stopped` only ever closes; nothing is sent on it.
         future::or(
             async {
