@@ -9,7 +9,7 @@
 //! | Platform | Reachability | Sleep and wake |
 //! |---|---|---|
 //! | macOS | [`nw_path_monitor`] (Network.framework) | [`IORegisterForSystemPower`] (`IOKit`) |
-//! | Linux | rtnetlink link and route groups, see [`rtnetlink(7)`] | logind [`PrepareForSleep`] over D-Bus |
+//! | Linux | rtnetlink link and route groups, see [`rtnetlink(7)`] | logind [`PrepareForSleep`] over D-Bus; none on a machine without a system bus |
 //! | Windows | [`NotifyNetworkConnectivityHintChange`] | [`PowerRegisterSuspendResumeNotification`] |
 //!
 //! Monitors run on their own threads or OS callbacks and publish through
