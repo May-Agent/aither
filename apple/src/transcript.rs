@@ -147,7 +147,7 @@ pub fn prepare(messages: &[Message]) -> Result<Prepared, AppleError> {
                 };
                 entries.push(PreparedEntry::ToolOutput {
                     id: tool_call_id.clone(),
-                    name: name.clone(),
+                    name,
                     text: content.clone(),
                 });
             }
