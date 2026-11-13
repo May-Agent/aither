@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/acp-v0.30.0...acp-v0.31.0) - 2026-11-13
+
+### Added
+
+- *(acp)* [**breaking**] map the new event set and run an ACP session as a subagent
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+
+### Fixed
+
+- build and test every crate on its own, warning-free per feature set
+
+### Other
+
+- remove the sed and patch programs
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- *(acp)* route session turns through SessionUpdateMapper
+
 ## [0.28.0](https://github.com/May-Agent/aither/compare/acp-v0.27.0...acp-v0.28.0) - 2026-11-09
 
 ### Added

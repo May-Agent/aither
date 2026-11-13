@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/aither-connectivity-v0.30.0...aither-connectivity-v0.31.0) - 2026-11-13
+
+### Added
+
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+
+### Fixed
+
+- *(connectivity)* track reachability alone on a machine with no system bus
+
+### Other
+
+- remove the sed and patch programs
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+
 ## [0.13.0](https://github.com/May-Agent/aither/compare/aither-connectivity-v0.0.0...aither-connectivity-v0.13.0) - 2026-11-03
 
 ### Added

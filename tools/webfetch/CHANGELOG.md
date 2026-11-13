@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/webfetch-v0.30.0...webfetch-v0.31.0) - 2026-11-13
+
+### Added
+
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+
+### Fixed
+
+- *(webfetch)* give Chrome's first start on a machine the time it takes
+- build and test every crate on its own, warning-free per feature set
+- *(sandbox)* keep no duplicate of a job's stdin pipe in the blocked-stdin probe
+- *(webfetch)* convert the main landmark whole instead of Readability's article
+
+### Other
+
+- remove the sed and patch programs
+- Merge remote-tracking branch 'origin/dev' into feat/718-bridge-leaves
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- Merge pull request #727 from May-Agent/feat/717-shell
+
 ## [0.20.0](https://github.com/May-Agent/aither/compare/webfetch-v0.19.0...webfetch-v0.20.0) - 2026-11-06
 
 ### Fixed

@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/sandbox-v0.30.0...sandbox-v0.31.0) - 2026-11-13
+
+### Added
+
+- *(sandbox)* let a subagent's space carry environment directories
+- *(sandbox)* [**breaking**] let the embedder keep a script's output verbatim
+- *(sandbox)* place jobs at a container or remote place for embedder tests
+- *(sandbox)* [**breaking**] take the host shell off Backend::Host and expose a shell's sandbox
+- *(sandbox)* [**breaking**] name the agent behind every shell event and reap a subagent shell's jobs
+- *(sandbox)* take appends to a job from before its process starts
+- *(sandbox)* let an embedder append to a running job's output
+- *(sandbox)* [**breaking**] a shell serves its embedder's commands to its scripts, and an SSH server is prepared on its first command
+- *(sandbox)* [**breaking**] the model reads run and terminal failures through ShellWording
+- *(sandbox)* [**breaking**] the embedder words every text the model reads about the shell's tools
+- *(sandbox)* [**breaking**] run container jobs through Sandbox::spawn
+- *(sandbox)* [**breaking**] run SSH jobs through Sandbox::spawn
+- *(sandbox)* [**breaking**] Shell::run replaces TerminalRunner
+- *(sandbox)* [**breaking**] JobEnded carries the job's info
+- *(sandbox)* [**breaking**] ShellTool and Shell::builder on a Sandbox
+- *(sandbox)* [**breaking**] rename TerminalTool to Shell
+- *(sandbox)* [**breaking**] jobs as handles with embedder-named control tools
+- *(sandbox)* [**breaking**] raise job facts as ShellEvent
+- *(sandbox)* [**breaking**] render every model-facing text through ShellWording
+- *(sandbox)* [**breaking**] backends take prepared launch inputs from the embedder
+- *(core)* a tool supplies its argument schema from its own state
+- *(sandbox)* [**breaking**] ShellArgs with sandbox and interpreter, without expect
+- *(sandbox)* [**breaking**] supply every output and time budget through OutputPolicy and ShellLimits
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+- *(sandbox)* [**breaking**] decide every script through ScriptPolicy
+- *(sandbox)* [**breaking**] add Sandbox::spawn with live Grants and DomainApprover
+
+### Fixed
+
+- *(sandbox)* take heel 0.10.1, which closes the broker's copy of an opened file before the caller runs it
+- *(sandbox)* run a script that expands inside double quotes in a shell
+- *(sandbox)* skip deleted read-only grants when confining a spawn
+- *(sandbox)* a reaped task's /proc stat line no longer fails the snapshot
+- *(sandbox)* [**breaking**] forget a claimed job once its flow settles it
+- *(sandbox)* [**breaking**] a foreground command reads the null device on every backend
+- *(sandbox)* a claiming wait reads the job taken as soon as it ended
+- *(sandbox)* release a job's task id when its output streams close
+- *(sandbox)* write container shims from the commands' declarations with heel shims
+- build and test every crate on its own, warning-free per feature set
+- *(sandbox)* build without test-heel, which the SSH control-path digest no longer needs
+- *(sandbox)* [**breaking**] identify a registry job by its task id, not its pid
+- *(sandbox)* keep scripts off the SSH command line
+- *(sandbox)* keep no duplicate of a job's stdin pipe in the blocked-stdin probe
+- *(sandbox)* a killed container job keeps its output, a failed descendant kill is not reported as complete
+- *(sandbox)* a confined container process keeps the sandbox's own directory as its root
+- *(sandbox)* the monitor pump owns its deadline and run_background returns the Job
+- *(sandbox)* a job handle holds its job and a waited job owes nothing
+- *(sandbox)* satisfy redundant_pub_crate on the Linux reap timeout
+- *(sandbox)* keep a job's word out of its IPC registry's lifetime
+- *(sandbox)* match KillTreeError::Ended only where it exists
+
+### Other
+
+- remove the sed and patch programs
+- Merge remote-tracking branch 'origin/main' into fix/script-exec-126
+- *(sandbox)* show the shell's stderr when a written script fails to run
+- Merge remote-tracking branch 'origin/main' into feat/subagent-space-env
+- Merge pull request #766 from May-Agent/fix/double-quoted-expansion
+- Merge remote-tracking branch 'origin/main' into HEAD
+- Merge pull request #758 from May-Agent/fix/638-dead-stat
+- *(sandbox)* upgrade heel to 0.10.0
+- Merge pull request #752 from May-Agent/fix/late-output-after-completion
+- Merge remote-tracking branch 'origin/dev' into fix/733-registry-by-task-id
+- *(sandbox)* derive the tidying bound from the cost of the real import
+- *(sandbox)* never replace a test heel another process may be running
+- *(sandbox)* upgrade heel to 0.9.5
+- *(sandbox)* gate the subagent-space test helpers to unix with their tests
+- *(sandbox)* run the no-provider probe through the managed shell on every platform
+- Merge remote-tracking branch 'origin/dev' into feat/718-bridge-leaves
+- *(sandbox)* open each server's SSH master under its own cell
+- Merge remote-tracking branch 'origin/dev' into feat/718-bridge-leaves
+- *(sandbox)* multiplex every SSH command to a server over one master connection
+- Merge remote-tracking branch 'origin/dev' into feat/718-bridge-leaves
+- *(sandbox)* [**breaking**] the host shell is a prepared program of Backend::Host, and an EnvSource reads the launch
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- *(sandbox)* [**breaking**] shells raise events on a shared handle, and an event is a fact with accessors
+- *(sandbox)* [**breaking**] the container backend serves a spawn's IPC router, and a spawn's command and grants are typed
+- *(sandbox)* [**breaking**] the shell runs its jobs in the Sandbox it is built on
+- Merge feat/709-shell-surface into feat/717-shell
+- Merge remote-tracking branch 'origin/feat/715-tool-schema' into feat/717-shell
+- Merge remote-tracking branch 'origin/feat/708-script-policy' into feat/716-backend-inputs
+- Merge remote-tracking branch 'origin/feat/707-sandbox-spawn' into feat/708-script-policy
+- Merge remote-tracking branch 'origin/dev' into feat/707-sandbox-spawn
+- Merge remote-tracking branch 'origin/feat/708-script-policy' into feat/716-backend-inputs
+- Merge remote-tracking branch 'origin/feat/707-sandbox-spawn' into feat/716-backend-inputs
+- Merge remote-tracking branch 'origin/feat/707-sandbox-spawn' into feat/708-script-policy
+- *(sandbox)* build the unsandboxed-args helper only where its tests run
+- Merge remote-tracking branch 'origin/feat/708-script-policy' into feat/716-backend-inputs
+- Merge remote-tracking branch 'origin/feat/707-sandbox-spawn' into feat/708-script-policy
+- Merge remote-tracking branch 'origin/feat/707-sandbox-spawn' into feat/708-script-policy
+- *(sandbox)* drop the claim that a readable path cannot execute
+
 ## [0.30.0](https://github.com/May-Agent/aither/compare/sandbox-v0.29.0...sandbox-v0.30.0) - 2026-11-10
 
 ### Fixed

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/apple-v0.30.0...apple-v0.31.0) - 2026-11-13
+
+### Fixed
+
+- *(apple)* drop a clone clippy 1.100 flags as redundant
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/apple-v0.21.0...apple-v0.22.0) - 2026-11-07
 
 ### Added
