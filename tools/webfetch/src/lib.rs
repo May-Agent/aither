@@ -348,7 +348,7 @@ pub const fn default_fetcher() -> DefaultFetcher {
 /// Build the default fetcher chain.
 #[cfg(not(feature = "headless"))]
 #[must_use]
-pub fn default_fetcher() -> DefaultFetcher {
+pub const fn default_fetcher() -> DefaultFetcher {
     Fallback2::new(JinaFetcher, StaticFetcher)
 }
 
