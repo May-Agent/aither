@@ -97,7 +97,7 @@ fn is_blocked_v4(addr: Ipv4Addr) -> bool {
         || addr.octets()[0] >= 240
 }
 
-fn is_blocked_v6(addr: Ipv6Addr) -> bool {
+const fn is_blocked_v6(addr: Ipv6Addr) -> bool {
     let segments = addr.segments();
     addr.is_loopback()
         || addr.is_unspecified()
@@ -238,13 +238,14 @@ pub(crate) mod testing {
     #[cfg(feature = "headless")]
     use super::{AddressPolicy, UrlPolicyError};
     use std::collections::HashMap;
+    use std::future::Future;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
     /// Answers lookups from a fixed table and records them; a host listed
     /// several times answers with every address listed for it.
     #[derive(Clone, Default)]
-    pub(crate) struct Table {
+    pub struct Table {
         hosts: Arc<HashMap<String, Vec<SocketAddr>>>,
         asked: Arc<Mutex<Vec<String>>>,
     }
@@ -273,21 +274,26 @@ pub(crate) mod testing {
     }
 
     impl Resolver for Table {
-        async fn resolve(&self, host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        fn resolve(
+            &self,
+            host: &str,
+            _port: u16,
+        ) -> impl Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
             self.asked
                 .lock()
                 .expect("lookup log poisoned")
                 .push(host.to_string());
-            self.hosts.get(host).cloned().ok_or_else(|| {
+            let result = self.hosts.get(host).cloned().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "not in the table")
-            })
+            });
+            std::future::ready(result)
         }
     }
 
     /// Allows exactly one address, which stands in for a public one.
     #[cfg(feature = "headless")]
     #[derive(Clone)]
-    pub(crate) struct Only(pub(crate) SocketAddr);
+    pub struct Only(pub(crate) SocketAddr);
 
     #[cfg(feature = "headless")]
     impl AddressPolicy for Only {

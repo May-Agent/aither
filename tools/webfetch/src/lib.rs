@@ -6,7 +6,7 @@
 //!
 //! - **Provider chain**: Jina Reader -> static fetch -> headless (optional)
 //! - **Static fetch**: HTTP fetching with markdown negotiation and HTML fallback
-//! - **Headless browser**: Full JavaScript rendering via Chrome DevTools Protocol
+//! - **Headless browser**: Full JavaScript rendering via Chrome `DevTools` Protocol
 //!   (enable with `headless` feature)
 //! - **Image extraction**: Extract image URLs from pages
 //! - **Image fetching**: Fetch images with automatic JPEG conversion
@@ -55,6 +55,7 @@ pub mod proxy;
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
@@ -77,7 +78,7 @@ const JINA_STAGE_BUDGET: Duration = Duration::from_millis(2500);
 const STATIC_STAGE_BUDGET: Duration = Duration::from_millis(2000);
 #[cfg(feature = "headless")]
 const HEADLESS_STAGE_BUDGET: Duration = Duration::from_millis(1500);
-/// How long Chrome may take to print its DevTools address. A Chrome that
+/// How long Chrome may take to print its `DevTools` address. A Chrome that
 /// exits is reported at once, so this only bounds one that is alive but slow.
 /// Its first start on a machine is the slow one: on a GitHub-hosted runner the
 /// test that holds it took 9.7-13.3 s when it passed and went past
@@ -162,7 +163,7 @@ impl FetchRequest {
 
     /// Override total deadline budget.
     #[must_use]
-    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+    pub const fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
         self
     }
@@ -182,6 +183,7 @@ pub struct FetchContext {
 }
 
 impl FetchContext {
+    /// Creates a new fetch context bounded by the given duration budget.
     #[must_use]
     pub fn new(budget: Duration) -> Self {
         Self {
@@ -191,16 +193,19 @@ impl FetchContext {
         }
     }
 
+    /// Returns the elapsed time since the context was created.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
         self.started_at.elapsed()
     }
 
+    /// Returns the remaining time budget, or zero if exhausted.
     #[must_use]
     pub fn remaining(&self) -> Duration {
         self.budget.saturating_sub(self.elapsed())
     }
 
+    /// Computes the budget allocated for an individual stage, capped by preferred duration.
     #[must_use]
     pub fn stage_budget(&self, preferred: Duration) -> Duration {
         self.remaining().min(preferred)
@@ -214,17 +219,24 @@ impl FetchContext {
 /// Stage execution outcome, used for diagnostics and fallback decisions.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StageOutcome {
+    /// The stage completed successfully.
     Success,
+    /// The stage failed due to an HTTP or network issue.
     HttpFailure,
+    /// The stage failed due to an error other than HTTP (e.g. extraction).
     NonHttpFailure,
 }
 
 /// Per-provider trace information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageTrace {
+    /// Name of the provider that ran.
     pub provider: String,
+    /// Elapsed time in milliseconds spent in this stage.
     pub elapsed_ms: u128,
+    /// Outcome of this stage execution.
     pub outcome: StageOutcome,
+    /// Optional failure or diagnostic message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -232,8 +244,11 @@ pub struct StageTrace {
 /// Error class used by provider chain to decide whether to fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderErrorKind {
+    /// Network or HTTP-level failure.
     HttpFailure,
+    /// Failure extracting content or parsing markdown.
     ExtractionFailure,
+    /// Unexpected or invalid response received.
     InvalidResponse,
 }
 
@@ -270,11 +285,13 @@ impl ProviderError {
         Self::new(provider, ProviderErrorKind::InvalidResponse, source)
     }
 
+    /// Returns true if the error was caused by an HTTP or network failure.
     #[must_use]
     pub const fn is_http_failure(&self) -> bool {
         matches!(self.kind, ProviderErrorKind::HttpFailure)
     }
 
+    /// Returns the classification of this provider error.
     #[must_use]
     pub const fn kind(&self) -> ProviderErrorKind {
         self.kind
@@ -294,14 +311,19 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 /// Async-first provider abstraction for web fetching.
-#[allow(async_fn_in_trait)]
-pub trait WebFetcher {
+pub trait WebFetcher: Send + Sync {
+    /// Returns the provider's unique name identifier.
     fn name(&self) -> &'static str;
-    async fn fetch(
+
+    /// Fetches a web page asynchronously, returning a result or provider error.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError`] if the fetch fails due to network, HTTP errors, or parsing failures.
+    fn fetch(
         &self,
         req: &FetchRequest,
         ctx: &mut FetchContext,
-    ) -> std::result::Result<FetchResult, ProviderError>;
+    ) -> impl Future<Output = std::result::Result<FetchResult, ProviderError>> + Send;
 }
 
 /// Default out-of-the-box fetcher chain type.
@@ -319,7 +341,7 @@ pub type DefaultFetcher = Fallback2<JinaFetcher, StaticFetcher>;
 /// Build the default fetcher chain.
 #[cfg(feature = "headless")]
 #[must_use]
-pub fn default_fetcher() -> DefaultFetcher {
+pub const fn default_fetcher() -> DefaultFetcher {
     Fallback3::new(JinaFetcher, StaticFetcher, HeadlessFetcher)
 }
 
@@ -338,13 +360,13 @@ pub struct Fallback2<A, B> {
 }
 
 impl<A, B> Fallback2<A, B> {
+    /// Creates a new two-stage fallback fetcher.
     #[must_use]
-    pub fn new(first: A, second: B) -> Self {
+    pub const fn new(first: A, second: B) -> Self {
         Self { first, second }
     }
 }
 
-#[allow(async_fn_in_trait)]
 impl<A, B> WebFetcher for Fallback2<A, B>
 where
     A: WebFetcher,
@@ -378,8 +400,9 @@ pub struct Fallback3<A, B, C> {
 }
 
 impl<A, B, C> Fallback3<A, B, C> {
+    /// Creates a new three-stage fallback fetcher.
     #[must_use]
-    pub fn new(first: A, second: B, third: C) -> Self {
+    pub const fn new(first: A, second: B, third: C) -> Self {
         Self {
             first,
             second,
@@ -388,7 +411,6 @@ impl<A, B, C> Fallback3<A, B, C> {
     }
 }
 
-#[allow(async_fn_in_trait)]
 impl<A, B, C> WebFetcher for Fallback3<A, B, C>
 where
     A: WebFetcher,
@@ -470,12 +492,22 @@ async fn run_stage<F: WebFetcher>(
 /// 1. Jina Reader (`https://r.jina.ai/`) with optional API key
 /// 2. Static fetch (`text/markdown` -> `text/html` + cleanup)
 /// 3. Headless browser (only when `headless` feature is enabled)
+///
+/// # Errors
+///
+/// Returns an error if the URL destination policy refuses the target or if all
+/// stages in the fetcher chain fail to retrieve or parse the content.
 pub async fn fetch(url: &str) -> Result<FetchResult> {
     ensure_rustls_provider();
     fetch_with_request(FetchRequest::new(url)).await
 }
 
 /// Fetch using an explicit request object.
+///
+/// # Errors
+///
+/// Returns an error if the URL is refused by the destination guard or if
+/// the fetch pipeline fails or exhausts its deadline.
 pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
     ensure_rustls_provider();
     guard::guard_url(&request.url).await?;
@@ -495,6 +527,11 @@ pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
 /// - JavaScript-based anti-bot measures
 ///
 /// Requires Chrome/Chromium to be installed on the system.
+///
+/// # Errors
+///
+/// Returns an error if the URL is refused by the destination guard, Chrome fails
+/// to start, or navigation fails.
 #[cfg(feature = "headless")]
 pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
     ensure_rustls_provider();
@@ -507,6 +544,11 @@ pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
 }
 
 /// Fetches raw HTML using a headless browser (for debugging).
+///
+/// # Errors
+///
+/// Returns an error if the URL is refused by the destination guard or if headless
+/// browser navigation fails.
 #[cfg(feature = "headless")]
 pub async fn fetch_html_raw(url: &str) -> Result<String> {
     guard::guard_url(url).await?;
@@ -517,6 +559,10 @@ pub async fn fetch_html_raw(url: &str) -> Result<String> {
 /// 1. Jina Reader
 /// 2. static markdown/html pipeline
 /// 3. headless browser render (if feature enabled)
+///
+/// # Errors
+///
+/// Returns an error if destination checks fail or fetching fails across all fallback stages.
 #[cfg(feature = "headless")]
 pub async fn fetch_smart(url: &str) -> Result<FetchResult> {
     fetch(url).await
@@ -527,6 +573,10 @@ pub async fn fetch_smart(url: &str) -> Result<FetchResult> {
 /// This handles various image formats (WebP, PNG, GIF, etc.) and converts
 /// them to JPEG for maximum LLM provider compatibility.
 ///
+/// # Errors
+///
+/// Returns an error if downloading image bytes fails or image format conversion fails.
+///
 /// # Returns
 ///
 /// A tuple of (JPEG data, MIME type).
@@ -536,7 +586,11 @@ pub async fn fetch_image(url: &str) -> Result<(Vec<u8>, String)> {
     convert_to_jpeg(&bytes)
 }
 
-/// Fetches an image and returns an ImageResult.
+/// Fetches an image and returns an `ImageResult`.
+///
+/// # Errors
+///
+/// Returns an error if fetching image bytes fails or image format conversion fails.
 pub async fn fetch_image_result(url: &str) -> Result<ImageResult> {
     let (data, mime) = fetch_image(url).await?;
     Ok(ImageResult {
@@ -584,7 +638,7 @@ fn extract_og_description(html: &str) -> Option<String> {
     })
 }
 
-/// Convert HTML to FetchResult using readability and htmd.
+/// Convert HTML to `FetchResult` using readability and htmd.
 fn html_to_result_with_metadata(
     url: &str,
     html: &str,
@@ -606,21 +660,18 @@ fn html_to_result_with_metadata(
 
     // If readability produces minimal content, try fallbacks
     let final_content = if content.len() < 200 {
-        // Try og:description first
-        if let Some(og_desc) = extract_og_description(html) {
-            og_desc
-        } else {
-            // Last resort: convert full HTML body to markdown
+        // Try og:description first, then fall back to full HTML body
+        extract_og_description(html).unwrap_or_else(|| {
             let body_content = extract_body_content(html);
             htmd::convert(&body_content).unwrap_or(content)
-        }
+        })
     } else {
         content
     };
 
     Ok(FetchResult {
         url: url.to_string(),
-        title: Some(extracted.title.to_string()),
+        title: Some(extracted.title),
         content: final_content,
         content_type,
         markdown_tokens: None,
@@ -889,7 +940,7 @@ async fn fetch_document_jina(
     })
 }
 
-fn clamp_timeout(timeout: Duration) -> Duration {
+const fn clamp_timeout(timeout: Duration) -> Duration {
     if timeout.is_zero() {
         Duration::from_millis(1)
     } else {
@@ -925,17 +976,15 @@ fn is_markdown_response(content_type: Option<&str>, markdown_tokens: Option<usiz
         return true;
     }
 
-    content_type
-        .map(|value| {
-            let mime = value
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-            mime == "text/markdown" || mime == "text/x-markdown"
-        })
-        .unwrap_or(false)
+    content_type.is_some_and(|value| {
+        let mime = value
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        mime == "text/markdown" || mime == "text/x-markdown"
+    })
 }
 
 fn markdown_to_result(
@@ -1024,10 +1073,10 @@ fn normalize_yaml_string(input: &str) -> String {
     trimmed.to_string()
 }
 
+/// Content fetcher that delegates to the Jina Reader API.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JinaFetcher;
 
-#[allow(async_fn_in_trait)]
 impl WebFetcher for JinaFetcher {
     fn name(&self) -> &'static str {
         "jina"
@@ -1063,10 +1112,10 @@ impl WebFetcher for JinaFetcher {
     }
 }
 
+/// Content fetcher that issues static HTTP requests and extracts markdown or HTML.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StaticFetcher;
 
-#[allow(async_fn_in_trait)]
 impl WebFetcher for StaticFetcher {
     fn name(&self) -> &'static str {
         "static"
@@ -1138,12 +1187,12 @@ impl WebFetcher for StaticFetcher {
     }
 }
 
+/// Content fetcher that runs a headless browser for dynamic page rendering.
 #[cfg(feature = "headless")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeadlessFetcher;
 
 #[cfg(feature = "headless")]
-#[allow(async_fn_in_trait)]
 impl WebFetcher for HeadlessFetcher {
     fn name(&self) -> &'static str {
         "headless"
@@ -1185,6 +1234,7 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
     policy: P,
 ) -> Result<String> {
     use chromiumoxide::browser::{Browser, BrowserConfig};
+    use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     use chromiumoxide::handler::viewport::Viewport;
     use futures_lite::StreamExt;
     use std::time::Duration;
@@ -1282,15 +1332,14 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
         .map_err(|e| anyhow!("Failed to create page: {e}"))?;
 
     // Inject stealth script BEFORE navigation
-    let stealth_js = r#"
+    let stealth_js = r"
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         window.chrome = { runtime: {} };
-    "#;
+    ";
 
     // Use Page.addScriptToEvaluateOnNewDocument to inject before any page script runs
-    use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     page.execute(AddScriptToEvaluateOnNewDocumentParams::new(stealth_js))
         .await
         .ok();
@@ -1619,9 +1668,8 @@ mod tests {
         let html = format!(
             r#"<html><head><title>Plain Article</title></head><body>
 <div class="menu"><a href="/a">Site menu entry</a></div>
-<article><h1>Plain Article</h1><p>{p}</p><p>{p}</p><p>{p}</p></article>
-<div class="footer"><a href="/b">Footer link</a></div></body></html>"#,
-            p = paragraph
+<article><h1>Plain Article</h1><p>{paragraph}</p><p>{paragraph}</p><p>{paragraph}</p></article>
+<div class="footer"><a href="/b">Footer link</a></div></body></html>"#
         );
         assert!(main_landmark_html(&html).is_none());
 
@@ -1707,26 +1755,26 @@ description: Example
         result: std::result::Result<FetchResult, ProviderErrorKind>,
     }
 
-    #[allow(async_fn_in_trait)]
     impl WebFetcher for MockFetcher {
         fn name(&self) -> &'static str {
             self.name
         }
 
-        async fn fetch(
+        fn fetch(
             &self,
             _req: &FetchRequest,
             _ctx: &mut FetchContext,
-        ) -> std::result::Result<FetchResult, ProviderError> {
+        ) -> impl Future<Output = std::result::Result<FetchResult, ProviderError>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            match &self.result {
+            let result = match &self.result {
                 Ok(result) => Ok(result.clone()),
                 Err(kind) => Err(ProviderError::new(
                     self.name,
                     *kind,
                     anyhow!("mock {} failure", self.name),
                 )),
-            }
+            };
+            std::future::ready(result)
         }
     }
 

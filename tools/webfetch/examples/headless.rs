@@ -13,8 +13,7 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
-        .map(|s| s.as_str())
-        .unwrap_or("https://example.com");
+        .map_or("https://example.com", std::string::String::as_str);
 
     println!("Fetching: {url}\n");
 

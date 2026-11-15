@@ -67,8 +67,8 @@ pub mod fixture {
     pub fn limits() -> ShellLimits {
         ShellLimits {
             foreground_wait: ForegroundWait::new(Duration::from_secs(10)),
-            timeout_cap: LiveDuration::new(Duration::from_secs(120 * 60)),
-            long_job_alert: LiveDuration::new(Duration::from_secs(40 * 60)),
+            timeout_cap: LiveDuration::new(Duration::from_hours(2)),
+            long_job_alert: LiveDuration::new(Duration::from_mins(40)),
             subagent_import: ImportBudget::new(1024 * 1024 * 1024),
             response_window: ResponseWindow::new(Duration::from_secs(120)),
         }

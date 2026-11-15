@@ -143,7 +143,7 @@ impl Default for ContextPolicy {
             start_distance: 50_000,
             warn_distance: 80_000,
             restore_budget: 0.15,
-            idle_compact_before_expiry: Duration::from_secs(6 * 60),
+            idle_compact_before_expiry: Duration::from_mins(6),
             compaction_floor: 20_000,
             count_distance: 30_000,
             spill_threshold: 4_000,

@@ -1469,8 +1469,7 @@ where
         // the run's are those its own space was prepared with.
         let space_environment = prepared
             .as_ref()
-            .map(|prepared| prepared.env_dirs().to_vec())
-            .unwrap_or_default();
+            .map_or_default(|prepared| prepared.env_dirs().to_vec());
         let sandbox = self
             .sandbox
             .derived(GrantSnapshot {
@@ -9262,8 +9261,7 @@ mod tests {
                     launch
                         .call
                         .as_ref()
-                        .map(|call| call.call().to_string())
-                        .unwrap_or_default(),
+                        .map_or_default(|call| call.call().to_string()),
                 ),
                 ("PROBE_MODE".to_string(), format!("{:?}", launch.mode)),
             ]
@@ -9730,7 +9728,7 @@ mod tests {
         let child = launch(&parent, SubagentGrant::new())
             .await
             .expect("the space is prepared");
-        let space = child.working_dir().to_path_buf();
+        let space = child.working_dir().clone();
         let (tmp, cache) = (space.join("tmp"), space.join("cache"));
         assert_eq!(
             child.prepared_space().unwrap().env_dirs().to_vec(),

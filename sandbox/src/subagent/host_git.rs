@@ -112,7 +112,7 @@ impl<'a> HostGit<'a> {
     }
 
     fn repository(&self) -> PathBuf {
-        self.git_dir.map(Path::to_path_buf).unwrap_or_default()
+        self.git_dir.map_or_default(Path::to_path_buf)
     }
 
     /// Runs git with its input fed from `stdin` until that closes, and returns

@@ -54,8 +54,7 @@ impl ImageGenerator for Gemini {
             let parts = response
                 .primary_candidate()
                 .and_then(|candidate| candidate.content.as_ref())
-                .map(|content| content.parts.clone())
-                .unwrap_or_default();
+                .map_or_default(|content| content.parts.clone());
             futures_lite::stream::iter(parts)
                 .filter_map(|part| {
                     part.inline_data
@@ -109,8 +108,7 @@ impl ImageGenerator for Gemini {
             let parts = response
                 .primary_candidate()
                 .and_then(|candidate| candidate.content.as_ref())
-                .map(|content| content.parts.clone())
-                .unwrap_or_default();
+                .map_or_default(|content| content.parts.clone());
             futures_lite::stream::iter(parts)
                 .filter_map(|part| {
                     part.inline_data

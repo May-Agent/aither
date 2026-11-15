@@ -12,9 +12,6 @@ keywords = ["sandbox", "agent", "tooling", "terminal"]
 categories = ["api-bindings"]
 
 # `ort` is declared only to choose how ONNX Runtime is obtained.
-[package.metadata.cargo-machete]
-ignored = ["ort"]
-
 [dependencies]
 arc-swap.workspace = true
 aither-core.workspace = true

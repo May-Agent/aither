@@ -1,4 +1,4 @@
-//! SearXNG metasearch engine provider.
+//! `SearXNG` metasearch engine provider.
 //!
 //! [SearXNG](https://docs.searxng.org/) is a free, open-source metasearch engine
 //! that aggregates results from multiple search engines. No API key required.
@@ -29,13 +29,13 @@ fn ensure_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Default public SearXNG endpoint.
+/// Default public `SearXNG` endpoint.
 pub const DEFAULT_SEARXNG_URL: &str = "https://serxng-deployment-production.up.railway.app";
 
 /// Engine enabled by the managed default endpoint for unauthenticated JSON search.
 pub const DEFAULT_SEARXNG_ENGINE: &str = "duckduckgo";
 
-/// SearXNG metasearch engine provider.
+/// `SearXNG` metasearch engine provider.
 ///
 /// A free, open-source metasearch engine that requires no API key.
 /// Uses a public instance by default, or can be configured with a custom URL.
@@ -52,11 +52,11 @@ impl Default for SearXNG {
 }
 
 impl SearXNG {
-    /// Create a new SearXNG provider with a custom instance URL.
+    /// Create a new `SearXNG` provider with a custom instance URL.
     ///
     /// # Arguments
     ///
-    /// * `base_url` - The base URL of your SearXNG instance (e.g., `http://localhost:8080`)
+    /// * `base_url` - The base URL of your `SearXNG` instance (e.g., `http://localhost:8080`)
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {

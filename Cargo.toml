@@ -38,11 +38,14 @@ edition = "2024"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
 repository = "https://github.com/May-Agent/aither"
-rust-version = "1.88"
+rust-version = "1.100"
 
 [workspace.lints]
 rust.missing_docs = "warn"
 rust.missing_debug_implementations = "warn"
+cargo.unused_dependencies = "deny"
+cargo.unused_workspace_dependencies = "deny"
+cargo.missing_lints_inheritance = "deny"
 clippy.all = { level = "warn", priority = -1 }
 clippy.style = { level = "warn", priority = -1 }
 clippy.correctness = { level = "warn", priority = -1 }
@@ -73,7 +76,6 @@ aither-fs = { path = "./tools/fs", version = "0.31.0" }
 aither-command = { path = "./tools/command", version = "0.31.0" }
 aither-mcp = { path = "./mcp", version = "0.31.0" }
 aither-acp = { path = "./acp", version = "0.31.0" }
-aither-sandbox = { path = "./sandbox", version = "0.31.0" }
 aither-connectivity = { path = "./connectivity", version = "0.31.0" }
 aither-agent = { path = "./agent", version = "0.31.0", default-features = false }
 aither-openai = { path = "./openai", version = "0.31.0" }
@@ -163,10 +165,6 @@ exclude = [
     "target/",
 ]
 
-[package.metadata.cargo-machete]
-# The `serde` feature below turns on `url/serde` for the whole dependency graph,
-# so `url` is load-bearing here even though no code in this crate names it.
-ignored = ["url"]
 
 [badges]
 maintenance = { status = "actively-developed" }
