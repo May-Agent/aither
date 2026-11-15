@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/v0.30.0...v0.31.0) - 2026-11-13
+
+### Added
+
+- *(agent)* [**breaking**] let an embedder read a run's checkpoint between its events
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+
+### Fixed
+
+- *(sandbox)* take heel 0.10.1, which closes the broker's copy of an opened file before the caller runs it
+- *(webfetch)* give Chrome's first start on a machine the time it takes
+- *(webfetch)* convert the main landmark whole instead of Readability's article
+
+### Other
+
+- remove the sed and patch programs
+- *(sandbox)* upgrade heel to 0.10.0
+- the release PR is never set to merge automatically
+- release from main and retire dev
+- *(sandbox)* upgrade heel to 0.9.5
+- drop the container-acceptance and verify-tools jobs and the tool cache nothing reads, and install fish on Linux
+- Merge remote-tracking branch 'origin/dev' into feat/718-bridge-leaves
+- *(sandbox)* [**breaking**] the host shell is a prepared program of Backend::Host, and an EnvSource reads the launch
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- *(webfetch)* run the headless tests one at a time
+
 ## [0.22.0](https://github.com/May-Agent/aither/compare/v0.21.0...v0.22.0) - 2026-11-07
 
 ### Added

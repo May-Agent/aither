@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/May-Agent/aither/compare/core-v0.30.0...core-v0.31.0) - 2026-11-13
+
+### Added
+
+- *(sandbox)* [**breaking**] name the agent behind every shell event and reap a subagent shell's jobs
+- *(core)* a tool supplies its argument schema from its own state
+- *(agent)* [**breaking**] serialize the event types behind a serde feature
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+- *(core)* report approver failures as errors, not denials
+- *(core)* approval and cancellation on ToolContext
+
+### Other
+
+- remove the sed and patch programs
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- Merge remote-tracking branch 'origin/feat/715-tool-schema' into feat/717-shell
+
 ## [0.30.0](https://github.com/May-Agent/aither/compare/core-v0.29.0...core-v0.30.0) - 2026-11-10
 
 ### Added
