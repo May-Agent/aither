@@ -15,7 +15,6 @@ categories = ["api-bindings"]
 aither-core = { workspace = true, features = ["zenwave", "timer"] }
 aither-models.workspace = true
 async-stream = "0.3"
-base64 = "0.23"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
 serde = { version = "1.0", features = ["derive"] }
@@ -26,6 +25,7 @@ zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 # The file:// attachment reader is native-only; wasm32 has no filesystem.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-fs = "2"
+base64 = "0.23"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt"] }

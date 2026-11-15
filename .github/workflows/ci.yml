@@ -83,7 +83,6 @@ jobs:
         env:
           WORKSPACE: ${{ steps.scope.outputs.workspace }}
           PACKAGES: ${{ steps.scope.outputs.packages }}
-          REPORT: ${{ steps.scope.outputs.report }}
           EVENT: ${{ github.event_name }}
           BASE_REV: >-
             ${{
@@ -95,6 +94,16 @@ jobs:
         run: |
           set -euo pipefail
           rust=$([ "${WORKSPACE}" = true ] || [ -n "${PACKAGES}" ] && echo true || echo false)
+          if [ -z "${BASE_REV}" ]; then
+            changed_files=""
+            audit=true
+            workflow_gates=true
+          else
+            merge_base="$(git merge-base "${BASE_REV}" HEAD)"
+            changed_files="$(git diff --name-only "${merge_base}" HEAD)"
+            audit="$(grep -Eq '^(Cargo\.lock|\.github/workflows/ci\.yml)$' <<< "${changed_files}" && echo true || echo false)"
+            workflow_gates="$(grep -Eq '^\.github/(workflows|tests)/' <<< "${changed_files}" && echo true || echo false)"
+          fi
           has() {
             [ "${WORKSPACE}" = true ] && return 0
             for want in "$@"; do
@@ -107,7 +116,7 @@ jobs:
             [ "${WORKSPACE}" = true ] && return 0
             local excluded=" $* "
             local direct_root
-            direct_root="$(jq -r '[.owners[] | select(. == "aither")] | length > 0' <<< "${REPORT}")"
+            direct_root="$(grep -Eq '^(Cargo\.toml|src/)' <<< "${changed_files}" && echo true || echo false)"
             for pkg in ${PACKAGES}; do
               if [ "${pkg}" = aither ]; then
                 [ "${direct_root}" = true ] && return 0
@@ -120,13 +129,6 @@ jobs:
             done
             return 1
           }
-          if [ -z "${BASE_REV}" ]; then
-            audit=true
-            workflow_gates=true
-          else
-            audit="$(jq -r '.owners | keys | any(. == "Cargo.lock" or . == ".github/workflows/ci.yml")' <<< "${REPORT}")"
-            workflow_gates="$(jq -r '.owners | keys | any(startswith(".github/workflows/") or startswith(".github/tests/"))' <<< "${REPORT}")"
-          fi
           filterset=""
           if [ "${WORKSPACE}" != true ]; then
             for name in ${PACKAGES}; do
