@@ -145,12 +145,24 @@ pub struct ResponsesUsage {
     pub input_tokens_details: Option<ResponsesInputTokenDetails>,
     #[serde(default)]
     pub output_tokens_details: Option<ResponsesOutputTokenDetails>,
+    #[serde(
+        default,
+        alias = "cache_creation_tokens",
+        alias = "cache_creation_input_tokens"
+    )]
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ResponsesInputTokenDetails {
     #[serde(default)]
     pub cached_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "cache_creation_tokens",
+        alias = "cache_creation_input_tokens"
+    )]
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -284,12 +296,26 @@ pub struct ChatCompletionUsage {
     pub prompt_tokens_details: Option<ChatPromptTokensDetails>,
     #[serde(default)]
     pub completion_tokens_details: Option<ChatCompletionTokensDetails>,
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "cache_creation_tokens",
+        alias = "cache_creation_input_tokens"
+    )]
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ChatPromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "cache_creation_tokens",
+        alias = "cache_creation_input_tokens"
+    )]
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

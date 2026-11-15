@@ -12,7 +12,7 @@ use crate::{
     },
     response::{
         ChatCompletionChunk, ChatCompletionUsage, DeltaToolCall, ResponsesOutputItem,
-        ResponsesStreamEvent, ResponsesUsage, should_skip_event,
+        ResponsesReasoningSummary, ResponsesStreamEvent, ResponsesUsage, should_skip_event,
     },
 };
 use aither_core::time::sleep;
@@ -27,7 +27,15 @@ use aither_core::{
 };
 use futures_core::Stream;
 use futures_lite::StreamExt;
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use zenwave::{Client, client, header};
 
 /// Runs `fut`, failing with [`OpenAIError::IdleTimeout`] when it has not
@@ -144,7 +152,9 @@ impl OpenAI {
     /// Override the REST base URL (useful for OpenAI-compatible endpoints).
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).base_url = base_url.into();
+        let cfg = Arc::make_mut(&mut self.inner);
+        cfg.base_url = base_url.into();
+        cfg.prompt_excludes_cached = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -158,7 +168,9 @@ impl OpenAI {
     /// Select which `OpenAI` API to call.
     #[must_use]
     pub fn with_api(mut self, api: ApiKind) -> Self {
-        Arc::make_mut(&mut self.inner).api_kind = api;
+        let cfg = Arc::make_mut(&mut self.inner);
+        cfg.api_kind = api;
+        cfg.prompt_excludes_cached = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -688,7 +700,10 @@ fn chat_completions_stream_inner(
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => {
                             if let Some(chunk_usage) = &chunk.usage {
-                                usage = Some(usage_from_chat_completion(chunk_usage));
+                                usage = Some(usage_from_chat_completion(
+                                    chunk_usage,
+                                    Some(&cfg.prompt_excludes_cached),
+                                ));
                             }
                             // Emit text events
                             for choice in &chunk.choices {
@@ -817,42 +832,134 @@ fn parse_tool_call_arguments(arguments: &str) -> serde_json::Value {
     }
 }
 
-fn usage_from_chat_completion(raw: &ChatCompletionUsage) -> Usage {
+fn normalize_usage(
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+    reasoning_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
+    cache_write_tokens: Option<u32>,
+    prompt_excludes_cached: Option<&AtomicBool>,
+) -> Usage {
+    let cached = cache_read_tokens.unwrap_or(0);
+    let written = cache_write_tokens.unwrap_or(0);
+    let cache_sum = cached.saturating_add(written);
+    let normalized_prompt = prompt_tokens.map(|prompt| {
+        let completion = completion_tokens.unwrap_or(0);
+        if cache_sum == 0 {
+            return prompt;
+        }
+        if let Some(total) = total_tokens {
+            let uncached_total = prompt.saturating_add(completion);
+            if total != uncached_total {
+                if total == uncached_total.saturating_add(cache_sum) {
+                    if let Some(flag) = prompt_excludes_cached {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    return prompt.saturating_add(cache_sum);
+                }
+                if cached > 0 && total == uncached_total.saturating_add(cached) {
+                    if let Some(flag) = prompt_excludes_cached {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    return prompt.saturating_add(cached);
+                }
+                if written > 0 && total == uncached_total.saturating_add(written) {
+                    if let Some(flag) = prompt_excludes_cached {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    return prompt.saturating_add(written);
+                }
+                return prompt;
+            }
+            if prompt < cache_sum {
+                if let Some(flag) = prompt_excludes_cached {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                return prompt.saturating_add(cache_sum);
+            }
+            if prompt_excludes_cached.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return prompt.saturating_add(cache_sum);
+            }
+            return prompt;
+        }
+        if prompt < cache_sum {
+            if let Some(flag) = prompt_excludes_cached {
+                flag.store(true, Ordering::Relaxed);
+            }
+            return prompt.saturating_add(cache_sum);
+        }
+        if prompt_excludes_cached.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return prompt.saturating_add(cache_sum);
+        }
+        prompt
+    });
+    let normalized_total = match (normalized_prompt, completion_tokens) {
+        (Some(prompt), Some(completion)) => total_tokens
+            .map(|total| total.max(prompt.saturating_add(completion)))
+            .or_else(|| Some(prompt.saturating_add(completion))),
+        _ => total_tokens,
+    };
     Usage {
-        prompt_tokens: raw.prompt_tokens,
-        completion_tokens: raw.completion_tokens,
-        total_tokens: raw.total_tokens,
-        reasoning_tokens: raw
-            .completion_tokens_details
-            .as_ref()
-            .and_then(|details| details.reasoning_tokens),
-        cache_read_tokens: raw
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|details| details.cached_tokens),
-        cache_write_tokens: None,
+        prompt_tokens: normalized_prompt,
+        completion_tokens,
+        total_tokens: normalized_total,
+        reasoning_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         cost_usd: None,
         stop_reason: None,
     }
 }
 
-fn usage_from_responses(raw: &ResponsesUsage) -> Usage {
-    Usage {
-        prompt_tokens: raw.input_tokens,
-        completion_tokens: raw.output_tokens,
-        total_tokens: raw.total_tokens,
-        reasoning_tokens: raw
-            .output_tokens_details
-            .as_ref()
-            .and_then(|details| details.reasoning_tokens),
-        cache_read_tokens: raw
-            .input_tokens_details
-            .as_ref()
-            .and_then(|details| details.cached_tokens),
-        cache_write_tokens: None,
-        cost_usd: None,
-        stop_reason: None,
-    }
+fn usage_from_chat_completion(
+    raw: &ChatCompletionUsage,
+    prompt_excludes_cached: Option<&AtomicBool>,
+) -> Usage {
+    let details = raw.prompt_tokens_details.as_ref();
+    let cache_read_tokens = details
+        .and_then(|details| details.cached_tokens)
+        .or(raw.prompt_cache_hit_tokens);
+    let cache_write_tokens = details
+        .and_then(|details| details.cache_write_tokens)
+        .or(raw.cache_write_tokens);
+    let reasoning_tokens = raw
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens);
+    normalize_usage(
+        raw.prompt_tokens,
+        raw.completion_tokens,
+        raw.total_tokens,
+        reasoning_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        prompt_excludes_cached,
+    )
+}
+
+fn usage_from_responses(
+    raw: &ResponsesUsage,
+    prompt_excludes_cached: Option<&AtomicBool>,
+) -> Usage {
+    let details = raw.input_tokens_details.as_ref();
+    let cache_read_tokens = details.and_then(|details| details.cached_tokens);
+    let cache_write_tokens = details
+        .and_then(|details| details.cache_write_tokens)
+        .or(raw.cache_write_tokens);
+    let reasoning_tokens = raw
+        .output_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens);
+    normalize_usage(
+        raw.input_tokens,
+        raw.output_tokens,
+        raw.total_tokens,
+        reasoning_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        prompt_excludes_cached,
+    )
 }
 
 fn mark_and_emit_done_function_call(
@@ -1119,7 +1226,10 @@ fn responses_stream_inner(
                             match stream_event {
                                 ResponsesStreamEvent::ResponseCreated { response } => {
                                     if let Some(meta) = response.and_then(|resp| resp.usage) {
-                                        usage = Some(usage_from_responses(&meta));
+                                        usage = Some(usage_from_responses(
+                                            &meta,
+                                            Some(&cfg.prompt_excludes_cached),
+                                        ));
                                     }
                                 }
                                 ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
@@ -1190,15 +1300,30 @@ fn responses_stream_inner(
                                         );
                                         yield Ok(Event::ToolCall(tool_call));
                                     } else if let ResponsesOutputItem::Reasoning {
-                                        id, encrypted_content, ..
+                                        id,
+                                        summary,
+                                        encrypted_content,
                                     } = item
                                     {
                                         // Only encrypted reasoning is replayable;
                                         // a summary alone cannot be verified.
                                         if let Some(encrypted) = encrypted_content {
+                                            let summary_items: Vec<_> = summary
+                                                .iter()
+                                                .filter_map(|part| match part {
+                                                    ResponsesReasoningSummary::SummaryText { text } => {
+                                                        Some(serde_json::json!({
+                                                            "type": "summary_text",
+                                                            "text": text,
+                                                        }))
+                                                    }
+                                                    ResponsesReasoningSummary::Other => None,
+                                                })
+                                                .collect();
                                             let payload = serde_json::json!({
                                                 "type": "reasoning",
                                                 "id": id,
+                                                "summary": summary_items,
                                                 "encrypted_content": encrypted,
                                             });
                                             yield Ok(Event::ReasoningState(ReasoningState::new(
@@ -1210,7 +1335,10 @@ fn responses_stream_inner(
                                 }
                                 ResponsesStreamEvent::ResponseCompleted { response } => {
                                     if let Some(meta) = response.usage {
-                                        let final_usage = usage_from_responses(&meta);
+                                        let final_usage = usage_from_responses(
+                                            &meta,
+                                            Some(&cfg.prompt_excludes_cached),
+                                        );
                                         usage = Some(final_usage.clone());
                                         yield Ok(Event::Usage(final_usage));
                                         usage_emitted = true;
@@ -2000,17 +2128,21 @@ mod tests {
             total_tokens: Some(18),
             prompt_tokens_details: Some(ChatPromptTokensDetails {
                 cached_tokens: Some(3),
+                cache_write_tokens: Some(2),
             }),
             completion_tokens_details: Some(ChatCompletionTokensDetails {
                 reasoning_tokens: Some(2),
             }),
+            prompt_cache_hit_tokens: None,
+            cache_write_tokens: None,
         };
-        let mapped = usage_from_chat_completion(&usage);
+        let mapped = usage_from_chat_completion(&usage, None);
         assert_eq!(mapped.prompt_tokens, Some(11));
         assert_eq!(mapped.completion_tokens, Some(7));
         assert_eq!(mapped.total_tokens, Some(18));
         assert_eq!(mapped.reasoning_tokens, Some(2));
         assert_eq!(mapped.cache_read_tokens, Some(3));
+        assert_eq!(mapped.cache_write_tokens, Some(2));
     }
 
     #[test]
@@ -2018,18 +2150,68 @@ mod tests {
         // Shape of `ResponseUsage` in OpenAI's OpenAPI spec.
         let usage: ResponsesUsage = serde_json::from_value(serde_json::json!({
             "input_tokens": 19,
-            "input_tokens_details": { "cached_tokens": 4 },
+            "input_tokens_details": { "cached_tokens": 4, "cache_creation_tokens": 6 },
             "output_tokens": 5,
             "output_tokens_details": { "reasoning_tokens": 1 },
             "total_tokens": 24
         }))
         .expect("deserialize Responses usage");
-        let mapped = usage_from_responses(&usage);
+        let mapped = usage_from_responses(&usage, None);
         assert_eq!(mapped.prompt_tokens, Some(19));
         assert_eq!(mapped.completion_tokens, Some(5));
         assert_eq!(mapped.total_tokens, Some(24));
         assert_eq!(mapped.reasoning_tokens, Some(1));
         assert_eq!(mapped.cache_read_tokens, Some(4));
+        assert_eq!(mapped.cache_write_tokens, Some(6));
+    }
+
+    #[test]
+    fn custom_responses_usage_normalizes_excluded_cache_tokens_across_turns() {
+        let excludes_cached = AtomicBool::new(false);
+
+        // Inclusive custom Responses proxy (like CLIProxyAPI gpt-5.6-sol): untouched.
+        let inclusive: ResponsesUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 8781,
+            "input_tokens_details": { "cached_tokens": 8758, "cache_write_tokens": 20 },
+            "output_tokens": 5,
+            "total_tokens": 8786
+        }))
+        .expect("deserialize inclusive");
+        let inclusive_flag = AtomicBool::new(false);
+        let mapped_inclusive = usage_from_responses(&inclusive, Some(&inclusive_flag));
+        assert_eq!(mapped_inclusive.prompt_tokens, Some(8781));
+        assert_eq!(mapped_inclusive.total_tokens, Some(8786));
+        assert_eq!(mapped_inclusive.cache_read_tokens, Some(8758));
+        assert_eq!(mapped_inclusive.cache_write_tokens, Some(20));
+        assert!(!inclusive_flag.load(Ordering::Relaxed));
+
+        // Exclusive proxy Turn 1: `input_tokens < cached + written` latches the mode.
+        let turn1: ResponsesUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 50,
+            "input_tokens_details": { "cached_tokens": 8000, "cache_write_tokens": 200 },
+            "output_tokens": 10,
+            "total_tokens": 60
+        }))
+        .expect("deserialize turn1");
+        let mapped1 = usage_from_responses(&turn1, Some(&excludes_cached));
+        assert_eq!(mapped1.prompt_tokens, Some(8250));
+        assert_eq!(mapped1.total_tokens, Some(8260));
+        assert_eq!(mapped1.cache_read_tokens, Some(8000));
+        assert_eq!(mapped1.cache_write_tokens, Some(200));
+        assert!(excludes_cached.load(Ordering::Relaxed));
+
+        // Exclusive proxy Turn 2: `input_tokens >= cached` still normalizes via sticky flag.
+        let turn2: ResponsesUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 9000,
+            "input_tokens_details": { "cached_tokens": 8200 },
+            "output_tokens": 10,
+            "total_tokens": 9010
+        }))
+        .expect("deserialize turn2");
+        let mapped2 = usage_from_responses(&turn2, Some(&excludes_cached));
+        assert_eq!(mapped2.prompt_tokens, Some(17200));
+        assert_eq!(mapped2.total_tokens, Some(17210));
+        assert_eq!(mapped2.cache_read_tokens, Some(8200));
     }
 }
 
@@ -2309,6 +2491,7 @@ impl Builder {
                 idle_timeout: self.idle_timeout,
                 extra_headers: self.extra_headers,
                 store: self.store,
+                prompt_excludes_cached: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -2335,6 +2518,7 @@ pub struct Config {
     pub(crate) idle_timeout: Duration,
     pub(crate) extra_headers: Vec<(String, String)>,
     pub(crate) store: Option<bool>,
+    pub(crate) prompt_excludes_cached: Arc<AtomicBool>,
     /// The published vocabulary `chat_model` counts with, when it has one.
     #[cfg(feature = "tokenizer")]
     pub(crate) vocabulary: Option<aither_core::tokenizer::Vocabulary>,

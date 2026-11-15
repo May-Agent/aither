@@ -618,14 +618,15 @@ pub enum ResponsesInputItem {
     },
     /// A reasoning item replayed verbatim from a previous response.
     ///
-    /// `OpenAI`'s stateless flow requires the reasoning item to be appended back
-    /// into `input` alongside the function call it produced; without it the
-    /// model loses the reasoning behind the call it is being given a result for.
+    /// `OpenAI`'s stateless flow and custom Responses proxies require `summary`
+    /// (at minimum `[]`) alongside encrypted reasoning when replayed back into
+    /// `input` with the function call it produced.
     Reasoning {
         #[serde(rename = "type")]
         kind: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        summary: Vec<ResponsesReasoningSummaryItem>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
     },
@@ -925,6 +926,14 @@ pub enum ResponsesToolChoice {
     },
 }
 
+/// A summary part replayed inside a `reasoning` Responses input item.
+#[derive(Debug, Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+pub struct ResponsesReasoningSummaryItem {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+}
+
 /// Decodes reasoning this crate previously emitted back into input items.
 ///
 /// The payload is this crate's own encoding of the response's `reasoning`
@@ -935,6 +944,8 @@ fn replayed_reasoning_items(message: &Message) -> Vec<ResponsesInputItem> {
     struct Replayed {
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        summary: Vec<ResponsesReasoningSummaryItem>,
         #[serde(default)]
         encrypted_content: Option<String>,
     }
@@ -954,6 +965,7 @@ fn replayed_reasoning_items(message: &Message) -> Vec<ResponsesInputItem> {
                 Ok(replayed) => Some(ResponsesInputItem::Reasoning {
                     kind: "reasoning",
                     id: replayed.id,
+                    summary: replayed.summary,
                     encrypted_content: replayed.encrypted_content,
                 }),
                 Err(error) => {
@@ -1577,8 +1589,37 @@ mod tests {
 
         assert_eq!(value[0]["type"], "reasoning");
         assert_eq!(value[0]["id"], "rs_1");
+        assert_eq!(value[0]["summary"], serde_json::json!([]));
         assert_eq!(value[0]["encrypted_content"], "cipher");
         assert_eq!(value[1]["type"], "function_call");
+    }
+
+    #[test]
+    fn reasoning_state_preserves_summary_entries_when_replayed() {
+        let state = ReasoningState::new(
+            PROVIDER_NAME,
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_2",
+                "summary": [{"type": "summary_text", "text": "checked"}],
+                "encrypted_content": "cipher2",
+            })
+            .to_string(),
+        );
+        let message = Message::assistant_with_reasoning(
+            "",
+            vec![ToolCall::new("call_2", "lookup", serde_json::json!({}))],
+            vec![state],
+        );
+        let items = to_responses_input(&[message]).expect("build responses input");
+        let value = serde_json::to_value(&items).expect("serialize input");
+
+        assert_eq!(value[0]["type"], "reasoning");
+        assert_eq!(
+            value[0]["summary"],
+            serde_json::json!([{"type": "summary_text", "text": "checked"}])
+        );
+        assert_eq!(value[0]["encrypted_content"], "cipher2");
     }
 
     #[test]
