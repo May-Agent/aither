@@ -163,6 +163,12 @@ pub enum Message {
         content: String,
         /// ID of the tool call this is responding to.
         tool_call_id: String,
+        /// Attachment URLs returned alongside the tool result (e.g. screenshots).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        attachments: Vec<Attachment>,
     },
     /// A reasoning effort change for the rest of the conversation, sent in
     /// the provider's per-message form: an effort-only `system` message on
@@ -222,11 +228,11 @@ impl Message {
         }
     }
 
-    /// Returns the typed attachments (only for User messages).
+    /// Returns the typed attachments (for User and Tool messages).
     #[must_use]
     pub fn attachments(&self) -> &[Attachment] {
         match self {
-            Self::User { attachments, .. } => attachments,
+            Self::User { attachments, .. } | Self::Tool { attachments, .. } => attachments,
             _ => &[],
         }
     }
@@ -318,23 +324,30 @@ impl Message {
         Self::Tool {
             content: content.into(),
             tool_call_id: tool_call_id.into(),
+            attachments: Vec::new(),
         }
     }
 
-    /// Adds a typed attachment to the message (only works for User messages).
+    /// Adds a typed attachment to a User or Tool message.
     #[must_use]
     pub fn with_attachment(mut self, attachment: Attachment) -> Self {
-        if let Self::User { attachments, .. } = &mut self {
-            attachments.push(attachment);
+        match &mut self {
+            Self::User { attachments, .. } | Self::Tool { attachments, .. } => {
+                attachments.push(attachment);
+            }
+            _ => {}
         }
         self
     }
 
-    /// Adds multiple typed attachments to the message.
+    /// Adds multiple typed attachments to a User or Tool message.
     #[must_use]
     pub fn with_attachments(mut self, values: impl IntoIterator<Item = Attachment>) -> Self {
-        if let Self::User { attachments, .. } = &mut self {
-            attachments.extend(values);
+        match &mut self {
+            Self::User { attachments, .. } | Self::Tool { attachments, .. } => {
+                attachments.extend(values);
+            }
+            _ => {}
         }
         self
     }
@@ -435,6 +448,24 @@ mod tests {
             "expected no attachments, got {:?}",
             message.attachments()
         );
+    }
+
+    #[test]
+    fn tool_message_with_attachment_roundtrips() {
+        let attachment = Attachment::new(
+            "https://example.com/screen.png".parse::<Url>().unwrap(),
+            mime::IMAGE_PNG,
+        );
+        let with_att = Message::tool("call_1", "screenshot").with_attachment(attachment.clone());
+        assert_eq!(with_att.attachments(), &[attachment]);
+
+        let json = serde_json::to_string(&with_att).expect("serialize");
+        let back: Message = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_att);
+
+        let plain = Message::tool("call_2", "ok");
+        let plain_json = serde_json::to_value(&plain).expect("serialize plain");
+        assert!(plain_json.get("attachments").is_none());
     }
 
     #[test]

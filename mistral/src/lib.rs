@@ -441,6 +441,7 @@ fn to_mistral_request(
             Message::Tool {
                 content,
                 tool_call_id,
+                ..
             } => request.add_tool_message(content, tool_call_id),
         };
     }

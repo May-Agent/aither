@@ -404,6 +404,8 @@ struct BrokenStream {
 pub struct FinishedToolCall {
     id: String,
     outcome: ToolOutcome,
+    /// Attachments sent on the resulting [`Message::tool`] item.
+    attachments: Vec<Attachment>,
     /// Context an `after_tool` hook appended, to follow the turn's results.
     appended: Option<String>,
 }
@@ -538,10 +540,18 @@ impl<H: Hooks> ToolRun<'_, H> {
             result,
             duration,
         };
+        let mut attachments = Vec::new();
         let mut appended = None;
         match self.hooks.after_tool(&outcome).await {
             AfterTool::Keep => {}
             AfterTool::Replace(replacement) => outcome.result = Ok(replacement),
+            AfterTool::ReplaceWithAttachments {
+                result,
+                attachments: attached,
+            } => {
+                outcome.result = Ok(result);
+                attachments = attached;
+            }
             AfterTool::Append(context) => appended = Some(context),
             AfterTool::Abort(reason) => {
                 return Err(AgentError::HookRejected {
@@ -557,6 +567,7 @@ impl<H: Hooks> ToolRun<'_, H> {
         Ok(FinishedToolCall {
             id: call.id.clone(),
             outcome,
+            attachments,
             appended,
         })
     }
@@ -1549,13 +1560,20 @@ where
                 .iter()
                 .position(|result| matches!(result, Ok(finished) if finished.id == call.id))
                 .and_then(|index| parked.remove(index));
-            let content = match finished {
-                Some(Ok(finished)) => finished.outcome.for_model().render_for_model(),
-                _ => CancelledToolCallTemplate { tool: &call.name }
-                    .render()
-                    .expect("cancelled tool call template must render"),
+            let (content, attachments) = match finished {
+                Some(Ok(finished)) => (
+                    finished.outcome.for_model().render_for_model(),
+                    finished.attachments,
+                ),
+                _ => (
+                    CancelledToolCallTemplate { tool: &call.name }
+                        .render()
+                        .expect("cancelled tool call template must render"),
+                    Vec::new(),
+                ),
             };
-            self.context.push(Message::tool(&call.id, content));
+            self.context
+                .push(Message::tool(&call.id, content).with_attachments(attachments));
         }
     }
 
@@ -1653,10 +1671,13 @@ where
         let mut appended = Vec::new();
         while let Some(result) = self.tool_results.pop_front() {
             let finished = result?;
-            self.context.push(Message::tool(
-                &finished.id,
-                finished.outcome.for_model().render_for_model(),
-            ));
+            self.context.push(
+                Message::tool(
+                    &finished.id,
+                    finished.outcome.for_model().render_for_model(),
+                )
+                .with_attachments(finished.attachments),
+            );
             outcomes.push(finished.outcome);
             appended.extend(finished.appended);
         }

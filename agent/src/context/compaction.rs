@@ -454,6 +454,7 @@ pub fn build_file_index(
         let Message::Tool {
             content,
             tool_call_id,
+            ..
         } = message
         else {
             continue;

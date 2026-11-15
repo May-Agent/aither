@@ -29,26 +29,37 @@ pub async fn resolve_messages(
 
     let mut resolved = Vec::with_capacity(messages.len());
     for message in messages {
-        let Message::User {
-            content,
-            attachments,
-        } = message
-        else {
+        if message.attachments().is_empty() {
             resolved.push(message);
             continue;
-        };
-
-        let mut next_attachments = Vec::with_capacity(attachments.len());
-        for attachment in attachments {
-            let resolved_url = resolve_attachment(cfg, &mut cache, &attachment).await?;
-            cache_dirty |= resolved_url.cache_updated;
-            next_attachments.push(attachment.with_url(resolved_url.url));
         }
-
-        resolved.push(Message::User {
-            content,
-            attachments: next_attachments,
-        });
+        match message {
+            Message::User {
+                content,
+                attachments,
+            } => {
+                let attachments =
+                    resolve_attachment_list(cfg, &mut cache, attachments, &mut cache_dirty).await?;
+                resolved.push(Message::User {
+                    content,
+                    attachments,
+                });
+            }
+            Message::Tool {
+                content,
+                tool_call_id,
+                attachments,
+            } => {
+                let attachments =
+                    resolve_attachment_list(cfg, &mut cache, attachments, &mut cache_dirty).await?;
+                resolved.push(Message::Tool {
+                    content,
+                    tool_call_id,
+                    attachments,
+                });
+            }
+            other => resolved.push(other),
+        }
     }
 
     if cache_dirty {
@@ -56,6 +67,22 @@ pub async fn resolve_messages(
     }
 
     Ok(resolved)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn resolve_attachment_list(
+    cfg: &GeminiConfig,
+    cache: &mut FileCache,
+    attachments: Vec<Attachment>,
+    cache_dirty: &mut bool,
+) -> Result<Vec<Attachment>, GeminiError> {
+    let mut next_attachments = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let resolved_url = resolve_attachment(cfg, cache, &attachment).await?;
+        *cache_dirty |= resolved_url.cache_updated;
+        next_attachments.push(attachment.with_url(resolved_url.url));
+    }
+    Ok(next_attachments)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

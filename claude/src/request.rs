@@ -363,7 +363,7 @@ pub enum ContentBlock {
         /// ID of the `tool_use` this is responding to.
         tool_use_id: String,
         /// Tool output content.
-        content: String,
+        content: ContentPayload,
         /// Optional explicit cache control for this block.
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlPayload>,
@@ -570,7 +570,7 @@ pub async fn to_claude_messages(
             }
             Role::User | Role::Tool => {
                 let content = if matches!(message.role(), Role::Tool) {
-                    build_tool_result_content(message)
+                    build_tool_result_content(message).await?
                 } else {
                     build_user_content(message).await?
                 };
@@ -780,16 +780,16 @@ fn build_assistant_content(message: &Message) -> ContentPayload {
     ContentPayload::Blocks(blocks)
 }
 
-fn build_tool_result_content(message: &Message) -> ContentPayload {
+async fn build_tool_result_content(message: &Message) -> Result<ContentPayload, String> {
     let tool_use_id = message.tool_call_id().unwrap_or_else(|| {
         panic!("Tool message missing tool_call_id required by Claude tool_result payload")
     });
-    let content = flatten_content(message);
-    ContentPayload::Blocks(vec![ContentBlock::ToolResult {
+    let content = build_user_content(message).await?;
+    Ok(ContentPayload::Blocks(vec![ContentBlock::ToolResult {
         tool_use_id: tool_use_id.to_string(),
         content,
         cache_control: None,
-    }])
+    }]))
 }
 
 /// Apply Claude cache strategy to request payload sections.
@@ -1636,7 +1636,12 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(tool_use_id, "call_9");
-                        assert_eq!(content, "{\"ok\":true}");
+                        match content {
+                            ContentPayload::Text(text) => assert_eq!(text, "{\"ok\":true}"),
+                            other @ ContentPayload::Blocks(_) => {
+                                panic!("expected text tool_result content, got: {other:?}")
+                            }
+                        }
                     }
                     other => panic!("expected tool_result block, got: {other:?}"),
                 }
@@ -1645,6 +1650,32 @@ mod tests {
                 panic!("expected user blocks payload, got: {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn tool_message_with_image_attachment_encodes_block_content() {
+        let image = Attachment::new(
+            "data:image/png;base64,AA==".parse().expect("image URL"),
+            "image/png".parse().expect("image MIME"),
+        );
+        let messages = vec![Message::tool("call_10", "screen").with_attachment(image)];
+        let (_, encoded) = to_claude_messages(&messages, false)
+            .await
+            .expect("encode Claude tool attachment");
+        let ContentPayload::Blocks(blocks) = &encoded[0].content else {
+            panic!("expected user blocks payload");
+        };
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            content: ContentPayload::Blocks(inner),
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected ToolResult with block content");
+        };
+        assert_eq!(tool_use_id, "call_10");
+        assert!(matches!(inner[0], ContentBlock::Image { .. }));
+        assert!(matches!(inner[1], ContentBlock::Text { .. }));
     }
 
     #[tokio::test]
