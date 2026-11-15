@@ -43,7 +43,7 @@ pub enum CopilotError {
     AccessDenied,
 
     /// Rate limit exceeded (HTTP 429).
-    #[error("Rate limit exceeded: {message}{}", retry_after.map(|d| format!(" (retry after {}s)", d.as_secs())).unwrap_or_default())]
+    #[error("Rate limit exceeded: {message}{}", retry_after.map_or_default(|d| format!(" (retry after {}s)", d.as_secs())))]
     RateLimit {
         /// Message from the API.
         message: String,

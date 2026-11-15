@@ -32,25 +32,38 @@ globs = [
 ]
 mark-changed = "all"
 
-# Workflows, composite actions, their tests and this file can rewrite what a
-# run does, so a change there is verified against the whole workspace.
+# CI workflows, composite actions and this file can change what every CI job
+# runs, so a change there is verified against the whole workspace.
 [[path-rule]]
 globs = [
-    ".github/workflows/**",
+    ".github/workflows/ci.yml",
+    ".github/workflows/test.yml",
     ".github/actions/**",
-    ".github/tests/**",
     ".github/affected-rules.toml",
 ]
 mark-changed = "all"
 
-# Prose outside every package selects nothing. These globs are deliberately
-# not `**/`: a markdown file inside a package is owned by that package,
-# because `include_str!` and `#![doc]` may compile it into a crate.
+# Other workflows and workflow tests do not alter Rust compilation; `scope`
+# routes `.github/workflows/**` and `.github/tests/**` to `workflow-gates`.
+[[path-rule]]
+globs = [
+    ".github/workflows/**",
+    ".github/tests/**",
+]
+mark-changed = []
+
+# Prose and repository metadata outside every package select nothing. These
+# globs are deliberately not `**/`: a markdown file inside a package is owned
+# by that package, because `include_str!` and `#![doc]` may compile it into a
+# crate.
 [[path-rule]]
 globs = [
     "*.md",
     "LICENSE*",
     "logo.svg",
+    ".gitignore",
+    ".gitattributes",
+    "release-plz.toml",
     ".github/ISSUE_TEMPLATE/**",
 ]
 mark-changed = []

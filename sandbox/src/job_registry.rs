@@ -1353,14 +1353,13 @@ impl ParkedOutput {
         self.prune();
         self.by_task
             .remove(task_id.as_str())
-            .map(|parked| {
+            .map_or_default(|parked| {
                 assert!(
                     parked.lease.refers_to(task_id),
                     "two live leases share the task id '{task_id}'"
                 );
                 parked.appends
             })
-            .unwrap_or_default()
     }
 
     /// Holds the `timeout` bound of task `task_id`, whose job registers next.

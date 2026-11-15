@@ -67,7 +67,7 @@ async fn dotdot_write_is_rejected_and_creates_nothing() {
             .await,
     );
     assert_denied(fs.create_dir(Path::new("../newdir")).await);
-    assert!(sb.outside_entries().is_empty());
+    assert_eq!(sb.outside_entries(), [] as [std::string::String; 0]);
     assert!(!sb.base.join("newdir").exists());
     assert!(!sb.base.join("escaped.txt").exists());
     assert!(
@@ -83,7 +83,7 @@ async fn absolute_path_outside_is_rejected_and_creates_nothing() {
     let target = sb.outside.join("deep/x.txt");
     assert_denied(fs.write_file(&target, "x".into()).await);
     assert_denied(fs.append_file(&target, "x".into()).await);
-    assert!(sb.outside_entries().is_empty());
+    assert_eq!(sb.outside_entries(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -105,7 +105,7 @@ async fn symlinked_directory_write_is_rejected_and_creates_nothing() {
     assert_denied(fs.write_file(Path::new("link/new/x.txt"), "x".into()).await);
     assert_denied(fs.append_file(Path::new("link/x.txt"), "x".into()).await);
     assert_denied(fs.create_dir(Path::new("link/sub")).await);
-    assert!(sb.outside_entries().is_empty());
+    assert_eq!(sb.outside_entries(), [] as [std::string::String; 0]);
 }
 
 #[cfg(unix)]
@@ -116,7 +116,7 @@ async fn dangling_symlink_leaf_is_rejected_and_creates_nothing() {
     let fs = sb.fs();
     assert!(fs.write_file(Path::new("link"), "x".into()).await.is_err());
     assert!(fs.append_file(Path::new("link"), "x".into()).await.is_err());
-    assert!(sb.outside_entries().is_empty());
+    assert_eq!(sb.outside_entries(), [] as [std::string::String; 0]);
 }
 
 #[cfg(unix)]

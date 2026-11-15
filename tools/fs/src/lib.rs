@@ -1,3 +1,5 @@
+//! Filesystem abstraction and tool for agent execution.
+
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -25,32 +27,49 @@ use serde::{Deserialize, Serialize};
 ///
 /// Implementors can provide virtual or real filesystem access.
 pub trait FileSystem: Send + Sync + 'static {
+    /// Reads the entire contents of a file as a string.
     fn read_file<'a>(
         &'a self,
         path: &'a Path,
     ) -> impl Future<Output = io::Result<String>> + Send + 'a;
+
+    /// Writes the contents to a file, replacing any existing content.
     fn write_file<'a>(
         &'a self,
         path: &'a Path,
         contents: String,
     ) -> impl Future<Output = io::Result<()>> + Send + 'a;
+
+    /// Appends the contents to a file, creating it if it does not exist.
     fn append_file<'a>(
         &'a self,
         path: &'a Path,
         contents: String,
     ) -> impl Future<Output = io::Result<()>> + Send + 'a;
+
+    /// Removes a file from the filesystem.
     fn remove_file<'a>(
         &'a self,
         path: &'a Path,
     ) -> impl Future<Output = io::Result<()>> + Send + 'a;
+
+    /// Lists entries in a directory.
     fn list_dir<'a>(
         &'a self,
         dir: &'a Path,
     ) -> impl Future<Output = io::Result<Vec<DirEntry>>> + Send + 'a;
+
+    /// Creates a directory and any necessary parent directories.
     fn create_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a;
+
+    /// Removes a directory and all of its contents.
     fn remove_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a;
 
     /// Find files matching a glob pattern. Returns relative paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the pattern is invalid or scanning fails.
     fn glob(&self, pattern: &str) -> io::Result<Vec<String>> {
         // Default implementation returns empty - override for real filesystems
         let _ = pattern;
@@ -106,9 +125,12 @@ pub enum FsOperation {
     },
 }
 
+/// File system entry information.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DirEntry {
+    /// Name of the entry.
     pub name: String,
+    /// Whether the entry is a directory.
     pub is_dir: bool,
 }
 
@@ -126,7 +148,8 @@ struct MatchesTemplate<'a> {
     matches: &'a [String],
 }
 
-#[derive(Clone)]
+/// Filesystem tool wrapper for agents.
+#[derive(Clone, Debug)]
 pub struct FileSystemTool<FS> {
     filesystem: FS,
     allow_writes: bool,
@@ -134,19 +157,37 @@ pub struct FileSystemTool<FS> {
 }
 
 impl FileSystemTool<LocalFileSystem> {
+    /// Create a new filesystem tool rooted at the given path with write access.
+    ///
+    /// # Panics
+    /// Panics if the filesystem initialization fails.
+    #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self::try_new(root).expect("failed to initialize filesystem tool")
     }
 
+    /// Try to create a new filesystem tool rooted at the given path with write access.
+    ///
+    /// # Errors
+    /// Returns an error if initialization or canonicalization fails.
     pub fn try_new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let fs = LocalFileSystem::new(root)?;
         Ok(Self::with_filesystem(fs))
     }
 
+    /// Create a read-only filesystem tool rooted at the given path.
+    ///
+    /// # Panics
+    /// Panics if initialization fails.
+    #[must_use]
     pub fn read_only(root: impl Into<PathBuf>) -> Self {
         Self::try_read_only(root).expect("failed to initialize filesystem tool")
     }
 
+    /// Try to create a read-only filesystem tool rooted at the given path.
+    ///
+    /// # Errors
+    /// Returns an error if initialization fails.
     pub fn try_read_only(root: impl Into<PathBuf>) -> io::Result<Self> {
         let fs = LocalFileSystem::read_only(root)?;
         Ok(Self::with_filesystem(fs).allow_writes(false))
@@ -154,12 +195,16 @@ impl FileSystemTool<LocalFileSystem> {
 }
 
 impl FileSystemTool<InMemoryFileSystem> {
+    /// Create an in-memory filesystem tool instance.
+    #[must_use]
     pub fn in_memory() -> Self {
         Self::with_filesystem(InMemoryFileSystem::new())
     }
 }
 
 impl<FS: FileSystem> FileSystemTool<FS> {
+    /// Create a new `FileSystemTool` wrapping the given filesystem.
+    #[must_use]
     pub fn with_filesystem(fs: FS) -> Self {
         Self {
             filesystem: fs,
@@ -168,11 +213,15 @@ impl<FS: FileSystem> FileSystemTool<FS> {
         }
     }
 
-    pub fn allow_writes(mut self, allow: bool) -> Self {
+    /// Configure whether writes are allowed.
+    #[must_use]
+    pub const fn allow_writes(mut self, allow: bool) -> Self {
         self.allow_writes = allow;
         self
     }
 
+    /// Set the tool name.
+    #[must_use]
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
@@ -236,7 +285,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
             FsOperation::List { path } => {
                 let listing = self
                     .filesystem
-                    .list_dir(path.as_deref().map_or(Path::new(""), Path::new))
+                    .list_dir(path.as_deref().map_or_else(|| Path::new(""), Path::new))
                     .await
                     .map_err(anyhow::Error::new)?;
                 Ok(ToolResult::text(
@@ -253,6 +302,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
     }
 }
 
+/// Local filesystem implementation backed by standard OS files.
 #[derive(Debug, Clone)]
 pub struct LocalFileSystem {
     root: PathBuf,
@@ -261,10 +311,18 @@ pub struct LocalFileSystem {
 }
 
 impl LocalFileSystem {
+    /// Create a new local filesystem rooted at `root` with write access enabled.
+    ///
+    /// # Errors
+    /// Returns an error if directory creation or canonicalization fails.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         Self::build(root, true)
     }
 
+    /// Create a new local filesystem rooted at `root` in read-only mode.
+    ///
+    /// # Errors
+    /// Returns an error if directory creation or canonicalization fails.
     pub fn read_only(root: impl Into<PathBuf>) -> io::Result<Self> {
         Self::build(root, false)
     }
@@ -442,6 +500,7 @@ impl FileSystem for LocalFileSystem {
     }
 }
 
+/// In-memory filesystem implementation.
 #[derive(Debug, Clone)]
 pub struct InMemoryFileSystem {
     state: Arc<ArcSwap<MemoryState>>,
@@ -459,6 +518,8 @@ enum MemoryEntry {
 }
 
 impl InMemoryFileSystem {
+    /// Create a new in-memory filesystem instance.
+    #[must_use]
     pub fn new() -> Self {
         let mut entries = BTreeMap::new();
         entries.insert(PathBuf::from("/"), MemoryEntry::Directory);
@@ -481,7 +542,6 @@ impl InMemoryFileSystem {
         let mut normalized = PathBuf::from("/");
         for component in path.components() {
             match component {
-                Component::CurDir => {}
                 Component::Normal(part) => normalized.push(part),
                 Component::ParentDir => {
                     return Err(io::Error::new(
@@ -489,33 +549,27 @@ impl InMemoryFileSystem {
                         "Parent directory traversal is not allowed",
                     ));
                 }
-                Component::RootDir => {}
-                Component::Prefix(_) => {}
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
             }
         }
         Ok(normalized)
     }
 
-    fn ensure_dir_present(
-        entries: &mut BTreeMap<PathBuf, MemoryEntry>,
-        dir: &Path,
-    ) -> io::Result<()> {
+    fn ensure_dir_present(entries: &mut BTreeMap<PathBuf, MemoryEntry>, dir: &Path) {
         if !entries.contains_key(dir) {
             entries.insert(dir.to_path_buf(), MemoryEntry::Directory);
         }
-        Ok(())
     }
 
     fn list_children(entries: &BTreeMap<PathBuf, MemoryEntry>, dir: &Path) -> Vec<DirEntry> {
         let mut result = Vec::new();
-        for (path, entry) in entries.iter() {
+        for (path, entry) in entries {
             if let Some(parent) = path.parent()
                 && parent == dir
             {
                 let name = path
                     .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "/".into());
+                    .map_or_else(|| "/".into(), |n| n.to_string_lossy().into_owned());
                 let is_dir = matches!(entry, MemoryEntry::Directory);
                 if name != "/" {
                     result.push(DirEntry { name, is_dir });
@@ -534,117 +588,149 @@ impl Default for InMemoryFileSystem {
 }
 
 impl FileSystem for InMemoryFileSystem {
-    async fn read_file<'a>(&'a self, path: &'a Path) -> io::Result<String> {
-        let path = Self::normalize(path)?;
-        let state = self.state.load();
-        match state.entries.get(&path) {
-            Some(MemoryEntry::File(contents)) => Ok(contents.clone()),
-            Some(MemoryEntry::Directory) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Cannot read a directory",
-            )),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "File not found")),
-        }
-    }
-
-    async fn write_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
-        let path = Self::normalize(path)?;
-        self.mutate_entries(|entries| {
-            if let Some(parent) = path.parent() {
-                Self::ensure_dir_present(entries, parent)?;
+    fn read_file<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> impl Future<Output = io::Result<String>> + Send + 'a {
+        let result = Self::normalize(path).and_then(|path| {
+            let state = self.state.load();
+            match state.entries.get(&path) {
+                Some(MemoryEntry::File(contents)) => Ok(contents.clone()),
+                Some(MemoryEntry::Directory) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Cannot read a directory",
+                )),
+                None => Err(io::Error::new(io::ErrorKind::NotFound, "File not found")),
             }
-            entries.insert(path, MemoryEntry::File(contents));
-            Ok(())
-        })
+        });
+        std::future::ready(result)
     }
 
-    async fn append_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
-        let path = Self::normalize(path)?;
-        self.mutate_entries(|entries| {
-            if let Some(entry) = entries.get_mut(&path) {
-                match entry {
-                    MemoryEntry::File(existing) => existing.push_str(&contents),
-                    MemoryEntry::Directory => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "Cannot append to a directory",
-                        ));
-                    }
-                }
-            } else {
+    fn write_file<'a>(
+        &'a self,
+        path: &'a Path,
+        contents: String,
+    ) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        let result = Self::normalize(path).and_then(|path| {
+            self.mutate_entries(|entries| {
                 if let Some(parent) = path.parent() {
-                    Self::ensure_dir_present(entries, parent)?;
+                    Self::ensure_dir_present(entries, parent);
                 }
                 entries.insert(path, MemoryEntry::File(contents));
-            }
-            Ok(())
-        })
+                Ok(())
+            })
+        });
+        std::future::ready(result)
     }
 
-    async fn remove_file<'a>(&'a self, path: &'a Path) -> io::Result<()> {
-        let path = Self::normalize(path)?;
-        self.mutate_entries(|entries| match entries.remove(&path) {
-            Some(MemoryEntry::File(_)) => Ok(()),
-            Some(MemoryEntry::Directory) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Use remove_dir for directories",
-            )),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "File not found")),
-        })
-    }
-
-    async fn list_dir<'a>(&'a self, dir: &'a Path) -> io::Result<Vec<DirEntry>> {
-        let dir = Self::normalize(dir)?;
-        let state = self.state.load();
-        if !matches!(state.entries.get(&dir), Some(MemoryEntry::Directory)) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Directory does not exist",
-            ));
-        }
-        Ok(Self::list_children(&state.entries, &dir))
-    }
-
-    async fn create_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
-        let dir = Self::normalize(dir)?;
-        self.mutate_entries(|entries| {
-            if let Some(parent) = dir.parent() {
-                Self::ensure_dir_present(entries, parent)?;
-            }
-            entries.insert(dir, MemoryEntry::Directory);
-            Ok(())
-        })
-    }
-
-    async fn remove_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
-        let dir = Self::normalize(dir)?;
-        if dir == Path::new("/") {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Cannot remove root directory",
-            ));
-        }
-        self.mutate_entries(|entries| {
-            let mut to_remove = Vec::new();
-            for path in entries.keys() {
-                if path.starts_with(&dir) {
-                    to_remove.push(path.clone());
+    fn append_file<'a>(
+        &'a self,
+        path: &'a Path,
+        contents: String,
+    ) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        let result = Self::normalize(path).and_then(|path| {
+            self.mutate_entries(|entries| {
+                if let Some(entry) = entries.get_mut(&path) {
+                    match entry {
+                        MemoryEntry::File(existing) => existing.push_str(&contents),
+                        MemoryEntry::Directory => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "Cannot append to a directory",
+                            ));
+                        }
+                    }
+                } else {
+                    if let Some(parent) = path.parent() {
+                        Self::ensure_dir_present(entries, parent);
+                    }
+                    entries.insert(path, MemoryEntry::File(contents));
                 }
-            }
-            if to_remove.is_empty() {
+                Ok(())
+            })
+        });
+        std::future::ready(result)
+    }
+
+    fn remove_file<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        let result = Self::normalize(path).and_then(|path| {
+            self.mutate_entries(|entries| match entries.remove(&path) {
+                Some(MemoryEntry::File(_)) => Ok(()),
+                Some(MemoryEntry::Directory) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Use remove_dir for directories",
+                )),
+                None => Err(io::Error::new(io::ErrorKind::NotFound, "File not found")),
+            })
+        });
+        std::future::ready(result)
+    }
+
+    fn list_dir<'a>(
+        &'a self,
+        dir: &'a Path,
+    ) -> impl Future<Output = io::Result<Vec<DirEntry>>> + Send + 'a {
+        let result = Self::normalize(dir).and_then(|dir| {
+            let state = self.state.load();
+            if !matches!(state.entries.get(&dir), Some(MemoryEntry::Directory)) {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "Directory does not exist",
                 ));
             }
-            for path in to_remove {
-                entries.remove(&path);
+            Ok(Self::list_children(&state.entries, &dir))
+        });
+        std::future::ready(result)
+    }
+
+    fn create_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        let result = Self::normalize(dir).and_then(|dir| {
+            self.mutate_entries(|entries| {
+                if let Some(parent) = dir.parent() {
+                    Self::ensure_dir_present(entries, parent);
+                }
+                entries.insert(dir, MemoryEntry::Directory);
+                Ok(())
+            })
+        });
+        std::future::ready(result)
+    }
+
+    fn remove_dir<'a>(&'a self, dir: &'a Path) -> impl Future<Output = io::Result<()>> + Send + 'a {
+        let result = Self::normalize(dir).and_then(|dir| {
+            if dir == Path::new("/") {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Cannot remove root directory",
+                ));
             }
-            Ok(())
-        })
+            self.mutate_entries(|entries| {
+                let mut to_remove = Vec::new();
+                for path in entries.keys() {
+                    if path.starts_with(&dir) {
+                        to_remove.push(path.clone());
+                    }
+                }
+                if to_remove.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Directory does not exist",
+                    ));
+                }
+                for path in to_remove {
+                    entries.remove(&path);
+                }
+                Ok(())
+            })
+        });
+        std::future::ready(result)
     }
 }
 
+/// Mount-table based composite filesystem.
 #[derive(Clone)]
 pub struct MountFileSystem<FS> {
     mounts: Arc<ArcSwap<Vec<MountPoint<FS>>>>,
@@ -664,20 +750,37 @@ impl<FS> Clone for MountPoint<FS> {
     }
 }
 
+impl<FS> fmt::Debug for MountPoint<FS>
+where
+    FS: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MountPoint")
+            .field("prefix", &self.prefix)
+            .field("fs", &self.fs)
+            .finish()
+    }
+}
+
 impl<FS> MountFileSystem<FS>
 where
     FS: FileSystem,
 {
+    /// Creates a new, empty mount-table filesystem.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             mounts: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
     }
 
+    /// Mounts a filesystem at the given path prefix.
+    #[must_use]
     pub fn mount(self, prefix: impl Into<PathBuf>, fs: FS) -> Self {
         let mut mounts = self.mounts.load().as_ref().clone();
+        let prefix = prefix.into();
         mounts.push(MountPoint {
-            prefix: normalize_mount(prefix.into()),
+            prefix: normalize_mount(&prefix),
             fs: Arc::new(fs),
         });
         self.mounts.store(Arc::new(mounts));
@@ -685,7 +788,7 @@ where
     }
 
     fn route(&self, path: &Path) -> io::Result<(Arc<FS>, PathBuf)> {
-        let normalized = normalize_mount(path.to_path_buf());
+        let normalized = normalize_mount(path);
         let mounts = self.mounts.load();
         let mut best: Option<&MountPoint<_>> = None;
         for mount in mounts.iter() {
@@ -770,34 +873,40 @@ where
     }
 }
 
-fn normalize_mount(path: PathBuf) -> PathBuf {
+fn normalize_mount(path: &Path) -> PathBuf {
     if path.as_os_str().is_empty() {
         return PathBuf::from("/");
     }
     let mut normalized = PathBuf::from("/");
     for component in path.components() {
         match component {
-            Component::CurDir => {}
             Component::Normal(part) => normalized.push(part),
             Component::ParentDir => {
                 normalized.pop();
             }
-            Component::RootDir => {}
-            Component::Prefix(_) => {}
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
         }
     }
     normalized
 }
 
+/// File permissions wrapper struct.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 pub struct FilePermissions {
+    /// Read permission.
     pub read: bool,
+    /// Write permission.
     pub write: bool,
+    /// List permission.
     pub list: bool,
+    /// Delete permission.
     pub delete: bool,
 }
 
 impl FilePermissions {
+    /// Create read-only permissions.
+    #[must_use]
     pub const fn read_only() -> Self {
         Self {
             read: true,
@@ -807,6 +916,8 @@ impl FilePermissions {
         }
     }
 
+    /// Create read-write permissions.
+    #[must_use]
     pub const fn read_write() -> Self {
         Self {
             read: true,
@@ -817,6 +928,7 @@ impl FilePermissions {
     }
 }
 
+/// Permissioned filesystem wrapper enforcing access control rules.
 #[derive(Debug, Clone)]
 pub struct PermissionedFileSystem<FS> {
     inner: FS,
@@ -824,11 +936,13 @@ pub struct PermissionedFileSystem<FS> {
 }
 
 impl<FS> PermissionedFileSystem<FS> {
-    pub fn new(inner: FS, permissions: FilePermissions) -> Self {
+    /// Create a new permissioned filesystem wrapper.
+    #[must_use]
+    pub const fn new(inner: FS, permissions: FilePermissions) -> Self {
         Self { inner, permissions }
     }
 
-    fn require(&self, allowed: bool, action: &str) -> io::Result<()> {
+    fn require(allowed: bool, action: &str) -> io::Result<()> {
         if allowed {
             Ok(())
         } else {
@@ -845,64 +959,114 @@ where
     FS: FileSystem,
 {
     async fn read_file<'a>(&'a self, path: &'a Path) -> io::Result<String> {
-        self.require(self.permissions.read, "read")?;
+        Self::require(self.permissions.read, "read")?;
         self.inner.read_file(path).await
     }
 
     async fn write_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
-        self.require(self.permissions.write, "write")?;
+        Self::require(self.permissions.write, "write")?;
         self.inner.write_file(path, contents).await
     }
 
     async fn append_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
-        self.require(self.permissions.write, "append")?;
+        Self::require(self.permissions.write, "append")?;
         self.inner.append_file(path, contents).await
     }
 
     async fn remove_file<'a>(&'a self, path: &'a Path) -> io::Result<()> {
-        self.require(self.permissions.delete, "remove_file")?;
+        Self::require(self.permissions.delete, "remove_file")?;
         self.inner.remove_file(path).await
     }
 
     async fn list_dir<'a>(&'a self, dir: &'a Path) -> io::Result<Vec<DirEntry>> {
-        self.require(self.permissions.list, "list_dir")?;
+        Self::require(self.permissions.list, "list_dir")?;
         self.inner.list_dir(dir).await
     }
 
     async fn create_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
-        self.require(self.permissions.write, "create_dir")?;
+        Self::require(self.permissions.write, "create_dir")?;
         self.inner.create_dir(dir).await
     }
 
     async fn remove_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
-        self.require(self.permissions.delete, "remove_dir")?;
+        Self::require(self.permissions.delete, "remove_dir")?;
         self.inner.remove_dir(dir).await
     }
 }
 
+/// Filesystem hook event.
 #[derive(Debug, Clone)]
 pub struct FsHook {
+    /// The triggered operation.
     pub operation: FsHookOperation,
 }
 
+/// Operations intercepted by the filesystem hook.
 #[derive(Debug, Clone)]
 pub enum FsHookOperation {
-    Read { path: PathBuf },
-    Write { path: PathBuf, bytes: usize },
-    Append { path: PathBuf, bytes: usize },
-    RemoveFile { path: PathBuf },
-    List { path: PathBuf },
-    CreateDir { path: PathBuf },
-    RemoveDir { path: PathBuf },
+    /// Read operation.
+    Read {
+        /// Path of the file.
+        path: PathBuf,
+    },
+    /// Write operation.
+    Write {
+        /// Path of the file.
+        path: PathBuf,
+        /// Number of bytes written.
+        bytes: usize,
+    },
+    /// Append operation.
+    Append {
+        /// Path of the file.
+        path: PathBuf,
+        /// Number of bytes appended.
+        bytes: usize,
+    },
+    /// Remove file operation.
+    RemoveFile {
+        /// Path of the file.
+        path: PathBuf,
+    },
+    /// List directory operation.
+    List {
+        /// Path of the directory.
+        path: PathBuf,
+    },
+    /// Create directory operation.
+    CreateDir {
+        /// Path of the directory.
+        path: PathBuf,
+    },
+    /// Remove directory operation.
+    RemoveDir {
+        /// Path of the directory.
+        path: PathBuf,
+    },
 }
 
+/// Filesystem wrapper that emits hooks on operations.
 #[derive(Clone)]
 pub struct HookedFileSystem<FS> {
     inner: FS,
     hook: Arc<dyn Fn(FsHook) + Send + Sync>,
 }
 
+impl<FS> fmt::Debug for HookedFileSystem<FS>
+where
+    FS: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HookedFileSystem")
+            .field("inner", &self.inner)
+            .field("hook", &"<closure>")
+            .finish()
+    }
+}
+
 impl<FS> HookedFileSystem<FS> {
+    /// Create a new hooked filesystem wrapper.
+    #[must_use]
     pub fn new(inner: FS, hook: impl Fn(FsHook) + Send + Sync + 'static) -> Self {
         Self {
             inner,

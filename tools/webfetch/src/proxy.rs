@@ -3,7 +3,7 @@
 //! A [`Proxy`] is a forward proxy on a loopback port, owned by one fetch and
 //! living as long as that fetch's browser. The browser is launched with it as
 //! its proxy for every destination, loopback included, so every connection it
-//! makes is a request here: `CONNECT host:port` for `https` and WebSockets,
+//! makes is a request here: `CONNECT host:port` for `https` and `WebSockets`,
 //! an absolute-form request (`GET http://host/path`) for plain `http`.
 //!
 //! For each request the proxy resolves the host once, judges every address it
@@ -488,7 +488,7 @@ mod tests {
 
         assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
         assert_eq!(accepted.load(Ordering::SeqCst), 0);
-        assert!(resolver.asked().is_empty());
+        assert_eq!(resolver.asked(), [] as [std::string::String; 0]);
     }
 
     #[tokio::test]

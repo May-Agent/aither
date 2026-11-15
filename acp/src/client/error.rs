@@ -25,7 +25,7 @@ pub enum ClientError {
     /// could be collected; in-memory and remote transports report `None`.
     #[error(
         "agent connection closed{}",
-        .status.map(|status| format!(" (exit status: {status})")).unwrap_or_default()
+        .status.map_or_default(|status| format!(" (exit status: {status})"))
     )]
     Closed {
         /// Exit status of the agent process, when the transport can report one.

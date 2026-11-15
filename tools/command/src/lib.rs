@@ -1,3 +1,5 @@
+//! Command execution tool for LLM agents.
+
 use std::{borrow::Cow, fmt, path::PathBuf, process::ExitStatus};
 
 use aither_core::llm::ToolContext;
@@ -19,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub struct CommandArgs {
     /// Program name to execute (e.g., "ls", "grep", "git", "cargo").
     pub program: String,
-    /// Command-line arguments as separate strings (e.g., ["-la"] for ls, ["-r", "TODO", "src/"] for grep).
+    /// Command-line arguments as separate strings (e.g., `["-la"]` for ls, `["-r", "TODO", "src/"]` for grep).
     #[serde(default)]
     pub args: Vec<String>,
     /// Working directory for command execution. Omit to use default.
@@ -30,9 +32,13 @@ pub struct CommandArgs {
 #[derive(Debug, Clone, Template)]
 #[template(path = "output.txt", escape = "none")]
 pub struct CommandOutput {
+    /// Program name that was executed.
     pub program: String,
+    /// How the command terminated.
     pub termination: Termination,
+    /// Standard output text.
     pub stdout: String,
+    /// Standard error text.
     pub stderr: String,
 }
 
@@ -78,6 +84,7 @@ impl fmt::Display for Termination {
     }
 }
 
+/// A tool that executes external commands.
 #[derive(Debug, Clone)]
 pub struct CommandTool {
     allowed: Option<Vec<String>>,
@@ -87,6 +94,7 @@ pub struct CommandTool {
 }
 
 impl CommandTool {
+    /// Create a new command tool with a default working directory.
     pub fn new(default_cwd: impl Into<PathBuf>) -> Self {
         let default_cwd = default_cwd.into();
         Self {
@@ -97,16 +105,22 @@ impl CommandTool {
         }
     }
 
+    /// Restrict execution to the specified list of programs.
+    #[must_use]
     pub fn restrict_to(mut self, commands: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.allowed = Some(commands.into_iter().map(Into::into).collect());
         self
     }
 
-    pub fn max_output(mut self, bytes: usize) -> Self {
+    /// Set the maximum output size in bytes.
+    #[must_use]
+    pub const fn max_output(mut self, bytes: usize) -> Self {
         self.max_output = bytes;
         self
     }
 
+    /// Set a custom name for the tool.
+    #[must_use]
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self

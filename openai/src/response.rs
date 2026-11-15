@@ -336,7 +336,7 @@ pub struct DeltaToolFunction {
     pub arguments: Option<String>,
 }
 
-pub fn should_skip_event(event: &Event) -> bool {
+pub const fn should_skip_event(event: &Event) -> bool {
     let text = event.text_data();
     text.is_empty() || text.eq_ignore_ascii_case(": ping")
 }

@@ -68,14 +68,18 @@ pub struct WebSearchArgs {
     pub limit: usize,
 }
 
-fn default_limit() -> usize {
+const fn default_limit() -> usize {
     5
 }
 
+/// A single web search result item.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchResult {
+    /// The title of the search result page.
     pub title: String,
+    /// The destination URL of the search result.
     pub url: String,
+    /// A text snippet or description of the search result content.
     pub snippet: String,
 }
 
@@ -90,7 +94,9 @@ fn render_results(results: &[SearchResult]) -> Result<String> {
     Ok(ResultsTemplate { results }.render()?)
 }
 
+/// A provider capable of performing web searches.
 pub trait SearchProvider: Send + Sync {
+    /// Perform a web search for the given query, returning up to `limit` results asynchronously.
     fn search(
         &self,
         query: &str,
@@ -98,6 +104,7 @@ pub trait SearchProvider: Send + Sync {
     ) -> impl Future<Output = Result<Vec<SearchResult>>> + Send;
 }
 
+/// A tool that integrates web search capabilities into LLM agents.
 #[derive(Debug, Clone)]
 pub struct WebSearchTool<P> {
     provider: P,

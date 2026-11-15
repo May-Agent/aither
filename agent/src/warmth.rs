@@ -163,11 +163,11 @@ mod tests {
         assert_eq!(
             warmth.state(),
             CacheState::Warm {
-                cold_in: Some(Duration::from_secs(3000))
+                cold_in: Some(Duration::from_mins(50))
             }
         );
 
-        clock.advance(Duration::from_secs(3000) - Duration::from_nanos(1));
+        clock.advance(Duration::from_mins(50) - Duration::from_nanos(1));
         assert_eq!(warmth.cold_in(), Some(Duration::from_nanos(1)));
         assert!(!warmth.has_expired());
 
@@ -181,7 +181,7 @@ mod tests {
     fn a_permanent_entry_never_goes_cold() {
         let (warmth, clock) = warmth(CacheLifetime::Permanent);
         warmth.start_entry_now();
-        clock.advance(Duration::from_secs(100 * 86_400));
+        clock.advance(Duration::from_hours(2400));
         assert_eq!(warmth.state(), CacheState::Warm { cold_in: None });
         assert!(warmth.is_warm());
         assert_eq!(warmth.cold_in(), None);
@@ -193,7 +193,7 @@ mod tests {
         let (warmth, clock) = warmth(CacheLifetime::Limited(HOUR));
         let early = warmth.clone();
         warmth.start_entry_now();
-        clock.advance(Duration::from_secs(3000));
+        clock.advance(Duration::from_mins(50));
         assert_eq!(early.cold_in(), Some(Duration::from_secs(600)));
 
         warmth.start_entry_now();

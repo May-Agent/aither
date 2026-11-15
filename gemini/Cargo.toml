@@ -14,12 +14,10 @@ categories = ["api-bindings"]
 [dependencies]
 aither-core = { workspace = true, features = ["zenwave", "timer"] }
 aither-models.workspace = true
-aither-attachments.workspace = true
 async-stream = "0.3"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
 base64 = "0.23"
-mime_guess = "2"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
@@ -29,7 +27,9 @@ zenwave = { workspace = true, features = ["hyper-backend", "rustls"] }
 tracing.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+aither-attachments.workspace = true
 async-fs = "2"
+mime_guess = "2"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }

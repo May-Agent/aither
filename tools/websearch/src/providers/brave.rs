@@ -63,19 +63,16 @@ impl SearchProvider for BraveSearch {
             .await
             .map_err(|e| anyhow!("{e}"))?;
 
-        Ok(response
-            .web
-            .map(|web| {
-                web.results
-                    .into_iter()
-                    .map(|r| SearchResult {
-                        title: r.title,
-                        url: r.url,
-                        snippet: r.description.unwrap_or_default(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(response.web.map_or_default(|web| {
+            web.results
+                .into_iter()
+                .map(|r| SearchResult {
+                    title: r.title,
+                    url: r.url,
+                    snippet: r.description.unwrap_or_default(),
+                })
+                .collect()
+        }))
     }
 }
 

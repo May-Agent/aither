@@ -118,8 +118,7 @@ fn resolved(path: &std::path::Path) -> heel::Result<ResolvedPath> {
 fn borrowed_object_stores(repository: &Path) -> Vec<PathBuf> {
     let objects = repository.join("objects");
     std::fs::read_to_string(objects.join("info/alternates"))
-        .map(|alternates| alternates.lines().map(|line| objects.join(line)).collect())
-        .unwrap_or_default()
+        .map_or_default(|alternates| alternates.lines().map(|line| objects.join(line)).collect())
 }
 
 impl<E: Executor + Clone + 'static> LocalGit<E> {

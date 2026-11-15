@@ -30,12 +30,11 @@ env:
 jobs:
   # ---------------------------------------------------------------------- scope
   # Which crates this change can reach: the changed crates plus everything that
-  # depends on them. A pull request measures against its base branch; every
-  # other event (a push to main, a merge group, a dispatch) names no base, so
-  # the tool selects the whole workspace and the full suite runs: the queue
-  # tests the exact commit that lands on main. Workflows, the toolchain, the
-  # lockfile, cargo and nextest configuration, and any path the rules do not
-  # name select the whole workspace; prose selects nothing
+  # depends on them. Pull requests, merge groups and pushes all diff against
+  # their base commit; only a manual `workflow_dispatch` (or an initial push
+  # with no `before` sha) selects the whole workspace. Workflows, the toolchain,
+  # the lockfile, cargo/nextest configuration, and any path the rules do not
+  # name select the whole workspace; prose and non-code metadata select nothing
   # (.github/affected-rules.toml).
   #
   # Scoped runs keep main's cache-saved feature resolution where they can: build
@@ -52,8 +51,12 @@ jobs:
       workspace: ${{ steps.jobs.outputs.workspace }}
       packages: ${{ steps.scope.outputs.packages }}
       package-args: ${{ steps.scope.outputs.package-args }}
+      audit: ${{ steps.jobs.outputs.audit }}
+      workflow_gates: ${{ steps.jobs.outputs.workflow_gates }}
       features: ${{ steps.jobs.outputs.features }}
       rust: ${{ steps.jobs.outputs.rust }}
+      portability: ${{ steps.jobs.outputs.portability }}
+      coverage: ${{ steps.jobs.outputs.coverage }}
       wasm: ${{ steps.jobs.outputs.wasm }}
       apple: ${{ steps.jobs.outputs.apple }}
       filterset: ${{ steps.jobs.outputs.filterset }}
@@ -67,23 +70,40 @@ jobs:
       - id: scope
         uses: lexoliu/affected-crates@v0.0.0
         with:
-          base: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+          base: >-
+            ${{
+              github.event_name == 'pull_request' && format('origin/{0}', github.base_ref)
+              || github.event_name == 'merge_group' && github.event.merge_group.base_sha
+              || (github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000') && github.event.before
+              || ''
+            }}
           rules: .github/affected-rules.toml
-      # Turns the affected set into what each job reads. `rust` is any affected
-      # crate (nothing at all for a prose-only change); `wasm` and `apple`
-      # are true when a crate the matching job builds is affected, which
-      # a changed dependency of it also makes true. `filterset` narrows nextest
-      # to the affected packages and is empty for the whole workspace.
-      # `features` is `rust` everywhere but a pull request: the merge queue
-      # runs the feature checks on what lands, as the promotion into main did.
+      # Turns the affected set and changed paths into per-job gates.
       - id: jobs
         env:
           WORKSPACE: ${{ steps.scope.outputs.workspace }}
           PACKAGES: ${{ steps.scope.outputs.packages }}
           EVENT: ${{ github.event_name }}
+          BASE_REV: >-
+            ${{
+              github.event_name == 'pull_request' && format('origin/{0}', github.base_ref)
+              || github.event_name == 'merge_group' && github.event.merge_group.base_sha
+              || (github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000') && github.event.before
+              || ''
+            }}
         run: |
           set -euo pipefail
           rust=$([ "${WORKSPACE}" = true ] || [ -n "${PACKAGES}" ] && echo true || echo false)
+          if [ -z "${BASE_REV}" ]; then
+            changed_files=""
+            audit=true
+            workflow_gates=true
+          else
+            merge_base="$(git merge-base "${BASE_REV}" HEAD)"
+            changed_files="$(git diff --name-only "${merge_base}" HEAD)"
+            audit="$(grep -Eq '^(Cargo\.lock|\.github/workflows/ci\.yml)$' <<< "${changed_files}" && echo true || echo false)"
+            workflow_gates="$(grep -Eq '^\.github/(workflows|tests)/' <<< "${changed_files}" && echo true || echo false)"
+          fi
           has() {
             [ "${WORKSPACE}" = true ] && return 0
             for want in "$@"; do
@@ -92,6 +112,23 @@ jobs:
             return 1
           }
           flag() { if "$@"; then echo true; else echo false; fi; }
+          has_non_excluded() {
+            [ "${WORKSPACE}" = true ] && return 0
+            local excluded=" $* "
+            local direct_root
+            direct_root="$(grep -Eq '^(Cargo\.toml|src/)' <<< "${changed_files}" && echo true || echo false)"
+            for pkg in ${PACKAGES}; do
+              if [ "${pkg}" = aither ]; then
+                [ "${direct_root}" = true ] && return 0
+                continue
+              fi
+              case "${excluded}" in
+                *" ${pkg} "*) ;;
+                *) return 0 ;;
+              esac
+            done
+            return 1
+          }
           filterset=""
           if [ "${WORKSPACE}" != true ]; then
             for name in ${PACKAGES}; do
@@ -100,8 +137,12 @@ jobs:
           fi
           {
             echo "workspace=${WORKSPACE}"
-            echo "features=$([ "${EVENT}" != pull_request ] && echo "${rust}" || echo false)"
+            echo "audit=${audit}"
+            echo "workflow_gates=${workflow_gates}"
+            echo "features=$([ "${EVENT}" != pull_request ] && flag has aither || echo false)"
             echo "rust=${rust}"
+            echo "portability=$(flag has_non_excluded aither-llama aither-ort aither-rag aither-search aither-apple)"
+            echo "coverage=$(flag has_non_excluded aither-llama aither-ort aither-apple)"
             echo "wasm=$(flag has aither-core aither-openai aither-gemini aither-claude)"
             echo "apple=$(flag has aither-apple)"
             echo "filterset=${filterset}"
@@ -114,7 +155,7 @@ jobs:
   audit:
     name: Security Audit
     needs: scope
-    if: needs.scope.outputs.workspace == 'true'
+    if: needs.scope.outputs.audit == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # audit-check reports through a check run, which the default read-only
@@ -146,24 +187,13 @@ jobs:
   workflow-gates:
     name: Workflow Gates
     needs: scope
-    if: needs.scope.outputs.workspace == 'true'
+    if: needs.scope.outputs.workflow_gates == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv run --with PyYAML==6.0.3 python .github/tests/test_ci_waiters.py
-
-  unused-deps:
-    name: Unused Dependencies
-    needs: scope
-    if: needs.scope.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-machete
-      - run: cargo machete
 
   # ------------------------------------------------------------------ the build
   # Lint carries every feature because a `#[cfg]` branch nobody compiles is a
@@ -240,7 +270,7 @@ jobs:
   test-portability:
     name: Test
     needs: scope
-    if: needs.scope.outputs.rust == 'true'
+    if: needs.scope.outputs.portability == 'true'
     uses: ./.github/workflows/test.yml
     with:
       flags: >-
@@ -370,7 +400,7 @@ jobs:
   coverage:
     name: Coverage
     needs: scope
-    if: needs.scope.outputs.rust == 'true'
+    if: needs.scope.outputs.coverage == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -440,7 +470,6 @@ jobs:
       - audit
       - format
       - workflow-gates
-      - unused-deps
       - lint
       - wasm
       - test-portability

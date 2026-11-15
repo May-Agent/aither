@@ -170,7 +170,7 @@ async fn a_permanent_lifetime_schedules_no_idle_compaction() {
     let mut agent = agent_after_one_turn(llm.clone(), Some(CacheLifetime::Permanent), &clock).await;
     assert_eq!(agent.cache_lifetime(), CacheLifetime::Permanent);
 
-    clock.advance(Duration::from_secs(10 * 86_400));
+    clock.advance(Duration::from_hours(240));
     assert_eq!(agent.idle_compaction_due_in(), None);
     assert!(compacts_nothing(&mut agent).await);
     assert_eq!(llm.requests(), 1);

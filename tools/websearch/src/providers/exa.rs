@@ -79,7 +79,7 @@ fn map_result(result: ExaResult) -> SearchResult {
     }
 }
 
-fn build_request(query: &str, limit: usize) -> ExaRequest<'_> {
+const fn build_request(query: &str, limit: usize) -> ExaRequest<'_> {
     ExaRequest {
         query,
         num_results: limit,
@@ -140,7 +140,7 @@ mod tests {
             ]
         });
         let response: ExaResponse = serde_json::from_value(response_json).expect("parse response");
-        let mapped: Vec<SearchResult> = response.results.into_iter().map(map_result).collect();
+        let mapped: Vec<_> = response.results.into_iter().map(map_result).collect();
 
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].title, "Rust Async Patterns");
@@ -155,9 +155,14 @@ mod tests {
     fn response_handles_empty_results() {
         let response_json = serde_json::json!({ "results": [] });
         let response: ExaResponse = serde_json::from_value(response_json).expect("parse response");
-        let mapped: Vec<SearchResult> = response.results.into_iter().map(map_result).collect();
-
-        assert!(mapped.is_empty());
+        assert!(
+            response
+                .results
+                .into_iter()
+                .map(map_result)
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -171,7 +176,7 @@ mod tests {
             ]
         });
         let response: ExaResponse = serde_json::from_value(response_json).expect("parse response");
-        let mapped: Vec<SearchResult> = response.results.into_iter().map(map_result).collect();
+        let mapped: Vec<_> = response.results.into_iter().map(map_result).collect();
 
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].title, "https://example.com/no-title");

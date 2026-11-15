@@ -1,4 +1,4 @@
-//! DuckDuckGo Instant Answer API provider.
+//! `DuckDuckGo` Instant Answer API provider.
 //!
 //! [DuckDuckGo](https://duckduckgo.com/) provides a free instant answer API
 //! that doesn't require an API key. Note that this API returns instant answers
@@ -24,10 +24,10 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use zenwave::{Client, client, header};
 
-/// DuckDuckGo Instant Answer API endpoint.
+/// `DuckDuckGo` Instant Answer API endpoint.
 const DDG_API_URL: &str = "https://api.duckduckgo.com/";
 
-/// DuckDuckGo Instant Answer API provider.
+/// `DuckDuckGo` Instant Answer API provider.
 ///
 /// Uses the [DuckDuckGo Instant Answer API](https://api.duckduckgo.com/api) which
 /// is free and doesn't require authentication. Returns instant answers, abstract,
@@ -38,7 +38,7 @@ pub struct DuckDuckGo {
 }
 
 impl DuckDuckGo {
-    /// Create a new DuckDuckGo provider.
+    /// Create a new `DuckDuckGo` provider.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
