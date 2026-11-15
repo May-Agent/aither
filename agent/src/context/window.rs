@@ -969,6 +969,7 @@ impl Context {
                 Message::Tool {
                     content,
                     tool_call_id,
+                    ..
                 } if content.len() > min_bytes && !asks.contains(tool_call_id.as_str()) => {
                     Some(LongToolOutput {
                         seq: item.seq,
@@ -984,9 +985,14 @@ impl Context {
     /// Replaces the content of the tool result numbered `seq`.
     pub(crate) fn replace_tool_output(&mut self, seq: u64, replacement: String) {
         if let Some(item) = self.items.iter_mut().find(|item| item.seq == seq)
-            && let Message::Tool { content, .. } = &mut item.message
+            && let Message::Tool {
+                content,
+                attachments,
+                ..
+            } = &mut item.message
         {
             *content = replacement;
+            attachments.clear();
         }
     }
 
@@ -1015,6 +1021,7 @@ impl Context {
             let Message::Tool {
                 content,
                 tool_call_id,
+                ..
             } = &item.message
             else {
                 continue;
@@ -1033,6 +1040,7 @@ impl Context {
             let Message::Tool {
                 content,
                 tool_call_id,
+                ..
             } = &item.message
             else {
                 continue;
@@ -1061,9 +1069,14 @@ impl Context {
         let (indices, bytes) = self.find_superseded_tool_results();
         for &index in &indices {
             if let Some(item) = self.items.get_mut(index)
-                && let Message::Tool { content, .. } = &mut item.message
+                && let Message::Tool {
+                    content,
+                    attachments,
+                    ..
+                } = &mut item.message
             {
                 *content = SUPERSEDED_TOOL_RESULT.to_string();
+                attachments.clear();
             }
         }
         (indices.len(), bytes)
@@ -2065,6 +2078,7 @@ mod tests {
             let Message::Tool {
                 tool_call_id,
                 content,
+                ..
             } = &kept[index * 2 + 1]
             else {
                 panic!("the answer follows its question");
@@ -2450,5 +2464,27 @@ mod tests {
             1,
             "a block that renders to nothing must not cost a message"
         );
+    }
+
+    #[test]
+    fn tombstoning_superseded_tool_result_clears_attachments() {
+        let attachment = aither_core::llm::Attachment::new(
+            "https://example.com/screen.png".parse().expect("url"),
+            "image/png".parse().expect("image MIME"),
+        );
+        let call = |id: &str| ToolCall::new(id, "screen", serde_json::json!({"tab": 1}));
+        let mut context = Context::new();
+        context.push(Message::assistant_with_tool_calls("", vec![call("c1")]));
+        context.push(
+            Message::tool("c1", "x".repeat(SUPERSEDED_TOOL_RESULT.len() + 64))
+                .with_attachment(attachment),
+        );
+        context.push(Message::assistant_with_tool_calls("", vec![call("c2")]));
+        context.push(Message::tool("c2", "newer"));
+
+        let (count, _) = context.tombstone_superseded_tool_results();
+        assert_eq!(count, 1);
+        assert_eq!(context.recent()[1].attachments(), []);
+        assert_eq!(context.recent()[1].content(), SUPERSEDED_TOOL_RESULT);
     }
 }

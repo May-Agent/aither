@@ -321,13 +321,30 @@ pub async fn to_chat_messages(
             )
         };
 
-        let content = build_content(message).await?;
-        payloads.push(ChatMessagePayload {
-            role,
-            content,
-            tool_calls,
-            tool_call_id,
-        });
+        if matches!(message.role(), Role::Tool) && !message.attachments().is_empty() {
+            payloads.push(ChatMessagePayload {
+                role,
+                content: ContentPayload::Text(message.content().to_owned()),
+                tool_calls,
+                tool_call_id,
+            });
+            let attachment_only =
+                Message::user("").with_attachments(message.attachments().to_vec());
+            payloads.push(ChatMessagePayload {
+                role: "user",
+                content: build_content(&attachment_only).await?,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        } else {
+            let content = build_content(message).await?;
+            payloads.push(ChatMessagePayload {
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+            });
+        }
     }
     Ok(payloads)
 }
@@ -623,7 +640,7 @@ pub enum ResponsesInputItem {
         #[serde(rename = "type")]
         kind: &'static str,
         call_id: String,
-        output: String,
+        output: ResponsesMessageContent,
     },
     /// A reasoning effort change for the rest of the conversation, leaving
     /// the request-level `reasoning.effort` and the cached prefix as they
@@ -722,7 +739,10 @@ impl ResponsesInputItem {
         }
     }
 
-    pub(crate) fn function_call_output(call_id: impl Into<String>, output: String) -> Self {
+    pub(crate) fn function_call_output(
+        call_id: impl Into<String>,
+        output: ResponsesMessageContent,
+    ) -> Self {
         Self::FunctionCallOutput {
             kind: "function_call_output",
             call_id: call_id.into(),
@@ -951,27 +971,10 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
     for message in messages {
         match message.role() {
             Role::User => {
-                let attachments = message.attachments();
-                if attachments.is_empty() {
-                    items.push(ResponsesInputItem::message(
-                        "user",
-                        ResponsesMessageContent::Text(flatten_content(message)),
-                    ));
-                } else {
-                    let mut parts = Vec::new();
-                    for attachment in attachments {
-                        parts.push(attachment_to_responses_part(attachment)?);
-                    }
-                    if !message.content().is_empty() {
-                        parts.push(ResponsesInputContent::InputText {
-                            text: message.content().to_owned(),
-                        });
-                    }
-                    items.push(ResponsesInputItem::message(
-                        "user",
-                        ResponsesMessageContent::Parts(parts),
-                    ));
-                }
+                items.push(ResponsesInputItem::message(
+                    "user",
+                    build_responses_content(message)?,
+                ));
             }
             Role::System => {
                 items.push(ResponsesInputItem::message(
@@ -1017,7 +1020,7 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
                 let call_id = require_non_empty_call_id(message.tool_call_id(), "tool result")?;
                 items.push(ResponsesInputItem::function_call_output(
                     call_id,
-                    message.content().to_string(),
+                    build_responses_content(message)?,
                 ));
             }
             Role::Configuration => {
@@ -1063,6 +1066,23 @@ fn validate_responses_input(items: &[ResponsesInputItem]) -> Result<(), OpenAIEr
         }
     }
     Ok(())
+}
+
+fn build_responses_content(message: &Message) -> Result<ResponsesMessageContent, OpenAIError> {
+    let attachments = message.attachments();
+    if attachments.is_empty() {
+        return Ok(ResponsesMessageContent::Text(flatten_content(message)));
+    }
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
+    for attachment in attachments {
+        parts.push(attachment_to_responses_part(attachment)?);
+    }
+    if !message.content().is_empty() {
+        parts.push(ResponsesInputContent::InputText {
+            text: message.content().to_owned(),
+        });
+    }
+    Ok(ResponsesMessageContent::Parts(parts))
 }
 
 fn attachment_to_responses_part(
@@ -1857,5 +1877,31 @@ mod tests {
             error.to_string(),
             "responses input[0] function_call 'lookup' has an empty call_id"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_message_attachments_encode_in_responses_and_chat() {
+        let image = Attachment::new(
+            "data:image/png;base64,AA==".parse().expect("image URL"),
+            "image/png".parse().expect("image MIME"),
+        );
+        let messages = vec![Message::tool("call_img", "captured").with_attachment(image)];
+
+        let items = to_responses_input(&messages).expect("responses input");
+        let value = serde_json::to_value(&items).expect("serialize responses");
+        assert_eq!(value[0]["type"], "function_call_output");
+        assert_eq!(value[0]["call_id"], "call_img");
+        assert_eq!(value[0]["output"][0]["type"], "input_image");
+        assert_eq!(value[0]["output"][1]["type"], "input_text");
+        assert_eq!(value[0]["output"][1]["text"], "captured");
+
+        let chat = to_chat_messages(&messages).await.expect("chat messages");
+        let chat_value = serde_json::to_value(&chat).expect("serialize chat");
+        assert_eq!(chat_value.as_array().expect("messages").len(), 2);
+        assert_eq!(chat_value[0]["role"], "tool");
+        assert_eq!(chat_value[0]["tool_call_id"], "call_img");
+        assert_eq!(chat_value[0]["content"], "captured");
+        assert_eq!(chat_value[1]["role"], "user");
+        assert_eq!(chat_value[1]["content"][0]["type"], "image_url");
     }
 }

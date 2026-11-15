@@ -475,6 +475,66 @@ fn flush_tool_results(contents: &mut Vec<GeminiContent>, pending: &mut Vec<(usiz
     contents.push(GeminiContent::with_parts("user", parts));
 }
 
+async fn append_tool_result(
+    message: &Message,
+    index: &ToolCallIndex<'_>,
+    contents: &mut Vec<GeminiContent>,
+    pending_results: &mut Vec<(usize, Part)>,
+) -> Result<(), GeminiError> {
+    let tool_call_id = message.tool_call_id().unwrap_or("");
+    let signature = index
+        .signatures
+        .get(tool_call_id)
+        .map(|value| (*value).to_string());
+    let attachments = message.attachments();
+
+    if let Some(&function_name) = index.names.get(tool_call_id) {
+        let position = index.positions[tool_call_id];
+        pending_results.push((
+            position,
+            Part::function_response_with_signature(
+                function_name.to_string(),
+                tool_response_value(message.content()),
+                signature,
+            ),
+        ));
+        for attachment in attachments {
+            pending_results.push((position, url_to_part(attachment).await?));
+        }
+        return Ok(());
+    }
+
+    if let Some((name, response, sig)) = parse_tool_response(message.content()) {
+        pending_results.push((
+            usize::MAX,
+            Part::function_response_with_signature(name, response, sig),
+        ));
+        for attachment in attachments {
+            pending_results.push((usize::MAX, url_to_part(attachment).await?));
+        }
+        return Ok(());
+    }
+
+    debug!(
+        "Tool message without matching tool_call_id: {}",
+        tool_call_id
+    );
+    flush_tool_results(contents, pending_results);
+    if attachments.is_empty() {
+        contents.push(GeminiContent::text("user", message.content()));
+    } else {
+        let mut parts = Vec::with_capacity(attachments.len() + 1);
+        for attachment in attachments {
+            parts.push(url_to_part(attachment).await?);
+        }
+        if !message.content().is_empty() {
+            parts.push(Part::text(message.content()));
+        }
+        contents.push(GeminiContent::with_parts("user", parts));
+    }
+    Ok(())
+}
+
 async fn messages_to_gemini(
     messages: &[Message],
 ) -> Result<(Option<GeminiContent>, Vec<GeminiContent>), GeminiError> {
@@ -517,37 +577,7 @@ async fn messages_to_gemini(
                 }
             }
             Role::Tool => {
-                // Get the function name from the tool_call_id
-                let tool_call_id = message.tool_call_id().unwrap_or("");
-                let base_id = tool_call_id.to_string();
-                let signature = index
-                    .signatures
-                    .get(tool_call_id)
-                    .map(|value| (*value).to_string());
-
-                if let Some(&function_name) = index.names.get(tool_call_id) {
-                    pending_results.push((
-                        index.positions[tool_call_id],
-                        Part::function_response_with_signature(
-                            function_name.to_string(),
-                            tool_response_value(message.content()),
-                            signature,
-                        ),
-                    ));
-                } else {
-                    // Fallback: try legacy format or send as user message
-                    if let Some((name, response, sig)) = parse_tool_response(message.content()) {
-                        pending_results.push((
-                            usize::MAX,
-                            Part::function_response_with_signature(name, response, sig),
-                        ));
-                    } else {
-                        // Last resort - wrap as text
-                        debug!("Tool message without matching tool_call_id: {}", base_id);
-                        flush_tool_results(&mut contents, &mut pending_results);
-                        contents.push(GeminiContent::text("user", message.content()));
-                    }
-                }
+                append_tool_result(message, &index, &mut contents, &mut pending_results).await?;
             }
             Role::Assistant => {
                 let tool_calls = message.tool_calls();
@@ -1136,5 +1166,24 @@ mod tests {
         assert_eq!(value["frequencyPenalty"], 0.25);
         assert_eq!(value["responseLogprobs"], true);
         assert_eq!(value["logprobs"], 3);
+    }
+
+    #[tokio::test]
+    async fn tool_message_with_image_attachment_appends_media_part() {
+        let image = Attachment::new(
+            "data:image/png;base64,AA==".parse().expect("image URL"),
+            "image/png".parse().expect("image MIME"),
+        );
+        let messages = [
+            Message::assistant_with_tool_calls("", vec![call("a", "screen")]),
+            Message::tool("a", "ok").with_attachment(image),
+        ];
+        let (_, contents) = messages_to_gemini(&messages).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize");
+        assert_eq!(value[1]["role"], "user");
+        let parts = value[1]["parts"].as_array().expect("parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionResponse"]["name"], "screen");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
     }
 }

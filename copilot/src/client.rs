@@ -414,12 +414,28 @@ async fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessagePayload
                 Some(msg.tool_call_id().unwrap_or_default().to_string()),
             ),
         };
-        payloads.push(ChatMessagePayload {
-            role,
-            content: build_content(msg).await?,
-            tool_calls,
-            tool_call_id,
-        });
+        if matches!(msg.role(), Role::Tool) && !msg.attachments().is_empty() {
+            payloads.push(ChatMessagePayload {
+                role,
+                content: ContentPayload::Text(msg.content().to_owned()),
+                tool_calls,
+                tool_call_id,
+            });
+            let attachment_only = Message::user("").with_attachments(msg.attachments().to_vec());
+            payloads.push(ChatMessagePayload {
+                role: "user",
+                content: build_content(&attachment_only).await?,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        } else {
+            payloads.push(ChatMessagePayload {
+                role,
+                content: build_content(msg).await?,
+                tool_calls,
+                tool_call_id,
+            });
+        }
     }
     Ok(payloads)
 }
@@ -961,5 +977,24 @@ mod tests {
         assert_eq!(usage.total_tokens, Some(18));
         assert_eq!(usage.reasoning_tokens, Some(2));
         assert_eq!(usage.cache_read_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn tool_message_with_attachment_emits_followup_user_message() {
+        let image = aither_core::llm::Attachment::new(
+            "data:image/png;base64,AA==".parse().expect("image URL"),
+            "image/png".parse().expect("image MIME"),
+        );
+        let payloads = to_chat_messages(&[Message::tool("c1", "seen").with_attachment(image)])
+            .await
+            .expect("copilot messages");
+        let value = serde_json::to_value(&payloads).expect("serialize");
+        let items = value.as_array().expect("array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["role"], "tool");
+        assert_eq!(items[0]["tool_call_id"], "c1");
+        assert_eq!(items[0]["content"], "seen");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"][0]["type"], "image_url");
     }
 }

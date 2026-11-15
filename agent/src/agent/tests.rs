@@ -790,3 +790,39 @@ async fn a_checkpoint_taken_mid_run_restores_the_completed_steps() {
     assert!(history.contains("go"), "the user message: {history}");
     assert!(history.contains("c1"), "the completed tool call: {history}");
 }
+
+struct AttachImageHook(aither_core::llm::Attachment);
+
+impl Hooks for AttachImageHook {
+    async fn after_tool(&self, _outcome: &crate::ToolOutcome) -> crate::AfterTool {
+        crate::AfterTool::ReplaceWithAttachments {
+            result: ToolResult::text("attached image"),
+            attachments: vec![self.0.clone()],
+        }
+    }
+}
+
+#[tokio::test]
+async fn after_tool_replace_with_attachments_reaches_the_model() {
+    let attachment = aither_core::llm::Attachment::new(
+        "data:image/png;base64,AA==".parse().expect("data url"),
+        "image/png".parse().expect("image MIME"),
+    );
+    let llm = Scripted::new([call("c1", "probe"), say("done")]);
+    let mut agent = AgentBuilder::new(llm.clone())
+        .tool(Probe::default())
+        .hooks(AttachImageHook(attachment.clone()))
+        .build();
+
+    let (result, _) = run_to_end(&mut agent, "go").await;
+
+    result.expect("the run completes");
+    let requests = llm.requests();
+    let tool_message = requests[1]
+        .messages()
+        .iter()
+        .find(|msg| msg.tool_call_id() == Some("c1"))
+        .expect("tool message in second request");
+    assert_eq!(tool_message.content(), "attached image");
+    assert_eq!(tool_message.attachments(), &[attachment]);
+}

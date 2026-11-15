@@ -137,7 +137,13 @@ pub fn prepare(messages: &[Message]) -> Result<Prepared, AppleError> {
             Message::Tool {
                 content,
                 tool_call_id,
+                attachments,
             } => {
+                if !attachments.is_empty() {
+                    return Err(unsupported(
+                        "tool output attachments are not supported by the on-device model",
+                    ));
+                }
                 seen_content = true;
                 let Some(name) = call_names.remove(tool_call_id) else {
                     return Err(unsupported(format!(

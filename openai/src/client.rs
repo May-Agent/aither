@@ -1570,7 +1570,7 @@ mod tests {
             vec![ResponsesInputItem::FunctionCallOutput {
                 kind: "function_call_output",
                 call_id: "   ".to_string(),
-                output: "{}".to_string(),
+                output: crate::request::ResponsesMessageContent::Text("{}".to_string()),
             }],
             &snapshot,
             None,

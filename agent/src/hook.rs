@@ -114,6 +114,13 @@ pub enum AfterTool {
     Keep,
     /// The model reads this instead.
     Replace(ToolResult),
+    /// The model reads `result` with `attachments` attached to the tool result.
+    ReplaceWithAttachments {
+        /// Replacement tool result (text/command content).
+        result: ToolResult,
+        /// Attachments (such as screenshots or read images) sent alongside the tool result.
+        attachments: Vec<aither_core::llm::Attachment>,
+    },
     /// The model reads what the tool returned, and the conversation gains
     /// this context as a durable block after the turn's results.
     Append(String),
