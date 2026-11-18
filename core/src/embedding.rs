@@ -51,7 +51,7 @@
 //! }
 //! ```
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::future::Future;
 
 /// A type alias for an embedding vector of 32-bit floats.
@@ -131,6 +131,34 @@ pub trait EmbeddingModel: Send + Sized + Sync {
     ///
     /// Implementations that need mutable state should use interior mutability.
     fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send;
+}
+
+macro_rules! impl_embedding_model {
+    ($($name:ident),*) => {
+        $(
+            impl<T: EmbeddingModel> EmbeddingModel for $name<T> {
+                fn dim(&self) -> usize {
+                    T::dim(self)
+                }
+
+                fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send {
+                    T::embed(self, text)
+                }
+            }
+        )*
+    };
+}
+
+impl_embedding_model!(Arc, Box);
+
+impl<T: EmbeddingModel> EmbeddingModel for &T {
+    fn dim(&self) -> usize {
+        T::dim(self)
+    }
+
+    fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send {
+        T::embed(self, text)
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +243,25 @@ mod tests {
         assert_eq!(embedding.len(), 1536);
         assert!((embedding[0] - 0.09).abs() < f32::EPSILON); // text length 9 + index 0 = 9 * 0.01
         assert!((embedding[1535] - 15.44).abs() < 0.01); // text length 9 + index 1535 = 1544 * 0.01
+    }
+
+    #[tokio::test]
+    async fn smart_pointer_forwarding_works_for_embedding_model() {
+        async fn run_embed(m: impl EmbeddingModel) -> usize {
+            let vec = m.embed("hello").await.unwrap();
+            assert_eq!(vec.len(), m.dim());
+            vec.len()
+        }
+
+        let model = MockEmbeddingModel { dimension: 8 };
+        assert_eq!(run_embed(&model).await, 8);
+        assert_eq!(
+            run_embed(Box::new(MockEmbeddingModel { dimension: 8 })).await,
+            8
+        );
+        assert_eq!(
+            run_embed(Arc::new(MockEmbeddingModel { dimension: 8 })).await,
+            8
+        );
     }
 }
