@@ -71,10 +71,8 @@ pub struct ContextItem {
     /// When the item was committed to the window. Bookkeeping only: it is
     /// never rendered into a request.
     committed_at: Timestamp,
-    /// Whether this tool result closes an exchange the user's own words
-    /// make up, such as an `ask_user` question and its answer. A kept
-    /// exchange survives a compaction handoff verbatim and its result is
-    /// never tombstoned or spilled.
+    /// Whether this tool result closes an exchange marked to be retained
+    /// verbatim across compaction, tombstoning, and recovery spills.
     #[serde(default)]
     kept: bool,
     /// Whether the next reassembly removes this alert whatever its
@@ -174,6 +172,15 @@ pub struct Context {
     /// change is staged and announced instead of written into it.
     #[serde(default)]
     prefix_sent: bool,
+
+    /// Monotonic counter bumped whenever the prefix, handoff, or committed
+    /// conversation items are rewritten in place rather than appended to.
+    #[serde(skip, default)]
+    rewrite_generation: u64,
+
+    /// Wall-clock time source for stamping newly committed items.
+    #[serde(skip, default)]
+    clock: crate::AnyClock,
 }
 
 impl Default for Context {
@@ -213,7 +220,13 @@ impl Context {
             items: Vec::new(),
             next_seq: 0,
             prefix_sent: false,
+            rewrite_generation: 0,
+            clock: crate::AnyClock::default(),
         }
+    }
+
+    pub(crate) fn set_clock(&mut self, clock: crate::AnyClock) {
+        self.clock = clock;
     }
 
     // ── System blocks (stable, cacheable prefix) ──────────────────────
@@ -365,12 +378,14 @@ impl Context {
         render_prefix(&self.instructions, &self.external)
     }
 
-    /// Returns a stable fingerprint of the rendered system prefix and the
-    /// live source blocks after it.
+    /// Returns a stable fingerprint of the cacheable prefix: the rendered
+    /// system prefix, the live source blocks, the compaction handoff, and any
+    /// destructive conversation rewrites.
     ///
-    /// The fingerprint changes if and only if those bytes change. Hosts can
-    /// use this to detect cache-invalidating modifications to the stable
-    /// prefix (for example, to track KV-cache hit rate over time).
+    /// Appending new conversation items leaves the fingerprint unchanged;
+    /// changing system blocks, applying a handoff, or rewriting/pruning
+    /// existing items advances it so [`PromptCache`](super::PromptCache)
+    /// rotates its epoch.
     #[must_use]
     pub fn stable_prefix_fingerprint(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -378,6 +393,8 @@ impl Context {
         for (_, block) in self.sourced.iter() {
             block.hash(&mut hasher);
         }
+        self.handoff.as_ref().map(Handoff::text).hash(&mut hasher);
+        self.rewrite_generation.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -392,12 +409,17 @@ impl Context {
 
     /// Sets or replaces the compaction handoff.
     pub fn set_handoff(&mut self, handoff: Handoff) {
+        if self.handoff.as_ref() != Some(&handoff) {
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
+        }
         self.handoff = Some(handoff);
     }
 
     /// Clears the compaction handoff.
     pub fn clear_handoff(&mut self) {
-        self.handoff = None;
+        if self.handoff.take().is_some() {
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
+        }
     }
 
     /// Returns the current compaction handoff document.
@@ -425,13 +447,29 @@ impl Context {
         self.push_item(message, ItemKind::Kept)
     }
 
+    /// Marks the committed tool result answering `tool_call_id` to be kept
+    /// verbatim across compactions, tombstoning, and recovery spills at its
+    /// original sequence number.
+    ///
+    /// Returns `true` when at least one matching tool result was found.
+    pub fn mark_kept(&mut self, tool_call_id: &str) -> bool {
+        let mut marked = false;
+        for item in &mut self.items {
+            if item.message.tool_call_id() == Some(tool_call_id) {
+                item.kept = true;
+                marked = true;
+            }
+        }
+        marked
+    }
+
     fn push_item(&mut self, message: Message, kind: ItemKind) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.items.push(ContextItem {
             seq,
             message,
-            committed_at: Timestamp::now(),
+            committed_at: self.clock.utc_now(),
             kept: matches!(kind, ItemKind::Kept),
             live: matches!(kind, ItemKind::Restated),
             undelivered: true,
@@ -467,13 +505,40 @@ impl Context {
         self.push(Message::system(block.content()))
     }
 
-    /// Returns the sequence number the next item will receive.
+    /// The sequence number the next item will receive.
+    pub(crate) const fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Returns the sequence number a compaction may split the window at.
     ///
-    /// This is the fork point handed to a background compaction: every item
-    /// numbered at or above it arrived after the fork and must survive the
-    /// handoff that replaces the rest.
+    /// Every item numbered at or above it arrived after the fork and must
+    /// survive the handoff that replaces the rest.
+    ///
+    /// A tool round is never split: when the tail has an assistant turn whose
+    /// tool calls still lack results, the point moves back to that turn's
+    /// sequence number, so the kept side never starts with an orphaned result
+    /// and the compacted side never ends inside an open round.
     #[must_use]
-    pub const fn fork_point(&self) -> u64 {
+    pub fn fork_point(&self) -> u64 {
+        let mut results = HashSet::new();
+        for item in self.items.iter().rev() {
+            if let Some(id) = item.message.tool_call_id() {
+                results.insert(id);
+                continue;
+            }
+            if matches!(item.message.role(), Role::System | Role::Configuration) {
+                continue;
+            }
+            let calls = item.message.tool_calls();
+            if calls.is_empty() {
+                break;
+            }
+            if calls.iter().any(|call| !results.contains(call.id.as_str())) {
+                return item.seq;
+            }
+            break;
+        }
         self.next_seq
     }
 
@@ -585,6 +650,7 @@ impl Context {
         if remove_count == 0 {
             return Vec::new();
         }
+        self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
         self.items
             .drain(..remove_count)
             .map(ContextItem::into_message)
@@ -603,9 +669,11 @@ impl Context {
     /// 4. the append-only conversation,
     /// 5. one system message holding every live tail block.
     ///
-    /// Steps 1-4 are byte-identical to the previous request whenever nothing
-    /// was staged or compacted, which is exactly the condition a provider
-    /// prefix cache needs.
+    /// Mid-conversation `Role::System` blocks are coalesced and aligned to
+    /// valid `user -> system -> assistant` (or `user -> system` at end)
+    /// boundaries so models with `MidConversationSystem` never see two
+    /// adjacent system turns, a system turn directly after an assistant turn,
+    /// or a system turn directly before a user turn.
     #[must_use]
     pub fn build_request(&self, tail: &[Block]) -> Vec<Message> {
         let mut messages = Vec::with_capacity(self.items.len() + self.sourced.len() + 3);
@@ -624,10 +692,80 @@ impl Context {
             messages.push(Message::system(handoff.render()));
         }
 
-        messages.extend(self.items.iter().map(|item| item.message.clone()));
+        let mut seen_turn = false;
+        let mut last_turn_is_user = false;
+        let mut pending_system: Vec<&str> = Vec::new();
+        let mut pending_configs: Vec<Message> = Vec::new();
 
-        if let Some(tail_message) = render_tail(tail) {
-            messages.push(tail_message);
+        for item in &self.items {
+            let message = &item.message;
+            match message.role() {
+                Role::System => {
+                    let text = message.content();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if seen_turn {
+                        pending_system.push(text);
+                    } else {
+                        messages.push(Message::system(text));
+                    }
+                }
+                Role::Configuration => {
+                    if !seen_turn || !pending_system.is_empty() {
+                        pending_configs.push(message.clone());
+                    } else {
+                        messages.push(message.clone());
+                    }
+                }
+                Role::User | Role::Tool => {
+                    messages.append(&mut pending_configs);
+                    messages.push(message.clone());
+                    seen_turn = true;
+                    last_turn_is_user = true;
+                }
+                Role::Assistant => {
+                    messages.append(&mut pending_configs);
+                    if !pending_system.is_empty() {
+                        let joined = pending_system.join("\n");
+                        pending_system.clear();
+                        if last_turn_is_user {
+                            messages.push(Message::system(joined));
+                        } else {
+                            messages.push(Message::user(joined));
+                        }
+                    }
+                    messages.push(message.clone());
+                    seen_turn = true;
+                    last_turn_is_user = false;
+                }
+            }
+        }
+
+        let tail_text = render_tail_text(tail);
+        if !seen_turn {
+            if let Some(tail_text) = tail_text {
+                messages.push(Message::system(tail_text));
+            }
+            messages.append(&mut pending_configs);
+        } else if last_turn_is_user {
+            messages.append(&mut pending_configs);
+            if let Some(ref tail_text) = tail_text {
+                pending_system.push(tail_text);
+            }
+            if !pending_system.is_empty() {
+                messages.push(Message::system(pending_system.join("\n")));
+            }
+        } else {
+            messages.append(&mut pending_configs);
+            if !pending_system.is_empty() {
+                messages.push(Message::user(pending_system.join("\n")));
+                if let Some(tail_text) = tail_text {
+                    messages.push(Message::system(tail_text));
+                }
+            } else if let Some(tail_text) = tail_text {
+                messages.push(Message::user(tail_text));
+            }
         }
 
         messages
@@ -676,11 +814,17 @@ impl Context {
 
     /// Clears only the conversation, keeping system blocks and the handoff.
     pub fn clear_recent(&mut self) {
+        if !self.items.is_empty() {
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
+        }
         self.items.clear();
     }
 
     /// Clears all non-persistent context: the handoff and the conversation.
     pub fn clear_history(&mut self) {
+        if self.handoff.is_some() || !self.items.is_empty() {
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
+        }
         self.handoff = None;
         self.items.clear();
     }
@@ -691,6 +835,7 @@ impl Context {
         self.external.clear();
         self.sourced.clear();
         self.prefix_sent = false;
+        self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
         self.clear_history();
     }
 
@@ -717,6 +862,7 @@ impl Context {
             .next_seq
             .max(checkpoint.items.last().map_or(0, |item| item.seq + 1));
         self.items = checkpoint.items;
+        self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
     }
 
     /// Restores runtime-managed state from another serialized context while
@@ -731,14 +877,19 @@ impl Context {
     /// above `fork_point` are kept: they arrived while the handoff was being
     /// written and are not described by it.
     ///
+    /// Kept post-fork items lose reasoning bound to the old prefix (Claude
+    /// thinking blocks): a provider whose thinking verifies the conversation
+    /// around it rejects a block replayed under a rewritten prefix. Text, tool
+    /// calls, and prefix-independent reasoning (`OpenAI` encrypted items,
+    /// Gemini signatures) stay intact.
+    ///
     /// An alert below the fork that no request has carried yet stays too:
     /// the model has not seen it, whatever the handoff says of it.
     ///
-    /// The user's own words outlive the handoff beside it, verbatim and in
-    /// order: every `ask_user` exchange from below the fork, whatever its
-    /// size, and the newest user messages that fit `user_message_chars`
-    /// characters. An exchange is the question and its answer together, so it
-    /// is kept or dropped whole, and it is dropped never.
+    /// Retained items below the fork survive beside the handoff, verbatim and
+    /// in chronological order: every completed tool exchange marked `kept`,
+    /// whatever its size, and the newest user messages that fit
+    /// `user_message_chars` characters.
     ///
     /// The last configuration update below the fork is kept too, in its
     /// place, so the effort it set stays in force: the handoff restates it.
@@ -757,13 +908,17 @@ impl Context {
     ) {
         let mut kept = self.verbatim_below(fork_point, user_message_chars, kept_attachments);
         self.items.retain(|item| item.seq >= fork_point);
+        for item in &mut self.items {
+            strip_prefix_bound_reasoning(&mut item.message);
+        }
         kept.append(&mut self.items);
         self.items = kept;
         self.set_handoff(handoff);
+        self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
     }
 
-    /// The items below `fork_point` that survive a handoff: answered
-    /// `ask_user` exchanges, and the newest user messages within
+    /// The items below `fork_point` that survive a handoff: completed `kept`
+    /// tool exchanges, and the newest user messages within
     /// `user_message_chars`, each carrying only the attachments
     /// `kept_attachments` names, oldest first.
     fn verbatim_below(
@@ -774,7 +929,7 @@ impl Context {
     ) -> Vec<ContextItem> {
         let below = || self.items.iter().filter(|item| item.seq < fork_point);
 
-        let asks: HashSet<&str> = below()
+        let kept_calls: HashSet<&str> = below()
             .filter(|item| item.kept)
             .filter_map(|item| item.message.tool_call_id())
             .collect();
@@ -787,7 +942,7 @@ impl Context {
                 Message::Assistant { tool_calls, .. } => {
                     let calls: Vec<ToolCall> = tool_calls
                         .iter()
-                        .filter(|call| asks.contains(call.id.as_str()))
+                        .filter(|call| kept_calls.contains(call.id.as_str()))
                         .cloned()
                         .collect();
                     if !calls.is_empty() {
@@ -931,6 +1086,10 @@ impl Context {
         report.tool_results_deduped = deduped;
         report.bytes_freed += dedupe_bytes;
 
+        if report.changed() {
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
+        }
+
         report
     }
 
@@ -957,12 +1116,16 @@ impl Context {
         self.items.retain(|item| {
             item.message.role() != Role::System || item.seq >= fork_point || item.undelivered
         });
-        before - self.items.len()
+        let pruned = before - self.items.len();
+        if pruned > 0 {
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
+        }
+        pruned
     }
 
     /// The tool results holding more than `min_bytes` bytes.
     pub(crate) fn long_tool_outputs(&self, min_bytes: usize) -> Vec<LongToolOutput> {
-        let asks = self.kept_call_ids();
+        let kept_calls = self.kept_call_ids();
         self.items
             .iter()
             .filter_map(|item| match &item.message {
@@ -970,7 +1133,7 @@ impl Context {
                     content,
                     tool_call_id,
                     ..
-                } if content.len() > min_bytes && !asks.contains(tool_call_id.as_str()) => {
+                } if content.len() > min_bytes && !kept_calls.contains(tool_call_id.as_str()) => {
                     Some(LongToolOutput {
                         seq: item.seq,
                         tool_call_id: tool_call_id.clone(),
@@ -993,6 +1156,7 @@ impl Context {
         {
             *content = replacement;
             attachments.clear();
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
         }
     }
 
@@ -1032,8 +1196,7 @@ impl Context {
             last_by_content.insert(content.as_str(), index);
         }
 
-        // An answer is the user's word, not a re-readable resource.
-        let asks = self.kept_call_ids();
+        let kept_calls = self.kept_call_ids();
         let mut indices = Vec::new();
         let mut bytes = 0usize;
         for (index, item) in self.items.iter().enumerate() {
@@ -1045,7 +1208,8 @@ impl Context {
             else {
                 continue;
             };
-            if content.len() <= SUPERSEDED_TOOL_RESULT.len() || asks.contains(tool_call_id.as_str())
+            if content.len() <= SUPERSEDED_TOOL_RESULT.len()
+                || kept_calls.contains(tool_call_id.as_str())
             {
                 continue;
             }
@@ -1202,8 +1366,19 @@ fn attachment_excerpt(content: &str) -> String {
         .collect()
 }
 
-/// Joins the live tail blocks into the single trailing system message.
-fn render_tail(tail: &[Block]) -> Option<Message> {
+/// Drops reasoning states bound to the conversation prefix that produced them.
+///
+/// Anthropic thinking blocks verify the surrounding prefix and fail with a 400
+/// when replayed after a client-side compaction handoff, whereas `OpenAI`'s
+/// encrypted items and Gemini's signatures remain valid.
+fn strip_prefix_bound_reasoning(message: &mut Message) {
+    if let Message::Assistant { reasoning, .. } = message {
+        reasoning.retain(|state| state.provider() != "claude");
+    }
+}
+
+/// Joins the live tail blocks into their rendered text.
+fn render_tail_text(tail: &[Block]) -> Option<String> {
     let mut rendered = String::new();
     for block in tail {
         if block.is_empty() {
@@ -1214,7 +1389,12 @@ fn render_tail(tail: &[Block]) -> Option<Message> {
         }
         rendered.push_str(block.content());
     }
-    (!rendered.is_empty()).then(|| Message::system(rendered))
+    (!rendered.is_empty()).then_some(rendered)
+}
+
+/// Joins the live tail blocks into the single trailing system message.
+fn render_tail(tail: &[Block]) -> Option<Message> {
+    render_tail_text(tail).map(Message::system)
 }
 
 /// Approximate rendered size of a message, tool calls included.
@@ -1954,34 +2134,30 @@ mod tests {
         )
     }
 
-    /// Pushes one answered `ask_user` exchange and returns its question.
+    /// Pushes one answered kept tool exchange alongside an unkept sibling call.
     fn push_exchange(context: &mut Context, id: &str, question: &str, answer: &str) {
         context.push(Message::assistant_with_tool_calls(
             "thinking out loud",
             vec![
                 tool_call(
                     id,
-                    "ask_user",
+                    "decision",
                     serde_json::json!({"question": question, "option": ["yes", "no"]}),
                 ),
-                tool_call(&format!("{id}-x"), "terminal", serde_json::json!({})),
+                tool_call(&format!("{id}-x"), "scratch", serde_json::json!({})),
             ],
         ));
-        context.push(Message::tool(format!("{id}-x"), "terminal output"));
-        context.push_kept(Message::tool(
-            id,
-            format!("The user answered:\n- {answer}\n"),
-        ));
+        context.push(Message::tool(format!("{id}-x"), "scratch output"));
+        context.push_kept(Message::tool(id, format!("Recorded answer:\n- {answer}\n")));
     }
 
-    /// Pushes one `terminal` call running `command`, with its result, kept
-    /// through compaction or not.
-    fn push_terminal_call(context: &mut Context, id: &str, command: &str, kept: bool) {
+    /// Pushes one tool call with its result, kept through compaction or not.
+    fn push_tool_exchange(context: &mut Context, id: &str, command: &str, kept: bool) {
         context.push(Message::assistant_with_tool_calls(
             "running it",
             vec![tool_call(
                 id,
-                "terminal",
+                "runner",
                 serde_json::json!({"command": command}),
             )],
         ));
@@ -1994,10 +2170,10 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_terminal_exchange_survives_a_handoff_and_an_ordinary_one_does_not() {
+    fn a_kept_tool_exchange_survives_a_handoff_and_an_ordinary_one_does_not() {
         let mut context = Context::new();
-        push_terminal_call(&mut context, "kept", "ask_user q", true);
-        push_terminal_call(&mut context, "plain", "ls", false);
+        push_tool_exchange(&mut context, "kept", "confirm q", true);
+        push_tool_exchange(&mut context, "plain", "ls", false);
         let fork = context.fork_point();
 
         context.apply_handoff(handoff(), fork, 0, &HashSet::new());
@@ -2006,16 +2182,16 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].tool_calls().len(), 1);
         assert_eq!(recent[0].tool_calls()[0].id, "kept");
-        assert_eq!(recent[0].tool_calls()[0].name, "terminal");
+        assert_eq!(recent[0].tool_calls()[0].name, "runner");
         assert_eq!(recent[0].content(), "");
-        assert_eq!(recent[1].content(), "ask_user q output");
+        assert_eq!(recent[1].content(), "confirm q output");
     }
 
     #[test]
     fn the_kept_tag_round_trips_through_a_checkpoint() {
         let mut context = Context::new();
-        push_terminal_call(&mut context, "kept", "ask_user q", true);
-        push_terminal_call(&mut context, "plain", "ls", false);
+        push_tool_exchange(&mut context, "kept", "confirm q", true);
+        push_tool_exchange(&mut context, "plain", "ls", false);
 
         let json = serde_json::to_string(&context.checkpoint()).unwrap();
         let checkpoint: ContextCheckpoint = serde_json::from_str(&json).unwrap();
@@ -2048,7 +2224,7 @@ mod tests {
     }
 
     #[test]
-    fn every_ask_user_exchange_survives_the_handoff_whatever_its_size() {
+    fn every_kept_exchange_survives_the_handoff_whatever_its_size() {
         let mut context = Context::new();
         context.push(Message::user("start"));
         let long_answer = "a long considered answer ".repeat(2_000);
@@ -2283,16 +2459,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unanswered_ask_user_call_is_not_kept() {
+    fn an_unanswered_call_below_the_fork_is_not_kept() {
         let mut context = Context::new();
         context.push(Message::assistant_with_tool_calls(
             "",
             vec![tool_call(
-                "ask-0",
-                "ask_user",
+                "call-0",
+                "confirm",
                 serde_json::json!({"question": "q"}),
             )],
         ));
+        context.push(Message::user("move on"));
         let fork = context.fork_point();
 
         context.apply_handoff(handoff(), fork, 0, &HashSet::new());
@@ -2301,15 +2478,158 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_answers_are_neither_tombstoned_nor_spilled() {
+    fn applying_a_handoff_strips_prefix_bound_reasoning_from_kept_items() {
+        let mut context = Context::new();
+        context.push(Message::user("old work"));
+        let fork = context.fork_point();
+        context.push(Message::assistant_with_reasoning(
+            "kept turn",
+            vec![tool_call("c1", "terminal", serde_json::json!({}))],
+            vec![
+                aither_core::llm::ReasoningState::new("claude", "sig-bound"),
+                aither_core::llm::ReasoningState::new("openai", "enc-item"),
+                aither_core::llm::ReasoningState::new("gemini", "sig-gem"),
+            ],
+        ));
+        context.push(Message::tool("c1", "done"));
+
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
+
+        let kept: Vec<&Message> = context.recent();
+        assert_eq!(kept.len(), 2);
+        let reasoning = kept[0].reasoning();
+        assert_eq!(reasoning.len(), 2);
+        assert_eq!(reasoning[0].provider(), "openai");
+        assert_eq!(reasoning[0].payload(), "enc-item");
+        assert_eq!(reasoning[1].provider(), "gemini");
+        assert_eq!(kept[0].content(), "kept turn");
+        assert_eq!(kept[0].tool_calls().len(), 1);
+        assert_eq!(kept[1].content(), "done");
+    }
+
+    #[test]
+    fn fork_point_never_splits_an_open_tool_round() {
+        let mut context = Context::new();
+        context.push(Message::user("closed round"));
+        let round_start = context.push(Message::assistant_with_tool_calls(
+            "",
+            vec![
+                tool_call("a", "read", serde_json::json!({})),
+                tool_call("b", "read", serde_json::json!({})),
+            ],
+        ));
+        context.push(Message::tool("a", "one result"));
+        context.push(Message::system("<alert>concurrent alert</alert>"));
+
+        // One result is still missing: even with an alert appended after the
+        // partial result, the fork point backs up to the assistant turn.
+        assert_eq!(context.fork_point(), round_start);
+
+        context.push(Message::tool("b", "two result"));
+        assert_eq!(context.fork_point(), context.next_seq());
+    }
+
+    #[test]
+    fn mark_kept_preserves_an_existing_exchange_in_place() {
+        let mut context = Context::new();
+        context.push(Message::user("first"));
+        context.push(Message::assistant_with_tool_calls(
+            "",
+            vec![tool_call("keep-me", "confirm", serde_json::json!({}))],
+        ));
+        context.push(Message::tool("keep-me", "confirmed"));
+        context.push(Message::user("later"));
+        assert!(context.mark_kept("keep-me"));
+        assert!(!context.mark_kept("missing"));
+
+        let fork = context.fork_point();
+        context.apply_handoff(handoff(), fork, "later".len(), &HashSet::new());
+
+        let recent = context.recent();
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].tool_calls()[0].id, "keep-me");
+        assert_eq!(recent[1].content(), "confirmed");
+        assert_eq!(recent[2].content(), "later");
+    }
+
+    #[test]
+    fn build_request_enforces_mid_conversation_system_adjacency_and_coalescing() {
+        let mut context = laid_out();
+        context
+            .instructions_mut()
+            .insert_tagged(&InstructionSlot::BASE_SYSTEM, "base");
+        context.push(Message::user("u1"));
+        context.push(Message::system("<alert>a1</alert>"));
+        context.push(Message::system("<alert>a2</alert>"));
+        context.push(Message::assistant("reply"));
+        // Post-assistant stop reminder with no new user message yet.
+        context.push(Message::system(
+            "<system-reminder>continue</system-reminder>",
+        ));
+
+        let mid_turn = context.build_request(&[Block::new("tasks", "<tasks>open</tasks>")]);
+        // Expected: [System(base), User(u1), System(a1\na2), Assistant(reply), User(continue), System(tasks)]
+        assert_eq!(mid_turn.len(), 6, "{mid_turn:?}");
+        assert_eq!(mid_turn[1].role(), Role::User);
+        assert_eq!(mid_turn[2].role(), Role::System);
+        assert_eq!(
+            mid_turn[2].content(),
+            "<alert>a1</alert>\n<alert>a2</alert>"
+        );
+        assert_eq!(mid_turn[3].role(), Role::Assistant);
+        assert_eq!(mid_turn[4].role(), Role::User);
+        assert_eq!(
+            mid_turn[4].content(),
+            "<system-reminder>continue</system-reminder>"
+        );
+        assert_eq!(mid_turn[5].role(), Role::System);
+        assert_eq!(mid_turn[5].content(), "<tasks>open</tasks>");
+
+        // Once a new user turn arrives after the reminder, the reminder slides
+        // after that user turn and coalesces with the tail as `Role::System`.
+        context.push(Message::user("u2"));
+        let next_run = context.build_request(&[Block::new("tasks", "<tasks>v2</tasks>")]);
+        // Expected: [System(base), User(u1), System(a1\na2), Assistant(reply), User(u2), System(continue\nv2)]
+        assert_eq!(next_run.len(), 6, "{next_run:?}");
+        assert_eq!(next_run[4].role(), Role::User);
+        assert_eq!(next_run[4].content(), "u2");
+        assert_eq!(next_run[5].role(), Role::System);
+        assert_eq!(
+            next_run[5].content(),
+            "<system-reminder>continue</system-reminder>\n<tasks>v2</tasks>"
+        );
+    }
+
+    #[test]
+    fn handoff_and_conversation_rewrites_rotate_prompt_cache_epoch() {
+        let mut context = Context::new();
+        let mut cache = crate::context::PromptCache::new("session");
+        context.push(Message::user("hello"));
+        assert!(!cache.observe_prefix(context.stable_prefix_fingerprint()));
+        assert_eq!(cache.epoch(), 0);
+
+        // Pure appends leave the stable prefix fingerprint unchanged.
+        context.push(Message::assistant("world"));
+        assert!(!cache.observe_prefix(context.stable_prefix_fingerprint()));
+        assert_eq!(cache.epoch(), 0);
+
+        // Applying a handoff advances the epoch.
+        let fork = context.fork_point();
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
+        assert!(cache.observe_prefix(context.stable_prefix_fingerprint()));
+        assert_eq!(cache.epoch(), 1);
+    }
+
+    #[test]
+    fn kept_exchanges_are_neither_tombstoned_nor_spilled() {
         let mut context = Context::new();
         let answer = "the same long answer ".repeat(64);
-        for id in ["ask-0", "ask-1"] {
+        for id in ["kept-0", "kept-1"] {
             context.push(Message::assistant_with_tool_calls(
                 "",
                 vec![tool_call(
                     id,
-                    "ask_user",
+                    "decision",
                     serde_json::json!({"question": "q"}),
                 )],
             ));

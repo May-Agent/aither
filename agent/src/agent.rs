@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(feature = "skills")]
 use crate::context::SkillCatalogEntry;
@@ -44,9 +44,9 @@ use aither_core::{
     LanguageModel,
     llm::{
         AnyApprover, Approval, ApprovalRequest, Approver, ApproverFailure, Attachment,
-        CancelSignal, Canceller, Event, LLMRequest, Message, ReasoningState, RetryPolicy, Role,
-        TokenCounting, ToolCall, ToolCallId,
-        model::{Ability, Parameters, Profile as ModelProfile},
+        CancelSignal, Canceller, Event, Failure, LLMRequest, Message, ReasoningState, RetryPolicy,
+        Role, TokenCounting, ToolCall, ToolCallId,
+        model::{Ability, ClaudePromptCacheTtl, Parameters, Profile as ModelProfile},
         tool::{Progress, ProgressSink},
     },
 };
@@ -103,7 +103,6 @@ struct ModelTurn {
     reasoning: Vec<ReasoningState>,
     /// What the provider reported the request used, if it did.
     usage: Option<aither_core::llm::Usage>,
-    malformed_function_call: bool,
 }
 
 /// Streams agent events to the consumer as they happen.
@@ -115,6 +114,8 @@ struct EventSink {
     sender: async_channel::Sender<TimedEvent>,
     /// The agent the sink emits for, stamped on every event.
     agent: AgentPath,
+    /// Time source stamped onto emitted events.
+    clock: crate::AnyClock,
     /// Where the run records its checkpoints for [`Run::checkpoints`].
     checkpoints: Checkpoints,
 }
@@ -133,7 +134,7 @@ impl EventSink {
 
     fn emit(&self, event: AgentEvent) {
         let _ = self.sender.try_send(TimedEvent {
-            at: jiff::Timestamp::now(),
+            at: self.clock.utc_now(),
             agent: self.agent.clone(),
             event,
         });
@@ -197,7 +198,11 @@ impl<F> Run<F>
 where
     F: Future<Output = Result<(), AgentError>>,
 {
-    fn new(agent: AgentPath, start: impl FnOnce(EventSink, CancelSignal) -> F) -> Self {
+    fn new(
+        agent: AgentPath,
+        clock: crate::AnyClock,
+        start: impl FnOnce(EventSink, CancelSignal) -> F,
+    ) -> Self {
         let (sender, events) = async_channel::unbounded();
         let cancel = CancelHandle::default();
         let checkpoints = Checkpoints::default();
@@ -205,6 +210,7 @@ where
         let sink = EventSink {
             sender,
             agent,
+            clock,
             checkpoints: checkpoints.clone(),
         };
         Self {
@@ -395,6 +401,8 @@ struct BrokenStream {
     error: AgentError,
     /// Whether an event arrived before the error: the stream had opened.
     opened: bool,
+    /// Whether the provider reported a malformed function call.
+    malformed: bool,
     /// What the provider reported the broken request used, if it did.
     usage: Option<aither_core::llm::Usage>,
 }
@@ -408,6 +416,8 @@ pub struct FinishedToolCall {
     attachments: Vec<Attachment>,
     /// Context an `after_tool` hook appended, to follow the turn's results.
     appended: Option<String>,
+    /// Whether the tool exchange is marked to survive compaction verbatim.
+    kept: bool,
 }
 
 pub type ToolExecutionResult = Result<FinishedToolCall, AgentError>;
@@ -417,6 +427,7 @@ struct ToolRun<'a, H> {
     hooks: &'a H,
     tools: &'a AgentTools,
     events: &'a EventSink,
+    clock: &'a crate::AnyClock,
     cancel: &'a CancelSignal,
     approver: Option<&'a AnyApprover>,
     identity: aither_core::llm::CallIdentity,
@@ -515,7 +526,7 @@ impl<H: Hooks> ToolRun<'_, H> {
                 Duration::ZERO,
             )
         } else {
-            let start = Instant::now();
+            let start = self.clock.now();
             // A panic from the tool ends only this call: it becomes the
             // call's failed result, so the other calls of the turn finish and
             // the run goes on. The panic hook has already run by the time the
@@ -531,7 +542,7 @@ impl<H: Hooks> ToolRun<'_, H> {
                 tracing::error!(tool = %panic.name, message = %panic.message, "tool panicked");
                 Err(panic.into())
             });
-            (result, start.elapsed())
+            (result, self.clock.since(start))
         };
         let mut outcome = ToolOutcome {
             call: self.identity.clone(),
@@ -540,26 +551,8 @@ impl<H: Hooks> ToolRun<'_, H> {
             result,
             duration,
         };
-        let mut attachments = Vec::new();
-        let mut appended = None;
-        match self.hooks.after_tool(&outcome).await {
-            AfterTool::Keep => {}
-            AfterTool::Replace(replacement) => outcome.result = Ok(replacement),
-            AfterTool::ReplaceWithAttachments {
-                result,
-                attachments: attached,
-            } => {
-                outcome.result = Ok(result);
-                attachments = attached;
-            }
-            AfterTool::Append(context) => appended = Some(context),
-            AfterTool::Abort(reason) => {
-                return Err(AgentError::HookRejected {
-                    hook: "after_tool".into(),
-                    reason,
-                });
-            }
-        }
+        let decision = self.hooks.after_tool(&outcome).await;
+        let (attachments, appended, kept) = apply_after_tool(decision, &mut outcome)?;
         self.events.emit(AgentEvent::ToolCallEnded {
             call: self.identity.call().clone(),
             result: outcome.for_model(),
@@ -569,8 +562,42 @@ impl<H: Hooks> ToolRun<'_, H> {
             outcome,
             attachments,
             appended,
+            kept,
         })
     }
+}
+
+fn apply_after_tool(
+    mut decision: AfterTool,
+    outcome: &mut ToolOutcome,
+) -> Result<(Vec<Attachment>, Option<String>, bool), AgentError> {
+    let mut attachments = Vec::new();
+    let mut appended = None;
+    let mut kept = false;
+    while let AfterTool::Kept(inner) = decision {
+        kept = true;
+        decision = *inner;
+    }
+    match decision {
+        AfterTool::Keep => {}
+        AfterTool::Replace(replacement) => outcome.result = Ok(replacement),
+        AfterTool::ReplaceWithAttachments {
+            result,
+            attachments: attached,
+        } => {
+            outcome.result = Ok(result);
+            attachments = attached;
+        }
+        AfterTool::Append(context) => appended = Some(context),
+        AfterTool::Kept(_) => unreachable!("unwrapped above"),
+        AfterTool::Abort(reason) => {
+            return Err(AgentError::HookRejected {
+                hook: "after_tool".into(),
+                reason,
+            });
+        }
+    }
+    Ok((attachments, appended, kept))
 }
 
 /// Reports a running tool's progress as events.
@@ -708,7 +735,7 @@ impl<'a> Response<'a> {
 /// What a model event asks the stream loop to do.
 enum ModelEventAction {
     Continue,
-    RetryMalformed,
+    RetryMalformed(AgentError),
 }
 
 fn handle_model_event(
@@ -786,9 +813,11 @@ fn handle_model_event(
             response.usage = Some(usage);
             Ok(ModelEventAction::Continue)
         }
-        Err(AgentError::Llm { message, .. }) if message.contains("malformed function call") => {
+        Err(error @ AgentError::Llm { .. })
+            if error.to_string().contains("malformed function call") =>
+        {
             tracing::warn!("Model generated malformed function call, retrying...");
-            Ok(ModelEventAction::RetryMalformed)
+            Ok(ModelEventAction::RetryMalformed(error))
         }
         Err(error) => Err(error),
     }
@@ -997,8 +1026,14 @@ pub struct Agent<M, H = (), C = M, Schema = HandoffDocument> {
     /// offline.
     pub(crate) connectivity: crate::connectivity::Watch,
 
-    /// Directory files are restored from after a forked compaction.
-    pub(crate) restore_dir: Option<PathBuf>,
+    /// Readable directories files may be restored from after a compaction.
+    pub(crate) restore_roots: Vec<PathBuf>,
+
+    /// Writable directory where compaction recovery spills long tool outputs.
+    pub(crate) spill_dir: Option<PathBuf>,
+
+    /// Time source shared with cache warmth, emitted events, and committed items.
+    pub(crate) clock: crate::AnyClock,
 
     /// How the handoff's file index finds the files tool results name.
     pub(crate) file_references: Option<AnyFileReferences>,
@@ -1049,8 +1084,12 @@ impl<M: LanguageModel> Agent<M> {
     #[must_use]
     pub fn with_config(llm: M, config: AgentConfig) -> Self {
         let prompt_cache = PromptCache::new(uuid::Uuid::new_v4().to_string());
+        let clock = crate::AnyClock::default();
+        let mut context = Context::default();
+        context.set_clock(clock.clone());
         Self {
-            warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), crate::AnyClock::default()),
+            warmth: crate::CacheWarmth::new(prompt_cache.lifetime(), clock.clone()),
+            clock,
             model: Arc::new(llm),
             compaction_model: None,
             parameters: Box::default(),
@@ -1061,7 +1100,7 @@ impl<M: LanguageModel> Agent<M> {
             approver: None,
             pauses: Arc::default(),
             config,
-            context: Context::default(),
+            context,
             budget: ContextBudget::default(),
             prompt_cache,
             context_sources: Vec::new(),
@@ -1079,7 +1118,8 @@ impl<M: LanguageModel> Agent<M> {
             compaction_profile: None,
             initialized: false,
             connectivity: crate::connectivity::Watch::default(),
-            restore_dir: None,
+            restore_roots: Vec::new(),
+            spill_dir: None,
             file_references: None,
             last_request: None,
             delivering: None,
@@ -1142,9 +1182,11 @@ where
         &mut self,
         mut request: LLMRequest,
         prefix: &PromptPrefix,
+        mut pending_tail: Option<RenderedTail>,
         events: &EventSink,
     ) -> Result<ModelTurn, AgentError> {
         let policy = self.retry_policy();
+        let retry_request = request.clone();
         let mut retries = 0;
         loop {
             let id = RequestId::new(self.request_ids);
@@ -1153,7 +1195,10 @@ where
                 request: id,
                 prefix: prefix.clone(),
             });
-            let broken = match self.stream_model_turn(request, id, events).await {
+            let broken = match self
+                .stream_model_turn(request, &retry_request, id, &mut pending_tail, events)
+                .await
+            {
                 Ok(turn) => {
                     events.emit(AgentEvent::RequestEnded {
                         request: id,
@@ -1164,24 +1209,27 @@ where
                 }
                 Err(broken) => broken,
             };
-            let failure = match broken.error.failure() {
-                Some(failure)
-                    if broken.opened
+            let retry_failure = if broken.malformed {
+                let transient = Failure::transient();
+                (policy.allows(retries, &transient) && !self.connectivity.is_offline())
+                    .then_some(transient)
+            } else {
+                broken.error.failure().copied().filter(|failure| {
+                    broken.opened
                         && policy.allows(retries, failure)
-                        && !self.connectivity.is_offline() =>
-                {
-                    *failure
-                }
-                _ => {
-                    events.emit(AgentEvent::RequestEnded {
-                        request: id,
-                        usage: broken.usage,
-                        outcome: RequestOutcome::Failed {
-                            error: broken.error.clone(),
-                        },
-                    });
-                    return Err(broken.error);
-                }
+                        && !self.connectivity.is_offline()
+                })
+            };
+            let Some(failure) = retry_failure else {
+                self.delivering = None;
+                events.emit(AgentEvent::RequestEnded {
+                    request: id,
+                    usage: broken.usage,
+                    outcome: RequestOutcome::Failed {
+                        error: broken.error.clone(),
+                    },
+                });
+                return Err(broken.error);
             };
             let delay = policy.delay(retries, &failure);
             retries += 1;
@@ -1190,7 +1238,7 @@ where
                 max_retries = policy.max_retries,
                 delay_ms = delay.as_millis(),
                 error = %broken.error,
-                "model response stream broke mid-response; sending the request again"
+                "model response stream failed retryably; sending the request again"
             );
             events.emit(AgentEvent::RequestEnded {
                 request: id,
@@ -1202,29 +1250,74 @@ where
                     delay,
                 },
             });
-            async_io::Timer::after(delay).await;
-            request = self
-                .last_request
-                .clone()
-                .expect("a request that reached the model is recorded as the last request");
+            if !delay.is_zero() {
+                async_io::Timer::after(delay).await;
+            }
+            request = retry_request.clone();
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "borrows disjoint fields while `self.model` and `self.connectivity` back the active stream"
+    )]
+    async fn mark_request_opened(
+        context_sources: &mut [AnyContextSource],
+        context: &mut Context,
+        delivering: &mut Option<u64>,
+        warmth: &crate::CacheWarmth,
+        idle_compacted: &mut bool,
+        prefix_rewrites: &mut PrefixRewrites,
+        requests_sent: &mut u64,
+        last_request: &mut Option<LLMRequest>,
+        sent_request: &LLMRequest,
+        pending_tail: &mut Option<RenderedTail>,
+    ) {
+        if let Some(tail) = pending_tail.take() {
+            Self::commit_tail(context_sources, &tail).await;
+        }
+        context.mark_prefix_carried();
+        if let Some(carried) = delivering.take() {
+            context.mark_delivered_below(carried);
+        }
+        warmth.start_entry_now();
+        *idle_compacted = false;
+        *prefix_rewrites = PrefixRewrites::default();
+        *requests_sent += 1;
+        *last_request = Some(sent_request.clone());
     }
 
     /// One attempt at streaming the model's response to `request`.
     async fn stream_model_turn(
         &mut self,
         request: LLMRequest,
+        sent_request: &LLMRequest,
         id: RequestId,
+        pending_tail: &mut Option<RenderedTail>,
         events: &EventSink,
     ) -> Result<ModelTurn, Box<BrokenStream>> {
         let mut response = Response::new(events, id);
-        let mut malformed_function_call = false;
         let mut opened = false;
 
         let stream = Self::respond_stream(&self.model, &self.connectivity, request);
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
-            let received = event.is_ok();
+            if !opened && event.is_ok() {
+                Self::mark_request_opened(
+                    &mut self.context_sources,
+                    &mut self.context,
+                    &mut self.delivering,
+                    &self.warmth,
+                    &mut self.idle_compacted,
+                    &mut self.prefix_rewrites,
+                    &mut self.requests_sent,
+                    &mut self.last_request,
+                    sent_request,
+                    pending_tail,
+                )
+                .await;
+                opened = true;
+            }
             let action = handle_model_event(
                 &mut self.cache_stats,
                 &mut self.budget,
@@ -1236,17 +1329,34 @@ where
                 Box::new(BrokenStream {
                     error,
                     opened,
+                    malformed: false,
                     usage: response.usage.take(),
                 })
             })?;
-            if received && let Some(carried) = self.delivering.take() {
-                self.context.mark_delivered_below(carried);
+            if let ModelEventAction::RetryMalformed(error) = action {
+                response.end_block();
+                return Err(Box::new(BrokenStream {
+                    error,
+                    opened,
+                    malformed: true,
+                    usage: response.usage.take(),
+                }));
             }
-            opened |= received;
-            if matches!(action, ModelEventAction::RetryMalformed) {
-                malformed_function_call = true;
-                break;
-            }
+        }
+        if !opened {
+            Self::mark_request_opened(
+                &mut self.context_sources,
+                &mut self.context,
+                &mut self.delivering,
+                &self.warmth,
+                &mut self.idle_compacted,
+                &mut self.prefix_rewrites,
+                &mut self.requests_sent,
+                &mut self.last_request,
+                sent_request,
+                pending_tail,
+            )
+            .await;
         }
         response.end_block();
 
@@ -1255,7 +1365,6 @@ where
             tool_calls: response.tool_calls,
             reasoning: response.reasoning,
             usage: response.usage,
-            malformed_function_call,
         })
     }
 
@@ -1391,20 +1500,16 @@ where
         turn: usize,
     ) -> Result<TurnControl, AgentError> {
         let events = cx.events;
-        let Some((request, prefix)) = self.prepare_request(cx, turn).await? else {
+        let Some((request, prefix, pending_tail)) = self.prepare_request(cx, turn).await? else {
             Self::end_turn(cx, turn, 0);
             return Ok(TurnControl::Break(LoopEnd::Paused(
                 RunPause::ContextExhausted,
             )));
         };
         let model_turn = self
-            .run_turn_racing_compaction(request, &prefix, events)
+            .run_turn_racing_compaction(request, &prefix, pending_tail, events)
             .await?;
 
-        if model_turn.malformed_function_call {
-            Self::end_turn(cx, turn, 0);
-            return Ok(TurnControl::Continue);
-        }
         let response_text = model_turn.response_text;
         let tool_calls = model_turn.tool_calls;
         ensure_non_empty_tool_call_ids(&tool_calls, &response_text)?;
@@ -1441,13 +1546,14 @@ where
         &mut self,
         request: LLMRequest,
         prefix: &PromptPrefix,
+        pending_tail: RenderedTail,
         events: &EventSink,
     ) -> Result<ModelTurn, AgentError> {
         let mut pending = self.compaction.take_running();
         let mut landed = None;
 
         let turn = {
-            let turn = self.collect_model_turn(request, prefix, events);
+            let turn = self.collect_model_turn(request, prefix, Some(pending_tail), events);
             futures_lite::pin!(turn);
             loop {
                 let step = match pending.as_mut() {
@@ -1560,20 +1666,26 @@ where
                 .iter()
                 .position(|result| matches!(result, Ok(finished) if finished.id == call.id))
                 .and_then(|index| parked.remove(index));
-            let (content, attachments) = match finished {
+            let (content, attachments, kept) = match finished {
                 Some(Ok(finished)) => (
                     finished.outcome.for_model().render_for_model(),
                     finished.attachments,
+                    finished.kept,
                 ),
                 _ => (
                     CancelledToolCallTemplate { tool: &call.name }
                         .render()
                         .expect("cancelled tool call template must render"),
                     Vec::new(),
+                    false,
                 ),
             };
-            self.context
-                .push(Message::tool(&call.id, content).with_attachments(attachments));
+            let message = Message::tool(&call.id, content).with_attachments(attachments);
+            if kept {
+                self.context.push_kept(message);
+            } else {
+                self.context.push(message);
+            }
         }
     }
 
@@ -1604,7 +1716,7 @@ where
             })
         });
         let incoming = self.subagents.as_ref().map(|runs| runs.incoming().clone());
-        let (hooks, tools, agent) = (&self.hooks, &self.tools, &self.identity);
+        let (hooks, tools, agent, clock) = (&self.hooks, &self.tools, &self.identity, &self.clock);
         let results = &mut self.tool_results;
         let tool_futures = tool_calls.iter().map(|call| {
             let identity = aither_core::llm::CallIdentity::new(
@@ -1617,6 +1729,7 @@ where
                     hooks,
                     tools,
                     events: cx.events,
+                    clock,
                     cancel: cx.cancel,
                     approver: approver.as_ref(),
                     identity,
@@ -1671,13 +1784,16 @@ where
         let mut appended = Vec::new();
         while let Some(result) = self.tool_results.pop_front() {
             let finished = result?;
-            self.context.push(
-                Message::tool(
-                    &finished.id,
-                    finished.outcome.for_model().render_for_model(),
-                )
-                .with_attachments(finished.attachments),
-            );
+            let message = Message::tool(
+                &finished.id,
+                finished.outcome.for_model().render_for_model(),
+            )
+            .with_attachments(finished.attachments);
+            if finished.kept {
+                self.context.push_kept(message);
+            } else {
+                self.context.push(message);
+            }
             outcomes.push(finished.outcome);
             appended.extend(finished.appended);
         }
@@ -1769,6 +1885,26 @@ where
         self.prompt_cache.lifetime()
     }
 
+    /// Updates how long the provider's prompt-cache entry stays warm without a
+    /// hit, taking effect immediately for [`cache_warmth`](Self::cache_warmth),
+    /// idle compaction, and cold-cache reassembly.
+    pub fn set_cache_lifetime(&mut self, lifetime: CacheLifetime) {
+        self.prompt_cache.set_lifetime(lifetime);
+        self.warmth.set_lifetime(lifetime);
+    }
+
+    /// The configured Claude cache breakpoint retention.
+    #[must_use]
+    pub const fn claude_cache_ttl(&self) -> ClaudePromptCacheTtl {
+        self.prompt_cache.ttl()
+    }
+
+    /// Updates the Claude cache breakpoint retention from the next request on,
+    /// leaving [`cache_lifetime`](Self::cache_lifetime) unchanged.
+    pub const fn set_claude_cache_ttl(&mut self, ttl: ClaudePromptCacheTtl) {
+        self.prompt_cache.set_ttl(ttl);
+    }
+
     /// Performs a one-shot query and returns the final response.
     ///
     /// This is the simplest way to use the agent. The agent handles tool
@@ -1834,6 +1970,7 @@ where
         let attachments: Vec<Attachment> = attachments.into_iter().collect();
         Run::new(
             AgentPath::of(&self.identity),
+            self.clock.clone(),
             move |sink, cancel| async move {
                 self.run_streaming(prompt, attachments, &sink, &cancel)
                     .await
@@ -1847,6 +1984,7 @@ where
     pub fn resume(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         Run::new(
             AgentPath::of(&self.identity),
+            self.clock.clone(),
             move |sink, cancel| async move { self.resume_streaming(&sink, &cancel).await },
         )
     }
@@ -1931,6 +2069,7 @@ where
         let focus = focus.map(str::to_string);
         Run::new(
             AgentPath::of(&self.identity),
+            self.clock.clone(),
             move |sink, _cancel| async move {
                 self.finish_lost_compaction(&sink);
                 Box::pin(self.compact_streaming(
@@ -1982,8 +2121,9 @@ where
             return Ok(None);
         }
         let definitions = self.tools.active_definitions();
-        let messages = self.request_messages(&self.last_tail);
-        let request = self.compaction_request(messages, definitions);
+        let messages = self.request_messages(&[]);
+        let has_trailing_system = has_trailing_mid_conversation_system(&messages);
+        let request = self.compaction_request(messages, definitions, has_trailing_system);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
         #[cfg(not(feature = "skills"))]
@@ -2157,8 +2297,17 @@ where
     /// live `tail`: its effort updates are left out when the model cannot
     /// read them.
     fn request_messages(&self, tail: &[Block]) -> Vec<Message> {
-        let mut messages = self.context.build_request(tail);
-        if !self.takes_per_message_effort() {
+        Self::filter_request_messages(
+            self.context.build_request(tail),
+            self.takes_per_message_effort(),
+        )
+    }
+
+    fn filter_request_messages(
+        mut messages: Vec<Message>,
+        takes_per_message_effort: bool,
+    ) -> Vec<Message> {
+        if !takes_per_message_effort {
             messages.retain(|message| message.role() != Role::Configuration);
         }
         messages
@@ -2177,6 +2326,7 @@ where
         &self,
         mut messages: Vec<Message>,
         definitions: Vec<aither_core::llm::tool::ToolDefinition>,
+        has_tail: bool,
     ) -> LLMRequest {
         if self.compaction_model.is_some() {
             messages.retain(|message| message.role() != Role::Configuration);
@@ -2190,6 +2340,7 @@ where
             &messages,
             !definitions.is_empty(),
             self.compaction_takes_mid_conversation_system(),
+            has_tail,
         );
         LLMRequest::new(messages)
             .with_parameters(parameters)
@@ -2275,6 +2426,7 @@ where
     pub fn compact_when_idle(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         Run::new(
             AgentPath::of(&self.identity),
+            self.clock.clone(),
             move |sink, _cancel| async move {
                 self.finish_lost_compaction(&sink);
                 if self.idle_compaction_due_in() != Some(Duration::ZERO) {
@@ -2398,28 +2550,23 @@ where
         let handoff = completed.handoff.clone();
         let restoration = completed.restoration.clone();
         let attachment_catalog = completed.attachment_catalog.clone();
-        let restored = match self.restore_dir.clone() {
-            Some(restore_dir) => {
-                let tokens = self
-                    .budget
-                    .fraction_tokens(self.config.context_policy.restore_budget);
-                let budget_chars = self.budget.chars_for_tokens(tokens);
-                #[cfg(feature = "skills")]
-                let skills = self.skill_catalog();
-                #[cfg(not(feature = "skills"))]
-                let skills = Vec::new();
-                restore_context(
-                    &restoration,
-                    handoff.file_index(),
-                    &[restore_dir],
-                    &skills,
-                    &attachment_catalog,
-                    budget_chars,
-                )
-                .await
-            }
-            None => None,
-        };
+        let tokens = self
+            .budget
+            .fraction_tokens(self.config.context_policy.restore_budget);
+        let budget_chars = self.budget.chars_for_tokens(tokens);
+        #[cfg(feature = "skills")]
+        let skills = self.skill_catalog();
+        #[cfg(not(feature = "skills"))]
+        let skills = Vec::new();
+        let restored = restore_context(
+            &restoration,
+            handoff.file_index(),
+            &self.restore_roots,
+            &skills,
+            &attachment_catalog,
+            budget_chars,
+        )
+        .await;
 
         // From here there is no await: the handoff, the cleanup and the
         // restored block commit together.
@@ -2521,7 +2668,8 @@ where
         let report = clean_for_recovery(
             &mut self.context,
             fork_point,
-            self.restore_dir.as_deref(),
+            self.spill_dir.as_deref(),
+            self.restore_roots.first().map(PathBuf::as_path),
             limits,
         )
         .await
@@ -2551,19 +2699,25 @@ where
     ///
     /// Separate from assembling the tail so that only a request that
     /// actually goes out advances a source's baseline.
-    async fn commit_tail(&mut self, tail: &RenderedTail) {
-        for (index, source) in self.context_sources.iter_mut().enumerate() {
-            let sent: Vec<Block> = tail
-                .blocks
-                .iter()
-                .zip(&tail.sources)
-                .filter(|(_, owner)| **owner == Some(index))
-                .map(|(block, _)| block.clone())
-                .collect();
-            if !sent.is_empty() {
+    async fn commit_tail(context_sources: &mut [AnyContextSource], tail: &RenderedTail) {
+        let commits: Vec<_> = context_sources
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, source)| {
+                let sent: Vec<Block> = tail
+                    .blocks
+                    .iter()
+                    .zip(&tail.sources)
+                    .filter(|(_, owner)| **owner == Some(index))
+                    .map(|(block, _)| block.clone())
+                    .collect();
+                (!sent.is_empty()).then_some((source, sent))
+            })
+            .map(|(source, sent)| async move {
                 source.committed(&sent).await;
-            }
-        }
+            })
+            .collect();
+        futures::future::join_all(commits).await;
     }
 
     /// Brings every live source's block to what it renders now.
@@ -2613,16 +2767,26 @@ where
     fn take_blocks(
         &mut self,
         events: &EventSink,
-        source: &SourceId,
-        owner: Option<usize>,
+        (source, owner): (&SourceId, Option<usize>),
         moment: Moment,
         blocks: Vec<ContextBlock>,
         tail: &mut RenderedTail,
+        mut dedup_stable: Option<&mut HashSet<(SourceId, String, String)>>,
     ) -> bool {
         let mut stable = false;
         for block in blocks {
             match block.placement() {
                 Placement::Stable => {
+                    if let Some(ref mut seen) = dedup_stable {
+                        let key = (
+                            source.clone(),
+                            block.block().tag().to_string(),
+                            block.block().content().to_string(),
+                        );
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                    }
                     self.push_stable_block(events, source, block.block());
                     stable = true;
                 }
@@ -2652,15 +2816,36 @@ where
     /// returned, and kept as the tail previews and snapshots show. Sources
     /// are told whether the window was reassembled since the last time,
     /// which is when their earlier stable blocks stopped being in it.
-    async fn collect_request_context(&mut self, cx: &RunCx<'_>, turn: usize) -> RenderedTail {
+    async fn collect_request_context(
+        &mut self,
+        cx: &RunCx<'_>,
+        turn: usize,
+        seen_stable: &mut HashSet<(SourceId, String, String)>,
+    ) -> RenderedTail {
         self.sync_live_sources(cx.events).await;
         let reassembled = std::mem::take(&mut self.reassembled);
         let moment = Moment::Request { reassembled };
         let mut tail = RenderedTail::default();
-        for index in 0..self.context_sources.len() {
-            let blocks = self.context_sources[index].blocks(moment).await;
-            let id = self.context_sources[index].id();
-            self.take_blocks(cx.events, &id, Some(index), moment, blocks, &mut tail);
+        let ids: Vec<SourceId> = self
+            .context_sources
+            .iter()
+            .map(AnyContextSource::id)
+            .collect();
+        let source_blocks = futures::future::join_all(
+            self.context_sources
+                .iter_mut()
+                .map(|source| source.blocks(moment)),
+        )
+        .await;
+        for (index, (id, blocks)) in ids.into_iter().zip(source_blocks).enumerate() {
+            self.take_blocks(
+                cx.events,
+                (&id, Some(index)),
+                moment,
+                blocks,
+                &mut tail,
+                Some(seen_stable),
+            );
         }
         let request = RequestCx {
             run: cx.run,
@@ -2670,11 +2855,11 @@ where
         let blocks = self.hooks.before_request(&request).await;
         self.take_blocks(
             cx.events,
-            &SourceId::new("hooks"),
-            None,
+            (&SourceId::new("hooks"), None),
             moment,
             blocks,
             &mut tail,
+            Some(seen_stable),
         );
         tail
     }
@@ -2683,18 +2868,25 @@ where
     /// turn's `after_tool` hooks appended.
     async fn push_tool_turn_context(&mut self, cx: &RunCx<'_>, appended: Vec<String>) {
         let mut tail = RenderedTail::default();
-        for index in 0..self.context_sources.len() {
-            let blocks = self.context_sources[index]
-                .blocks(Moment::ToolTurnEnd)
-                .await;
-            let id = self.context_sources[index].id();
+        let ids: Vec<SourceId> = self
+            .context_sources
+            .iter()
+            .map(AnyContextSource::id)
+            .collect();
+        let source_blocks = futures::future::join_all(
+            self.context_sources
+                .iter_mut()
+                .map(|source| source.blocks(Moment::ToolTurnEnd)),
+        )
+        .await;
+        for (index, (id, blocks)) in ids.into_iter().zip(source_blocks).enumerate() {
             self.take_blocks(
                 cx.events,
-                &id,
-                Some(index),
+                (&id, Some(index)),
                 Moment::ToolTurnEnd,
                 blocks,
                 &mut tail,
+                None,
             );
         }
         let hooks = SourceId::new("hooks");
@@ -2710,16 +2902,25 @@ where
     async fn push_final_turn_context(&mut self, cx: &RunCx<'_>) -> bool {
         let mut tail = RenderedTail::default();
         let mut objected = false;
-        for index in 0..self.context_sources.len() {
-            let blocks = self.context_sources[index].blocks(Moment::FinalTurn).await;
-            let id = self.context_sources[index].id();
+        let ids: Vec<SourceId> = self
+            .context_sources
+            .iter()
+            .map(AnyContextSource::id)
+            .collect();
+        let source_blocks = futures::future::join_all(
+            self.context_sources
+                .iter_mut()
+                .map(|source| source.blocks(Moment::FinalTurn)),
+        )
+        .await;
+        for (index, (id, blocks)) in ids.into_iter().zip(source_blocks).enumerate() {
             objected |= self.take_blocks(
                 cx.events,
-                &id,
-                Some(index),
+                (&id, Some(index)),
                 Moment::FinalTurn,
                 blocks,
                 &mut tail,
+                None,
             );
         }
         objected
@@ -2963,16 +3164,21 @@ where
         &mut self,
         cx: &RunCx<'_>,
         turn: usize,
-    ) -> Result<Option<(LLMRequest, PromptPrefix)>, AgentError> {
+    ) -> Result<Option<(LLMRequest, PromptPrefix, RenderedTail)>, AgentError> {
         let events = cx.events;
+        self.delivering = None;
         self.forward_child_events(events);
         self.apply_completed_compaction(events).await;
         self.rebuild_if_cache_is_cold(events).await?;
         self.settle_effort()?;
 
         let definitions = self.tools.active_definitions();
-        let mut tail = self.collect_request_context(cx, turn).await;
+        let mut seen_stable = HashSet::new();
+        let mut tail = self
+            .collect_request_context(cx, turn, &mut seen_stable)
+            .await;
         let mut messages = self.request_messages(&tail);
+        let mut has_tail = tail.blocks.iter().any(|block| !block.is_empty());
         self.measure_assembled(&messages, &definitions).await;
 
         if self
@@ -2981,7 +3187,8 @@ where
             .should_compact(self.budget.estimated_tokens(), self.budget.window())
             && !self.compaction.is_active()
         {
-            let fork_request = self.compaction_request(messages.clone(), definitions.clone());
+            let fork_request =
+                self.compaction_request(messages.clone(), definitions.clone(), has_tail);
             self.start_compaction(&fork_request, None, events);
         }
 
@@ -2997,8 +3204,11 @@ where
             if !self.make_room(events).await? {
                 return Ok(None);
             }
-            tail = self.collect_request_context(cx, turn).await;
+            tail = self
+                .collect_request_context(cx, turn, &mut seen_stable)
+                .await;
             messages = self.request_messages(&tail);
+            has_tail = tail.blocks.iter().any(|block| !block.is_empty());
             self.measure_assembled(&messages, &definitions).await;
             // A landed compaction is still no guarantee the rebuilt request
             // fits; an unshrinkable request is paused rather than sent.
@@ -3011,21 +3221,16 @@ where
             }
         }
 
-        self.commit_tail(&tail).await;
-        self.context.mark_prefix_carried();
-        self.delivering = Some(self.context.fork_point());
-        self.warmth.start_entry_now();
-        self.idle_compacted = false;
+        self.delivering = Some(self.context.next_seq());
         self.publish_fork_snapshot(&tail, &definitions);
         self.last_tail.clone_from(&tail.blocks);
 
         let has_tools = !definitions.is_empty();
         let prefix = PromptPrefix {
-            chain: PrefixChain::of(&definitions, &messages),
-            rewrites: std::mem::take(&mut self.prefix_rewrites),
+            chain: PrefixChain::of(&definitions, &messages, has_tail),
+            rewrites: self.prefix_rewrites,
             first_request: self.requests_sent == 0,
         };
-        self.requests_sent += 1;
         self.prompt_cache
             .observe_prefix(self.context.stable_prefix_fingerprint());
         let parameters = self.prompt_cache.apply(
@@ -3033,12 +3238,12 @@ where
             &messages,
             has_tools,
             self.takes_mid_conversation_system(),
+            has_tail,
         );
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);
-        self.last_request = Some(request.clone());
-        Ok(Some((request, prefix)))
+        Ok(Some((request, prefix, tail)))
     }
 
     /// Publishes the request about to be sent for a fork to start from.
@@ -3222,7 +3427,7 @@ where
     /// only told about a request once it is actually sent.
     ///
     /// The tail and the stable blocks are the ones the request would carry:
-    /// the sources are asked through [`ContextSource::peek`] and the
+    /// [`ContextSource::peek`](crate::ContextSource::peek) and the
     /// `before_request` hook is asked as it would be, so nothing a source
     /// holds for delivery is consumed. A live source's change is not
     /// previewed, since staging it writes to the context.
@@ -3241,33 +3446,39 @@ where
         let moment = Moment::Request {
             reassembled: self.reassembled,
         };
-        let mut blocks = Vec::new();
-        for source in &self.context_sources {
-            blocks.extend(source.peek(moment).await);
-        }
-        let checkpoint = self.context.checkpoint();
-        self.context.extend(extra_messages);
-        self.context
-            .push(Message::user(prompt).with_attachments(attachments));
+        let peeked = futures::future::join_all(
+            self.context_sources
+                .iter()
+                .map(|source| source.peek(moment)),
+        )
+        .await;
+        let mut blocks: Vec<ContextBlock> = peeked.into_iter().flatten().collect();
+
+        // Work on a forked context so dropping the future mid-await leaves
+        // `self.context` and its sequence numbers untouched.
+        let mut preview = self.context.fork();
+        preview.extend(extra_messages);
+        preview.push(Message::user(prompt).with_attachments(attachments));
         let run = RunId::new("preview");
         let request = RequestCx {
             run: &run,
             turn: 1,
-            message_count: self.context.len_recent(),
+            message_count: preview.len_recent(),
         };
         blocks.extend(self.hooks.before_request(&request).await);
         let mut tail = Vec::new();
         for block in blocks {
             match block.placement() {
                 Placement::Stable => {
-                    self.context.push_block_alert(block.block());
+                    preview.push_block_alert(block.block());
                 }
                 Placement::Tail => tail.push(block.block().clone()),
             }
         }
-        let messages = self.request_messages(&tail);
-        self.context.restore(checkpoint);
-        Ok(messages)
+        Ok(Self::filter_request_messages(
+            preview.build_request(&tail),
+            self.takes_per_message_effort(),
+        ))
     }
 
     /// Tells the embedder the agent's state changed, so it can persist it
@@ -3290,6 +3501,17 @@ where
             message_count: self.context.len_recent(),
         });
     }
+}
+
+fn has_trailing_mid_conversation_system(messages: &[Message]) -> bool {
+    let leading_system = messages
+        .iter()
+        .take_while(|message| message.role() == Role::System)
+        .count();
+    messages[leading_system..]
+        .iter()
+        .rfind(|message| message.role() != Role::Configuration)
+        .is_some_and(|message| message.role() == Role::System)
 }
 
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {

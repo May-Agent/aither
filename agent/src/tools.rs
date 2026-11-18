@@ -156,13 +156,6 @@ impl AgentTools {
             .flat_map(aither_mcp::McpToolService::definitions)
             .collect()
     }
-
-    /// Merge another `AgentTools` into this one.
-    ///
-    /// Note: MCP connections are not cloned (they would require ownership transfer).
-    pub fn merge(&mut self, _other: Self) {
-        // Core tools cannot be merged without re-registering concrete tool instances.
-    }
 }
 
 #[cfg(test)]

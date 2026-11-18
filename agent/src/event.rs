@@ -770,7 +770,7 @@ mod serde_tests {
             AgentEvent::RequestStarted {
                 request: request(),
                 prefix: PromptPrefix {
-                    chain: PrefixChain::of(&[], &[Message::user("hello")]),
+                    chain: PrefixChain::of(&[], &[Message::user("hello")], false),
                     rewrites: PrefixRewrites {
                         compacted: true,
                         reassembled: false,
