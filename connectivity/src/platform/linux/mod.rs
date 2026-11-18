@@ -108,8 +108,8 @@ fn run(
         };
         let _ = ready.send(Ok(())).await;
 
-        let routes_fut = watch_routes_with_reconnect(routes, sink);
-        let power_fut = watch_power_with_reconnect(logind, sink);
+        let routes_fut = Box::pin(watch_routes_with_reconnect(routes, sink));
+        let power_fut = Box::pin(watch_power_with_reconnect(logind, sink));
         match race_watchers(routes_fut, power_fut, stopped).await {
             ExitReason::Stopped => {}
             ExitReason::RoutesExited => {
