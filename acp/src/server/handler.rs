@@ -2,7 +2,7 @@
 
 use std::future::Future;
 
-use aither_mcp::protocol::{JsonRpcError, JsonRpcNotification};
+use aither_mcp::protocol::{JsonRpcError, JsonRpcNotification, JsonRpcRequest};
 use serde_json::Value;
 use tracing::debug;
 
@@ -11,9 +11,10 @@ use crate::protocol::{
     AuthenticateParams, AuthenticateResult, ExtMethod, InitializeParams, InitializeResult,
     LogoutParams, LogoutResult, PromptParams, PromptResult, SessionCancelParams,
     SessionCloseParams, SessionCloseResult, SessionDeleteParams, SessionDeleteResult,
-    SessionListParams, SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams,
-    SessionNewResult, SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
-    SessionSetConfigOptionResult, SessionSetModeParams, SessionSetModeResult,
+    SessionForkParams, SessionForkResult, SessionListParams, SessionListResult, SessionLoadParams,
+    SessionLoadResult, SessionNewParams, SessionNewResult, SessionResumeParams,
+    SessionResumeResult, SessionSetConfigOptionParams, SessionSetConfigOptionResult,
+    SessionSetModeParams, SessionSetModeResult,
 };
 
 /// Handles traffic the client (editor) initiates toward the agent.
@@ -97,6 +98,17 @@ pub trait AgentHandler: Send + Sync + 'static {
         async { Err(JsonRpcError::method_not_found("session/resume")) }
     }
 
+    /// Handle a `session/fork` request.
+    ///
+    /// The default responds with a JSON-RPC method-not-found error.
+    fn fork_session(
+        &self,
+        _peer: &ClientPeer,
+        _params: SessionForkParams,
+    ) -> impl Future<Output = Result<SessionForkResult, JsonRpcError>> + Send {
+        async { Err(JsonRpcError::method_not_found("session/fork")) }
+    }
+
     /// Handle a `session/list` request.
     ///
     /// The default responds with a JSON-RPC method-not-found error.
@@ -174,6 +186,20 @@ pub trait AgentHandler: Send + Sync + 'static {
         _params: Option<Value>,
     ) -> impl Future<Output = Result<Value, JsonRpcError>> + Send {
         async move { Err(JsonRpcError::method_not_found(method.as_str())) }
+    }
+
+    /// Handle any other client-to-agent request this crate does not model.
+    ///
+    /// Prefer the typed methods and [`ext_request`](Self::ext_request); this
+    /// exists for vendor methods that predate the `_` naming rule (see
+    /// [`crate::vendor::codex`]) and for methods this crate does not model.
+    /// The default responds with a JSON-RPC method-not-found error.
+    fn request(
+        &self,
+        _peer: &ClientPeer,
+        request: JsonRpcRequest,
+    ) -> impl Future<Output = Result<Value, JsonRpcError>> + Send {
+        async move { Err(JsonRpcError::method_not_found(&request.method)) }
     }
 
     /// Handle a `session/cancel` notification.

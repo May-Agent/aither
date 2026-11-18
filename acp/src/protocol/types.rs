@@ -177,14 +177,17 @@ pub struct SessionCapabilities {
     /// Whether the agent supports `session/resume`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<SessionResumeCapabilities>,
+    /// Whether the agent supports `session/fork`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<SessionForkCapabilities>,
     /// Whether the agent supports `session/close`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close: Option<SessionCloseCapabilities>,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
-    /// Session capability keys this crate does not model (e.g. `fork`,
-    /// `subagents`), preserved verbatim.
+    /// Session capability keys this crate does not model (e.g. `subagents`),
+    /// preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -222,6 +225,14 @@ pub struct SessionResumeCapabilities {
     pub meta: Option<Value>,
 }
 
+/// Capabilities for the `session/fork` method.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionForkCapabilities {
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
 /// Capabilities for the `session/close` method.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionCloseCapabilities {
@@ -234,8 +245,8 @@ pub struct SessionCloseCapabilities {
 // Session Management
 // =============================================================================
 
-/// An MCP server offered to the agent in `session/new`, `session/load`, or
-/// `session/resume`.
+/// An MCP server offered to the agent in `session/new`, `session/load`,
+/// `session/resume`, or `session/fork`.
 ///
 /// Local stdio servers carry no `type` field; remote servers are tagged
 /// `"type": "http"` or `"type": "sse"`. Whether an agent accepts remote
@@ -669,6 +680,84 @@ pub struct SessionResumeResult {
     #[serde(default)]
     pub modes: Option<SessionModeState>,
     /// Configuration options, if the agent supports them.
+    #[serde(default)]
+    pub config_options: Option<Vec<ConfigOption>>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+    /// Vendor fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Fork session request parameters (`session/fork`).
+///
+/// Creates a new session seeded with the conversation history of `session_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionForkParams {
+    /// Source session ID to fork from.
+    pub session_id: String,
+    /// Working directory for the forked session. Must be absolute.
+    pub cwd: PathBuf,
+    /// MCP servers to connect to in the forked session.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
+    /// Additional workspace roots for the forked session. Each path must be
+    /// absolute and is only honoured when the agent advertises
+    /// [`SessionCapabilities::additional_directories`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
+    /// Extension metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+impl SessionForkParams {
+    /// Build params forking `session_id` into a new session rooted at `cwd`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            mcp_servers: Vec::new(),
+            additional_directories: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// Set the MCP servers to connect.
+    #[must_use]
+    pub fn mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
+    }
+
+    /// Set additional workspace roots.
+    #[must_use]
+    pub fn additional_directories(mut self, additional_directories: Vec<PathBuf>) -> Self {
+        self.additional_directories = additional_directories;
+        self
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+}
+
+/// Fork session response (`session/fork`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionForkResult {
+    /// Newly created forked session ID.
+    pub session_id: String,
+    /// Initial mode state, if the agent supports session modes.
+    #[serde(default)]
+    pub modes: Option<SessionModeState>,
+    /// Initial configuration options, if the agent supports them.
     #[serde(default)]
     pub config_options: Option<Vec<ConfigOption>>,
     /// Extension metadata.
@@ -1988,5 +2077,85 @@ mod tests {
             serde_json::from_str(r#"{"resume":{}}"#).expect("deserializes");
         assert!(caps.resume.is_some());
         assert!(caps.close.is_none());
+    }
+
+    /// `session/fork` params, result, and capability serialize with camelCase
+    /// keys, omit empty optional fields, and preserve flattened extras.
+    #[test]
+    fn session_fork_wire_format() {
+        let minimal = SessionForkParams::new("s1", "/tmp/fork");
+        let minimal_json = serde_json::to_value(&minimal).expect("serializes");
+        assert_eq!(minimal_json["sessionId"], "s1");
+        assert_eq!(minimal_json["cwd"], "/tmp/fork");
+        assert_eq!(minimal_json["mcpServers"], serde_json::json!([]));
+        assert!(minimal_json.get("additionalDirectories").is_none());
+        assert!(minimal_json.get("_meta").is_none());
+
+        let full = SessionForkParams::new("s1", "/tmp/fork")
+            .mcp_servers(vec![McpServerStdio::new("fs", "/bin/mcp").into()])
+            .additional_directories(vec![PathBuf::from("/tmp/extra")])
+            .meta(serde_json::json!({"trace": "t-1"}));
+        let full_json = serde_json::to_value(&full).expect("serializes");
+        assert_eq!(
+            full_json["additionalDirectories"],
+            serde_json::json!(["/tmp/extra"])
+        );
+        assert_eq!(full_json["_meta"]["trace"], "t-1");
+        assert_eq!(full_json["mcpServers"][0]["name"], "fs");
+        let parsed_params: SessionForkParams =
+            serde_json::from_value(full_json).expect("deserializes");
+        assert_eq!(parsed_params.session_id, "s1");
+        assert_eq!(parsed_params.cwd, PathBuf::from("/tmp/fork"));
+        assert_eq!(parsed_params.mcp_servers.len(), 1);
+        assert_eq!(
+            parsed_params.additional_directories,
+            vec![PathBuf::from("/tmp/extra")]
+        );
+
+        let result: SessionForkResult = serde_json::from_value(serde_json::json!({
+            "sessionId": "s2",
+            "modes": {
+                "currentModeId": "code",
+                "availableModes": [{"id": "code", "name": "Code"}]
+            },
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "currentValue": "gpt-5"
+            }],
+            "_meta": {"source": "s1"},
+            "models": {
+                "availableModels": [{"modelId": "gpt-5", "name": "GPT-5"}],
+                "currentModelId": "gpt-5"
+            }
+        }))
+        .expect("deserializes");
+        assert_eq!(result.session_id, "s2");
+        assert_eq!(
+            result
+                .modes
+                .as_ref()
+                .map(|modes| modes.current_mode_id.as_str()),
+            Some("code")
+        );
+        assert_eq!(result.config_options.as_ref().map(Vec::len), Some(1));
+        assert_eq!(result.meta, Some(serde_json::json!({"source": "s1"})));
+        assert_eq!(result.extra["models"]["currentModelId"], "gpt-5");
+        let round_trip = serde_json::to_value(&result).expect("serializes");
+        assert_eq!(round_trip["sessionId"], "s2");
+        assert_eq!(round_trip["_meta"]["source"], "s1");
+        assert_eq!(round_trip["models"]["currentModelId"], "gpt-5");
+
+        let default_caps =
+            serde_json::to_value(SessionCapabilities::default()).expect("serializes");
+        assert!(default_caps.get("fork").is_none());
+
+        let caps: SessionCapabilities =
+            serde_json::from_str(r#"{"fork":{"_meta":{"v":1}}}"#).expect("deserializes");
+        assert_eq!(
+            caps.fork.as_ref().and_then(|fork| fork.meta.as_ref()),
+            Some(&serde_json::json!({"v": 1}))
+        );
+        assert!(caps.extra.is_empty());
     }
 }

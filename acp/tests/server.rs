@@ -16,21 +16,23 @@ use aither_acp::{
     ContentChunk, ElicitationAction, ElicitationCompleteParams, ElicitationCreateParams,
     ElicitationCreateResult, ElicitationFormMode, ElicitationMode, ElicitationSchema,
     ElicitationSessionScope, ElicitationUrlMode, ExtMethod, Implementation, InitializeParams,
-    InitializeResult, LogoutParams, LogoutResult, PROTOCOL_VERSION, PermissionOption,
-    PermissionOptionKind, PromptParams, PromptResult, ReadTextFileParams, ReadTextFileResult,
-    RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult, ServerError,
-    SessionCancelParams, SessionCloseParams, SessionCloseResult, SessionConfigValue,
-    SessionDeleteParams, SessionDeleteResult, SessionInfo, SessionListParams, SessionListResult,
-    SessionLoadParams, SessionLoadResult, SessionMode, SessionModeState, SessionNewParams,
-    SessionNewResult, SessionNotification, SessionResumeParams, SessionResumeResult,
-    SessionSetConfigOptionParams, SessionSetConfigOptionResult, SessionSetModeParams,
-    SessionSetModeResult, SessionUpdate, StopReason, TerminalCreateParams, TerminalCreateResult,
-    TerminalExitStatus, TerminalKillParams, TerminalKillResult, TerminalOutputParams,
-    TerminalOutputResult, TerminalReleaseParams, TerminalReleaseResult, TerminalWaitForExitParams,
-    TextContent, ToolCall, ToolCallStatus, WriteTextFileParams, WriteTextFileResult, serve,
+    InitializeResult, LogoutParams, LogoutResult, McpServerStdio, PROTOCOL_VERSION,
+    PermissionOption, PermissionOptionKind, PromptParams, PromptResult, ReadTextFileParams,
+    ReadTextFileResult, RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult,
+    ServerError, SessionAdditionalDirectoriesCapabilities, SessionCancelParams,
+    SessionCapabilities, SessionCloseParams, SessionCloseResult, SessionConfigValue,
+    SessionDeleteParams, SessionDeleteResult, SessionForkCapabilities, SessionForkParams,
+    SessionForkResult, SessionInfo, SessionListParams, SessionListResult, SessionLoadParams,
+    SessionLoadResult, SessionMode, SessionModeState, SessionNewParams, SessionNewResult,
+    SessionNotification, SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
+    SessionSetConfigOptionResult, SessionSetModeParams, SessionSetModeResult, SessionUpdate,
+    StopReason, TerminalCreateParams, TerminalCreateResult, TerminalExitStatus, TerminalKillParams,
+    TerminalKillResult, TerminalOutputParams, TerminalOutputResult, TerminalReleaseParams,
+    TerminalReleaseResult, TerminalWaitForExitParams, TextContent, ToolCall, ToolCallStatus,
+    WriteTextFileParams, WriteTextFileResult, serve,
 };
 use aither_mcp::protocol::{
-    ErrorCode, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcResponse,
+    ErrorCode, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
 use aither_mcp::transport::{BidirectionalTransport, DuplexTransport, StreamTransport};
 use futures_lite::future::or;
@@ -517,6 +519,11 @@ async fn default_agent_handler_methods_report_method_not_found_and_ignore_notifi
             .resume_session(SessionResumeParams::new("s1", "/tmp"))
             .await,
     );
+    assert_method_not_found(
+        client
+            .fork_session(SessionForkParams::new("s1", "/tmp"))
+            .await,
+    );
     assert_method_not_found(client.list_sessions(SessionListParams::new()).await);
     assert_method_not_found(client.close_session("s1").await);
     assert_method_not_found(client.delete_session("s1").await);
@@ -545,6 +552,9 @@ async fn default_agent_handler_methods_report_method_not_found_and_ignore_notifi
             .request::<_, Value>("unknown/method", &json!({}))
             .await,
     );
+    assert_method_not_found(aither_acp::vendor::codex::set_model(&client, "s1", "gpt-5").await);
+    assert_method_not_found(aither_acp::vendor::codex::authentication_status(&client).await);
+    assert_method_not_found(aither_acp::vendor::codex::authentication_logout(&client).await);
 
     // Malformed `initialize` params surface as INVALID_PARAMS.
     match client
@@ -1874,6 +1884,321 @@ async fn ndjson_stream_transport_preserves_u2028_u2029_and_cjk_in_both_direction
     }
 
     peer.close();
+    client.close();
+    client_task.await.expect("client task");
+    server_task.await.expect("server task");
+}
+
+// =============================================================================
+// Test 8: `session/fork` round-trip with causal `session/update` replay
+// =============================================================================
+
+struct ForkingAgent {
+    observed: Arc<Mutex<Vec<SessionForkParams>>>,
+}
+
+impl AgentHandler for ForkingAgent {
+    fn initialize(
+        &self,
+        _peer: &ClientPeer,
+        _params: Option<InitializeParams>,
+    ) -> impl Future<Output = Result<InitializeResult, JsonRpcError>> + Send {
+        std::future::ready(Ok(InitializeResult {
+            protocol_version: PROTOCOL_VERSION,
+            agent_capabilities: AgentCapabilities {
+                session_capabilities: SessionCapabilities {
+                    fork: Some(SessionForkCapabilities::default()),
+                    additional_directories: Some(
+                        SessionAdditionalDirectoriesCapabilities::default(),
+                    ),
+                    ..SessionCapabilities::default()
+                },
+                ..AgentCapabilities::default()
+            },
+            agent_info: None,
+            auth_methods: vec![],
+            meta: None,
+        }))
+    }
+
+    fn fork_session(
+        &self,
+        peer: &ClientPeer,
+        params: SessionForkParams,
+    ) -> impl Future<Output = Result<SessionForkResult, JsonRpcError>> + Send {
+        let peer = peer.clone();
+        let observed = self.observed.clone();
+        async move {
+            let forked_id = format!("{}-fork-1", params.session_id);
+            observed.lock().expect("observed").push(params);
+
+            peer.session_update(SessionNotification::new(
+                &forked_id,
+                user_chunk("replayed question"),
+            ))
+            .await
+            .map_err(|err| JsonRpcError::internal_error(err.to_string()))?;
+            peer.session_update(SessionNotification::new(
+                &forked_id,
+                message_chunk("replayed answer"),
+            ))
+            .await
+            .map_err(|err| JsonRpcError::internal_error(err.to_string()))?;
+
+            Ok(SessionForkResult {
+                session_id: forked_id,
+                modes: Some(SessionModeState {
+                    current_mode_id: "code".to_string(),
+                    available_modes: vec![SessionMode {
+                        id: "code".to_string(),
+                        name: "Code".to_string(),
+                        description: None,
+                        meta: None,
+                    }],
+                    meta: None,
+                }),
+                config_options: Some(vec![ConfigOption {
+                    id: "model".to_string(),
+                    name: "Model".to_string(),
+                    description: None,
+                    category: None,
+                    kind: None,
+                    current_value: Some(ConfigOptionValue::Selected("gpt-5".to_string())),
+                    options: None,
+                    meta: None,
+                }]),
+                meta: Some(json!({"forked": true})),
+                extra: BTreeMap::from([(
+                    aither_acp::vendor::codex::MODELS.to_string(),
+                    json!({
+                        "availableModels": [{"modelId": "gpt-5", "name": "GPT-5"}],
+                        "currentModelId": "gpt-5",
+                    }),
+                )]),
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn fork_session_replays_updates_before_result_and_preserves_fields() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let (client_end, server_end) = DuplexTransport::pair();
+    let (_peer, server_driver) = serve(
+        server_end,
+        ForkingAgent {
+            observed: observed.clone(),
+        },
+    );
+    let server_task = tokio::spawn(server_driver);
+    let (client, client_driver) = AcpClient::connect(client_end, RecordingClient::default());
+    let client_task = tokio::spawn(client_driver);
+
+    let init = client.initialize().await.expect("initialize");
+    assert!(init.agent_capabilities.session_capabilities.fork.is_some());
+
+    let forked = client
+        .fork_session(
+            SessionForkParams::new("sess-parent", "/tmp/forked")
+                .mcp_servers(vec![McpServerStdio::new("fs", "/bin/echo").into()])
+                .additional_directories(vec![PathBuf::from("/tmp/shared")])
+                .meta(json!({"origin": "test"})),
+        )
+        .await
+        .expect("session/fork");
+
+    assert_eq!(forked.session_id, "sess-parent-fork-1");
+    assert_eq!(
+        forked.modes.as_ref().map(|m| m.current_mode_id.as_str()),
+        Some("code")
+    );
+    assert_eq!(forked.config_options.as_ref().map(Vec::len), Some(1));
+    assert_eq!(forked.meta, Some(json!({"forked": true})));
+    let models = aither_acp::vendor::codex::models(&forked.extra).expect("codex models extra");
+    assert_eq!(models.current_model_id.as_deref(), Some("gpt-5"));
+
+    // Both replayed `session/update` notifications must arrive before
+    // `SessionForkResult` resolves.
+    {
+        let updates = client.handler().updates.lock().expect("updates");
+        assert_eq!(
+            updates.len(),
+            2,
+            "fork_session updates must flush before SessionForkResult"
+        );
+        assert_eq!(updates[0].session_id, "sess-parent-fork-1");
+        assert_eq!(updates[1].session_id, "sess-parent-fork-1");
+    }
+
+    {
+        let recorded = observed.lock().expect("observed");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].session_id, "sess-parent");
+        assert_eq!(recorded[0].cwd, PathBuf::from("/tmp/forked"));
+        assert_eq!(recorded[0].mcp_servers.len(), 1);
+        assert_eq!(recorded[0].mcp_servers[0].name(), "fs");
+        assert_eq!(
+            recorded[0].additional_directories,
+            vec![PathBuf::from("/tmp/shared")]
+        );
+        assert_eq!(recorded[0].meta, Some(json!({"origin": "test"})));
+    }
+
+    // Malformed `session/fork` params report `INVALID_PARAMS`.
+    match client
+        .request::<_, Value>("session/fork", &json!({"cwd": "/tmp/missing-session-id"}))
+        .await
+    {
+        Err(ClientError::JsonRpc(error)) => assert_eq!(error.code, ErrorCode::INVALID_PARAMS),
+        other => panic!("expected INVALID_PARAMS, got {other:?}"),
+    }
+
+    client.close();
+    client_task.await.expect("client task");
+    server_task.await.expect("server task");
+}
+
+// =============================================================================
+// Test 9: `AgentHandler::request` fallback answers legacy Codex vendor methods
+// =============================================================================
+
+struct LegacyCodexAgent {
+    selected_models: Arc<Mutex<Vec<(String, String)>>>,
+    authenticated_email: Arc<Mutex<Option<String>>>,
+}
+
+impl AgentHandler for LegacyCodexAgent {
+    fn initialize(
+        &self,
+        _peer: &ClientPeer,
+        _params: Option<InitializeParams>,
+    ) -> impl Future<Output = Result<InitializeResult, JsonRpcError>> + Send {
+        std::future::ready(Ok(InitializeResult {
+            protocol_version: PROTOCOL_VERSION,
+            agent_capabilities: AgentCapabilities::default(),
+            agent_info: None,
+            auth_methods: vec![],
+            meta: None,
+        }))
+    }
+
+    fn request(
+        &self,
+        peer: &ClientPeer,
+        request: JsonRpcRequest,
+    ) -> impl Future<Output = Result<Value, JsonRpcError>> + Send {
+        let peer = peer.clone();
+        let selected_models = self.selected_models.clone();
+        let authenticated_email = self.authenticated_email.clone();
+        async move {
+            match request.method.as_str() {
+                aither_acp::vendor::codex::SET_MODEL_METHOD => {
+                    let params = request
+                        .params
+                        .ok_or_else(|| JsonRpcError::invalid_params("missing params"))?;
+                    let session_id = params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| JsonRpcError::invalid_params("missing sessionId"))?
+                        .to_string();
+                    let model_id = params
+                        .get("modelId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| JsonRpcError::invalid_params("missing modelId"))?
+                        .to_string();
+                    selected_models
+                        .lock()
+                        .expect("selected_models")
+                        .push((session_id.clone(), model_id.clone()));
+                    peer.session_update(SessionNotification::new(
+                        &session_id,
+                        message_chunk(&format!("model:{model_id}")),
+                    ))
+                    .await
+                    .map_err(|err| JsonRpcError::internal_error(err.to_string()))?;
+                    Ok(json!({}))
+                }
+                aither_acp::vendor::codex::AUTHENTICATION_STATUS_METHOD => {
+                    let email = authenticated_email
+                        .lock()
+                        .expect("authenticated_email")
+                        .clone();
+                    let status = email.map_or(
+                        aither_acp::vendor::codex::AuthenticationStatus::Unauthenticated,
+                        |email| aither_acp::vendor::codex::AuthenticationStatus::ChatGpt { email },
+                    );
+                    serde_json::to_value(status)
+                        .map_err(|err| JsonRpcError::internal_error(err.to_string()))
+                }
+                aither_acp::vendor::codex::AUTHENTICATION_LOGOUT_METHOD => {
+                    *authenticated_email.lock().expect("authenticated_email") = None;
+                    Ok(json!({}))
+                }
+                other => Err(JsonRpcError::method_not_found(other)),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn agent_handler_request_fallback_serves_legacy_codex_vendor_methods() {
+    let selected_models = Arc::new(Mutex::new(Vec::new()));
+    let authenticated_email = Arc::new(Mutex::new(Some("dev@example.com".to_string())));
+
+    let (client_end, server_end) = DuplexTransport::pair();
+    let (_peer, server_driver) = serve(
+        server_end,
+        LegacyCodexAgent {
+            selected_models: selected_models.clone(),
+            authenticated_email,
+        },
+    );
+    let server_task = tokio::spawn(server_driver);
+    let (client, client_driver) = AcpClient::connect(client_end, RecordingClient::default());
+    let client_task = tokio::spawn(client_driver);
+
+    client.initialize().await.expect("initialize");
+
+    let initial_status = aither_acp::vendor::codex::authentication_status(&client)
+        .await
+        .expect("authentication/status");
+    assert!(matches!(
+        initial_status,
+        aither_acp::vendor::codex::AuthenticationStatus::ChatGpt { ref email }
+            if email == "dev@example.com"
+    ));
+
+    aither_acp::vendor::codex::set_model(&client, "sess-codex", "gpt-5")
+        .await
+        .expect("session/set_model");
+    assert_eq!(
+        selected_models.lock().expect("selected_models").as_slice(),
+        [("sess-codex".to_string(), "gpt-5".to_string())]
+    );
+    assert_eq!(
+        client.handler().updates.lock().expect("updates").len(),
+        1,
+        "session/update queued inside AgentHandler::request must flush before response"
+    );
+
+    aither_acp::vendor::codex::authentication_logout(&client)
+        .await
+        .expect("authentication/logout");
+
+    let post_logout_status = aither_acp::vendor::codex::authentication_status(&client)
+        .await
+        .expect("authentication/status after logout");
+    assert!(matches!(
+        post_logout_status,
+        aither_acp::vendor::codex::AuthenticationStatus::Unauthenticated
+    ));
+
+    assert_method_not_found(
+        client
+            .request::<_, Value>("legacy/unrecognized", &json!({}))
+            .await,
+    );
+
     client.close();
     client_task.await.expect("client task");
     server_task.await.expect("server task");
