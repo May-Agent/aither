@@ -12077,6 +12077,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_for_monitored_line(
+        receiver: &ShellEvents,
+        lines: &mut Vec<String>,
+        expected: &str,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !lines.iter().any(|line| line == expected) {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let Some(alert) = receiver.recv_timeout(remaining).await else {
+                break;
+            };
+            if let ShellEvent::MonitorIncrement(increment) = alert {
+                lines.extend(increment.lines);
+            }
+        }
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "appended line {expected:?} is delivered, across rotation: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn monitored_file_delivers_appends_and_refuses_an_unreadable_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -12118,40 +12142,31 @@ mod tests {
             )
             .await
             .expect("monitor starts");
+        let receiver = tool.background_receiver();
+        let mut lines = Vec::new();
         async_io::Timer::after(Duration::from_millis(1500)).await;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut file, b"appended\n").unwrap();
+        drop(file);
+        wait_for_monitored_line(&receiver, &mut lines, "appended").await;
         std::fs::rename(&path, tool.working_dir().join("followed.log.1")).unwrap();
         std::fs::write(&path, "rotated\n").unwrap();
-        async_io::Timer::after(Duration::from_millis(500)).await;
+        wait_for_monitored_line(&receiver, &mut lines, "rotated").await;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut file, b"after\n").unwrap();
+        drop(file);
+        wait_for_monitored_line(&receiver, &mut lines, "after").await;
 
-        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
-        let lines: Vec<&String> = alerts
-            .iter()
-            .filter_map(|alert| match alert {
-                ShellEvent::MonitorIncrement(increment) => Some(&increment.lines),
-                _ => None,
-            })
-            .flatten()
-            .collect();
         assert!(
-            !lines.iter().any(|line| *line == "existing"),
+            !lines.iter().any(|line| line == "existing"),
             "content written before the monitor started is not delivered: {lines:?}"
         );
-        for expected in ["appended", "rotated", "after"] {
-            assert!(
-                lines.iter().any(|line| *line == expected),
-                "appended line {expected:?} is delivered, across rotation: {lines:?}"
-            );
-        }
         tool.job_registry().kill_running().await;
     }
 
