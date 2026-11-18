@@ -23,7 +23,7 @@ const FORK_HEADROOM: f64 = 0.9;
 
 /// Thresholds that govern context compaction and pausing.
 ///
-/// The window is the calibrated one of the [`ContextBudget`]: it subtracts
+/// The window is the calibrated one of the [`ContextBudget`](super::ContextBudget): it subtracts
 /// what the response and the tool surface need from the model's raw context
 /// length. From it the policy derives three points, each in tokens:
 ///
@@ -130,8 +130,8 @@ pub struct ContextPolicy {
     /// The user's words are the authoritative record of what was asked,
     /// decided and ruled out, and a retelling drifts from them. The newest
     /// messages are kept up to this budget; the handoff covers the rest.
-    /// `ask_user` exchanges are kept whole whatever their size and do not
-    /// count against it.
+    /// Tool exchanges marked `kept` survive whole whatever their size and do
+    /// not count against it.
     pub user_message_budget: usize,
 }
 
