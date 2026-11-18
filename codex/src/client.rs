@@ -13,13 +13,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aither_core::llm::model::{Ability, Profile as ModelProfile};
-use aither_core::llm::{Event, LLMRequest, LanguageModel};
+use aither_core::llm::{
+    Event, GenerateError, LLMRequest, LanguageModel, RetryPolicy, TokenCounting,
+};
 use aither_openai::OpenAI;
 use async_lock::Mutex;
 use futures_lite::StreamExt as _;
 
-use crate::auth::{CodexCredentials, refresh_tokens};
-use crate::constant::{ACCOUNT_ID_HEADER, CODEX_BASE_URL, ORIGINATOR, RESIDENCY_HEADER};
+use crate::auth::{CodexCredentials, refresh_tokens_at};
+use crate::constant::{ACCOUNT_ID_HEADER, CODEX_BASE_URL, ORIGINATOR, RESIDENCY_HEADER, TOKEN_URL};
 use crate::error::CodexError;
 
 /// Refresh the access token this long before its recorded expiry.
@@ -35,87 +37,134 @@ const NO_RESIDENCY_CONSTRAINT: &str = "no_constraint";
 /// rather than perform it inline.
 pub type OnRefresh = Arc<dyn Fn(&CodexCredentials) + Send + Sync>;
 
+pub async fn resolve_shared_credentials(
+    shared: &Mutex<CodexCredentials>,
+    token_url: &str,
+    on_refresh: Option<&OnRefresh>,
+    force: bool,
+    failed_access_token: Option<&str>,
+) -> Result<CodexCredentials, CodexError> {
+    let mut credentials = shared.lock().await;
+    if !force && !credentials.is_expired(EXPIRY_SKEW) {
+        return Ok(credentials.clone());
+    }
+    if force
+        && let Some(failed) = failed_access_token
+        && credentials.access_token != failed
+    {
+        return Ok(credentials.clone());
+    }
+    let Some(refresh_token) = credentials.refresh_token_opt() else {
+        if !force && !credentials.is_expired(Duration::ZERO) {
+            return Ok(credentials.clone());
+        }
+        return Err(CodexError::Api(
+            "ChatGPT access token expired and no refresh token is configured".into(),
+        ));
+    };
+
+    let fresh = refresh_tokens_at(refresh_token, token_url).await?;
+    tracing::debug!("refreshed ChatGPT access token");
+    if let Some(callback) = on_refresh {
+        callback(&fresh);
+    }
+    *credentials = fresh.clone();
+    drop(credentials);
+    Ok(fresh)
+}
+
 /// A [`LanguageModel`] for a single model on the Codex subscription backend.
 #[derive(Clone)]
 pub struct Codex {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone)]
 struct Inner {
     model: String,
     base_url: String,
+    token_url: String,
     originator: String,
     session_id: String,
-    cell: Mutex<Cell>,
+    shared: Arc<Mutex<CodexCredentials>>,
     on_refresh: Option<OnRefresh>,
+    template_client: OpenAI,
 }
 
-struct Cell {
-    credentials: CodexCredentials,
+pub fn codex_from_shared(
+    shared: Arc<Mutex<CodexCredentials>>,
+    model: impl Into<String>,
+    base_url: impl Into<String>,
+    token_url: impl Into<String>,
+    originator: impl Into<String>,
+    on_refresh: Option<OnRefresh>,
+) -> Codex {
+    let model = model.into();
+    let base_url = base_url.into();
+    let template_client = OpenAI::builder("codex-template")
+        .base_url(&base_url)
+        .model(&model)
+        .store(false)
+        .build();
+    Codex {
+        inner: Arc::new(Inner {
+            model,
+            base_url,
+            token_url: token_url.into(),
+            originator: originator.into(),
+            session_id: session_id(),
+            shared,
+            on_refresh,
+            template_client,
+        }),
+    }
 }
 
 impl Codex {
     /// Create a client for `model` using the given credentials.
     #[must_use]
     pub fn new(credentials: CodexCredentials, model: impl Into<String>) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                model: model.into(),
-                base_url: CODEX_BASE_URL.into(),
-                originator: ORIGINATOR.into(),
-                session_id: session_id(),
-                cell: Mutex::new(Cell { credentials }),
-                on_refresh: None,
-            }),
-        }
+        codex_from_shared(
+            Arc::new(Mutex::new(credentials)),
+            model,
+            CODEX_BASE_URL,
+            TOKEN_URL,
+            ORIGINATOR,
+            None,
+        )
     }
 
     /// Override the backend base URL (defaults to the Codex subscription
     /// endpoint).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the client has already been cloned/shared.
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("with_base_url must be called before the client is shared")
-            .base_url = base_url.into();
+        let base_url = base_url.into();
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.template_client = inner.template_client.clone().with_base_url(&base_url);
+        inner.base_url = base_url;
         self
     }
 
     /// Override the `originator` header (defaults to [`ORIGINATOR`]).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the client has already been cloned/shared.
     #[must_use]
     pub fn with_originator(mut self, originator: impl Into<String>) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("with_originator must be called before the client is shared")
-            .originator = originator.into();
+        Arc::make_mut(&mut self.inner).originator = originator.into();
         self
     }
 
     /// Register a callback fired whenever tokens rotate.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the client has already been cloned/shared.
     #[must_use]
     pub fn on_refresh(
         mut self,
         callback: impl Fn(&CodexCredentials) + Send + Sync + 'static,
     ) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("on_refresh must be called before the client is shared")
-            .on_refresh = Some(Arc::new(callback));
+        Arc::make_mut(&mut self.inner).on_refresh = Some(Arc::new(callback));
         self
     }
 
     /// A snapshot of the current credentials.
     pub async fn credentials(&self) -> CodexCredentials {
-        self.inner.cell.lock().await.credentials.clone()
+        self.inner.shared.lock().await.clone()
     }
 }
 
@@ -141,30 +190,28 @@ impl Inner {
         builder.build()
     }
 
-    /// Return valid credentials, refreshing if expired (or if `force`).
-    ///
-    /// The lock is held across the refresh so concurrent callers share one
-    /// refresh — the first to acquire performs it and the rest observe the
-    /// fresh credentials.
-    async fn valid_credentials(&self, force: bool) -> Result<CodexCredentials, CodexError> {
-        let mut cell = self.cell.lock().await;
-        if !force && !cell.credentials.is_expired(EXPIRY_SKEW) {
-            return Ok(cell.credentials.clone());
-        }
-        let fresh = refresh_tokens(&cell.credentials.refresh_token).await?;
-        tracing::debug!("refreshed ChatGPT access token");
-        if let Some(callback) = &self.on_refresh {
-            callback(&fresh);
-        }
-        cell.credentials = fresh.clone();
-        drop(cell);
-        Ok(fresh)
+    async fn can_refresh(&self) -> bool {
+        self.shared.lock().await.can_refresh()
     }
 
-    /// Build a request-ready client (fresh token + credential headers).
-    async fn request_client(&self, force_refresh: bool) -> Result<OpenAI, CodexError> {
-        let credentials = self.valid_credentials(force_refresh).await?;
-        Ok(self.openai_client(&credentials))
+    /// Build a request-ready client (fresh token + credential headers), returning
+    /// the access token used so single-flight 401 retries know whether a sibling
+    /// already rotated it.
+    async fn request_client(
+        &self,
+        force_refresh: bool,
+        failed_access_token: Option<&str>,
+    ) -> Result<(OpenAI, String), CodexError> {
+        let credentials = resolve_shared_credentials(
+            &self.shared,
+            &self.token_url,
+            self.on_refresh.as_ref(),
+            force_refresh,
+            failed_access_token,
+        )
+        .await?;
+        let client = self.openai_client(&credentials);
+        Ok((client, credentials.access_token))
     }
 }
 
@@ -173,6 +220,7 @@ impl fmt::Debug for Codex {
         f.debug_struct("Codex")
             .field("model", &self.inner.model)
             .field("base_url", &self.inner.base_url)
+            .field("originator", &self.inner.originator)
             .field("session_id", &self.inner.session_id)
             .finish_non_exhaustive()
     }
@@ -181,6 +229,36 @@ impl fmt::Debug for Codex {
 impl LanguageModel for Codex {
     type Error = CodexError;
 
+    fn token_counting(&self) -> TokenCounting {
+        self.inner.template_client.token_counting()
+    }
+
+    async fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> Result<Option<u32>, GenerateError<Self::Error>> {
+        self.inner
+            .template_client
+            .count_tokens(request)
+            .await
+            .map_err(|err| match err {
+                GenerateError::Provider(source) => {
+                    GenerateError::Provider(CodexError::OpenAI(source))
+                }
+                GenerateError::Parse { source, response } => {
+                    GenerateError::Parse { source, response }
+                }
+            })
+    }
+
+    fn count_text(&self, text: &str) -> Option<u32> {
+        self.inner.template_client.count_text(text)
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.inner.template_client.retry_policy()
+    }
+
     fn respond(
         &self,
         request: LLMRequest,
@@ -188,23 +266,35 @@ impl LanguageModel for Codex {
         let inner = Arc::clone(&self.inner);
         async_stream::stream! {
             let mut retried = false;
+            let mut failed_token: Option<String> = None;
             loop {
-                let client = match inner.request_client(retried).await {
-                    Ok(client) => client,
-                    Err(err) => {
-                        yield Err(err);
-                        return;
-                    }
-                };
+                let (client, used_token) =
+                    match inner.request_client(retried, failed_token.as_deref()).await {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            yield Err(err);
+                            return;
+                        }
+                    };
                 let mut stream = std::pin::pin!(client.respond(request.clone()));
                 let mut unauthorized = false;
+                let mut yielded_any = false;
                 while let Some(event) = stream.next().await {
                     match event {
-                        Err(err) if is_unauthorized(&err) && !retried => {
+                        Err(err)
+                            if is_unauthorized(&err)
+                                && !retried
+                                && !yielded_any
+                                && inner.can_refresh().await =>
+                        {
                             unauthorized = true;
+                            failed_token = Some(used_token.clone());
                             break;
                         }
-                        event => yield event.map_err(CodexError::OpenAI),
+                        event => {
+                            yielded_any = true;
+                            yield event.map_err(CodexError::OpenAI);
+                        }
                     }
                 }
                 if !unauthorized {

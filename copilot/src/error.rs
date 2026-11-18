@@ -119,6 +119,7 @@ impl Classify for CopilotError {
             }
             Self::ServerError { .. } => Failure::transient(),
             Self::Timeout => Failure::network(),
+            Self::Json(err) if err.is_eof() => Failure::network(),
             Self::Json(_)
             | Self::Api(_)
             | Self::AuthorizationPending

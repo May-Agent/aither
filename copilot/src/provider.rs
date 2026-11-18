@@ -2,14 +2,15 @@
 
 use crate::{
     Copilot,
-    auth::get_session_token,
-    constant::{COPILOT_BASE_URL, COPILOT_INTEGRATION_ID, EDITOR_VERSION},
+    client::{SessionState, copilot_from_shared, refresh_shared_session},
+    constant::{COPILOT_BASE_URL, COPILOT_INTEGRATION_ID, COPILOT_TOKEN_URL, EDITOR_VERSION},
     error::CopilotError,
 };
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
 use aither_models::lookup as lookup_model_info;
+use async_lock::Mutex;
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
 use zenwave::{Client, client, header};
@@ -25,8 +26,11 @@ impl CopilotProvider {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(ProviderConfig {
-                token: token.into(),
-                base_url: COPILOT_BASE_URL.to_string(),
+                session: Arc::new(Mutex::new(SessionState {
+                    token: token.into(),
+                    base_url: COPILOT_BASE_URL.to_string(),
+                })),
+                token_exchange_url: COPILOT_TOKEN_URL.to_string(),
                 editor_version: EDITOR_VERSION.to_string(),
                 integration_id: COPILOT_INTEGRATION_ID.to_string(),
                 oauth_token: None,
@@ -37,7 +41,14 @@ impl CopilotProvider {
     /// Set the base URL for API calls.
     #[must_use]
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).base_url = url.into();
+        let base_url = url.into();
+        let cfg = Arc::make_mut(&mut self.inner);
+        if Arc::strong_count(&cfg.session) == 1 {
+            cfg.session.lock_blocking().base_url = base_url;
+        } else {
+            let token = cfg.session.lock_blocking().token.clone();
+            cfg.session = Arc::new(Mutex::new(SessionState { token, base_url }));
+        }
         self
     }
 
@@ -45,6 +56,12 @@ impl CopilotProvider {
     #[must_use]
     pub fn oauth_token(mut self, token: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.inner).oauth_token = Some(token.into());
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_token_exchange_url(mut self, url: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.inner).token_exchange_url = url.into();
         self
     }
 }
@@ -56,16 +73,22 @@ impl LanguageModelProvider for CopilotProvider {
     fn list_models(&self) -> impl Future<Output = Result<Vec<ModelProfile>, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
-            let mut cfg = cfg.as_ref().clone();
-            let response = match fetch_models(&cfg).await {
+            let snapshot = cfg.session.lock().await.clone();
+            let response = match fetch_models(&snapshot, &cfg).await {
                 Ok(response) => response,
-                Err(err) if is_unauthorized(&err) => match refresh_provider_config(&cfg).await? {
-                    Some(refreshed) => {
-                        cfg = refreshed;
-                        fetch_models(&cfg).await?
+                Err(err) if is_unauthorized(&err) => {
+                    match refresh_shared_session(
+                        &cfg.session,
+                        &snapshot.token,
+                        cfg.oauth_token.as_deref(),
+                        &cfg.token_exchange_url,
+                    )
+                    .await?
+                    {
+                        Some(refreshed) => fetch_models(&refreshed, &cfg).await?,
+                        None => return Err(err),
                     }
-                    None => return Err(err),
-                },
+                }
                 Err(err) => return Err(err),
             };
 
@@ -104,13 +127,14 @@ impl LanguageModelProvider for CopilotProvider {
         let cfg = self.inner.clone();
         let name = name.to_string();
         async move {
-            let mut builder = Copilot::builder(cfg.token.clone())
-                .base_url(cfg.base_url.clone())
-                .model(name);
-            if let Some(oauth_token) = &cfg.oauth_token {
-                builder = builder.oauth_token(oauth_token.clone());
-            }
-            Ok(builder.build())
+            Ok(copilot_from_shared(
+                Arc::clone(&cfg.session),
+                cfg.token_exchange_url.clone(),
+                &name,
+                cfg.editor_version.clone(),
+                cfg.integration_id.clone(),
+                cfg.oauth_token.clone(),
+            ))
         }
     }
 
@@ -119,13 +143,32 @@ impl LanguageModelProvider for CopilotProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ProviderConfig {
-    token: String,
-    base_url: String,
+    session: Arc<Mutex<SessionState>>,
+    token_exchange_url: String,
     editor_version: String,
     integration_id: String,
     oauth_token: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let base_url = self
+            .session
+            .try_lock()
+            .map_or_else(|| "<locked>".to_string(), |guard| guard.base_url.clone());
+        f.debug_struct("ProviderConfig")
+            .field("token", &"[REDACTED]")
+            .field("base_url", &base_url)
+            .field("editor_version", &self.editor_version)
+            .field("integration_id", &self.integration_id)
+            .field(
+                "oauth_token",
+                &self.oauth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,15 +189,18 @@ struct ModelDescriptor {
     input_token_limit: Option<u32>,
 }
 
-async fn fetch_models(cfg: &ProviderConfig) -> Result<ModelListResponse, CopilotError> {
-    let endpoint = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+async fn fetch_models(
+    session: &SessionState,
+    cfg: &ProviderConfig,
+) -> Result<ModelListResponse, CopilotError> {
+    let endpoint = format!("{}/models", session.base_url.trim_end_matches('/'));
     let mut backend = client();
     backend
         .get(endpoint)
         .map_err(CopilotError::Http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            format!("Bearer {}", cfg.token),
+            format!("Bearer {}", session.token),
         )
         .map_err(CopilotError::Http)?
         .header(header::USER_AGENT.as_str(), "aither-copilot/0.1")
@@ -175,17 +221,4 @@ const fn is_unauthorized(err: &CopilotError) -> bool {
         err,
         CopilotError::Http(zenwave::Error::Http { status, .. }) if status.as_u16() == 401
     )
-}
-
-async fn refresh_provider_config(
-    cfg: &ProviderConfig,
-) -> Result<Option<ProviderConfig>, CopilotError> {
-    let Some(oauth_token) = cfg.oauth_token.as_deref() else {
-        return Ok(None);
-    };
-    let session = get_session_token(oauth_token).await?;
-    let mut refreshed = cfg.clone();
-    refreshed.token = session.token;
-    refreshed.base_url = session.api_endpoint;
-    Ok(Some(refreshed))
 }

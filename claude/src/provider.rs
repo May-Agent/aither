@@ -2,6 +2,7 @@
 
 use crate::{
     Claude,
+    client::{is_anthropic_host, resolve_v1_url},
     constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL},
     error::ClaudeError,
 };
@@ -11,7 +12,7 @@ use aither_core::llm::{
 use aither_models::lookup as lookup_model_info;
 use serde::Deserialize;
 use std::{future::Future, sync::Arc};
-use zenwave::{Client, client};
+use zenwave::{Client, client, header};
 
 /// Provider capable of listing and instantiating `Claude` models.
 #[derive(Clone, Debug)]
@@ -45,18 +46,24 @@ impl LanguageModelProvider for ClaudeProvider {
     fn list_models(&self) -> impl Future<Output = Result<Vec<ModelProfile>, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
-            let endpoint = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+            let endpoint = resolve_v1_url(&cfg.base_url, "/v1/models");
             let mut backend = client();
-            let response: ModelListResponse = backend
+            let mut req = backend
                 .get(endpoint)
                 .map_err(ClaudeError::Http)?
                 .header("x-api-key", cfg.api_key.clone())
                 .map_err(ClaudeError::Http)?
                 .header("anthropic-version", ANTHROPIC_VERSION)
-                .map_err(ClaudeError::Http)?
-                .json()
-                .await
                 .map_err(ClaudeError::Http)?;
+            if !is_anthropic_host(&cfg.base_url) {
+                req = req
+                    .header(
+                        header::AUTHORIZATION.as_str(),
+                        format!("Bearer {}", cfg.api_key),
+                    )
+                    .map_err(ClaudeError::Http)?;
+            }
+            let response: ModelListResponse = req.json().await.map_err(ClaudeError::Http)?;
 
             Ok(response
                 .data
@@ -104,10 +111,19 @@ impl LanguageModelProvider for ClaudeProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ProviderConfig {
     api_key: String,
     base_url: String,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,8 +134,9 @@ struct ModelListResponse {
 #[derive(Debug, Deserialize)]
 struct ModelDescriptor {
     id: String,
+    #[serde(default)]
     display_name: String,
-    #[serde(default, alias = "inputTokenLimit")]
+    #[serde(default, alias = "inputTokenLimit", alias = "max_input_tokens")]
     input_token_limit: Option<u32>,
     #[serde(default)]
     context_length: Option<u32>,

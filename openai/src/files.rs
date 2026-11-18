@@ -5,12 +5,17 @@
 //!
 //! See: <https://platform.openai.com/docs/api-reference/files>
 
+use std::fmt::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-use zenwave::{Client, client, header};
+use url::Url;
+use zenwave::{
+    Client, client, header,
+    multipart::{Multipart, MultipartPart},
+};
 
 use crate::error::OpenAIError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -116,7 +121,7 @@ pub struct ListFilesResponse {
 }
 
 /// Configuration for `OpenAI` Files API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FilesConfig {
     /// API key for authentication.
     pub api_key: String,
@@ -124,6 +129,16 @@ pub struct FilesConfig {
     pub base_url: String,
     /// Organization ID (optional).
     pub organization: Option<String>,
+}
+
+impl std::fmt::Debug for FilesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilesConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("organization", &self.organization)
+            .finish()
+    }
 }
 
 impl FilesConfig {
@@ -156,6 +171,65 @@ impl FilesConfig {
     }
 }
 
+pub(crate) fn csprng_multipart_boundary() -> Result<String, OpenAIError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|err| {
+        OpenAIError::Api(format!(
+            "failed to generate CSPRNG multipart boundary: {err}"
+        ))
+    })?;
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(format!("----aither-{hex}"))
+}
+
+pub(crate) fn encode_multipart_parts(
+    parts: Vec<MultipartPart>,
+) -> Result<(String, Vec<u8>), OpenAIError> {
+    let mut multipart = Multipart::new().boundary(csprng_multipart_boundary()?);
+    for part in parts {
+        multipart.push(part);
+    }
+    Ok(multipart.encode())
+}
+
+fn validate_multipart_upload_metadata(file_name: &str, mime_type: &str) -> Result<(), OpenAIError> {
+    if file_name.is_empty()
+        || file_name
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b'"' | b'\\'))
+    {
+        return Err(OpenAIError::Api(
+            "invalid upload file_name: must be non-empty without control characters, quotes, or backslashes".to_string(),
+        ));
+    }
+    if mime_type.is_empty()
+        || mime_type
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b'"' | b'\\'))
+    {
+        return Err(OpenAIError::Api(
+            "invalid upload mime_type: must be non-empty without control characters, quotes, or backslashes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_upload_multipart(
+    file_name: &str,
+    mime_type: &str,
+    data: Vec<u8>,
+    purpose: FilePurpose,
+) -> Result<(String, Vec<u8>), OpenAIError> {
+    validate_multipart_upload_metadata(file_name, mime_type)?;
+    encode_multipart_parts(vec![
+        MultipartPart::text("purpose", purpose.as_str()),
+        MultipartPart::binary("file", file_name.to_owned(), mime_type.to_owned(), data),
+    ])
+}
+
 /// Upload raw bytes to `OpenAI` Files API.
 ///
 /// This is the cross-platform upload entry point (including wasm).
@@ -179,37 +253,7 @@ pub async fn upload_bytes(
     purpose: FilePurpose,
 ) -> Result<OpenAIFile, OpenAIError> {
     let endpoint = cfg.files_endpoint();
-
-    // Build multipart form data
-    let boundary = format!(
-        "----aither{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-
-    let mut body = Vec::new();
-
-    // Part 1: purpose field
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"purpose\"\r\n\r\n");
-    body.extend_from_slice(purpose.as_str().as_bytes());
-    body.extend_from_slice(b"\r\n");
-
-    // Part 2: file field
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
-        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n")
-            .as_bytes(),
-    );
-    body.extend_from_slice(format!("Content-Type: {mime_type}\r\n\r\n").as_bytes());
-    body.extend_from_slice(&data);
-    body.extend_from_slice(b"\r\n");
-
-    // End boundary
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-
+    let (boundary, body) = build_upload_multipart(file_name, mime_type, data, purpose)?;
     let content_type = format!("multipart/form-data; boundary={boundary}");
 
     let mut backend = client();
@@ -255,9 +299,7 @@ pub async fn upload_file(
 ) -> Result<OpenAIFile, OpenAIError> {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
-    let data = async_fs::read(path)
-        .await
-        .map_err(|e| OpenAIError::Api(format!("Failed to read file: {e}")))?;
+    let data = async_fs::read(path).await?;
 
     upload_bytes(cfg, file_name, mime_type, data, purpose).await
 }
@@ -340,11 +382,12 @@ pub async fn list_files(
     cfg: &FilesConfig,
     purpose: Option<FilePurpose>,
 ) -> Result<ListFilesResponse, OpenAIError> {
-    let mut endpoint = cfg.files_endpoint();
+    let mut url = Url::parse(&cfg.files_endpoint())
+        .map_err(|err| OpenAIError::Api(format!("invalid files endpoint URL: {err}")))?;
     if let Some(p) = purpose {
-        endpoint.push_str("?purpose=");
-        endpoint.push_str(p.as_str());
+        url.query_pairs_mut().append_pair("purpose", p.as_str());
     }
+    let endpoint = url.to_string();
 
     let mut backend = client();
     let mut builder = backend
@@ -391,5 +434,54 @@ mod tests {
         assert_eq!(FilePurpose::Assistants.as_str(), "assistants");
         assert_eq!(FilePurpose::FineTune.as_str(), "fine-tune");
         assert_eq!(FilePurpose::Batch.as_str(), "batch");
+    }
+
+    #[test]
+    fn upload_multipart_rejects_header_injection_and_encodes_clean_parts() {
+        assert!(
+            build_upload_multipart(
+                "bad\r\nX-Inject: 1.png",
+                "image/png",
+                vec![1],
+                FilePurpose::Vision
+            )
+            .is_err()
+        );
+        assert!(
+            build_upload_multipart("bad\"quote.png", "image/png", vec![1], FilePurpose::Vision)
+                .is_err()
+        );
+        assert!(
+            build_upload_multipart(
+                "ok.png",
+                "image/png\r\nX-Inject: 1",
+                vec![1],
+                FilePurpose::Vision
+            )
+            .is_err()
+        );
+
+        let (b1, body) = build_upload_multipart(
+            "report.pdf",
+            "application/pdf",
+            b"hello".to_vec(),
+            FilePurpose::Assistants,
+        )
+        .expect("valid multipart upload");
+        let b2 = csprng_multipart_boundary().expect("second boundary");
+        assert_ne!(b1, b2);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"purpose\""));
+        assert!(text.contains("assistants"));
+        assert!(text.contains("filename=\"report.pdf\""));
+        assert!(text.contains("Content-Type: application/pdf"));
+    }
+
+    #[test]
+    fn files_config_debug_redacts_api_key() {
+        let cfg = FilesConfig::new("sk-secret-files-key");
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("sk-secret-files-key"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 }

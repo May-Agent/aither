@@ -3,7 +3,11 @@ use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
 use futures_lite::StreamExt;
-use std::{future::Future, path::PathBuf, sync::Arc};
+use std::{
+    future::Future,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 /// Provider for local llama.cpp GGUF models from disk.
 #[derive(Clone, Debug)]
@@ -66,8 +70,8 @@ impl LanguageModelProvider for LlamaProvider {
         let cfg = self.inner.clone();
         let name = name.to_string();
         async move {
-            let path = cfg.models_dir.join(name);
-            Llama::from_file(path)
+            let path = resolve_gguf_model_path(&cfg.models_dir, &name)?;
+            blocking::unblock(move || Llama::from_file(path)).await
         }
     }
 
@@ -76,7 +80,75 @@ impl LanguageModelProvider for LlamaProvider {
     }
 }
 
+fn resolve_gguf_model_path(models_dir: &Path, name: &str) -> Result<PathBuf, LlamaError> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(LlamaError::Model(format!(
+            "invalid GGUF model file name '{name}'"
+        )));
+    }
+    let candidate = Path::new(name);
+    let mut components = candidate.components();
+    let Some(Component::Normal(file_name)) = components.next() else {
+        return Err(LlamaError::Model(format!(
+            "invalid GGUF model file name '{name}'"
+        )));
+    };
+    if components.next().is_some() {
+        return Err(LlamaError::Model(format!(
+            "invalid GGUF model file name '{name}'"
+        )));
+    }
+    let has_gguf_ext = Path::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
+    let has_stem = Path::new(file_name)
+        .file_stem()
+        .is_some_and(|stem| !stem.is_empty());
+    if !has_gguf_ext || !has_stem {
+        return Err(LlamaError::Model(format!(
+            "model file '{name}' must have a .gguf extension"
+        )));
+    }
+    Ok(models_dir.join(file_name))
+}
+
 #[derive(Debug, Clone)]
 struct ProviderConfig {
     models_dir: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_gguf_model_path_accepts_single_gguf_name() {
+        let dir = Path::new("/models");
+        assert_eq!(
+            resolve_gguf_model_path(dir, "qwen3-4b.gguf").unwrap(),
+            PathBuf::from("/models/qwen3-4b.gguf")
+        );
+    }
+
+    #[test]
+    fn resolve_gguf_model_path_rejects_traversal_and_non_gguf() {
+        let dir = Path::new("/models");
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".gguf",
+            "../secret.gguf",
+            "nested/model.gguf",
+            "nested\\model.gguf",
+            "/etc/passwd.gguf",
+            "weights.safetensors",
+        ] {
+            assert!(
+                resolve_gguf_model_path(dir, bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
 }

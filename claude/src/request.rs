@@ -549,7 +549,7 @@ impl From<&Parameters> for ParameterSnapshot {
 pub async fn to_claude_messages(
     messages: &[Message],
     mid_conversation_system: bool,
-) -> Result<(Option<SystemPayload>, Vec<MessagePayload>), String> {
+) -> Result<(Option<SystemPayload>, Vec<MessagePayload>), ClaudeError> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut claude_messages: Vec<MessagePayload> = Vec::new();
 
@@ -588,12 +588,10 @@ pub async fn to_claude_messages(
                 });
             }
             Role::Configuration => {
-                let effort = message
-                    .configured_effort()
-                    .expect("a configuration message carries its effort");
-                claude_messages.push(
-                    MessagePayload::effort_update(effort).map_err(|error| error.to_string())?,
-                );
+                let effort = message.configured_effort().ok_or_else(|| {
+                    ClaudeError::Api("Configuration message is missing configured_effort".into())
+                })?;
+                claude_messages.push(MessagePayload::effort_update(effort)?);
             }
         }
     }
@@ -615,7 +613,7 @@ pub async fn to_claude_messages(
         ))
     };
 
-    check_system_turn_placement(&claude_messages)?;
+    check_system_turn_placement(&claude_messages).map_err(ClaudeError::Api)?;
 
     Ok((system, claude_messages))
 }
@@ -654,7 +652,7 @@ fn check_system_turn_placement(messages: &[MessagePayload]) -> Result<(), String
 }
 
 /// Build content for a user message, handling image and PDF attachments.
-async fn build_user_content(message: &Message) -> Result<ContentPayload, String> {
+async fn build_user_content(message: &Message) -> Result<ContentPayload, ClaudeError> {
     let attachments = message.attachments();
 
     if attachments.is_empty() {
@@ -676,9 +674,9 @@ async fn build_user_content(message: &Message) -> Result<ContentPayload, String>
                 cache_control: None,
             });
         } else {
-            return Err(format!(
+            return Err(ClaudeError::Api(format!(
                 "Claude Messages API does not support attachment MIME type '{media_type}'"
-            ));
+            )));
         }
     }
 
@@ -780,10 +778,16 @@ fn build_assistant_content(message: &Message) -> ContentPayload {
     ContentPayload::Blocks(blocks)
 }
 
-async fn build_tool_result_content(message: &Message) -> Result<ContentPayload, String> {
-    let tool_use_id = message.tool_call_id().unwrap_or_else(|| {
-        panic!("Tool message missing tool_call_id required by Claude tool_result payload")
-    });
+async fn build_tool_result_content(message: &Message) -> Result<ContentPayload, ClaudeError> {
+    let tool_use_id = message
+        .tool_call_id()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ClaudeError::Api(
+                "Tool message missing tool_call_id required by Claude tool_result payload"
+                    .to_string(),
+            )
+        })?;
     let content = build_user_content(message).await?;
     Ok(ContentPayload::Blocks(vec![ContentBlock::ToolResult {
         tool_use_id: tool_use_id.to_string(),
@@ -1328,7 +1332,7 @@ fn set_cache_control(
 }
 
 /// Converts a typed attachment into a Claude media source.
-async fn parse_media_source(attachment: &Attachment) -> Result<MediaSource, String> {
+async fn parse_media_source(attachment: &Attachment) -> Result<MediaSource, ClaudeError> {
     let url = attachment.url();
     let media_type = attachment.media_type().as_ref();
     match url.scheme() {
@@ -1336,17 +1340,17 @@ async fn parse_media_source(attachment: &Attachment) -> Result<MediaSource, Stri
             let after_data = url
                 .as_str()
                 .strip_prefix("data:")
-                .ok_or_else(|| "attachment data URL is malformed".to_string())?;
-            let (header, data) = after_data
-                .split_once(',')
-                .ok_or_else(|| "attachment data URL is missing its payload".to_string())?;
-            let encoded_media_type = header
-                .strip_suffix(";base64")
-                .ok_or_else(|| "attachment data URL must use base64 encoding".to_string())?;
+                .ok_or_else(|| ClaudeError::Api("attachment data URL is malformed".to_string()))?;
+            let (header, data) = after_data.split_once(',').ok_or_else(|| {
+                ClaudeError::Api("attachment data URL is missing its payload".to_string())
+            })?;
+            let encoded_media_type = header.strip_suffix(";base64").ok_or_else(|| {
+                ClaudeError::Api("attachment data URL must use base64 encoding".to_string())
+            })?;
             if encoded_media_type != media_type {
-                return Err(format!(
+                return Err(ClaudeError::Api(format!(
                     "attachment MIME type '{media_type}' does not match data URL MIME type '{encoded_media_type}'"
-                ));
+                )));
             }
             Ok(MediaSource::Base64 {
                 media_type: media_type.to_string(),
@@ -1355,17 +1359,15 @@ async fn parse_media_source(attachment: &Attachment) -> Result<MediaSource, Stri
         }
         // wasm32 has no filesystem, and CI builds this crate for it with -D warnings.
         #[cfg(target_arch = "wasm32")]
-        "file" => {
-            Err("Claude attachments from file:// URLs are not supported on wasm32".to_string())
-        }
+        "file" => Err(ClaudeError::Api(
+            "Claude attachments from file:// URLs are not supported on wasm32".to_string(),
+        )),
         #[cfg(not(target_arch = "wasm32"))]
         "file" => {
-            let path = url
-                .to_file_path()
-                .map_err(|()| "attachment file URL could not be converted to a path".to_string())?;
-            let data = async_fs::read(&path).await.map_err(|error| {
-                format!("failed to read attachment '{}': {error}", path.display())
+            let path = url.to_file_path().map_err(|()| {
+                ClaudeError::Api("attachment file URL could not be converted to a path".to_string())
             })?;
+            let data = async_fs::read(&path).await?;
             Ok(MediaSource::Base64 {
                 media_type: media_type.to_string(),
                 data: base64::engine::general_purpose::STANDARD.encode(data),
@@ -1374,9 +1376,9 @@ async fn parse_media_source(attachment: &Attachment) -> Result<MediaSource, Stri
         "http" | "https" => Ok(MediaSource::Url {
             url: url.as_str().to_string(),
         }),
-        scheme => Err(format!(
+        scheme => Err(ClaudeError::Api(format!(
             "Claude does not support attachment URL scheme '{scheme}'"
-        )),
+        ))),
     }
 }
 
@@ -1712,7 +1714,20 @@ mod tests {
         let error = to_claude_messages(&messages, false)
             .await
             .expect_err("Claude audio input must fail");
-        assert!(error.contains("does not support attachment MIME type"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not support attachment MIME type")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_message_missing_tool_call_id_returns_error_instead_of_panicking() {
+        let missing = Message::tool("", "output");
+        let err = to_claude_messages(&[missing], false)
+            .await
+            .expect_err("empty tool_call_id must fail");
+        assert!(err.to_string().contains("missing tool_call_id"), "{err}");
     }
 
     #[test]
@@ -2098,7 +2113,10 @@ mod tests {
         let error = to_claude_messages(&after_assistant, true)
             .await
             .expect_err("a system message after an assistant turn is refused");
-        assert!(error.contains("directly after a user message"), "{error}");
+        assert!(
+            error.to_string().contains("directly after a user message"),
+            "{error}"
+        );
 
         // Followed by a user turn.
         let before_user = vec![
@@ -2110,7 +2128,10 @@ mod tests {
         let error = to_claude_messages(&before_user, true)
             .await
             .expect_err("a system message before a user turn is refused");
-        assert!(error.contains("followed by another turn"), "{error}");
+        assert!(
+            error.to_string().contains("followed by another turn"),
+            "{error}"
+        );
     }
 
     #[test]

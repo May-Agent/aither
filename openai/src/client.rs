@@ -31,7 +31,7 @@ use std::{
     collections::HashMap,
     future::Future,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -146,6 +146,7 @@ impl OpenAI {
             cfg.vocabulary = aither_core::tokenizer::Vocabulary::for_model(&model);
         }
         cfg.chat_model = model;
+        cfg.cached_context_length = Arc::new(OnceLock::new());
         self
     }
 
@@ -155,6 +156,7 @@ impl OpenAI {
         let cfg = Arc::make_mut(&mut self.inner);
         cfg.base_url = base_url.into();
         cfg.prompt_excludes_cached = Arc::new(AtomicBool::new(false));
+        cfg.cached_context_length = Arc::new(OnceLock::new());
         self
     }
 
@@ -439,22 +441,24 @@ impl LanguageModel for OpenAI {
     fn profile(&self) -> impl Future<Output = Result<ModelProfile, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
-            // Try to fetch context window from API, fallback to models database
-            let context_length = match fetch_model_context_length(&cfg).await {
-                Ok(len) => len,
-                Err(e) => {
-                    tracing::debug!("API did not return context_length: {e}");
-                    aither_models::lookup(&cfg.chat_model)
-                        .and_then(aither_models::ModelEntry::max_input_tokens)
-                        .ok_or_else(|| {
-                            OpenAIError::Api(format!(
-                                "cannot determine context length for model '{model}': \
-                                 {models_url} request failed ({e}) and aither-models has no entry",
-                                model = cfg.chat_model,
-                                models_url = cfg.request_url("/models"),
-                            ))
-                        })?
-                }
+            let context_length = if let Some(&cached) = cfg.cached_context_length.get() {
+                cached
+            } else if let Some(known) = aither_models::lookup(&cfg.chat_model)
+                .and_then(aither_models::ModelEntry::max_input_tokens)
+            {
+                let _ = cfg.cached_context_length.set(known);
+                known
+            } else {
+                let fetched = fetch_model_context_length(&cfg).await.map_err(|e| {
+                    OpenAIError::Api(format!(
+                        "cannot determine context length for model '{model}': \
+                         {models_url} request failed ({e}) and aither-models has no entry",
+                        model = cfg.chat_model,
+                        models_url = cfg.request_url("/models"),
+                    ))
+                })?;
+                let _ = cfg.cached_context_length.set(fetched);
+                fetched
             };
 
             let mut profile = ModelProfile::new(
@@ -1016,54 +1020,21 @@ fn drain_pending_function_calls(
         .collect()
 }
 
-#[allow(clippy::items_after_statements)]
 fn validate_serialized_responses_request(request: &ResponsesRequest) -> Result<(), OpenAIError> {
-    let request_value = serde_json::to_value(request).map_err(OpenAIError::Json)?;
-    let Some(items) = request_value
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Ok(());
-    };
-
-    fn find_blank_call_id(value: &serde_json::Value, path: &str) -> Option<(String, String)> {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, child) in map {
-                    let child_path = format!("{path}.{key}");
-                    if key == "call_id"
-                        && let Some(call_id) = child.as_str()
-                        && call_id.trim().is_empty()
-                    {
-                        return Some((child_path, call_id.to_string()));
-                    }
-                    if let Some(found) = find_blank_call_id(child, &child_path) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            serde_json::Value::Array(items) => {
-                for (index, child) in items.iter().enumerate() {
-                    let child_path = format!("{path}[{index}]");
-                    if let Some(found) = find_blank_call_id(child, &child_path) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            serde_json::Value::Null
-            | serde_json::Value::Bool(_)
-            | serde_json::Value::Number(_)
-            | serde_json::Value::String(_) => None,
-        }
-    }
-
-    for (index, item) in items.iter().enumerate() {
-        if let Some((path, call_id)) = find_blank_call_id(item, &format!("input[{index}]")) {
+    for (index, item) in request.input.iter().enumerate() {
+        let call_id = match item {
+            ResponsesInputItem::FunctionCall { call_id, .. }
+            | ResponsesInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            ResponsesInputItem::Message { .. }
+            | ResponsesInputItem::Reasoning { .. }
+            | ResponsesInputItem::ConfigurationUpdate { .. } => None,
+        };
+        if let Some(call_id) = call_id
+            && call_id.trim().is_empty()
+        {
             let snippet = serde_json::to_string(item).map_err(OpenAIError::Json)?;
             return Err(OpenAIError::Api(format!(
-                "responses request serialized blank call_id at {path}: {call_id:?}; item={snippet}"
+                "responses request serialized blank call_id at input[{index}].call_id: {call_id:?}; item={snippet}"
             )));
         }
     }
@@ -1071,15 +1042,14 @@ fn validate_serialized_responses_request(request: &ResponsesRequest) -> Result<(
 }
 
 /// Make a responses API SSE request (single attempt).
-async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStreamResult {
-    validate_serialized_responses_request(request)?;
-    let serialized_request = serde_json::to_string(request).map_err(OpenAIError::Json)?;
+async fn responses_request(cfg: &Config, serialized_request: &str) -> SseStreamResult {
     let endpoint = cfg.request_url("/responses");
     let mut backend = client();
 
     let build_result = backend
         .post(endpoint)
         .and_then(|b| b.header(header::AUTHORIZATION.as_str(), cfg.request_auth()))
+        .and_then(|b| b.header(header::CONTENT_TYPE.as_str(), "application/json"))
         .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-openai/0.1"))
         .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"));
 
@@ -1098,7 +1068,9 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
 
     match request_within_idle(
         cfg.idle_timeout,
-        builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
+        builder
+            .bytes_body(serialized_request.as_bytes().to_vec())
+            .sse(),
     )
     .await
     {
@@ -1166,12 +1138,22 @@ fn responses_stream_inner(
             true, // stream: true
         );
         request.store = cfg.store;
-        let serialized_request = serde_json::to_string(&request).unwrap_or_default();
+        if let Err(err) = validate_serialized_responses_request(&request) {
+            yield Err(err);
+            return;
+        }
+        let serialized_request = match serde_json::to_string(&request) {
+            Ok(json) => json,
+            Err(err) => {
+                yield Err(OpenAIError::Json(err));
+                return;
+            }
+        };
 
-        tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
+        tracing::debug!(request = %serialized_request, "Sending responses request");
 
         // Make request with retry
-        let sse_stream = match sse_request_with_retry(&cfg, || responses_request(&cfg, &request)).await {
+        let sse_stream = match sse_request_with_retry(&cfg, || responses_request(&cfg, &serialized_request)).await {
             Ok(stream) => stream,
             Err(e) => {
                 yield Err(e);
@@ -1344,6 +1326,27 @@ fn responses_stream_inner(
                                         usage_emitted = true;
                                     }
                                 }
+                                ResponsesStreamEvent::ResponseIncomplete { response } => {
+                                    let mut final_usage = response
+                                        .usage
+                                        .as_ref()
+                                        .map(|meta| {
+                                            usage_from_responses(
+                                                meta,
+                                                Some(&cfg.prompt_excludes_cached),
+                                            )
+                                        })
+                                        .or_else(|| usage.take())
+                                        .unwrap_or_default();
+                                    final_usage.stop_reason = response
+                                        .incomplete_details
+                                        .and_then(|details| details.reason)
+                                        .filter(|reason| !reason.is_empty())
+                                        .or_else(|| Some("incomplete".to_string()));
+                                    usage = Some(final_usage.clone());
+                                    yield Ok(Event::Usage(final_usage));
+                                    usage_emitted = true;
+                                }
                                 ResponsesStreamEvent::ResponseFailed { response } => {
                                     let (code, message) = response
                                         .and_then(|response| response.error)
@@ -1368,7 +1371,8 @@ fn responses_stream_inner(
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, data = %data, "Failed to parse Responses API event");
+                            yield Err(OpenAIError::from(e));
+                            return;
                         }
                     }
                 }
@@ -2213,6 +2217,110 @@ mod tests {
         assert_eq!(mapped2.total_tokens, Some(17210));
         assert_eq!(mapped2.cache_read_tokens, Some(8200));
     }
+
+    #[tokio::test]
+    async fn responses_stream_propagates_malformed_sse_json() {
+        let url = serve_scripted(vec![vec![
+            Step::Send(SSE_HEAD.to_string()),
+            Step::Send("data: {truncated-json\n\n".to_string()),
+        ]]);
+        let client = scripted_client(ApiKind::Responses, url, RetryPolicy::none());
+        let stream = client.respond(oneshot("system", "hello"));
+        futures_lite::pin!(stream);
+        let err = stream
+            .next()
+            .await
+            .expect("stream yields")
+            .expect_err("malformed SSE JSON must propagate");
+        assert!(matches!(err, OpenAIError::Json(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn responses_stream_emits_usage_and_stop_reason_on_incomplete() {
+        let incomplete_event = serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_inc_1",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": {
+                    "input_tokens": 42,
+                    "output_tokens": 128,
+                    "total_tokens": 170
+                }
+            }
+        });
+        let url = serve_scripted(vec![vec![
+            Step::Send(SSE_HEAD.to_string()),
+            Step::Send(text_event(ApiKind::Responses, "partial")),
+            Step::Send(format!("data: {incomplete_event}\n\n")),
+        ]]);
+        let client = scripted_client(ApiKind::Responses, url, RetryPolicy::none());
+        let stream = client.respond(oneshot("system", "hello"));
+        futures_lite::pin!(stream);
+
+        let first = stream.next().await.expect("text event").expect("ok text");
+        assert!(matches!(first, Event::Text(ref t) if t == "partial"));
+
+        let second = stream.next().await.expect("usage event").expect("ok usage");
+        match second {
+            Event::Usage(usage) => {
+                assert_eq!(usage.prompt_tokens, Some(42));
+                assert_eq!(usage.completion_tokens, Some(128));
+                assert_eq!(usage.stop_reason.as_deref(), Some("max_output_tokens"));
+            }
+            other => panic!("expected Usage event, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn profile_uses_registry_and_caches_fetched_context_length() {
+        // Known model resolves from aither-models without hitting /models.
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let known = OpenAI::builder("key")
+            .base_url(format!("http://127.0.0.1:{closed_port}"))
+            .model("gpt-4o")
+            .build();
+        let profile = known.profile().await.expect("registry lookup succeeds");
+        assert!(profile.context_length > 0);
+
+        // Unknown model fetches /models once and caches across calls.
+        let base_url = serve_once(
+            r#"{"object":"list","data":[{"id":"custom-proxy-model","context_length":65536}]}"#,
+        );
+        let custom = OpenAI::builder("key")
+            .base_url(base_url)
+            .model("custom-proxy-model")
+            .build();
+        let p1 = custom.profile().await.expect("first profile fetch");
+        let p2 = custom.profile().await.expect("second profile uses cache");
+        assert_eq!(p1.context_length, 65_536);
+        assert_eq!(p2.context_length, 65_536);
+    }
+
+    #[test]
+    fn debug_redacts_secrets_across_builder_client_and_provider() {
+        let builder = OpenAI::builder("sk-live-secret-key")
+            .extra_header("X-Custom-Token", "bearer-secret-header");
+        let builder_dbg = format!("{builder:?}");
+        assert!(!builder_dbg.contains("sk-live-secret-key"));
+        assert!(!builder_dbg.contains("bearer-secret-header"));
+        assert!(builder_dbg.contains("[REDACTED]"));
+
+        let client = builder.build();
+        let client_dbg = format!("{client:?}");
+        assert!(!client_dbg.contains("sk-live-secret-key"));
+        assert!(!client_dbg.contains("bearer-secret-header"));
+
+        let provider = crate::OpenAIProvider::new("sk-provider-secret");
+        let provider_dbg = format!("{provider:?}");
+        assert!(!provider_dbg.contains("sk-provider-secret"));
+        assert!(provider_dbg.contains("[REDACTED]"));
+    }
 }
 
 fn filter_tool_definitions(
@@ -2230,7 +2338,6 @@ fn filter_tool_definitions(
 }
 
 /// Builder for [`OpenAI`] clients.
-#[derive(Debug)]
 pub struct Builder {
     api_key: String,
     base_url: String,
@@ -2251,6 +2358,37 @@ pub struct Builder {
     idle_timeout: Duration,
     extra_headers: Vec<(String, String)>,
     store: Option<bool>,
+}
+
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_headers: Vec<(&str, &str)> = self
+            .extra_headers
+            .iter()
+            .map(|(k, _)| (k.as_str(), "[REDACTED]"))
+            .collect();
+        f.debug_struct("Builder")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("api_kind", &self.api_kind)
+            .field("chat_model", &self.chat_model)
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_dimensions", &self.embedding_dimensions)
+            .field("image_model", &self.image_model)
+            .field("audio_model", &self.audio_model)
+            .field("audio_voice", &self.audio_voice)
+            .field("audio_format", &self.audio_format)
+            .field("transcription_model", &self.transcription_model)
+            .field("moderation_model", &self.moderation_model)
+            .field("legacy_max_tokens", &self.legacy_max_tokens)
+            .field("organization", &self.organization)
+            .field("native_abilities", &self.native_abilities)
+            .field("retry", &self.retry)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("extra_headers", &redacted_headers)
+            .field("store", &self.store)
+            .finish()
+    }
 }
 
 impl Builder {
@@ -2492,12 +2630,13 @@ impl Builder {
                 extra_headers: self.extra_headers,
                 store: self.store,
                 prompt_excludes_cached: Arc::new(AtomicBool::new(false)),
+                cached_context_length: Arc::new(OnceLock::new()),
             }),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub(crate) api_key: String,
     pub(crate) base_url: String,
@@ -2519,9 +2658,41 @@ pub struct Config {
     pub(crate) extra_headers: Vec<(String, String)>,
     pub(crate) store: Option<bool>,
     pub(crate) prompt_excludes_cached: Arc<AtomicBool>,
+    pub(crate) cached_context_length: Arc<OnceLock<u32>>,
     /// The published vocabulary `chat_model` counts with, when it has one.
     #[cfg(feature = "tokenizer")]
     pub(crate) vocabulary: Option<aither_core::tokenizer::Vocabulary>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_headers: Vec<(&str, &str)> = self
+            .extra_headers
+            .iter()
+            .map(|(k, _)| (k.as_str(), "[REDACTED]"))
+            .collect();
+        f.debug_struct("Config")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("api_kind", &self.api_kind)
+            .field("chat_model", &self.chat_model)
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_dimensions", &self.embedding_dimensions)
+            .field("image_model", &self.image_model)
+            .field("audio_model", &self.audio_model)
+            .field("audio_voice", &self.audio_voice)
+            .field("audio_format", &self.audio_format)
+            .field("transcription_model", &self.transcription_model)
+            .field("moderation_model", &self.moderation_model)
+            .field("legacy_max_tokens", &self.legacy_max_tokens)
+            .field("organization", &self.organization)
+            .field("native_abilities", &self.native_abilities)
+            .field("retry", &self.retry)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("extra_headers", &redacted_headers)
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
