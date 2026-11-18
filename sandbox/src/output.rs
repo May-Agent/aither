@@ -1049,7 +1049,7 @@ mod tests {
             rendered.contains(&file.url) && rendered.contains(&file.path),
             "guidance must reference the saved file: {rendered}"
         );
-        assert!(rendered.contains("Use head/tail/rg"));
+        assert!(rendered.contains("[Partial view:"));
     }
 
     #[tokio::test]

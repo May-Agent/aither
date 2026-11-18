@@ -933,10 +933,9 @@ impl ClaudeTextEditorTool {
 }
 
 /// Tool choice policy for tool calling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[serde(rename_all = "lowercase")]
-#[derive(Default)]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum ToolChoice {
     /// Let the model decide whether to call tools.
     #[default]
@@ -2054,5 +2053,26 @@ mod tests {
             cache.strategy,
             ClaudePromptCacheStrategy::AutomaticAndExplicit(breakpoints)
         );
+    }
+
+    #[test]
+    fn tool_choice_defaults_to_auto_and_round_trips_when_serde_enabled() {
+        assert_eq!(ToolChoice::default(), ToolChoice::Auto);
+        let exact = ToolChoice::Exact(String::from("search"));
+        assert_eq!(
+            Parameters::default().tool_choice(exact.clone()).tool_choice,
+            exact
+        );
+        #[cfg(feature = "serde")]
+        {
+            assert_eq!(
+                serde_json::to_string(&ToolChoice::Auto).unwrap(),
+                "\"auto\""
+            );
+            assert_eq!(
+                serde_json::from_str::<ToolChoice>("\"required\"").unwrap(),
+                ToolChoice::Required
+            );
+        }
     }
 }

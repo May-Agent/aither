@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use futures_core::Stream;
 
 /// Audio data as bytes.
@@ -59,6 +59,60 @@ pub trait AudioTranscriber {
     /// part-way through, so each chunk is fallible rather than silently
     /// returning a partial transcript.
     fn transcribe(&self, audio: &[u8]) -> impl Stream<Item = Result<String, Self::Error>> + Send;
+}
+
+macro_rules! impl_audio_generator {
+    ($($name:ident),*) => {
+        $(
+            impl<T: AudioGenerator> AudioGenerator for $name<T> {
+                type Error = T::Error;
+
+                fn generate(
+                    &self,
+                    prompt: &str,
+                ) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
+                    T::generate(self, prompt)
+                }
+            }
+        )*
+    };
+}
+
+impl_audio_generator!(Arc, Box);
+
+impl<T: AudioGenerator> AudioGenerator for &T {
+    type Error = T::Error;
+
+    fn generate(&self, prompt: &str) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
+        T::generate(self, prompt)
+    }
+}
+
+macro_rules! impl_audio_transcriber {
+    ($($name:ident),*) => {
+        $(
+            impl<T: AudioTranscriber> AudioTranscriber for $name<T> {
+                type Error = T::Error;
+
+                fn transcribe(
+                    &self,
+                    audio: &[u8],
+                ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+                    T::transcribe(self, audio)
+                }
+            }
+        )*
+    };
+}
+
+impl_audio_transcriber!(Arc, Box);
+
+impl<T: AudioTranscriber> AudioTranscriber for &T {
+    type Error = T::Error;
+
+    fn transcribe(&self, audio: &[u8]) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+        T::transcribe(self, audio)
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +378,37 @@ mod tests {
 
         let full_transcription: String = transcription_chunks.join("");
         assert_eq!(full_transcription, "This is a longer transcription");
+    }
+
+    #[tokio::test]
+    async fn smart_pointer_forwarding_works_for_audio_traits() {
+        async fn gen_len(g: impl AudioGenerator) -> usize {
+            let stream = g.generate("Hi");
+            futures_lite::pin!(stream);
+            let mut total = 0;
+            while let Some(chunk) = stream.next().await {
+                total += chunk.unwrap().len();
+            }
+            total
+        }
+        async fn trans_text(t: impl AudioTranscriber) -> String {
+            let stream = t.transcribe(&[1_u8; 50]);
+            futures_lite::pin!(stream);
+            let mut out = String::new();
+            while let Some(chunk) = stream.next().await {
+                out.push_str(&chunk.unwrap());
+            }
+            out
+        }
+
+        let g = MockAudioGenerator;
+        assert_eq!(gen_len(&g).await, 512);
+        assert_eq!(gen_len(Box::new(MockAudioGenerator)).await, 512);
+        assert_eq!(gen_len(Arc::new(MockAudioGenerator)).await, 512);
+
+        let t = MockAudioTranscriber;
+        assert_eq!(trans_text(&t).await, "Short");
+        assert_eq!(trans_text(Box::new(MockAudioTranscriber)).await, "Short");
+        assert_eq!(trans_text(Arc::new(MockAudioTranscriber)).await, "Short");
     }
 }

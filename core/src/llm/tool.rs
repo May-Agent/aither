@@ -206,14 +206,16 @@
 // Re-export procedural macros
 #[cfg(feature = "derive")]
 pub use aither_derive::tool;
-use alloc::borrow::Cow;
+#[doc(hidden)]
+pub use alloc::borrow::Cow;
 use serde_json::Value;
 
 use crate::Result;
-use alloc::format;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::{boxed::Box, collections::BTreeMap};
 use core::any::Any;
 use core::fmt::{Debug, Display};
 use core::{future::Future, pin::Pin};
@@ -232,8 +234,8 @@ pub use approval::{
 };
 pub use cancel::{CancelSignal, Canceller};
 pub use command::{
-    CommandOutcome, CommandResult, CommandStream, Interruption, InterruptionCause, StoredFile,
-    render_interruptions,
+    CommandOutcome, CommandResult, CommandStream, CommandWording, DefaultCommandWording,
+    Interruption, InterruptionCause, StoredFile, render_interruptions,
 };
 pub use context::{Progress, ProgressError, ProgressSink, ToolContext};
 pub use identity::{AgentIdentity, AgentPath, CallIdentity, SubagentIdentity, ToolCallId};
@@ -438,13 +440,19 @@ impl ToolResult {
     /// Projects the result into a textual representation safe to re-inject into model context.
     #[must_use]
     pub fn render_for_model(&self) -> String {
+        self.render_for_model_with(&DefaultCommandWording)
+    }
+
+    /// Projects the result into a textual representation using custom [`CommandWording`].
+    #[must_use]
+    pub fn render_for_model_with(&self, wording: &dyn CommandWording) -> String {
         match self {
             Self::Done => String::new(),
             Self::Text { text } | Self::Tsv { text } => text.clone(),
-            Self::Command(command) => command.render_for_model(),
-            Self::Binary { mime, content } => render_binary_placeholder(mime, content),
+            Self::Command(command) => command.render_for_model_with(wording),
+            Self::Binary { mime, content } => wording.binary_placeholder(mime, content.len()),
             Self::Error { message } => message.clone(),
-            Self::Parts { parts } => join_part_renders(parts),
+            Self::Parts { parts } => join_part_renders(parts, wording),
         }
     }
 
@@ -531,9 +539,15 @@ impl ToolResultPart {
     /// Projects the part into a textual representation safe to re-inject into model context.
     #[must_use]
     pub fn render_for_model(&self) -> String {
+        self.render_for_model_with(&DefaultCommandWording)
+    }
+
+    /// Projects the part into a textual representation using custom [`CommandWording`].
+    #[must_use]
+    pub fn render_for_model_with(&self, wording: &dyn CommandWording) -> String {
         match self {
             Self::Text { text } | Self::Tsv { text } => text.clone(),
-            Self::Binary { mime, content } => render_binary_placeholder(mime, content),
+            Self::Binary { mime, content } => wording.binary_placeholder(mime, content.len()),
         }
     }
 
@@ -565,20 +579,10 @@ impl ToolResultPart {
     }
 }
 
-fn render_binary_placeholder(mime: &str, content: &[u8]) -> String {
-    let mut rendered = String::new();
-    rendered.push_str("[binary tool result: ");
-    rendered.push_str(mime);
-    rendered.push_str(", ");
-    rendered.push_str(content.len().to_string().as_str());
-    rendered.push_str(" bytes]");
-    rendered
-}
-
-fn join_part_renders(parts: &[ToolResultPart]) -> String {
+fn join_part_renders(parts: &[ToolResultPart], wording: &dyn CommandWording) -> String {
     let mut rendered = String::new();
     for part in parts {
-        let text = part.render_for_model();
+        let text = part.render_for_model_with(wording);
         if text.is_empty() {
             continue;
         }
@@ -792,29 +796,22 @@ trait ToolImpl: Send + Sync + Any {
 }
 
 /// Dynamic tool implementation for type-erased tools.
-struct DynToolImpl<F>
-where
-    F: Fn(&str, ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
-        + Send
-        + Sync,
-{
+struct DynToolImpl<F> {
     definition: ToolDefinition,
     handler: F,
 }
 
-impl<F> ToolImpl for DynToolImpl<F>
+impl<F, Fut> ToolImpl for DynToolImpl<F>
 where
-    F: Fn(&str, ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
-        + Send
-        + Sync
-        + 'static,
+    F: Fn(&str, ToolContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<ToolResult>> + Send + 'static,
 {
     fn call(
         &self,
         args: &str,
         cx: ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
-        (self.handler)(args, cx)
+        Box::pin((self.handler)(args, cx))
     }
 
     fn definition(&self) -> &ToolDefinition {
@@ -833,19 +830,82 @@ where
 /// Whether a schema describes a JSON object, and so can be sent to a provider
 /// as tool arguments without being wrapped in [`ToolArgument`].
 fn schema_is_object(value: &Value) -> bool {
-    matches!(value.get("type").and_then(Value::as_str), Some("object"))
-        || value.get("properties").is_some()
-        || value.get("oneOf").is_some()
-        || value.get("anyOf").is_some()
-        || value.get("$defs").is_some()
+    let defs = extract_defs(value);
+    let mut visited = BTreeSet::new();
+    schema_value_is_object(value, &defs, &mut visited)
+}
+
+fn schema_value_is_object(
+    value: &Value,
+    defs: &serde_json::Map<String, Value>,
+    visited: &mut BTreeSet<String>,
+) -> bool {
+    let Value::Object(map) = value else {
+        return false;
+    };
+
+    if let Some(Value::String(ref_path)) = map.get("$ref") {
+        let Some(name) = ref_name(ref_path) else {
+            return false;
+        };
+        if !visited.insert(String::from(name)) {
+            return false;
+        }
+        let resolved_is_object = defs
+            .get(name)
+            .is_some_and(|target| schema_value_is_object(target, defs, visited));
+        visited.remove(name);
+        if resolved_is_object {
+            return true;
+        }
+        if map.get("type").is_none()
+            && !map.contains_key("properties")
+            && map.get("oneOf").is_none()
+            && map.get("anyOf").is_none()
+            && map.get("allOf").is_none()
+        {
+            return false;
+        }
+    }
+
+    match map.get("type") {
+        Some(Value::String(kind)) => return kind == "object",
+        Some(Value::Array(kinds)) => {
+            return kinds.len() == 1 && kinds[0].as_str() == Some("object");
+        }
+        Some(_) => return false,
+        None => {}
+    }
+
+    if map.contains_key("properties") {
+        return true;
+    }
+
+    if let Some(Value::Array(all_of)) = map.get("allOf")
+        && !all_of.is_empty()
+        && all_of
+            .iter()
+            .all(|sub| schema_value_is_object(sub, defs, visited))
+    {
+        return true;
+    }
+
+    if let Some(Value::Array(variants)) = map.get("oneOf").or_else(|| map.get("anyOf")) {
+        return !variants.is_empty()
+            && variants
+                .iter()
+                .all(|variant| schema_value_is_object(variant, defs, visited));
+    }
+
+    false
 }
 
 fn is_object<T: JsonSchema>() -> bool {
-    schema_is_object(&schema_for!(T).to_value())
+    schema_is_object(schema_for!(T).as_value())
 }
 
-/// Builds the argument schema for a tool, wrapping scalars so the root is
-/// always an object as providers require.
+/// Builds the argument schema for a tool, wrapping non-object schemas so the
+/// root is always an object as providers require.
 fn derived_arguments_schema<T: JsonSchema>() -> Schema {
     if is_object::<T>() {
         schema_for!(T)
@@ -857,18 +917,14 @@ fn derived_arguments_schema<T: JsonSchema>() -> Schema {
 /// Reads the `description` a `JsonSchema` derive records from a type's rustdoc.
 fn description_from_schema<T: JsonSchema>() -> Option<Cow<'static, str>> {
     schema_for!(T)
-        .to_value()
+        .as_value()
         .get("description")
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty())
         .map(|text| Cow::Owned(text.to_string()))
 }
 
-/// A registered tool together with everything derived from its type.
-///
-/// The argument schema and the "are these arguments an object?" decision are
-/// properties of `T::Arguments` alone, so they are computed once here rather
-/// than rebuilt on every invocation.
+/// A registered tool together with everything derived from its definition.
 struct RegisteredTool<T: Tool> {
     tool: T,
     definition: ToolDefinition,
@@ -878,7 +934,12 @@ struct RegisteredTool<T: Tool> {
 impl<T: Tool> RegisteredTool<T> {
     fn new(tool: T) -> Self {
         let definition = ToolDefinition::new(&tool);
-        let args_are_object = is_object::<T::Arguments>();
+        let args_are_object = if is_object::<T::Arguments>() {
+            schema_is_object(definition.arguments.as_value())
+        } else {
+            definition.arguments != schema_for!(ToolArgument<T::Arguments>)
+                && schema_is_object(definition.arguments.as_value())
+        };
         Self {
             tool,
             definition,
@@ -1028,11 +1089,25 @@ impl Debug for Tools {
     }
 }
 
+#[derive(Clone)]
+struct CachedOpenAiSchema {
+    value: Value,
+    json: Box<str>,
+}
+
+impl CachedOpenAiSchema {
+    fn from_schema(arguments: &Schema) -> Self {
+        let mut value = arguments.clone().to_value();
+        clean_schema(&mut value);
+        let json = value.to_string().into_boxed_str();
+        Self { value, json }
+    }
+}
+
 /// Tool definition including schema for language models.
 ///
 /// Used to provide language models with information about available [`Tool`]s.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone)]
 pub struct ToolDefinition {
     /// Tool name.
     name: Cow<'static, str>,
@@ -1040,20 +1115,93 @@ pub struct ToolDefinition {
     description: Cow<'static, str>,
     /// JSON schema for tool arguments.
     arguments: Schema,
+    /// Cleaned OpenAI-compatible schema and serialized JSON string, cached at
+    /// construction so request assembly and token counting never re-clean or
+    /// re-format unchanged schemas.
+    openai_schema: Arc<CachedOpenAiSchema>,
+}
+
+impl Debug for ToolDefinition {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ToolDefinition")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("arguments", &self.arguments)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ToolDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.arguments == other.arguments
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for ToolDefinition {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> core::result::Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Wire<'a> {
+            name: &'a str,
+            description: &'a str,
+            arguments: &'a Schema,
+        }
+        Wire {
+            name: &self.name,
+            description: &self.description,
+            arguments: &self.arguments,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ToolDefinition {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> core::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            name: Cow<'static, str>,
+            description: Cow<'static, str>,
+            arguments: Schema,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self::from_schema(
+            wire.name,
+            wire.description,
+            wire.arguments,
+        ))
+    }
 }
 
 impl ToolDefinition {
+    fn from_schema(
+        name: Cow<'static, str>,
+        description: Cow<'static, str>,
+        arguments: Schema,
+    ) -> Self {
+        let openai_schema = Arc::new(CachedOpenAiSchema::from_schema(&arguments));
+        Self {
+            name,
+            description,
+            arguments,
+            openai_schema,
+        }
+    }
+
     /// Creates a tool definition for a given tool type.
     ///
     /// The description comes from [`Tool::description`], which by default reads
     /// the rustdoc on the tool's `Arguments` type.
     #[must_use]
     pub fn new<T: Tool>(tool: &T) -> Self {
-        Self {
-            name: tool.name(),
-            description: tool.description(),
-            arguments: tool.arguments_schema(),
-        }
+        Self::from_schema(tool.name(), tool.description(), tool.arguments_schema())
     }
 
     /// Creates a tool definition from raw parts.
@@ -1075,11 +1223,7 @@ impl ToolDefinition {
             .try_into()
             .map_err(|_| InvalidSchema { name: name.clone() })?;
 
-        Ok(Self {
-            name,
-            description,
-            arguments,
-        })
+        Ok(Self::from_schema(name, description, arguments))
     }
 
     /// Returns the tool's name.
@@ -1096,19 +1240,69 @@ impl ToolDefinition {
 
     /// Return an OpenAI-compatible JSON schema for the tool's arguments.
     ///
-    /// This schema would have an object type at the root, as required by `OpenAI`.
+    /// This schema has an object type at the root, as required by `OpenAI`.
     #[must_use]
     pub fn arguments_openai_schema(&self) -> serde_json::Value {
-        let mut inner = self.arguments.clone().to_value();
-        clean_schema(&mut inner);
+        self.openai_schema.value.clone()
+    }
 
-        inner
+    /// Borrows the cached OpenAI-compatible JSON schema without cloning it.
+    #[must_use]
+    pub fn arguments_openai_schema_ref(&self) -> &serde_json::Value {
+        &self.openai_schema.value
+    }
+
+    /// Borrows the cached serialized JSON string of [`Self::arguments_openai_schema`].
+    #[must_use]
+    pub fn arguments_openai_schema_str(&self) -> &str {
+        &self.openai_schema.json
     }
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, schemars::JsonSchema)]
 struct ToolArgument<T> {
     value: T,
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ToolArgument<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> core::result::Result<Self, D::Error> {
+        struct ToolArgumentVisitor<T>(core::marker::PhantomData<T>);
+
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for ToolArgumentVisitor<T> {
+            type Value = ToolArgument<T>;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str("struct ToolArgument")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> core::result::Result<Self::Value, A::Error> {
+                let mut value: Option<T> = None;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    if key == "value" {
+                        if value.is_some() {
+                            return Err(serde::de::Error::duplicate_field("value"));
+                        }
+                        value = Some(map.next_value()?);
+                    } else {
+                        let _: serde::de::IgnoredAny = map.next_value()?;
+                    }
+                }
+                let value = value.ok_or_else(|| serde::de::Error::missing_field("value"))?;
+                Ok(ToolArgument { value })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "ToolArgument",
+            &["value"],
+            ToolArgumentVisitor(core::marker::PhantomData),
+        )
+    }
 }
 
 fn clean_schema(value: &mut Value) {
@@ -1142,33 +1336,75 @@ fn extract_defs(value: &Value) -> serde_json::Map<String, Value> {
 }
 
 /// Resolves `$ref` and cleans the schema recursively.
-#[allow(clippy::too_many_lines)]
 fn resolve_and_clean(value: &mut Value, defs: &serde_json::Map<String, Value>) {
-    resolve_and_clean_inner(value, defs, false);
+    let root_type = match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("object")
+                || map.contains_key("properties")
+            {
+                Some("object")
+            } else {
+                map.get("type").and_then(Value::as_str)
+            }
+        }
+        _ => None,
+    }
+    .map(String::from);
+    let mut active_refs = BTreeSet::new();
+    resolve_and_clean_inner(value, defs, root_type.as_deref(), false, &mut active_refs);
 }
 
-/// Inner recursive function with flag to track if we're inside a properties object.
+/// Inner recursive function with flag to track if we're inside a properties object
+/// and a stack of active `$ref` names to break recursive reference cycles.
 #[allow(clippy::too_many_lines)]
 fn resolve_and_clean_inner(
     value: &mut Value,
     defs: &serde_json::Map<String, Value>,
+    root_type: Option<&str>,
     inside_properties: bool,
+    active_refs: &mut BTreeSet<String>,
 ) {
     match value {
         Value::Object(map) => {
-            // Handle $ref - inline the referenced definition, preserving sibling properties
-            if let Some(Value::String(ref_path)) = map.remove("$ref")
-                && let Some(Value::Object(resolved_map)) = resolve_ref(&ref_path, defs)
-            {
-                // Merge resolved definition with any existing properties (like description)
-                // Resolved definition takes precedence for conflicts except description
-                let existing_description = map.remove("description");
-                for (k, v) in resolved_map {
-                    map.entry(k).or_insert(v);
+            // Handle $ref chains while guarding against recursive $ref cycles.
+            let mut pushed_refs = Vec::new();
+            while let Some(Value::String(ref_path)) = map.remove("$ref") {
+                if ref_path == "#" {
+                    if !map.contains_key("type")
+                        && let Some(kind) = root_type
+                    {
+                        map.insert("type".to_string(), Value::String(String::from(kind)));
+                    }
+                    break;
                 }
-                // Preserve the field-level description if it exists
-                if let Some(desc) = existing_description {
-                    map.insert("description".to_string(), desc);
+                let Some(name) = ref_name(&ref_path) else {
+                    break;
+                };
+                if !active_refs.insert(String::from(name)) {
+                    if !map.contains_key("type")
+                        && let Some(Value::Object(target)) = defs.get(name)
+                    {
+                        if target.get("type").and_then(Value::as_str) == Some("object")
+                            || target.contains_key("properties")
+                        {
+                            map.insert("type".to_string(), Value::String("object".to_string()));
+                        } else if let Some(Value::String(kind)) = target.get("type") {
+                            map.insert("type".to_string(), Value::String(kind.clone()));
+                        }
+                    }
+                    break;
+                }
+                pushed_refs.push(String::from(name));
+                if let Some(Value::Object(resolved_map)) = defs.get(name).cloned() {
+                    let existing_description = map.remove("description");
+                    for (k, v) in resolved_map {
+                        map.entry(k).or_insert(v);
+                    }
+                    if let Some(desc) = existing_description {
+                        map.insert("description".to_string(), desc);
+                    }
+                } else {
+                    break;
                 }
             }
 
@@ -1181,107 +1417,133 @@ fn resolve_and_clean_inner(
             if let Some(Value::Array(variants)) =
                 map.remove("oneOf").or_else(|| map.remove("anyOf"))
             {
-                // Check if this is a simple string enum (variants have const/type but no properties)
-                let is_simple_enum = variants.iter().all(|v| {
-                    if let Value::Object(vm) = v {
-                        (vm.contains_key("const") || vm.contains_key("enum"))
-                            && !vm.contains_key("properties")
-                    } else {
-                        false
+                let is_null_variant = |v: &Value| matches!(v, Value::Object(vm) if vm.get("type").and_then(Value::as_str) == Some("null"));
+                let has_null = variants.iter().any(is_null_variant);
+                let non_null_variants: Vec<Value> = variants
+                    .iter()
+                    .filter(|v| !is_null_variant(v))
+                    .cloned()
+                    .collect();
+
+                if has_null && non_null_variants.len() == 1 {
+                    // Option<T>: resolve & clean the single non-null branch and mark nullable.
+                    let mut inner = non_null_variants.into_iter().next().expect("len == 1");
+                    resolve_and_clean_inner(&mut inner, defs, root_type, false, active_refs);
+                    if let Value::Object(inner_map) = inner {
+                        let existing_description = map.remove("description");
+                        for (k, v) in inner_map {
+                            map.entry(k).or_insert(v);
+                        }
+                        if let Some(desc) = existing_description {
+                            map.insert("description".to_string(), desc);
+                        }
                     }
-                });
+                    map.insert("nullable".to_string(), Value::Bool(true));
+                } else {
+                    // Check if this is a simple string enum (variants have const/type but no properties)
+                    let is_simple_enum = variants.iter().all(|v| {
+                        if let Value::Object(vm) = v {
+                            (vm.contains_key("const") || vm.contains_key("enum"))
+                                && !vm.contains_key("properties")
+                        } else {
+                            false
+                        }
+                    });
 
-                if is_simple_enum {
-                    // Collect all const/enum values into a single enum array
-                    let mut enum_values: alloc::vec::Vec<Value> = alloc::vec::Vec::new();
-                    let mut variant_type: Option<String> = None;
+                    if is_simple_enum {
+                        let mut enum_values: alloc::vec::Vec<Value> = alloc::vec::Vec::new();
+                        let mut variant_type: Option<String> = None;
 
-                    for variant in &variants {
-                        if let Value::Object(vm) = variant {
-                            if let Some(const_val) = vm.get("const")
-                                && !enum_values.contains(const_val)
-                            {
-                                enum_values.push(const_val.clone());
-                            }
-                            if let Some(Value::Array(arr)) = vm.get("enum") {
-                                for val in arr {
-                                    if !enum_values.contains(val) {
-                                        enum_values.push(val.clone());
+                        for variant in &variants {
+                            if let Value::Object(vm) = variant {
+                                if let Some(const_val) = vm.get("const")
+                                    && !enum_values.contains(const_val)
+                                {
+                                    enum_values.push(const_val.clone());
+                                }
+                                if let Some(Value::Array(arr)) = vm.get("enum") {
+                                    for val in arr {
+                                        if !enum_values.contains(val) {
+                                            enum_values.push(val.clone());
+                                        }
                                     }
                                 }
+                                if variant_type.is_none()
+                                    && let Some(Value::String(t)) = vm.get("type")
+                                {
+                                    variant_type = Some(t.clone());
+                                }
                             }
-                            if variant_type.is_none()
-                                && let Some(Value::String(t)) = vm.get("type")
+                        }
+
+                        if !enum_values.is_empty() {
+                            map.insert("enum".to_string(), Value::Array(enum_values));
+                            if let Some(t) = variant_type {
+                                map.insert("type".to_string(), Value::String(t));
+                            }
+                        }
+                    } else {
+                        // Complex variants with properties - resolve $refs on variants then merge
+                        let mut all_properties = serde_json::Map::new();
+
+                        for mut variant in variants {
+                            resolve_and_clean_inner(
+                                &mut variant,
+                                defs,
+                                root_type,
+                                false,
+                                active_refs,
+                            );
+                            if let Value::Object(variant_map) = variant
+                                && let Some(Value::Object(props)) = variant_map.get("properties")
                             {
-                                variant_type = Some(t.clone());
-                            }
-                        }
-                    }
-
-                    if !enum_values.is_empty() {
-                        map.insert("enum".to_string(), Value::Array(enum_values));
-                        if let Some(t) = variant_type {
-                            map.insert("type".to_string(), Value::String(t));
-                        }
-                    }
-                } else {
-                    // Complex variants with properties - merge them
-                    let mut all_properties = serde_json::Map::new();
-
-                    for variant in variants {
-                        if let Value::Object(variant_map) = variant
-                            && let Some(Value::Object(props)) = variant_map.get("properties")
-                        {
-                            for (key, val) in props {
-                                // Extract enum value - handle both "enum" and "const"
-                                let new_values: Option<alloc::vec::Vec<Value>> =
-                                    if let Value::Object(val_obj) = val {
-                                        if let Some(Value::Array(arr)) = val_obj.get("enum") {
-                                            Some(arr.clone())
+                                for (key, val) in props {
+                                    let new_values: Option<alloc::vec::Vec<Value>> =
+                                        if let Value::Object(val_obj) = val {
+                                            if let Some(Value::Array(arr)) = val_obj.get("enum") {
+                                                Some(arr.clone())
+                                            } else {
+                                                val_obj
+                                                    .get("const")
+                                                    .map(|const_val| alloc::vec![const_val.clone()])
+                                            }
                                         } else {
-                                            val_obj
-                                                .get("const")
-                                                .map(|const_val| alloc::vec![const_val.clone()])
-                                        }
-                                    } else {
-                                        None
-                                    };
+                                            None
+                                        };
 
-                                if all_properties.contains_key(key) {
-                                    // Merge enum/const values into existing
-                                    if let Some(values) = new_values
-                                        && let Some(Value::Object(existing_obj)) =
-                                            all_properties.get_mut(key)
-                                        && let Some(Value::Array(existing_enum)) =
-                                            existing_obj.get_mut("enum")
-                                    {
-                                        for e in values {
-                                            if !existing_enum.contains(&e) {
-                                                existing_enum.push(e);
+                                    if all_properties.contains_key(key) {
+                                        if let Some(values) = new_values
+                                            && let Some(Value::Object(existing_obj)) =
+                                                all_properties.get_mut(key)
+                                            && let Some(Value::Array(existing_enum)) =
+                                                existing_obj.get_mut("enum")
+                                        {
+                                            for e in values {
+                                                if !existing_enum.contains(&e) {
+                                                    existing_enum.push(e);
+                                                }
                                             }
                                         }
+                                    } else {
+                                        let mut val_clone = val.clone();
+                                        if let Value::Object(obj) = &mut val_clone
+                                            && let Some(const_val) = obj.remove("const")
+                                        {
+                                            obj.insert(
+                                                "enum".to_string(),
+                                                Value::Array(alloc::vec![const_val]),
+                                            );
+                                        }
+                                        all_properties.insert(key.clone(), val_clone);
                                     }
-                                } else {
-                                    // First time seeing this property - convert const to enum
-                                    let mut val_clone = val.clone();
-                                    if let Value::Object(obj) = &mut val_clone
-                                        && let Some(const_val) = obj.remove("const")
-                                    {
-                                        obj.insert(
-                                            "enum".to_string(),
-                                            Value::Array(alloc::vec![const_val]),
-                                        );
-                                    }
-                                    all_properties.insert(key.clone(), val_clone);
                                 }
                             }
                         }
-                    }
 
-                    // Set type as object if we have properties
-                    if !all_properties.is_empty() {
-                        map.insert("type".to_string(), Value::String("object".to_string()));
-                        map.insert("properties".to_string(), Value::Object(all_properties));
+                        if !all_properties.is_empty() {
+                            map.insert("type".to_string(), Value::String("object".to_string()));
+                            map.insert("properties".to_string(), Value::Object(all_properties));
+                        }
                     }
                 }
             }
@@ -1303,7 +1565,6 @@ fn resolve_and_clean_inner(
 
             // Simplify "type" arrays like ["string", "null"] to single type
             if let Some(Value::Array(types)) = map.get("type") {
-                // Filter out "null" and take the first non-null type
                 let non_null: Vec<&Value> = types
                     .iter()
                     .filter(|t| !matches!(t, Value::String(s) if s == "null"))
@@ -1315,28 +1576,28 @@ fn resolve_and_clean_inner(
 
             // Recursively clean all values
             for (key, v) in map.iter_mut() {
-                // When entering "properties", its children are property definitions
                 let child_inside_props = key == "properties";
-                resolve_and_clean_inner(v, defs, child_inside_props);
+                resolve_and_clean_inner(v, defs, root_type, child_inside_props, active_refs);
+            }
+
+            for name in pushed_refs {
+                active_refs.remove(&name);
             }
         }
         Value::Array(arr) => {
             for v in arr {
-                resolve_and_clean_inner(v, defs, false);
+                resolve_and_clean_inner(v, defs, root_type, false, active_refs);
             }
         }
         _ => {}
     }
 }
 
-/// Resolves a `$ref` path like `#/$defs/FsOperation` to its definition.
-fn resolve_ref(ref_path: &str, defs: &serde_json::Map<String, Value>) -> Option<Value> {
-    // Handle common patterns: #/$defs/Name or #/definitions/Name
-    let name = ref_path
+/// Extracts the definition key from a local `$ref` path like `#/$defs/FsOperation`.
+fn ref_name(ref_path: &str) -> Option<&str> {
+    ref_path
         .strip_prefix("#/$defs/")
-        .or_else(|| ref_path.strip_prefix("#/definitions/"))?;
-
-    defs.get(name).cloned()
+        .or_else(|| ref_path.strip_prefix("#/definitions/"))
 }
 
 impl Default for Tools {
@@ -1415,16 +1676,14 @@ impl Tools {
     /// # Errors
     ///
     /// Same conditions as [`Self::register`].
-    pub fn register_dyn<F>(
+    pub fn register_dyn<F, Fut>(
         &mut self,
         definition: ToolDefinition,
         handler: F,
     ) -> core::result::Result<(), RegisterError>
     where
-        F: Fn(&str, ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&str, ToolContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolResult>> + Send + 'static,
     {
         self.insert(Box::new(DynToolImpl {
             definition,
@@ -1457,10 +1716,16 @@ impl Tools {
     /// Returns an error if the tool is not found, arguments cannot be parsed,
     /// or tool execution fails.
     pub async fn call(&self, name: &str, args: &str, cx: ToolContext) -> Result<ToolResult> {
+        #[derive(askama::Template)]
+        #[template(path = "tool_not_found.txt", escape = "none")]
+        struct ToolNotFound<'a> {
+            name: &'a str,
+        }
+
         if let Some(tool) = self.tools.get(name) {
             tool.call(args, cx).await
         } else {
-            Err(anyhow::Error::msg(format!("Tool '{name}' not found")))
+            Err(anyhow::Error::msg(ToolNotFound { name }.to_string()))
         }
     }
 }
@@ -2229,5 +2494,259 @@ mod tests {
         assert_eq!(value["parts"][0]["kind"], "text");
         let back: ToolResult = serde_json::from_value(value).unwrap();
         assert_eq!(back, result);
+    }
+
+    #[tokio::test]
+    async fn vec_of_struct_and_documented_enum_wrap_in_object_root_schema() {
+        #[derive(JsonSchema, Deserialize, Debug, PartialEq, Eq)]
+        struct Entry {
+            id: u32,
+        }
+
+        /// Processes a batch of entries.
+        struct BatchVecTool;
+
+        impl Tool for BatchVecTool {
+            fn name(&self) -> Cow<'static, str> {
+                Cow::Borrowed("batch_vec")
+            }
+            fn description(&self) -> Cow<'static, str> {
+                Cow::Borrowed("Processes a batch of entries.")
+            }
+            type Arguments = Vec<Entry>;
+            type Res = String;
+
+            fn call(
+                &self,
+                args: Self::Arguments,
+                _cx: ToolContext,
+            ) -> impl Future<Output = Result<Self::Res>> + Send {
+                core::future::ready(Ok(args.len().to_string()))
+            }
+        }
+
+        /// Execution mode.
+        #[derive(JsonSchema, Deserialize, Debug, PartialEq, Eq)]
+        enum DocMode {
+            /// Fast execution path.
+            Fast,
+            /// Thorough execution path.
+            Thorough,
+        }
+
+        struct ModeTool;
+
+        impl Tool for ModeTool {
+            fn name(&self) -> Cow<'static, str> {
+                Cow::Borrowed("mode_tool")
+            }
+            type Arguments = DocMode;
+            type Res = &'static str;
+
+            fn call(
+                &self,
+                args: Self::Arguments,
+                _cx: ToolContext,
+            ) -> impl Future<Output = Result<Self::Res>> + Send {
+                core::future::ready(Ok(match args {
+                    DocMode::Fast => "fast",
+                    DocMode::Thorough => "thorough",
+                }))
+            }
+        }
+
+        let mut tools = Tools::new();
+        tools.register(BatchVecTool).expect("batch registers");
+        tools.register(ModeTool).expect("mode registers");
+
+        for def in tools.definitions() {
+            let schema = def.arguments_openai_schema();
+            assert_eq!(
+                schema["type"],
+                "object",
+                "tool '{}' must emit an object root schema, got: {schema}",
+                def.name()
+            );
+            assert!(
+                schema["properties"]["value"].is_object(),
+                "non-object argument must wrap under `value`: {schema}"
+            );
+        }
+
+        let out = tools
+            .call(
+                "batch_vec",
+                r#"{"value": [{"id": 1}, {"id": 2}]}"#,
+                ToolContext::new(),
+            )
+            .await
+            .expect("batch runs");
+        assert_eq!(out.as_text(), Some("2"));
+
+        let out = tools
+            .call("mode_tool", r#"{"value": "Thorough"}"#, ToolContext::new())
+            .await
+            .expect("mode runs");
+        assert_eq!(out.as_text(), Some("thorough"));
+    }
+
+    #[test]
+    fn recursive_and_cyclic_schemas_terminate_while_preserving_shared_defs() {
+        /// Recursive filter tree.
+        #[derive(JsonSchema, Deserialize)]
+        #[expect(dead_code, reason = "schema test")]
+        #[allow(clippy::use_self)]
+        struct FilterTree {
+            field: Option<String>,
+            children: Vec<FilterTree>,
+            negated: Option<Box<FilterTree>>,
+        }
+
+        struct TreeTool;
+
+        impl Tool for TreeTool {
+            fn name(&self) -> Cow<'static, str> {
+                Cow::Borrowed("tree")
+            }
+            type Arguments = FilterTree;
+            type Res = ToolResult;
+
+            fn call(
+                &self,
+                _args: Self::Arguments,
+                _cx: ToolContext,
+            ) -> impl Future<Output = Result<Self::Res>> + Send {
+                core::future::ready(Ok(ToolResult::Done))
+            }
+        }
+
+        let def = ToolDefinition::new(&TreeTool);
+        let schema = def.arguments_openai_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["children"]["items"]["type"], "object");
+        assert_eq!(schema["properties"]["negated"]["type"], "object");
+        assert_eq!(schema["properties"]["negated"]["nullable"], true);
+
+        // Mutual $ref cycle (#/$defs/A <-> #/$defs/B) must also terminate cleanly.
+        let mut mutual = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "start": { "$ref": "#/$defs/A" }
+            },
+            "$defs": {
+                "A": {
+                    "type": "object",
+                    "properties": {
+                        "b": { "$ref": "#/$defs/B" }
+                    }
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {
+                        "a": { "$ref": "#/$defs/A" }
+                    }
+                }
+            }
+        });
+        clean_schema(&mut mutual);
+        assert_eq!(
+            mutual["properties"]["start"]["properties"]["b"]["properties"]["a"]["type"],
+            "object"
+        );
+
+        // Shared non-cyclic $ref must still inline on every sibling field.
+        let mut shared = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": { "$ref": "#/$defs/State" },
+                "to": { "$ref": "#/$defs/State" }
+            },
+            "$defs": {
+                "State": {
+                    "type": "string",
+                    "enum": ["open", "closed"]
+                }
+            }
+        });
+        clean_schema(&mut shared);
+        assert_eq!(
+            shared["properties"]["from"]["enum"],
+            serde_json::json!(["open", "closed"])
+        );
+        assert_eq!(
+            shared["properties"]["to"]["enum"],
+            serde_json::json!(["open", "closed"])
+        );
+    }
+
+    #[tokio::test]
+    async fn overridden_arguments_schema_and_register_dyn_impl_future_work() {
+        struct DynamicJsonTool;
+
+        impl Tool for DynamicJsonTool {
+            fn name(&self) -> Cow<'static, str> {
+                Cow::Borrowed("dyn_json")
+            }
+            fn description(&self) -> Cow<'static, str> {
+                Cow::Borrowed("Accepts dynamic object arguments.")
+            }
+            fn arguments_schema(&self) -> Schema {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                })
+                .try_into()
+                .expect("object schema")
+            }
+            type Arguments = Value;
+            type Res = String;
+
+            fn call(
+                &self,
+                args: Self::Arguments,
+                _cx: ToolContext,
+            ) -> impl Future<Output = Result<Self::Res>> + Send {
+                core::future::ready(Ok(args["query"].as_str().unwrap_or_default().to_string()))
+            }
+        }
+
+        let mut tools = Tools::new();
+        tools.register(DynamicJsonTool).expect("registers");
+
+        let dyn_def = ToolDefinition::from_parts(
+            Cow::Borrowed("echo_dyn"),
+            Cow::Borrowed("Echoes JSON input via impl Future."),
+            serde_json::json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
+        )
+        .expect("valid definition");
+        tools
+            .register_dyn(dyn_def.clone(), |raw, _cx| {
+                let raw = raw.to_string();
+                async move { Ok(ToolResult::text(raw)) }
+            })
+            .expect("register_dyn accepts impl Future");
+
+        let out = tools
+            .call("dyn_json", r#"{"query":"rust"}"#, ToolContext::new())
+            .await
+            .expect("overridden object schema unwraps directly");
+        assert_eq!(out.as_text(), Some("rust"));
+
+        let echoed = tools
+            .call("echo_dyn", r#"{"msg":"hi"}"#, ToolContext::new())
+            .await
+            .expect("dyn tool runs");
+        assert_eq!(echoed.as_text(), Some(r#"{"msg":"hi"}"#));
+
+        // Cached OpenAI schema shares its Arc across clones.
+        let cloned = dyn_def.clone();
+        assert!(Arc::ptr_eq(&dyn_def.openai_schema, &cloned.openai_schema));
+        assert_eq!(
+            dyn_def.arguments_openai_schema_str(),
+            dyn_def.arguments_openai_schema().to_string()
+        );
     }
 }

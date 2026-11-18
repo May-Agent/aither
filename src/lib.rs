@@ -40,8 +40,6 @@
 //! - [`aither_core::audio`] — speech synthesis and transcription.
 //! - [`aither_core::moderation`] — provider-neutral moderation scoring.
 
-extern crate alloc;
-
 pub use aither_core::*;
 #[cfg(feature = "derive")]
 pub use aither_derive::tool;
@@ -105,9 +103,3 @@ pub use aither_command as command;
 // Model Context Protocol
 #[cfg(feature = "mcp")]
 pub use aither_mcp as mcp;
-
-#[doc(hidden)]
-/// For internal use only.
-pub mod __hidden {
-    pub type CowStr = alloc::borrow::Cow<'static, str>;
-}
