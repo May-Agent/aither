@@ -175,11 +175,18 @@ impl<M> ModelGroup<M> {
     /// Returns the current active model, or None if all are exhausted.
     #[must_use]
     pub fn current(&self) -> Option<&BudgetedModel<M>> {
+        self.current_with_index().map(|(_, model)| model)
+    }
+
+    fn current_with_index(&self) -> Option<(usize, &BudgetedModel<M>)> {
         if !self.try_advance() {
             return None;
         }
         let idx = self.current.load(Ordering::Acquire);
-        self.models.get(idx).filter(|m| !m.is_exhausted())
+        self.models
+            .get(idx)
+            .filter(|m| !m.is_exhausted())
+            .map(|m| (idx, m))
     }
 
     /// Advances to the next model if the current one is exhausted.
@@ -263,26 +270,22 @@ impl<M> ModelGroup<M> {
 
 use aither_core::{
     LanguageModel,
-    llm::{Event, GenerateError, LLMRequest, RetryPolicy, TokenCounting, model::Profile},
+    llm::{
+        Classify as _, Event, FailureKind, GenerateError, LLMRequest, RetryPolicy, TokenCounting,
+        model::Profile,
+    },
 };
-use futures_core::Stream;
+use futures_core::{FusedStream, Stream};
 
 /// Error type for model group operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ModelGroupError<E> {
     /// All models in the group are exhausted.
+    #[error("all models in group are exhausted")]
     AllModelsExhausted,
     /// Underlying model error.
-    Model(E),
-}
-
-impl<E: std::fmt::Display> std::fmt::Display for ModelGroupError<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AllModelsExhausted => write!(f, "all models in group are exhausted"),
-            Self::Model(e) => write!(f, "{e}"),
-        }
-    }
+    #[error("{0}")]
+    Model(#[source] E),
 }
 
 impl<E: aither_core::llm::Classify> aither_core::llm::Classify for ModelGroupError<E> {
@@ -292,28 +295,6 @@ impl<E: aither_core::llm::Classify> aither_core::llm::Classify for ModelGroupErr
             Self::Model(e) => e.failure(),
         }
     }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for ModelGroupError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::AllModelsExhausted => None,
-            Self::Model(e) => Some(e),
-        }
-    }
-}
-
-/// Checks if an error message indicates budget/quota exhaustion.
-fn is_quota_error(error_msg: &str) -> bool {
-    let lower = error_msg.to_lowercase();
-    lower.contains("insufficient_quota")
-        || lower.contains("rate_limit")
-        || lower.contains("quota")
-        || lower.contains("resource_exhausted")
-        || lower.contains("overloaded")
-        || lower.contains("capacity")
-        || lower.contains("billing")
-        || lower.contains("exceeded")
 }
 
 impl<M> LanguageModel for ModelGroup<M>
@@ -395,18 +376,33 @@ use std::task::{Context, Poll};
 type BoxedModelStream<'a, M> =
     Pin<Box<dyn Stream<Item = Result<Event, <M as LanguageModel>::Error>> + Send + 'a>>;
 
+enum StreamState<'a, M: LanguageModel> {
+    Active {
+        model_index: usize,
+        stream: BoxedModelStream<'a, M>,
+    },
+    Exhausted,
+    Done,
+}
+
 struct ModelGroupStream<'a, M: LanguageModel> {
     group: &'a ModelGroup<M>,
-    inner: Option<BoxedModelStream<'a, M>>,
+    state: StreamState<'a, M>,
 }
 
 impl<'a, M: LanguageModel> ModelGroupStream<'a, M> {
     fn new(group: &'a ModelGroup<M>, request: LLMRequest) -> Self {
-        let inner = group.current().map(|m| {
-            let stream = m.inner().respond(request);
-            Box::pin(stream) as BoxedModelStream<'a, M>
-        });
-        Self { group, inner }
+        let state = match group.current_with_index() {
+            Some((model_index, model)) => {
+                let stream = Box::pin(model.inner().respond(request)) as BoxedModelStream<'a, M>;
+                StreamState::Active {
+                    model_index,
+                    stream,
+                }
+            }
+            None => StreamState::Exhausted,
+        };
+        Self { group, state }
     }
 }
 
@@ -417,33 +413,57 @@ where
     type Item = Result<Event, ModelGroupError<M::Error>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let Some(ref mut inner) = self.inner else {
-            return Poll::Ready(Some(Err(ModelGroupError::AllModelsExhausted)));
-        };
-
-        match inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(event))) => {
-                // Track usage
-                if let Event::Usage(ref usage) = event
-                    && let Some(model) = self.group.current()
-                {
-                    model.record_usage(usage);
-                }
-                Poll::Ready(Some(Ok(event)))
+        match &mut self.state {
+            StreamState::Done => Poll::Ready(None),
+            StreamState::Exhausted => {
+                self.state = StreamState::Done;
+                Poll::Ready(Some(Err(ModelGroupError::AllModelsExhausted)))
             }
-            Poll::Ready(Some(Err(e))) => {
-                // Check if this is a quota error
-                let error_msg = e.to_string();
-                if is_quota_error(&error_msg) {
-                    let _ = self.group.mark_current_exhausted();
-                    tracing::warn!("Model quota exhausted: {}", error_msg);
+            StreamState::Active {
+                model_index,
+                stream,
+            } => {
+                let idx = *model_index;
+                match stream.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(event))) => {
+                        if let Event::Usage(ref usage) = event
+                            && let Some(model) = self.group.models.get(idx)
+                        {
+                            model.record_usage(usage);
+                            if model.is_exhausted() {
+                                let _ = self.group.try_advance();
+                            }
+                        }
+                        Poll::Ready(Some(Ok(event)))
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        if e.failure().kind == FailureKind::Quota {
+                            if let Some(model) = self.group.models.get(idx) {
+                                model.mark_exhausted();
+                            }
+                            let _ = self.group.try_advance();
+                            tracing::warn!(error = %e, "Model quota exhausted");
+                        }
+                        self.state = StreamState::Done;
+                        Poll::Ready(Some(Err(ModelGroupError::Model(e))))
+                    }
+                    Poll::Ready(None) => {
+                        self.state = StreamState::Done;
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
                 }
-                self.inner = None;
-                Poll::Ready(Some(Err(ModelGroupError::Model(e))))
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl<M: LanguageModel> FusedStream for ModelGroupStream<'_, M>
+where
+    M::Error: Send + 'static,
+{
+    fn is_terminated(&self) -> bool {
+        matches!(self.state, StreamState::Done)
     }
 }
 
@@ -594,5 +614,118 @@ mod tests {
             Some(Ok(Event::Text(text))) => assert_eq!(text, "fallback"),
             other => panic!("expected fallback model text event, got {other:?}"),
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingError {
+        msg: &'static str,
+        failure: aither_core::llm::Failure,
+    }
+
+    impl std::fmt::Display for FailingError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.msg)
+        }
+    }
+
+    impl std::error::Error for FailingError {}
+
+    impl aither_core::llm::Classify for FailingError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            self.failure
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedGroupModel {
+        events: Vec<Result<Event, FailingError>>,
+    }
+
+    impl LanguageModel for ScriptedGroupModel {
+        type Error = FailingError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl futures_core::Stream<Item = Result<Event, Self::Error>> + Send {
+            stream::iter(self.events.clone())
+        }
+
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
+            std::future::ready(Ok(Profile::new("scripted", "m", "test", "m", 0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_stream_yields_one_error_and_terminates() {
+        let group = ModelGroup::new(BudgetedModel::new(
+            DummyModel { name: "only" },
+            Budget::tokens(1),
+        ));
+        group.models[0].mark_exhausted();
+
+        let request = LLMRequest::new([aither_core::llm::Message::user("hello")]);
+        let items: Vec<_> = group.respond(request).collect().await;
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Err(ModelGroupError::AllModelsExhausted)));
+    }
+
+    #[tokio::test]
+    async fn quota_classification_and_bound_model_index_govern_exhaustion() {
+        // Non-quota error containing "exceeded" must not exhaust the model, and
+        // collecting the stream after an error must terminate cleanly.
+        let permanent_exceeded = ScriptedGroupModel {
+            events: vec![Err(FailingError {
+                msg: "context_length_exceeded",
+                failure: aither_core::llm::Failure::permanent(),
+            })],
+        };
+        let group = ModelGroup::from_models(vec![
+            BudgetedModel::unlimited(permanent_exceeded),
+            BudgetedModel::unlimited(ScriptedGroupModel {
+                events: vec![Ok(Event::Text("fallback".into()))],
+            }),
+        ]);
+        let items: Vec<_> = group
+            .respond(LLMRequest::new([aither_core::llm::Message::user("hi")]))
+            .collect()
+            .await;
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Err(ModelGroupError::Model(_))));
+        assert!(
+            !group.models[0].is_exhausted(),
+            "substring 'exceeded' without FailureKind::Quota must not exhaust primary"
+        );
+
+        // A stream opened on primary records usage and quota exhaustion on
+        // primary even if `group` advances while the stream is open.
+        let quota_stream = ScriptedGroupModel {
+            events: vec![
+                Ok(Event::Usage(Usage::new(10, 5))),
+                Err(FailingError {
+                    msg: "limit reached",
+                    failure: aither_core::llm::Failure::quota(),
+                }),
+            ],
+        };
+        let group = ModelGroup::from_models(vec![
+            BudgetedModel::unlimited(quota_stream),
+            BudgetedModel::unlimited(ScriptedGroupModel {
+                events: vec![Ok(Event::Text("fallback".into()))],
+            }),
+        ]);
+        let mut open_stream =
+            group.respond(LLMRequest::new([aither_core::llm::Message::user("hi")]));
+        // Simulate concurrent advance to fallback before `open_stream` is polled.
+        group.current.store(1, Ordering::Release);
+
+        let collected: Vec<_> = (&mut open_stream).collect().await;
+        assert_eq!(collected.len(), 2);
+        assert_eq!(group.models[0].tokens_used(), 15);
+        assert_eq!(group.models[1].tokens_used(), 0);
+        assert!(group.models[0].is_exhausted());
+        assert!(!group.models[1].is_exhausted());
     }
 }

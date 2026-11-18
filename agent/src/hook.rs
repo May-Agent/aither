@@ -124,8 +124,45 @@ pub enum AfterTool {
     /// The model reads what the tool returned, and the conversation gains
     /// this context as a durable block after the turn's results.
     Append(String),
+    /// Wraps a non-aborting decision so the call and its result are retained
+    /// verbatim across compactions, tombstoning, and recovery spills at their
+    /// original sequence numbers.
+    Kept(Box<Self>),
     /// End the run with this reason as its error.
     Abort(String),
+}
+
+impl AfterTool {
+    /// Marks this tool exchange to be retained verbatim across compactions,
+    /// tombstoning, and recovery spills at its original sequence number.
+    ///
+    /// Leaves [`Abort`](Self::Abort) unchanged and avoids double-wrapping.
+    #[must_use]
+    pub fn kept(self) -> Self {
+        match self {
+            Self::Abort(_) | Self::Kept(_) => self,
+            other => Self::Kept(Box::new(other)),
+        }
+    }
+
+    /// Conditionally marks this tool exchange `kept` when `kept` is `true`.
+    #[must_use]
+    pub fn with_kept(self, kept: bool) -> Self {
+        if kept {
+            self.kept()
+        } else {
+            match self {
+                Self::Kept(inner) => *inner,
+                other => other,
+            }
+        }
+    }
+
+    /// Whether this decision marks the exchange to be retained verbatim.
+    #[must_use]
+    pub const fn is_kept(&self) -> bool {
+        matches!(self, Self::Kept(_))
+    }
 }
 
 /// The model ended its turn with no tool call.

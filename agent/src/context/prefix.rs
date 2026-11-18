@@ -47,12 +47,16 @@ pub struct PrefixChain {
 impl PrefixChain {
     /// The chain of a request carrying `definitions` and `messages`.
     ///
+    /// `has_tail` indicates whether the final message in `messages` is a
+    /// volatile live tail that is rebuilt on the next request and therefore
+    /// excluded from the cached prefix.
+    ///
     /// # Panics
     ///
     /// Panics when a message or tool definition cannot be serialized, which
     /// would mean the request itself cannot be sent.
     #[must_use]
-    pub fn of(definitions: &[ToolDefinition], messages: &[Message]) -> Self {
+    pub fn of(definitions: &[ToolDefinition], messages: &[Message], has_tail: bool) -> Self {
         let mut hasher = HashWriter(Sha256::new());
         let mut blocks = Vec::with_capacity(messages.len() + 1);
         let mut links = Vec::with_capacity(messages.len() + 1);
@@ -67,7 +71,8 @@ impl PrefixChain {
             });
             links.push(hasher.link());
         }
-        let cached = 1 + super::cache::stable_conversation_end(messages).map_or(0, |end| end + 1);
+        let cached =
+            1 + super::cache::stable_conversation_end(messages, has_tail).map_or(0, |end| end + 1);
         Self {
             blocks,
             links,
@@ -184,11 +189,11 @@ mod tests {
     #[test]
     fn an_unchanged_prefix_with_a_new_tail_does_not_diverge() {
         let tools = [tool("terminal")];
-        let first = PrefixChain::of(&tools, &conversation());
+        let first = PrefixChain::of(&tools, &conversation(), true);
         let mut next = conversation();
         next.pop();
         next.extend([Message::user("again"), Message::system("new tail")]);
-        let second = PrefixChain::of(&tools, &next);
+        let second = PrefixChain::of(&tools, &next, true);
         assert_eq!(second.first_divergence(&first), None);
         assert_eq!(
             first.cached_blocks(),
@@ -198,19 +203,31 @@ mod tests {
     }
 
     #[test]
+    fn a_request_without_a_tail_caches_every_message() {
+        let tools = [tool("terminal")];
+        let messages = [
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+        ];
+        let chain = PrefixChain::of(&tools, &messages, false);
+        assert_eq!(chain.cached_blocks(), 4);
+    }
+
+    #[test]
     fn a_changed_tool_set_diverges_at_the_tools() {
-        let first = PrefixChain::of(&[tool("terminal")], &conversation());
-        let second = PrefixChain::of(&[tool("terminal"), tool("monitor")], &conversation());
+        let first = PrefixChain::of(&[tool("terminal")], &conversation(), true);
+        let second = PrefixChain::of(&[tool("terminal"), tool("monitor")], &conversation(), true);
         assert_eq!(second.first_divergence(&first), Some(PrefixBlock::Tools));
     }
 
     #[test]
     fn a_changed_message_names_its_index_and_role() {
         let tools = [tool("terminal")];
-        let first = PrefixChain::of(&tools, &conversation());
+        let first = PrefixChain::of(&tools, &conversation(), true);
         let mut edited = conversation();
         edited[1] = Message::user("hello there");
-        let second = PrefixChain::of(&tools, &edited);
+        let second = PrefixChain::of(&tools, &edited, true);
         assert_eq!(
             second.first_divergence(&first),
             Some(PrefixBlock::Message {
@@ -223,8 +240,8 @@ mod tests {
     #[test]
     fn a_shorter_request_diverges_at_the_first_missing_block() {
         let tools = [tool("terminal")];
-        let first = PrefixChain::of(&tools, &conversation());
-        let second = PrefixChain::of(&tools, &[Message::system("prefix")]);
+        let first = PrefixChain::of(&tools, &conversation(), true);
+        let second = PrefixChain::of(&tools, &[Message::system("prefix")], false);
         assert_eq!(
             second.first_divergence(&first),
             Some(PrefixBlock::Message {
@@ -236,7 +253,7 @@ mod tests {
 
     #[test]
     fn a_chain_survives_serialization() {
-        let chain = PrefixChain::of(&[tool("terminal")], &conversation());
+        let chain = PrefixChain::of(&[tool("terminal")], &conversation(), true);
         let text = serde_json::to_string(&chain).expect("serializes");
         let back: PrefixChain = serde_json::from_str(&text).expect("deserializes");
         assert_eq!(back, chain);

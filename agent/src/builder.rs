@@ -64,6 +64,8 @@ pub struct AgentBuilder<M, H = (), C = M, Schema = HandoffDocument> {
     config: AgentConfig,
     context: Context,
     prompt_cache: crate::context::PromptCache,
+    cache_lifetime_override: Option<crate::context::CacheLifetime>,
+    claude_cache_ttl_override: Option<aither_core::llm::model::ClaudePromptCacheTtl>,
     clock: crate::AnyClock,
     context_sources: Vec<AnyContextSource>,
     live_sources: Vec<AnyLiveSource>,
@@ -73,7 +75,8 @@ pub struct AgentBuilder<M, H = (), C = M, Schema = HandoffDocument> {
     identity: aither_core::llm::AgentIdentity,
     tools: AgentTools,
     connectivity: crate::connectivity::Watch,
-    restore_dir: Option<std::path::PathBuf>,
+    restore_roots: Vec<std::path::PathBuf>,
+    spill_dir: Option<std::path::PathBuf>,
     file_references: Option<AnyFileReferences>,
     /// The window state a fork inherits, which replaces initialization.
     inherited: Option<Inherited>,
@@ -111,6 +114,8 @@ impl<M: LanguageModel> AgentBuilder<M> {
             config: AgentConfig::default(),
             context: Context::default(),
             prompt_cache: crate::context::PromptCache::new(uuid::Uuid::new_v4().to_string()),
+            cache_lifetime_override: None,
+            claude_cache_ttl_override: None,
             clock: crate::AnyClock::default(),
             context_sources: Vec::new(),
             live_sources: Vec::new(),
@@ -120,7 +125,8 @@ impl<M: LanguageModel> AgentBuilder<M> {
             identity: aither_core::llm::AgentIdentity::Main,
             tools: AgentTools::new(),
             connectivity: crate::connectivity::Watch::default(),
-            restore_dir: None,
+            restore_roots: Vec::new(),
+            spill_dir: None,
             file_references: None,
             inherited: None,
             #[cfg(feature = "skills")]
@@ -293,37 +299,73 @@ where
     /// asks for a new cache shard; a host that rebuilds its agent supplies
     /// the session's identity (and the replaced agent's epoch, through
     /// [`PromptCache::with_epoch`](crate::context::PromptCache::with_epoch))
-    /// so the key stays the same across rebuilds.
-    pub fn prompt_cache(mut self, cache: crate::context::PromptCache) -> Self {
+    /// so the key stays the same across rebuilds. Explicit
+    /// [`cache_lifetime`](Self::cache_lifetime) and
+    /// [`claude_cache_ttl`](Self::claude_cache_ttl) overrides set on this
+    /// builder apply regardless of call order.
+    pub fn prompt_cache(mut self, mut cache: crate::context::PromptCache) -> Self {
+        if let Some(lifetime) = self.cache_lifetime_override {
+            cache.set_lifetime(lifetime);
+        }
+        if let Some(ttl) = self.claude_cache_ttl_override {
+            cache.set_ttl(ttl);
+        }
         self.prompt_cache = cache;
         self
     }
 
     /// Sets the Claude cache retention of the session's prompt cache,
-    /// keeping its session key; the cache lifetime follows the retention.
-    pub fn claude_cache_ttl(mut self, ttl: aither_core::llm::model::ClaudePromptCacheTtl) -> Self {
-        self.prompt_cache = self.prompt_cache.with_ttl(ttl);
+    /// keeping its session key and [`cache_lifetime`](Self::cache_lifetime).
+    pub const fn claude_cache_ttl(
+        mut self,
+        ttl: aither_core::llm::model::ClaudePromptCacheTtl,
+    ) -> Self {
+        self.claude_cache_ttl_override = Some(ttl);
+        self.prompt_cache.set_ttl(ttl);
         self
     }
 
     /// Sets the conversation's cache lifetime, keeping the rest of its
     /// prompt cache. Idle compaction and idle reassembly follow it.
-    pub fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
-        self.prompt_cache = self.prompt_cache.with_lifetime(lifetime);
+    pub const fn cache_lifetime(mut self, lifetime: crate::context::CacheLifetime) -> Self {
+        self.cache_lifetime_override = Some(lifetime);
+        self.prompt_cache.set_lifetime(lifetime);
         self
     }
 
-    /// Sets the time source idle compaction, idle reassembly and cache
-    /// warmth read; the system clock by default.
+    /// Sets the time source idle compaction, idle reassembly, cache warmth,
+    /// emitted events and committed context items read; the system clock by
+    /// default.
     pub fn clock(mut self, clock: impl crate::Clock) -> Self {
         self.clock = crate::AnyClock::new(clock);
         self
     }
 
-    /// Sets the directory files are restored from after a compaction.
-    pub fn restore_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.restore_dir = Some(path.into());
+    /// Sets the readable directories files may be restored from after a
+    /// compaction. Relative handoff paths resolve against the first root, and
+    /// every candidate must canonicalize inside one of the roots.
+    pub fn restore_roots<I, P>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<std::path::PathBuf>,
+    {
+        self.restore_roots = roots.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Sets the writable directory where compaction recovery spills long tool
+    /// outputs.
+    pub fn spill_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.spill_dir = Some(path.into());
+        self
+    }
+
+    /// Convenience alias setting `path` as the sole readable restoration root
+    /// and `path/outputs` as [`spill_dir`](Self::spill_dir).
+    pub fn restore_dir(self, path: impl Into<std::path::PathBuf>) -> Self {
+        let root = path.into();
+        let spill = root.join(crate::context::recovery::DEFAULT_SPILL_SUBDIR);
+        self.restore_roots([root]).spill_dir(spill)
     }
 
     /// Sets how a compaction's file index finds the files tool results name.
@@ -347,6 +389,8 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            cache_lifetime_override: self.cache_lifetime_override,
+            claude_cache_ttl_override: self.claude_cache_ttl_override,
             clock: self.clock,
             context_sources: self.context_sources,
             live_sources: self.live_sources,
@@ -356,7 +400,8 @@ where
             identity: self.identity,
             tools: self.tools,
             connectivity: self.connectivity,
-            restore_dir: self.restore_dir,
+            restore_roots: self.restore_roots,
+            spill_dir: self.spill_dir,
             file_references: self.file_references,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
@@ -393,6 +438,8 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            cache_lifetime_override: self.cache_lifetime_override,
+            claude_cache_ttl_override: self.claude_cache_ttl_override,
             clock: self.clock,
             context_sources: self.context_sources,
             live_sources: self.live_sources,
@@ -402,7 +449,8 @@ where
             identity: self.identity,
             tools: self.tools,
             connectivity: self.connectivity,
-            restore_dir: self.restore_dir,
+            restore_roots: self.restore_roots,
+            spill_dir: self.spill_dir,
             file_references: self.file_references,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
@@ -422,6 +470,8 @@ where
             config: self.config,
             context: self.context,
             prompt_cache: self.prompt_cache,
+            cache_lifetime_override: self.cache_lifetime_override,
+            claude_cache_ttl_override: self.claude_cache_ttl_override,
             clock: self.clock,
             context_sources: self.context_sources,
             live_sources: self.live_sources,
@@ -431,7 +481,8 @@ where
             identity: self.identity,
             tools: self.tools,
             connectivity: self.connectivity,
-            restore_dir: self.restore_dir,
+            restore_roots: self.restore_roots,
+            spill_dir: self.spill_dir,
             file_references: self.file_references,
             inherited: self.inherited,
             #[cfg(feature = "skills")]
@@ -469,7 +520,14 @@ where
     /// definitions.
     pub fn forked_from(mut self, fork: &crate::fork::ForkSnapshot) -> Self {
         self.context = fork.context.clone();
-        self.prompt_cache = fork.prompt_cache.clone();
+        let mut cache = fork.prompt_cache.clone();
+        if let Some(lifetime) = self.cache_lifetime_override {
+            cache.set_lifetime(lifetime);
+        }
+        if let Some(ttl) = self.claude_cache_ttl_override {
+            cache.set_ttl(ttl);
+        }
+        self.prompt_cache = cache;
         self.parameters = fork.request_parameters.clone();
         self.config.context_policy = fork.context_policy;
         self.inherited = Some(Inherited {
@@ -520,7 +578,7 @@ where
     ///
     /// Panics when the agent is a fork and its tools do not present the
     /// definitions the main agent's request carried.
-    pub fn build(self) -> Agent<M, H, C, Schema> {
+    pub fn build(mut self) -> Agent<M, H, C, Schema> {
         let inherited = self.inherited.as_ref();
         if let Some(inherited) = inherited {
             assert_eq!(
@@ -538,8 +596,13 @@ where
                 Some(inherited.profile.clone()),
             )
         });
+        self.context.set_clock(self.clock.clone());
+        if let Some(subagents) = &self.subagents {
+            subagents.set_clock(self.clock.clone());
+        }
         Agent {
-            warmth: crate::CacheWarmth::new(self.prompt_cache.lifetime(), self.clock),
+            warmth: crate::CacheWarmth::new(self.prompt_cache.lifetime(), self.clock.clone()),
+            clock: self.clock,
             model: std::sync::Arc::new(self.model),
             compaction_model: self.compaction_model.map(|compactor| WithParameters {
                 model: std::sync::Arc::new(compactor.model),
@@ -572,7 +635,8 @@ where
             compaction_profile: None,
             initialized,
             connectivity: self.connectivity,
-            restore_dir: self.restore_dir,
+            restore_roots: self.restore_roots,
+            spill_dir: self.spill_dir,
             file_references: self.file_references,
             last_request: None,
             delivering: None,
@@ -739,6 +803,73 @@ mod tests {
         assert_eq!(
             agent.config.max_iterations,
             AgentConfig::default().max_iterations
+        );
+    }
+
+    #[test]
+    fn prompt_cache_lifetime_and_ttl_are_order_independent() {
+        use crate::context::{CacheLifetime, PromptCache};
+        use aither_core::llm::model::ClaudePromptCacheTtl;
+        use std::time::Duration;
+
+        let first = AgentBuilder::new(MockLlm)
+            .cache_lifetime(CacheLifetime::Permanent)
+            .claude_cache_ttl(ClaudePromptCacheTtl::FiveMinutes)
+            .prompt_cache(PromptCache::new("session-a").with_epoch(4))
+            .build();
+        let second = AgentBuilder::new(MockLlm)
+            .prompt_cache(PromptCache::new("session-a").with_epoch(4))
+            .cache_lifetime(CacheLifetime::Permanent)
+            .claude_cache_ttl(ClaudePromptCacheTtl::FiveMinutes)
+            .build();
+
+        assert_eq!(first.prompt_cache.key(), "session-a:4");
+        assert_eq!(first.prompt_cache.key(), second.prompt_cache.key());
+        assert_eq!(first.cache_lifetime(), CacheLifetime::Permanent);
+        assert_eq!(second.cache_lifetime(), CacheLifetime::Permanent);
+        assert_eq!(first.claude_cache_ttl(), ClaudePromptCacheTtl::FiveMinutes);
+        assert_eq!(second.claude_cache_ttl(), ClaudePromptCacheTtl::FiveMinutes);
+
+        let custom = AgentBuilder::new(MockLlm)
+            .prompt_cache(
+                PromptCache::new("session-b")
+                    .with_ttl(ClaudePromptCacheTtl::FiveMinutes)
+                    .with_lifetime(CacheLifetime::Limited(Duration::from_mins(30))),
+            )
+            .build();
+        assert_eq!(
+            custom.cache_lifetime(),
+            CacheLifetime::Limited(Duration::from_mins(30))
+        );
+        assert_eq!(custom.claude_cache_ttl(), ClaudePromptCacheTtl::FiveMinutes);
+    }
+
+    #[test]
+    fn restore_roots_and_spill_dir_can_be_configured_separately_or_by_alias() {
+        let separate = AgentBuilder::new(MockLlm)
+            .restore_roots(["/sandbox", "/repo"])
+            .spill_dir("/sandbox/spills")
+            .build();
+        assert_eq!(
+            separate.restore_roots,
+            vec![
+                std::path::PathBuf::from("/sandbox"),
+                std::path::PathBuf::from("/repo")
+            ]
+        );
+        assert_eq!(
+            separate.spill_dir,
+            Some(std::path::PathBuf::from("/sandbox/spills"))
+        );
+
+        let aliased = AgentBuilder::new(MockLlm).restore_dir("/session").build();
+        assert_eq!(
+            aliased.restore_roots,
+            vec![std::path::PathBuf::from("/session")]
+        );
+        assert_eq!(
+            aliased.spill_dir,
+            Some(std::path::PathBuf::from("/session/outputs"))
         );
     }
 }

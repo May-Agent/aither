@@ -605,90 +605,49 @@ async fn handle_client_request<H: AgentHandler>(
     debug!(method = %request.method, "handling client request");
     match request.method.as_str() {
         "initialize" => {
-            dispatch_optional(&request, |params| async move {
-                handler.initialize(&peer, params).await
-            })
-            .await
+            dispatch_optional(&request, |params| handler.initialize(&peer, params)).await
         }
-        "authenticate" => {
-            dispatch(&request, |params| async move {
-                handler.authenticate(&peer, params).await
-            })
-            .await
-        }
-        "logout" => {
-            dispatch_default(&request, |params| async move {
-                handler.logout(&peer, params).await
-            })
-            .await
-        }
-        "session/new" => {
-            dispatch(&request, |params| async move {
-                handler.new_session(&peer, params).await
-            })
-            .await
-        }
-        "session/load" => {
-            dispatch(&request, |params| async move {
-                handler.load_session(&peer, params).await
-            })
-            .await
-        }
+        "authenticate" => dispatch(&request, |params| handler.authenticate(&peer, params)).await,
+        "logout" => dispatch_default(&request, |params| handler.logout(&peer, params)).await,
+        "session/new" => dispatch(&request, |params| handler.new_session(&peer, params)).await,
+        "session/load" => dispatch(&request, |params| handler.load_session(&peer, params)).await,
         "session/resume" => {
-            dispatch(&request, |params| async move {
-                handler.resume_session(&peer, params).await
-            })
-            .await
+            dispatch(&request, |params| handler.resume_session(&peer, params)).await
         }
+        "session/fork" => dispatch(&request, |params| handler.fork_session(&peer, params)).await,
         "session/list" => {
-            dispatch_default(&request, |params| async move {
-                handler.list_sessions(&peer, params).await
-            })
-            .await
+            dispatch_default(&request, |params| handler.list_sessions(&peer, params)).await
         }
-        "session/close" => {
-            dispatch(&request, |params| async move {
-                handler.close_session(&peer, params).await
-            })
-            .await
-        }
+        "session/close" => dispatch(&request, |params| handler.close_session(&peer, params)).await,
         "session/delete" => {
-            dispatch(&request, |params| async move {
-                handler.delete_session(&peer, params).await
-            })
-            .await
+            dispatch(&request, |params| handler.delete_session(&peer, params)).await
         }
-        "session/prompt" => {
-            dispatch(&request, |params| async move {
-                handler.prompt(&peer, params).await
-            })
-            .await
-        }
-        "session/set_mode" => {
-            dispatch(&request, |params| async move {
-                handler.set_mode(&peer, params).await
-            })
-            .await
-        }
+        "session/prompt" => dispatch(&request, |params| handler.prompt(&peer, params)).await,
+        "session/set_mode" => dispatch(&request, |params| handler.set_mode(&peer, params)).await,
         "session/set_config_option" => {
-            dispatch(&request, |params| async move {
-                handler.set_config_option(&peer, params).await
-            })
-            .await
+            dispatch(&request, |params| handler.set_config_option(&peer, params)).await
         }
-        method if method.starts_with('_') => {
-            let Ok(method) = ExtMethod::try_new(request.method.clone()) else {
-                return JsonRpcResponse::error(
-                    request.id,
-                    JsonRpcError::method_not_found(&request.method),
-                );
-            };
-            match handler.ext_request(&peer, method, request.params).await {
-                Ok(result) => JsonRpcResponse::success(request.id, result),
-                Err(error) => JsonRpcResponse::error(request.id, error),
-            }
+        _ => handle_custom_request(handler.as_ref(), &peer, request).await,
+    }
+}
+
+/// Dispatch a `_`-prefixed extension request or an unmodeled vendor request.
+async fn handle_custom_request<H: AgentHandler>(
+    handler: &H,
+    peer: &ClientPeer,
+    request: JsonRpcRequest,
+) -> JsonRpcResponse {
+    if let Ok(method) = ExtMethod::try_new(request.method.clone()) {
+        match handler.ext_request(peer, method, request.params).await {
+            Ok(result) => JsonRpcResponse::success(request.id, result),
+            Err(error) => JsonRpcResponse::error(request.id, error),
         }
-        method => JsonRpcResponse::error(request.id, JsonRpcError::method_not_found(method)),
+    } else {
+        let id = request.id.clone();
+        match handler.request(peer, request).await {
+            Ok(result) => JsonRpcResponse::success(id, result),
+            Err(error) => JsonRpcResponse::error(id, error),
+        }
     }
 }
 

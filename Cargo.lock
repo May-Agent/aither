@@ -460,8 +460,12 @@ version = "0.31.0"
 dependencies = [
  "aither-core",
  "async-fs",
+ "futures-lite",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
  "zenwave",
 ]
 

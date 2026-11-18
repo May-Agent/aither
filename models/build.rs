@@ -80,6 +80,15 @@ fn generate_registry_code(entries: &[convert::ConvertedEntry]) -> String {
         if let Some(i) = entry.image_per_token {
             let _ = write!(code, ".with_image({i:?})");
         }
+        if let Some(io) = entry.image_output_per_token {
+            let _ = write!(code, ".with_image_output({io:?})");
+        }
+        if let Some(a) = entry.audio_per_token {
+            let _ = write!(code, ".with_audio({a:?})");
+        }
+        if let Some(ao) = entry.audio_output_per_token {
+            let _ = write!(code, ".with_audio_output({ao:?})");
+        }
         code.push_str(",\n");
 
         // Abilities

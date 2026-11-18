@@ -4,7 +4,7 @@
 //!
 //! - the `_meta.codex` namespace (subagent refs, collaboration routing,
 //!   phase labels) plus codex-emitted top-level `_meta` keys on tool calls;
-//! - the `models` extra on `session/new|load|resume` results;
+//! - the `models` extra on `session/new|load|resume|fork` results;
 //! - auth method IDs and the gateway auth flow;
 //! - legacy methods that predate the `_` naming rule (`session/set_model`,
 //!   `authentication/status`, `authentication/logout`) and the
@@ -153,7 +153,7 @@ pub fn terminal_exit(meta: Option<&Value>) -> Option<TerminalExit> {
     serde_json::from_value(meta?.get(TERMINAL_EXIT)?.clone()).ok()
 }
 
-/// The `models` extra Codex returns on `session/new|load|resume` results.
+/// The `models` extra Codex returns on `session/new|load|resume|fork` results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModels {
@@ -190,7 +190,7 @@ pub const MODELS: &str = "models";
 /// Extract the [`SessionModels`] extra from a session result.
 ///
 /// Works on the `extra` map of `SessionNewResult`, `SessionLoadResult`,
-/// and `SessionResumeResult`.
+/// `SessionResumeResult`, and `SessionForkResult`.
 #[must_use]
 pub fn models(extra: &BTreeMap<String, Value>) -> Option<SessionModels> {
     serde_json::from_value(extra.get(MODELS)?.clone()).ok()
