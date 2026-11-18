@@ -3,17 +3,16 @@
 //! Enable with `features = ["remote"]`.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::convert;
+use futures_lite::io::AsyncWriteExt;
+
+use crate::convert::{self, ConvertedEntry};
 use crate::registry::ModelRegistry;
 
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
 const CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Fetch the latest `LiteLLM` model data and build a registry.
 ///
@@ -32,8 +31,8 @@ async fn fetch_litellm_from_url(
     url: &str,
     cache_path: Option<&Path>,
 ) -> Result<ModelRegistry, FetchError> {
-    let bytes = fetch_with_cache(url, cache_path).await?;
-    Ok(ModelRegistry::try_from_litellm_json(&bytes)?)
+    let entries = fetch_with_cache(url, cache_path).await?;
+    Ok(ModelRegistry::from_converted(entries))
 }
 
 /// Error type for remote fetch operations.
@@ -70,7 +69,10 @@ impl From<zenwave::Error> for FetchError {
     }
 }
 
-async fn fetch_with_cache(url: &str, cache_path: Option<&Path>) -> Result<Vec<u8>, FetchError> {
+async fn fetch_with_cache(
+    url: &str,
+    cache_path: Option<&Path>,
+) -> Result<Vec<ConvertedEntry>, FetchError> {
     // Check cache freshness
     if let Some(path) = cache_path
         && let Ok(meta) = async_fs::metadata(path).await
@@ -78,7 +80,8 @@ async fn fetch_with_cache(url: &str, cache_path: Option<&Path>) -> Result<Vec<u8
     {
         let age = modified.elapsed().unwrap_or_default();
         if age.as_secs() < CACHE_MAX_AGE_SECS {
-            return Ok(async_fs::read(path).await?);
+            let bytes = async_fs::read(path).await?;
+            return Ok(convert::try_parse_litellm_json(&bytes)?);
         }
     }
 
@@ -92,16 +95,16 @@ async fn fetch_with_cache(url: &str, cache_path: Option<&Path>) -> Result<Vec<u8
     }
     let bytes = response.into_body().into_bytes().await?.to_vec();
 
-    // Validate JSON before persisting so error pages or partial payloads never
-    // poison the on-disk cache.
-    let _ = convert::try_parse_litellm_json(&bytes)?;
+    // Parse once and validate JSON before persisting so error pages or partial
+    // payloads never poison the on-disk cache.
+    let entries = convert::try_parse_litellm_json(&bytes)?;
 
     // Write cache atomically
     if let Some(path) = cache_path {
         write_file_atomic(path, &bytes).await?;
     }
 
-    Ok(bytes)
+    Ok(entries)
 }
 
 async fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -113,14 +116,40 @@ async fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("litellm_cache");
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
 
-    if let Err(err) = async_fs::write(&tmp_path, bytes).await {
-        let _ = async_fs::remove_file(&tmp_path).await;
-        return Err(err);
+    let (tmp_path, mut file) = {
+        let mut attempt = 0u32;
+        loop {
+            let candidate = parent.join(format!(".{file_name}.tmp.{pid}.{nanos}.{attempt}"));
+            match async_fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+                .await
+            {
+                Ok(file) => break (candidate, file),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < 64 => {
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    };
+
+    let write_result = async {
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        drop(file);
+        async_fs::rename(&tmp_path, path).await
     }
-    if let Err(err) = async_fs::rename(&tmp_path, path).await {
+    .await;
+
+    if let Err(err) = write_result {
         let _ = async_fs::remove_file(&tmp_path).await;
         return Err(err);
     }
@@ -133,7 +162,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn spawn_single_response_server(
         status_line: &'static str,

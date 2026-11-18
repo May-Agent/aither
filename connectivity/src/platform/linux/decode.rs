@@ -65,9 +65,10 @@ pub fn scan(datagram: &[u8]) -> Result<Scan, DecodeError> {
         let message = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&datagram[offset..])
             .map_err(|error| DecodeError::Malformed(error.to_string()))?;
         let length = message.header.length as usize;
-        if length < NLMSG_HDRLEN {
+        if length < NLMSG_HDRLEN || length > datagram.len() - offset {
             return Err(DecodeError::Malformed(format!(
-                "netlink message length {length} is smaller than {NLMSG_HDRLEN}-byte header"
+                "netlink message length {length} is out of bounds for {NLMSG_HDRLEN}-byte header and {} remaining bytes",
+                datagram.len() - offset
             )));
         }
         match message.payload {
@@ -82,7 +83,10 @@ pub fn scan(datagram: &[u8]) -> Result<Scan, DecodeError> {
             }
             _ => {}
         }
-        offset = offset.saturating_add(length.next_multiple_of(NLMSG_ALIGNTO));
+        let aligned = length
+            .checked_next_multiple_of(NLMSG_ALIGNTO)
+            .ok_or_else(|| DecodeError::Malformed("netlink message length overflow".into()))?;
+        offset = offset.saturating_add(aligned);
     }
     Ok(scan)
 }
@@ -245,5 +249,10 @@ mod tests {
         let mut short_len = [0u8; 16];
         short_len[..4].copy_from_slice(&8u32.to_ne_bytes());
         assert!(matches!(scan(&short_len), Err(DecodeError::Malformed(_))));
+
+        // 16-byte nlmsghdr whose length exceeds the remaining datagram must be rejected.
+        let mut truncated = [0u8; 16];
+        truncated[..4].copy_from_slice(&64u32.to_ne_bytes());
+        assert!(matches!(scan(&truncated), Err(DecodeError::Malformed(_))));
     }
 }

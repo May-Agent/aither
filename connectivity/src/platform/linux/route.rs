@@ -20,7 +20,8 @@ pub struct Watcher {
 
 impl Watcher {
     /// Opens the sockets and reports the initial reachability to `sink`.
-    pub fn open(sink: &Sink) -> Result<Self, ConnectivityError> {
+    #[allow(clippy::future_not_send)]
+    pub async fn open(sink: &Sink) -> Result<Self, ConnectivityError> {
         let register = |reason: io::Error| ConnectivityError::Register {
             monitor: "rtnetlink",
             reason: reason.to_string(),
@@ -30,16 +31,18 @@ impl Watcher {
         events.set_non_blocking(true).map_err(register)?;
         let mut dump = Socket::new(NETLINK_ROUTE).map_err(register)?;
         dump.bind_auto().map_err(register)?;
-        sink.set_online(has_default_route_sync(&dump).map_err(register)?);
         dump.set_non_blocking(true).map_err(register)?;
+        let dump = Async::new(dump).map_err(register)?;
+        sink.set_online(has_default_route(&dump).await.map_err(register)?);
         Ok(Self {
             events: Async::new(events).map_err(register)?,
-            dump: Async::new(dump).map_err(register)?,
+            dump,
         })
     }
 
     /// Re-reads the routes whenever the kernel announces a link or route
     /// change, until the socket fails.
+    #[allow(clippy::future_not_send)]
     pub async fn watch(self, sink: &Sink) -> io::Result<()> {
         loop {
             match self
@@ -69,43 +72,6 @@ impl Watcher {
     }
 }
 
-struct DumpAccumulator {
-    default_route: bool,
-}
-
-impl DumpAccumulator {
-    const fn new() -> Self {
-        Self {
-            default_route: false,
-        }
-    }
-
-    fn feed(&mut self, datagram: &[u8]) -> io::Result<Option<bool>> {
-        let scan = decode::scan(datagram).map_err(io::Error::other)?;
-        self.default_route |= scan.default_route;
-        Ok(scan.done.then_some(self.default_route))
-    }
-}
-
-/// Dumps every route synchronously for initial startup before entering the async loop.
-fn has_default_route_sync(dump: &Socket) -> io::Result<bool> {
-    let request = decode::dump_request();
-    let sent = dump.send_to(&request, &SocketAddr::new(0, 0), 0)?;
-    if sent != request.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "short netlink dump request write",
-        ));
-    }
-    let mut acc = DumpAccumulator::new();
-    loop {
-        let (datagram, _) = dump.recv_from_full()?;
-        if let Some(default_route) = acc.feed(&datagram)? {
-            return Ok(default_route);
-        }
-    }
-}
-
 /// Dumps every route asynchronously and reports whether one is a default route.
 async fn has_default_route(dump: &Async<Socket>) -> io::Result<bool> {
     let request = decode::dump_request();
@@ -119,10 +85,12 @@ async fn has_default_route(dump: &Async<Socket>) -> io::Result<bool> {
             "short netlink dump request write",
         ));
     }
-    let mut acc = DumpAccumulator::new();
+    let mut default_route = false;
     loop {
         let (datagram, _) = dump.read_with(netlink_sys::Socket::recv_from_full).await?;
-        if let Some(default_route) = acc.feed(&datagram)? {
+        let scan = decode::scan(&datagram).map_err(io::Error::other)?;
+        default_route |= scan.default_route;
+        if scan.done {
             return Ok(default_route);
         }
     }

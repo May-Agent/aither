@@ -37,9 +37,7 @@ impl ModelRegistry {
     /// Build a registry from parsed `LiteLLM` JSON bytes.
     #[must_use]
     pub fn from_litellm_json(json: &[u8]) -> Self {
-        let converted = convert::parse_litellm_json(json);
-        let entries = converted.into_iter().filter_map(convert_to_entry).collect();
-        Self::from_entries(entries)
+        Self::from_converted(convert::parse_litellm_json(json))
     }
 
     /// Fallibly build a registry from `LiteLLM` JSON bytes.
@@ -48,9 +46,12 @@ impl ModelRegistry {
     ///
     /// Returns an error if `json` is not a valid JSON object.
     pub fn try_from_litellm_json(json: &[u8]) -> Result<Self, serde_json::Error> {
-        let converted = convert::try_parse_litellm_json(json)?;
+        Ok(Self::from_converted(convert::try_parse_litellm_json(json)?))
+    }
+
+    pub(crate) fn from_converted(converted: Vec<convert::ConvertedEntry>) -> Self {
         let entries = converted.into_iter().filter_map(convert_to_entry).collect();
-        Ok(Self::from_entries(entries))
+        Self::from_entries(entries)
     }
 
     fn from_entries(entries: Vec<ModelEntry>) -> Self {

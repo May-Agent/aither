@@ -2,17 +2,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use async_fs::File;
-use futures_lite::io::AsyncReadExt;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const CACHE_FILE_NAME: &str = "file_cache.json";
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the default cache directory for attachments.
 #[must_use]
@@ -124,17 +121,42 @@ impl FileCache {
         let contents = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_file = self.cache_dir.join(format!(
-            ".{CACHE_FILE_NAME}.tmp.{}.{seq}",
-            std::process::id()
-        ));
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
 
-        if let Err(err) = async_fs::write(&tmp_file, contents).await {
-            let _ = async_fs::remove_file(&tmp_file).await;
-            return Err(err);
+        let (tmp_file, mut file) = {
+            let mut attempt = 0u32;
+            loop {
+                let candidate = self
+                    .cache_dir
+                    .join(format!(".{CACHE_FILE_NAME}.tmp.{pid}.{nanos}.{attempt}"));
+                match async_fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                    .await
+                {
+                    Ok(file) => break (candidate, file),
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < 64 => {
+                        attempt += 1;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        };
+
+        let write_result = async {
+            file.write_all(contents.as_bytes()).await?;
+            file.flush().await?;
+            drop(file);
+            async_fs::rename(&tmp_file, &cache_file).await
         }
-        if let Err(err) = async_fs::rename(&tmp_file, &cache_file).await {
+        .await;
+
+        if let Err(err) = write_result {
             let _ = async_fs::remove_file(&tmp_file).await;
             return Err(err);
         }

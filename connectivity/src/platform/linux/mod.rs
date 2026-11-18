@@ -44,17 +44,16 @@ pub struct Monitor {
 
 impl Monitor {
     pub fn start(sink: Sink) -> Result<Self, ConnectivityError> {
-        let routes = route::Watcher::open(&sink)?;
         let (stop, stopped) = async_channel::bounded::<()>(1);
         let (ready_tx, ready_rx) = async_channel::bounded(1);
         let thread = std::thread::Builder::new()
             .name("aither-connectivity".into())
-            .spawn(move || run(routes, &sink, &stopped, &ready_tx))
+            .spawn(move || run(&sink, &stopped, &ready_tx))
             .map_err(|error| ConnectivityError::Register {
                 monitor: "linux watcher thread",
                 reason: error.to_string(),
             })?;
-        // The thread reports whether the system bus connection came up.
+        // The thread reports whether the route and system bus watchers came up.
         match ready_rx.recv_blocking() {
             Ok(Ok(())) => Ok(Self {
                 stop,
@@ -88,12 +87,18 @@ impl Drop for Monitor {
     reason = "this is a dedicated OS thread, nothing else runs on it"
 )]
 fn run(
-    routes: route::Watcher,
     sink: &Sink,
     stopped: &async_channel::Receiver<()>,
     ready: &async_channel::Sender<Result<(), ConnectivityError>>,
 ) {
     future::block_on(async {
+        let routes = match route::Watcher::open(sink).await {
+            Ok(routes) => routes,
+            Err(error) => {
+                let _ = ready.send(Err(error)).await;
+                return;
+            }
+        };
         let logind = match logind::Watcher::connect().await {
             Ok(logind) => logind,
             Err(error) => {
@@ -159,7 +164,7 @@ async fn watch_routes_with_reconnect(initial: route::Watcher, sink: &Sink) {
         |watcher| async move {
             let _ = watcher.watch(sink).await;
         },
-        || async { route::Watcher::open(sink).map(Some) },
+        || async { route::Watcher::open(sink).await.map(Some) },
         Timer::after,
     )
     .await;
@@ -204,7 +209,7 @@ async fn run_with_reconnect<W, E, Watch, WatchFut, Reconnect, ReconnectFut, Slee
     Reconnect: FnMut() -> ReconnectFut,
     ReconnectFut: Future<Output = Result<Option<W>, E>>,
     Sleep: FnMut(Duration) -> SleepFut,
-    SleepFut: Future<Output = ()>,
+    SleepFut: Future,
 {
     loop {
         if let Some(watcher) = current.take() {
@@ -217,7 +222,7 @@ async fn run_with_reconnect<W, E, Watch, WatchFut, Reconnect, ReconnectFut, Slee
 
         let mut reconnected = false;
         for &delay in delays {
-            sleep(delay).await;
+            let _ = sleep(delay).await;
             match reconnect().await {
                 Ok(Some(watcher)) => {
                     tracing::info!(watcher = name, "connectivity watcher reconnected");

@@ -79,15 +79,11 @@ impl SkillLoader {
                     })?
             {
                 let path = entry.path();
-                let is_dir = afs::metadata(&path)
-                    .await
-                    .map_err(|source| SkillError::ReadFile {
-                        path: path.clone(),
-                        source,
-                    })?
-                    .is_dir();
+                let Some(meta) = entry_metadata(&path).await? else {
+                    continue;
+                };
 
-                if is_dir {
+                if meta.is_dir() {
                     let skill = Self::load_from_dir(&path).await?;
                     skills.push(skill);
                 }
@@ -192,15 +188,11 @@ impl SkillLoader {
             })?
         {
             let path = entry.path();
-            let is_file = afs::metadata(&path)
-                .await
-                .map_err(|source| SkillError::ReadFile {
-                    path: path.clone(),
-                    source,
-                })?
-                .is_file();
+            let Some(meta) = entry_metadata(&path).await? else {
+                continue;
+            };
 
-            if !is_file {
+            if !meta.is_file() {
                 continue;
             }
 
@@ -231,15 +223,19 @@ fn is_single_normal_component(name: &str) -> bool {
     ) && !name.contains('\\')
 }
 
-async fn path_exists_async(path: &Path) -> Result<bool, SkillError> {
+async fn entry_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, SkillError> {
     match afs::metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(SkillError::ReadFile {
             path: path.to_path_buf(),
             source: err,
         }),
     }
+}
+
+async fn path_exists_async(path: &Path) -> Result<bool, SkillError> {
+    Ok(entry_metadata(path).await?.is_some())
 }
 
 #[cfg(test)]
@@ -414,6 +410,38 @@ mod tests {
             .expect("create symlink");
 
         let skills = loader.load_all().await.expect("load symlinked skill");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "linked-skill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_all_skips_dangling_symlinks_beside_valid_skills() {
+        let target_root = tempdir().expect("target dir");
+        let target_skill = create_skill_with_content(
+            target_root.path(),
+            "linked-skill",
+            &minimal_skill_content("linked-skill", "Symlinked skill"),
+        );
+
+        let (dir, loader) = prepare_loader();
+        std::os::unix::fs::symlink(&target_skill, dir.path().join("linked-skill"))
+            .expect("create valid symlink");
+        std::os::unix::fs::symlink(
+            target_root.path().join("missing-target"),
+            dir.path().join("dangling-skill"),
+        )
+        .expect("create dangling skill symlink");
+
+        let scripts_dir = target_skill.join("scripts");
+        fs::create_dir(&scripts_dir).expect("create scripts dir");
+        std::os::unix::fs::symlink(
+            target_root.path().join("missing-script.sh"),
+            scripts_dir.join("dangling.sh"),
+        )
+        .expect("create dangling script symlink");
+
+        let skills = loader.load_all().await.expect("skip dangling symlinks");
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "linked-skill");
     }

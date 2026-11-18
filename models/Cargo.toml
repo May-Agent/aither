@@ -17,6 +17,7 @@ serde = { version = "1.0", default-features = false, features = ["derive", "std"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0", default-features = false, optional = true }
 async-fs = { version = "2", default-features = false, optional = true }
+futures-lite = { version = "2.6", default-features = false, features = ["std"], optional = true }
 zenwave = { workspace = true, optional = true, features = ["hyper-backend", "rustls"] }
 
 [build-dependencies]
@@ -29,7 +30,7 @@ tokio = { version = "1.53", features = ["macros", "rt"] }
 
 [features]
 default = []
-remote = ["dep:zenwave", "dep:async-fs", "dep:thiserror"]
+remote = ["dep:zenwave", "dep:async-fs", "dep:futures-lite", "dep:thiserror"]
 
 [lints]
 workspace = true
