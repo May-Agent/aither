@@ -39,10 +39,11 @@ use crate::protocol::{
     AuthenticateParams, AuthenticateResult, ConfigOption, ElicitationCompleteParams, ExtMethod,
     Implementation, InitializeParams, InitializeResult, LogoutParams, LogoutResult,
     PROTOCOL_VERSION, PromptParams, PromptResult, SessionCancelParams, SessionCloseParams,
-    SessionCloseResult, SessionDeleteParams, SessionDeleteResult, SessionListParams,
-    SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams, SessionNewResult,
-    SessionNotification, SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
-    SessionSetConfigOptionResult, SessionSetModeParams, SessionSetModeResult,
+    SessionCloseResult, SessionDeleteParams, SessionDeleteResult, SessionForkParams,
+    SessionForkResult, SessionListParams, SessionListResult, SessionLoadParams, SessionLoadResult,
+    SessionNewParams, SessionNewResult, SessionNotification, SessionResumeParams,
+    SessionResumeResult, SessionSetConfigOptionParams, SessionSetConfigOptionResult,
+    SessionSetModeParams, SessionSetModeResult,
 };
 
 /// An outbound message plus, for requests, the channel that receives the
@@ -272,6 +273,24 @@ impl<H: ClientHandler> AcpClient<H> {
         params: SessionResumeParams,
     ) -> Result<SessionResumeResult, ClientError> {
         self.call("session/resume", &params).await
+    }
+
+    /// `session/fork` request.
+    ///
+    /// Only valid when the agent advertised
+    /// [`SessionCapabilities::fork`](crate::protocol::SessionCapabilities::fork).
+    /// Creates a new session seeded with the conversation history of
+    /// `params.session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is closed or the agent replies with
+    /// an error or a malformed result.
+    pub async fn fork_session(
+        &self,
+        params: SessionForkParams,
+    ) -> Result<SessionForkResult, ClientError> {
+        self.call("session/fork", &params).await
     }
 
     /// `session/list` request.

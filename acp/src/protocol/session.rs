@@ -75,7 +75,8 @@ pub struct SessionListResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
-    /// Session ID usable with `session/load` or `session/resume`.
+    /// Session ID usable with `session/load`, `session/resume`, or
+    /// `session/fork`.
     pub session_id: String,
     /// Working directory the session was created with.
     pub cwd: PathBuf,
