@@ -11,9 +11,13 @@ readme = "../README.md"
 keywords = ["ai", "agent", "acp", "editor-integration"]
 categories = ["api-bindings"]
 
+[features]
+default = ["agent"]
+agent = ["dep:aither-agent", "dep:aither-core", "dep:uuid"]
+
 [dependencies]
-aither-core.workspace = true
-aither-agent = { workspace = true, default-features = true, features = ["mcp"] }
+aither-core = { workspace = true, optional = true }
+aither-agent = { workspace = true, optional = true, default-features = false, features = ["mcp"] }
 aither-mcp.workspace = true
 executor-core = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -24,7 +28,15 @@ async-channel = "2"
 async-process = "2"
 thiserror = "2"
 tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", optional = true, features = ["v4"] }
+
+[[test]]
+name = "child_agent"
+required-features = ["agent"]
+
+[[test]]
+name = "session_mcp"
+required-features = ["agent"]
 
 [dev-dependencies]
 executor-core = { version = "0.7", features = ["tokio"] }

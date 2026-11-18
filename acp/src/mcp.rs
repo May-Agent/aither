@@ -16,7 +16,9 @@ pub enum ConnectError {
     /// The server did not connect.
     #[error("could not connect MCP server '{server}': {source}")]
     Failed {
+        /// Name of the MCP server that failed to connect.
         server: String,
+        /// Underlying MCP connection error.
         #[source]
         source: McpError,
     },
@@ -24,6 +26,11 @@ pub enum ConnectError {
 
 /// Connects every server concurrently and returns the connections in the
 /// order the servers were given.
+///
+/// # Errors
+///
+/// Returns [`ConnectError::Unsupported`] if any server uses SSE, or
+/// [`ConnectError::Failed`] if spawning or handshaking with a server fails.
 pub async fn connect_all(
     executor: &AnyExecutor,
     servers: &[McpServer],

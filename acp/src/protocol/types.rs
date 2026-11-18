@@ -1225,6 +1225,26 @@ pub struct SessionNotification {
     pub extra: BTreeMap<String, Value>,
 }
 
+impl SessionNotification {
+    /// Build a `session/update` notification for `session_id`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, update: SessionUpdate) -> Self {
+        Self {
+            session_id: session_id.into(),
+            update,
+            meta: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// Set extension metadata.
+    #[must_use]
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+}
+
 /// A session update streamed from the agent in a `session/update`
 /// notification.
 ///
