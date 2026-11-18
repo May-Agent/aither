@@ -16,6 +16,9 @@ use netlink_packet_route::{
 /// Netlink messages are padded to four bytes (`NLMSG_ALIGN`).
 const NLMSG_ALIGNTO: usize = 4;
 
+/// Minimum length of a netlink message: the 16-byte `nlmsghdr`.
+const NLMSG_HDRLEN: usize = 16;
+
 /// What one datagram of a route dump held.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Scan {
@@ -62,6 +65,11 @@ pub fn scan(datagram: &[u8]) -> Result<Scan, DecodeError> {
         let message = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&datagram[offset..])
             .map_err(|error| DecodeError::Malformed(error.to_string()))?;
         let length = message.header.length as usize;
+        if length < NLMSG_HDRLEN {
+            return Err(DecodeError::Malformed(format!(
+                "netlink message length {length} is smaller than {NLMSG_HDRLEN}-byte header"
+            )));
+        }
         match message.payload {
             NetlinkPayload::Done(_) => scan.done = true,
             NetlinkPayload::Error(error) => {
@@ -74,7 +82,7 @@ pub fn scan(datagram: &[u8]) -> Result<Scan, DecodeError> {
             }
             _ => {}
         }
-        offset += length.next_multiple_of(NLMSG_ALIGNTO);
+        offset = offset.saturating_add(length.next_multiple_of(NLMSG_ALIGNTO));
     }
     Ok(scan)
 }
@@ -225,5 +233,17 @@ mod tests {
     #[test]
     fn garbage_is_malformed() {
         assert!(matches!(scan(&[1, 2, 3]), Err(DecodeError::Malformed(_))));
+    }
+
+    #[test]
+    fn zero_and_short_length_headers_are_rejected_without_looping() {
+        // 16-byte nlmsghdr with length == 0 must not loop forever.
+        let zero_len = [0u8; 16];
+        assert!(matches!(scan(&zero_len), Err(DecodeError::Malformed(_))));
+
+        // 16-byte nlmsghdr with length == 8 (< 16) must also be rejected.
+        let mut short_len = [0u8; 16];
+        short_len[..4].copy_from_slice(&8u32.to_ne_bytes());
+        assert!(matches!(scan(&short_len), Err(DecodeError::Malformed(_))));
     }
 }

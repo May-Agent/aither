@@ -39,9 +39,18 @@ pub struct RawLiteLLMEntry {
     /// USD per reasoning token, where billed separately.
     #[serde(default)]
     pub output_cost_per_reasoning_token: Option<f64>,
+    /// USD per image input token.
+    #[serde(default)]
+    pub input_cost_per_image_token: Option<f64>,
+    /// USD per image output token.
+    #[serde(default)]
+    pub output_cost_per_image_token: Option<f64>,
     /// USD per audio input token.
     #[serde(default)]
     pub input_cost_per_audio_token: Option<f64>,
+    /// USD per audio output token.
+    #[serde(default)]
+    pub output_cost_per_audio_token: Option<f64>,
     /// Date the provider retires the model, as `YYYY-MM-DD`.
     #[serde(default)]
     pub deprecation_date: Option<String>,
@@ -260,8 +269,14 @@ pub struct ConvertedEntry {
     pub cache_write_per_token: Option<f64>,
     /// USD per reasoning token, where billed separately.
     pub reasoning_per_token: Option<f64>,
-    /// USD per image token.
+    /// USD per image input token.
     pub image_per_token: Option<f64>,
+    /// USD per image output token.
+    pub image_output_per_token: Option<f64>,
+    /// USD per audio input token.
+    pub audio_per_token: Option<f64>,
+    /// USD per audio output token.
+    pub audio_output_per_token: Option<f64>,
     /// Capability names this model advertises.
     pub abilities: Vec<&'static str>,
     /// Retirement date, as `YYYY-MM-DD`.
@@ -336,22 +351,22 @@ pub fn convert_litellm_entry(key: &str, raw: &RawLiteLLMEntry) -> Option<Convert
         cache_read_per_token: raw.cache_read_input_token_cost,
         cache_write_per_token: raw.cache_creation_input_token_cost,
         reasoning_per_token: raw.output_cost_per_reasoning_token,
-        image_per_token: raw.input_cost_per_audio_token,
+        image_per_token: raw.input_cost_per_image_token,
+        image_output_per_token: raw.output_cost_per_image_token,
+        audio_per_token: raw.input_cost_per_audio_token,
+        audio_output_per_token: raw.output_cost_per_audio_token,
         abilities,
         deprecation_date: raw.deprecation_date.clone(),
     })
 }
 
-/// Parse the full `LiteLLM` JSON blob and return converted entries.
+/// Fallibly parse a `LiteLLM` JSON blob and return converted entries.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `json_bytes` is not a JSON object. The only caller supplies either
-/// the committed snapshot or a payload already validated by the caller.
-#[must_use]
-pub fn parse_litellm_json(json_bytes: &[u8]) -> Vec<ConvertedEntry> {
-    let map: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(json_bytes).expect("invalid LiteLLM JSON");
+/// Returns an error if `json_bytes` is not a valid JSON object.
+pub fn try_parse_litellm_json(json_bytes: &[u8]) -> Result<Vec<ConvertedEntry>, serde_json::Error> {
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(json_bytes)?;
 
     let mut entries = Vec::new();
     for (key, value) in &map {
@@ -365,5 +380,69 @@ pub fn parse_litellm_json(json_bytes: &[u8]) -> Vec<ConvertedEntry> {
             entries.push(entry);
         }
     }
-    entries
+    Ok(entries)
+}
+
+/// Parse the full `LiteLLM` JSON blob and return converted entries.
+///
+/// # Panics
+///
+/// Panics if `json_bytes` is not a JSON object. The only caller supplies either
+/// the committed snapshot or a payload already validated by the caller.
+#[must_use]
+pub fn parse_litellm_json(json_bytes: &[u8]) -> Vec<ConvertedEntry> {
+    try_parse_litellm_json(json_bytes).expect("invalid LiteLLM JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_and_audio_token_costs_map_to_distinct_fields() {
+        let json = br#"{
+            "multimodal-model": {
+                "litellm_provider": "openai",
+                "mode": "chat",
+                "input_cost_per_token": 1e-6,
+                "output_cost_per_token": 2e-6,
+                "input_cost_per_image_token": 5e-6,
+                "output_cost_per_image_token": 4e-5,
+                "input_cost_per_audio_token": 3.2e-5,
+                "output_cost_per_audio_token": 6.4e-5
+            },
+            "audio-only-model": {
+                "litellm_provider": "gemini",
+                "mode": "chat",
+                "input_cost_per_token": 3e-7,
+                "output_cost_per_token": 2.5e-6,
+                "input_cost_per_audio_token": 1e-6
+            }
+        }"#;
+
+        let entries = try_parse_litellm_json(json).expect("valid json");
+        let mm = entries
+            .iter()
+            .find(|e| e.litellm_id == "multimodal-model")
+            .expect("multimodal-model");
+        assert_eq!(mm.image_per_token, Some(5e-6));
+        assert_eq!(mm.image_output_per_token, Some(4e-5));
+        assert_eq!(mm.audio_per_token, Some(3.2e-5));
+        assert_eq!(mm.audio_output_per_token, Some(6.4e-5));
+
+        let audio = entries
+            .iter()
+            .find(|e| e.litellm_id == "audio-only-model")
+            .expect("audio-only-model");
+        assert_eq!(audio.image_per_token, None);
+        assert_eq!(audio.image_output_per_token, None);
+        assert_eq!(audio.audio_per_token, Some(1e-6));
+        assert_eq!(audio.audio_output_per_token, None);
+    }
+
+    #[test]
+    fn try_parse_litellm_json_rejects_malformed_input() {
+        assert!(try_parse_litellm_json(b"not json").is_err());
+        assert!(try_parse_litellm_json(b"[]").is_err());
+    }
 }

@@ -42,6 +42,17 @@ impl ModelRegistry {
         Self::from_entries(entries)
     }
 
+    /// Fallibly build a registry from `LiteLLM` JSON bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `json` is not a valid JSON object.
+    pub fn try_from_litellm_json(json: &[u8]) -> Result<Self, serde_json::Error> {
+        let converted = convert::try_parse_litellm_json(json)?;
+        let entries = converted.into_iter().filter_map(convert_to_entry).collect();
+        Ok(Self::from_entries(entries))
+    }
+
     fn from_entries(entries: Vec<ModelEntry>) -> Self {
         let mut index = HashMap::with_capacity(entries.len() * 2);
         // Canonical IDs index first-party records only. Unprefixed keys
@@ -311,6 +322,15 @@ fn convert_to_entry(c: convert::ConvertedEntry) -> Option<ModelEntry> {
     }
     if let Some(v) = c.image_per_token {
         pricing = pricing.with_image(v);
+    }
+    if let Some(v) = c.image_output_per_token {
+        pricing = pricing.with_image_output(v);
+    }
+    if let Some(v) = c.audio_per_token {
+        pricing = pricing.with_audio(v);
+    }
+    if let Some(v) = c.audio_output_per_token {
+        pricing = pricing.with_audio_output(v);
     }
 
     let abilities: Vec<Ability> = c
@@ -698,5 +718,46 @@ pub mod tests {
             .map(ModelEntry::litellm_id)
             .collect();
         assert_eq!(copilot, ["github_copilot/fixture-hosted"]);
+    }
+
+    #[test]
+    fn registry_pricing_distinguishes_image_and_audio_tokens() {
+        let registry = ModelRegistry::try_from_litellm_json(
+            br#"{
+                "audio-chat": {
+                    "litellm_provider": "gemini",
+                    "mode": "chat",
+                    "input_cost_per_token": 3e-7,
+                    "output_cost_per_token": 2.5e-6,
+                    "input_cost_per_audio_token": 1e-6,
+                    "output_cost_per_audio_token": 4e-6
+                },
+                "vision-audio-chat": {
+                    "litellm_provider": "openai",
+                    "mode": "chat",
+                    "input_cost_per_token": 4e-6,
+                    "output_cost_per_token": 1.6e-5,
+                    "input_cost_per_image_token": 5e-6,
+                    "output_cost_per_image_token": 2e-5,
+                    "input_cost_per_audio_token": 3.2e-5,
+                    "output_cost_per_audio_token": 6.4e-5
+                }
+            }"#,
+        )
+        .expect("valid json");
+
+        let audio = registry.lookup("audio-chat").expect("audio-chat");
+        assert_eq!(audio.pricing().image_per_token(), None);
+        assert_eq!(audio.pricing().image_output_per_token(), None);
+        assert_eq!(audio.pricing().audio_per_token(), Some(1e-6));
+        assert_eq!(audio.pricing().audio_output_per_token(), Some(4e-6));
+
+        let both = registry
+            .lookup("vision-audio-chat")
+            .expect("vision-audio-chat");
+        assert_eq!(both.pricing().image_per_token(), Some(5e-6));
+        assert_eq!(both.pricing().image_output_per_token(), Some(2e-5));
+        assert_eq!(both.pricing().audio_per_token(), Some(3.2e-5));
+        assert_eq!(both.pricing().audio_output_per_token(), Some(6.4e-5));
     }
 }
