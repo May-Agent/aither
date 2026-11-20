@@ -284,8 +284,8 @@ pub(crate) async fn refresh_tokens_at(
         .json()
         .await?;
     let mut creds = response.into_credentials();
-    if creds.refresh_token.is_empty() {
-        creds.refresh_token = refresh_token.to_string();
+    if creds.refresh_token.is_none() {
+        creds.refresh_token = Some(refresh_token.to_string());
     }
     Ok(creds)
 }
@@ -360,6 +360,22 @@ pub async fn poll_device_code(
     }
 }
 
+fn normalize_optional_token(token: Option<String>) -> Option<String> {
+    token.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+fn deserialize_optional_refresh_token<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(normalize_optional_token(Option::<String>::deserialize(
+        deserializer,
+    )?))
+}
+
 /// Persisted `ChatGPT` OAuth credentials.
 ///
 /// `account_id` and `residency` are decoded from the JWT claims of the
@@ -369,9 +385,13 @@ pub struct CodexCredentials {
     /// Short-lived bearer token sent as `Authorization`.
     pub access_token: String,
     /// Long-lived token for [`refresh_tokens`]; rotated on every refresh.
-    /// Empty when only an access token is available.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub refresh_token: String,
+    /// `None` when only an access token is available.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_refresh_token"
+    )]
+    pub refresh_token: Option<String>,
     /// `OpenID` ID token; a source of the account ID claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
@@ -395,11 +415,7 @@ impl std::fmt::Debug for CodexCredentials {
             .field("access_token", &"[REDACTED]")
             .field(
                 "refresh_token",
-                &if self.refresh_token.is_empty() {
-                    "<none>"
-                } else {
-                    "[REDACTED]"
-                },
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
             .field("account_id", &self.account_id)
@@ -414,10 +430,10 @@ impl CodexCredentials {
     /// Build credentials from raw token strings, decoding `account_id` and
     /// `residency` from the JWT claims.
     #[must_use]
-    pub fn new(access_token: impl Into<String>, refresh_token: impl Into<String>) -> Self {
+    pub fn new(access_token: impl Into<String>, refresh_token: impl Into<Option<String>>) -> Self {
         let mut credentials = Self {
             access_token: access_token.into(),
-            refresh_token: refresh_token.into(),
+            refresh_token: normalize_optional_token(refresh_token.into()),
             id_token: None,
             account_id: None,
             residency: None,
@@ -431,14 +447,16 @@ impl CodexCredentials {
     /// Build non-refreshable credentials from an access token alone.
     #[must_use]
     pub fn access_only(access_token: impl Into<String>) -> Self {
-        Self::new(access_token, String::new())
+        Self::new(access_token, None)
     }
 
     /// The configured refresh token when present and non-whitespace.
     #[must_use]
     pub fn refresh_token_opt(&self) -> Option<&str> {
-        let trimmed = self.refresh_token.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
+        self.refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
     }
 
     /// Whether a refresh token is available to rotate expired access tokens.
@@ -524,7 +542,7 @@ impl TokenResponse {
             .or(expires_at);
         let mut creds = CodexCredentials {
             access_token: self.access_token,
-            refresh_token: self.refresh_token.unwrap_or_default(),
+            refresh_token: normalize_optional_token(self.refresh_token),
             id_token: self.id_token,
             account_id: None,
             residency: None,
@@ -692,25 +710,43 @@ mod tests {
 
     #[test]
     fn credentials_roundtrip() {
-        let creds = CodexCredentials::new("at", "rt").with_expires_at(42);
+        let creds = CodexCredentials::new("at", "rt".to_string()).with_expires_at(42);
         let json = serde_json::to_string(&creds).unwrap();
         let back: CodexCredentials = serde_json::from_str(&json).unwrap();
         assert_eq!(back.access_token, "at");
-        assert_eq!(back.refresh_token, "rt");
+        assert_eq!(back.refresh_token.as_deref(), Some("rt"));
         assert_eq!(back.expires_at, Some(42));
 
+        let blank_refresh = CodexCredentials::new("at-blank", "   ".to_string());
+        assert_eq!(blank_refresh.refresh_token, None);
+        assert!(!blank_refresh.can_refresh());
+
         let access_only = CodexCredentials::access_only("at-only");
+        assert_eq!(access_only.refresh_token, None);
         assert!(!access_only.can_refresh());
         let json_only = serde_json::to_string(&access_only).unwrap();
         assert!(!json_only.contains("refresh_token"));
         let parsed_only: CodexCredentials = serde_json::from_str(&json_only).unwrap();
         assert_eq!(parsed_only.access_token, "at-only");
+        assert_eq!(parsed_only.refresh_token, None);
         assert!(!parsed_only.can_refresh());
+
+        // Legacy JSON carrying empty or null refresh_token deserializes to None.
+        for raw in [
+            r#"{"access_token":"at-legacy","refresh_token":""}"#,
+            r#"{"access_token":"at-legacy","refresh_token":"   "}"#,
+            r#"{"access_token":"at-legacy","refresh_token":null}"#,
+            r#"{"access_token":"at-legacy"}"#,
+        ] {
+            let parsed: CodexCredentials = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed.refresh_token, None, "{raw}");
+            assert!(!parsed.can_refresh(), "{raw}");
+        }
     }
 
     #[test]
     fn debug_redacts_codex_credentials_and_pkce() {
-        let creds = CodexCredentials::new("secret-access-jwt", "secret-refresh-token")
+        let creds = CodexCredentials::new("secret-access-jwt", "secret-refresh-token".to_string())
             .with_id_token("secret-id-jwt");
         let dbg = format!("{creds:?}");
         assert!(!dbg.contains("secret-access-jwt"), "{dbg}");

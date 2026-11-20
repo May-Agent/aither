@@ -264,7 +264,10 @@ mod tests {
             CloudImageGenerator::try_from(CloudProvider::Copilot(Copilot::new("test"))),
             Err(CloudImageGeneratorError::UnsupportedProvider("copilot"))
         ));
-        let codex = Codex::new(CodexCredentials::new("at", "rt"), "gpt-5.3-codex");
+        let codex = Codex::new(
+            CodexCredentials::new("at", "rt".to_string()),
+            "gpt-5.3-codex",
+        );
         assert!(matches!(
             CloudImageGenerator::try_from(CloudProvider::Codex(codex)),
             Err(CloudImageGeneratorError::UnsupportedProvider("codex"))

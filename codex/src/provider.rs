@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn cloned_codex_setters_do_not_panic_and_default_originator_is_aither() {
         assert_eq!(ORIGINATOR, "aither");
-        let c1 = Codex::new(CodexCredentials::new("at", "rt"), "gpt-4o");
+        let c1 = Codex::new(CodexCredentials::new("at", "rt".to_string()), "gpt-4o");
         let c2 = c1
             .clone()
             .with_base_url("http://127.0.0.1:9999")
@@ -311,8 +311,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn provider_and_models_share_single_use_refresh_rotation_and_base_url() {
+    fn spawn_codex_rotation_server() -> (String, Arc<AtomicUsize>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -389,16 +388,23 @@ mod tests {
                 }
             }
         });
+        (base, refresh_hits)
+    }
+
+    #[tokio::test]
+    async fn provider_and_models_share_single_use_refresh_rotation_and_base_url() {
+        let (base, refresh_hits) = spawn_codex_rotation_server();
 
         let callback_count = Arc::new(AtomicUsize::new(0));
         let callback_count_clone = Arc::clone(&callback_count);
-        let provider = CodexProvider::new(CodexCredentials::new("at-stale", "rt-initial"))
-            .with_base_url(&base)
-            .with_token_url(format!("{base}/oauth/token"))
-            .on_refresh(move |creds| {
-                assert_eq!(creds.refresh_token, "rt-rotated");
-                callback_count_clone.fetch_add(1, Ordering::SeqCst);
-            });
+        let provider =
+            CodexProvider::new(CodexCredentials::new("at-stale", "rt-initial".to_string()))
+                .with_base_url(&base)
+                .with_token_url(format!("{base}/oauth/token"))
+                .on_refresh(move |creds| {
+                    assert_eq!(creds.refresh_token.as_deref(), Some("rt-rotated"));
+                    callback_count_clone.fetch_add(1, Ordering::SeqCst);
+                });
 
         let model_a = provider.get_model("gpt-5.3-codex").await.expect("model a");
         let model_b = provider.get_model("gpt-5.4").await.expect("model b");
@@ -421,7 +427,10 @@ mod tests {
         .expect("model_b reuses rotated token");
         assert_eq!(out_b, "shared");
         assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.credentials().await.refresh_token, "rt-rotated");
+        assert_eq!(
+            provider.credentials().await.refresh_token.as_deref(),
+            Some("rt-rotated")
+        );
     }
 
     #[tokio::test]
@@ -454,8 +463,11 @@ mod tests {
             }
         });
 
-        let client =
-            Codex::new(CodexCredentials::new("at", "rt"), "gpt-5.3-codex").with_base_url(&base);
+        let client = Codex::new(
+            CodexCredentials::new("at", "rt".to_string()),
+            "gpt-5.3-codex",
+        )
+        .with_base_url(&base);
         let events: Vec<Result<Event, CodexError>> =
             client.respond(oneshot("sys", "hi")).collect().await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
