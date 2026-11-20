@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use crate::clock::{AnyClock, Instant};
 use crate::context::CacheLifetime;
 
@@ -32,7 +34,7 @@ pub enum CacheState {
 
 #[derive(Debug)]
 struct Inner {
-    lifetime: CacheLifetime,
+    lifetime: ArcSwap<CacheLifetime>,
     clock: AnyClock,
     /// The latest of the last request start and the last keep-alive send, in
     /// nanoseconds on `clock`, or [`NOT_STARTED`].
@@ -54,11 +56,22 @@ impl CacheWarmth {
     pub(crate) fn new(lifetime: CacheLifetime, clock: AnyClock) -> Self {
         Self {
             inner: Arc::new(Inner {
-                lifetime,
+                lifetime: ArcSwap::from_pointee(lifetime),
                 clock,
                 entry_started_nanos: AtomicU64::new(NOT_STARTED),
             }),
         }
+    }
+
+    /// Updates how long the entry stays warm, visible immediately to every
+    /// clone of this handle.
+    pub(crate) fn set_lifetime(&self, lifetime: CacheLifetime) {
+        self.inner.lifetime.store(Arc::new(lifetime));
+    }
+
+    /// The current configured lifetime.
+    fn lifetime(&self) -> CacheLifetime {
+        **self.inner.lifetime.load()
     }
 
     /// Records that a request or keep-alive started the entry at `at`.
@@ -84,7 +97,7 @@ impl CacheWarmth {
     /// Whether the entry was started and has since expired, as opposed to
     /// never having been started.
     pub(crate) fn has_expired(&self) -> bool {
-        match (self.inner.lifetime, self.idle()) {
+        match (self.lifetime(), self.idle()) {
             (CacheLifetime::Limited(lifetime), Some(idle)) => idle >= lifetime,
             _ => false,
         }
@@ -96,7 +109,7 @@ impl CacheWarmth {
         let Some(idle) = self.idle() else {
             return CacheState::Cold;
         };
-        match self.inner.lifetime {
+        match self.lifetime() {
             CacheLifetime::Permanent => CacheState::Warm { cold_in: None },
             CacheLifetime::Limited(lifetime) => match lifetime.checked_sub(idle) {
                 Some(remaining) if !remaining.is_zero() => CacheState::Warm {

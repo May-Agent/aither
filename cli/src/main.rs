@@ -156,18 +156,19 @@ async fn main() -> Result<()> {
 /// Each session the editor opens gets its own agent, rooted at the working
 /// directory the editor supplied for that session.
 async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
-    use aither_acp::AcpServer;
+    use aither_acp::aither::{AitherHost, SessionSetup};
+    use aither_acp::domain::Implementation;
+    use aither_acp::server::Server;
 
-    let mut server = AcpServer::stdio(
-        "aither",
-        env!("CARGO_PKG_VERSION"),
-        TokioGlobal,
-        move |setup| {
+    let server = Server::new(
+        AitherHost::new(TokioGlobal, move |setup: SessionSetup| {
             let cloud = cloud.clone();
             async move { Ok(acp_session_agent(cloud, setup)) }
-        },
+        }),
+        Implementation::new("aither", env!("CARGO_PKG_VERSION")),
     );
-    server.run().await?;
+    let (_peer, serve) = server.serve_stdio();
+    serve.await;
     Ok(())
 }
 
@@ -177,7 +178,7 @@ async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
 /// has no hooks, so nothing would ask the editor's user before a command ran.
 fn acp_session_agent(
     cloud: CloudProvider,
-    setup: aither_acp::SessionSetup,
+    setup: aither_acp::aither::SessionSetup,
 ) -> Agent<CloudProvider> {
     let builder = Agent::builder(cloud)
         .tool(aither_agent::filesystem::FileSystemTool::read_only(

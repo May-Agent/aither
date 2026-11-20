@@ -22,7 +22,6 @@ pub struct Skill {
 
 /// YAML frontmatter parsed from SKILL.md files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SkillFrontmatter {
     /// Unique name of the skill.
     pub name: String,
@@ -126,5 +125,13 @@ mod tests {
         let content = "---\nname: test\n\nNo closing delimiter";
         let result = Skill::parse(content);
         assert!(matches!(result, Err(SkillError::MissingFrontmatter)));
+    }
+
+    #[test]
+    fn test_parse_allows_extra_frontmatter_fields() {
+        let content = "---\nname: extra\ndescription: Has metadata\nversion: 1.0\nauthor: tester\n---\n\nBody.";
+        let skill = Skill::parse(content).expect("extra frontmatter fields should be allowed");
+        assert_eq!(skill.name, "extra");
+        assert_eq!(skill.description, "Has metadata");
     }
 }

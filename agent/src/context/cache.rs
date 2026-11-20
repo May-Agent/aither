@@ -17,12 +17,12 @@
 
 use std::time::Duration;
 
-use aither_core::llm::Message;
 use aither_core::llm::model::Parameters;
 use aither_core::llm::model::{
     CacheOptions, ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoint,
     ClaudeExplicitCacheBreakpoints, ClaudePromptCache, ClaudePromptCacheTtl,
 };
+use aither_core::llm::{Message, ReasoningState, Role};
 
 /// How long the conversation's prompt cache stays warm.
 ///
@@ -69,18 +69,23 @@ impl PromptCache {
         }
     }
 
-    /// Overrides the Claude cache retention.
-    ///
-    /// The cache lifetime follows the retention, since Claude's advertised
-    /// TTL is exactly how long the provider promises to keep the prefix.
+    /// Overrides the Claude cache breakpoint retention without altering
+    /// [`lifetime`](Self::lifetime).
     #[must_use]
     pub const fn with_ttl(mut self, ttl: ClaudePromptCacheTtl) -> Self {
         self.ttl = ttl;
-        self.lifetime = CacheLifetime::Limited(match ttl {
-            ClaudePromptCacheTtl::FiveMinutes => Duration::from_secs(300),
-            ClaudePromptCacheTtl::OneHour => Duration::from_secs(3600),
-        });
         self
+    }
+
+    /// Updates the Claude cache breakpoint retention in place.
+    pub const fn set_ttl(&mut self, ttl: ClaudePromptCacheTtl) {
+        self.ttl = ttl;
+    }
+
+    /// The configured Claude cache breakpoint retention.
+    #[must_use]
+    pub const fn ttl(&self) -> ClaudePromptCacheTtl {
+        self.ttl
     }
 
     /// Overrides how long the conversation's cache is trusted to stay warm.
@@ -93,6 +98,11 @@ impl PromptCache {
     pub const fn with_lifetime(mut self, lifetime: CacheLifetime) -> Self {
         self.lifetime = lifetime;
         self
+    }
+
+    /// Updates how long the conversation's cache is trusted to stay warm.
+    pub const fn set_lifetime(&mut self, lifetime: CacheLifetime) {
+        self.lifetime = lifetime;
     }
 
     /// How long the conversation's cache stays warm.
@@ -148,9 +158,10 @@ impl PromptCache {
     /// Applies cache controls to `parameters` for a request.
     ///
     /// `messages` is the assembled request, `has_tools` says whether tool
-    /// definitions are attached, and `mid_conversation_system` whether the
-    /// model keeps later system messages in the conversation; all three decide
-    /// where a Claude breakpoint can legally be placed.
+    /// definitions are attached, `mid_conversation_system` whether the model
+    /// keeps later system messages in the conversation, and `has_tail` whether
+    /// the final message carries a volatile live tail; all four decide where a
+    /// Claude breakpoint can legally be placed.
     #[must_use]
     pub fn apply(
         &self,
@@ -158,16 +169,15 @@ impl PromptCache {
         messages: &[Message],
         has_tools: bool,
         mid_conversation_system: bool,
+        has_tail: bool,
     ) -> Parameters {
         parameters.cache = CacheOptions {
             openai: Some(aither_core::llm::model::OpenAIPromptCache {
                 key: Some(self.key()),
                 retention: Some(aither_core::llm::model::OpenAIPromptCacheRetention::Hours24),
             }),
-            claude: Some(ClaudePromptCache::explicit(
-                self.ttl,
-                Self::breakpoints(messages, has_tools, mid_conversation_system),
-            )),
+            claude: Self::breakpoints(messages, has_tools, mid_conversation_system, has_tail)
+                .map(|breakpoints| ClaudePromptCache::explicit(self.ttl, breakpoints)),
             gemini: None,
         };
         parameters
@@ -175,55 +185,148 @@ impl PromptCache {
 
     /// Chooses the Claude breakpoints for an assembled request.
     ///
-    /// The subtlety is the last message: it is the live tail, rebuilt from
-    /// context sources on every single request, so caching *it* would write a
-    /// new entry each turn and read none of them back. The breakpoint goes on
-    /// the message before it — the newest byte that will still be there next
-    /// time.
+    /// When `has_tail` is true, the last message carries the volatile live
+    /// tail rebuilt on every request, so caching *it* would write a new entry
+    /// each turn and read none of them back. The breakpoint goes on the last
+    /// cacheable block of the newest stable message before it — or on the
+    /// final message itself when `has_tail` is false.
     fn breakpoints(
         messages: &[Message],
         has_tools: bool,
         mid_conversation_system: bool,
-    ) -> ClaudeExplicitCacheBreakpoints {
-        // Tool definitions precede the system prompt in Claude's cacheable
-        // order, so a breakpoint there protects the whole tool surface.
-        let breakpoints = if has_tools {
-            ClaudeExplicitCacheBreakpoints::new(ClaudeExplicitCacheBreakpoint::new(
-                ClaudeCacheBreakpointTarget::LastTool,
-            ))
-            .with_second(ClaudeExplicitCacheBreakpoint::new(
-                ClaudeCacheBreakpointTarget::LastSystem,
-            ))
-        } else {
-            ClaudeExplicitCacheBreakpoints::new(ClaudeExplicitCacheBreakpoint::new(
-                ClaudeCacheBreakpointTarget::LastSystem,
-            ))
-        };
-        let Some(index) = stable_conversation_end(messages)
-            .and_then(|end| claude_message_index(messages, end, mid_conversation_system))
-        else {
-            return breakpoints;
-        };
-        let breakpoint = ClaudeExplicitCacheBreakpoint::new(ClaudeCacheBreakpointTarget::Message {
-            message_index: index,
-            block_index: 0,
-        });
+        has_tail: bool,
+    ) -> Option<ClaudeExplicitCacheBreakpoints> {
+        let mut targets = Vec::with_capacity(3);
         if has_tools {
-            breakpoints.with_third(breakpoint)
-        } else {
-            breakpoints.with_second(breakpoint)
+            targets.push(ClaudeCacheBreakpointTarget::LastTool);
         }
+        if has_non_empty_claude_system(messages, mid_conversation_system) {
+            targets.push(ClaudeCacheBreakpointTarget::LastSystem);
+        }
+        if let Some((message_index, block_index)) =
+            stable_claude_message_target(messages, mid_conversation_system, has_tail)
+        {
+            targets.push(ClaudeCacheBreakpointTarget::Message {
+                message_index,
+                block_index,
+            });
+        }
+
+        let mut iter = targets.into_iter().map(ClaudeExplicitCacheBreakpoint::new);
+        let first = iter.next()?;
+        let mut breakpoints = ClaudeExplicitCacheBreakpoints::new(first);
+        if let Some(second) = iter.next() {
+            breakpoints = breakpoints.with_second(second);
+        }
+        if let Some(third) = iter.next() {
+            breakpoints = breakpoints.with_third(third);
+        }
+        Some(breakpoints)
     }
 }
 
 /// Index of the last conversation message that will still be present, byte
 /// for byte, in the next request.
 ///
-/// Returns `None` when there is nothing but the prefix and the live tail.
-pub(crate) const fn stable_conversation_end(messages: &[Message]) -> Option<usize> {
-    // The final message is the live tail; the one before it is the newest
-    // append-only item.
-    messages.len().checked_sub(2)
+/// When `has_tail` is true, the final message carries the volatile live tail
+/// and the message before it is the newest stable item; otherwise the final
+/// message itself is stable.
+pub(crate) const fn stable_conversation_end(messages: &[Message], has_tail: bool) -> Option<usize> {
+    if has_tail {
+        messages.len().checked_sub(2)
+    } else {
+        messages.len().checked_sub(1)
+    }
+}
+
+fn has_non_empty_claude_system(messages: &[Message], mid_conversation_system: bool) -> bool {
+    if mid_conversation_system {
+        messages
+            .iter()
+            .take_while(|message| message.role() == Role::System)
+            .any(|message| !message.content().is_empty())
+    } else {
+        messages
+            .iter()
+            .filter(|message| message.role() == Role::System)
+            .any(|message| !message.content().is_empty())
+    }
+}
+
+fn stable_claude_message_target(
+    messages: &[Message],
+    mid_conversation_system: bool,
+    has_tail: bool,
+) -> Option<(usize, usize)> {
+    let end = stable_conversation_end(messages, has_tail)?;
+    for index in (0..=end).rev() {
+        let Some(message_index) = claude_message_index(messages, index, mid_conversation_system)
+        else {
+            continue;
+        };
+        if let Some(block_index) = last_claude_cacheable_block(&messages[index]) {
+            return Some((message_index, block_index));
+        }
+    }
+    None
+}
+
+fn last_claude_cacheable_block(message: &Message) -> Option<usize> {
+    match message {
+        Message::System { content } => (!content.is_empty()).then_some(0),
+        Message::Tool { .. } => Some(0),
+        Message::User {
+            content,
+            attachments,
+        } => {
+            let count = attachments.len() + usize::from(!content.is_empty());
+            count.checked_sub(1)
+        }
+        Message::Assistant {
+            content,
+            tool_calls,
+            reasoning,
+        } => {
+            let cacheable = usize::from(!content.is_empty()) + tool_calls.len();
+            if cacheable == 0 {
+                return None;
+            }
+            let thinking = count_claude_thinking_blocks(reasoning);
+            Some(thinking + cacheable - 1)
+        }
+        Message::Configuration { .. } => None,
+    }
+}
+
+fn count_claude_thinking_blocks(reasoning: &[ReasoningState]) -> usize {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum Replayed {
+        #[serde(rename = "thinking")]
+        Thinking {
+            #[expect(dead_code, reason = "validates replayed Claude thinking shape")]
+            thinking: String,
+            #[expect(dead_code, reason = "validates replayed Claude thinking shape")]
+            signature: String,
+        },
+        #[serde(rename = "redacted_thinking")]
+        RedactedThinking {
+            #[expect(
+                dead_code,
+                reason = "validates replayed Claude redacted_thinking shape"
+            )]
+            data: String,
+        },
+    }
+
+    reasoning
+        .iter()
+        .filter(|state| {
+            state
+                .payload_for("claude")
+                .is_some_and(|payload| serde_json::from_str::<Replayed>(payload).is_ok())
+        })
+        .count()
 }
 
 /// Position, in the message list Claude is sent, of `messages[index]`.
@@ -237,12 +340,16 @@ fn claude_message_index(
     index: usize,
     mid_conversation_system: bool,
 ) -> Option<usize> {
-    let is_system = |message: &Message| message.role() == aither_core::llm::Role::System;
+    let is_system = |message: &Message| message.role() == Role::System;
     let lifted = if mid_conversation_system {
-        messages
+        let leading = messages
             .iter()
             .take_while(|message| is_system(message))
-            .count()
+            .count();
+        if index < leading {
+            return None;
+        }
+        leading
     } else {
         if is_system(&messages[index]) {
             return None;
@@ -300,7 +407,7 @@ mod tests {
             Message::user("hello"),
             Message::system("live tail"),
         ];
-        let parameters = cache.apply(Parameters::default(), &messages, true, true);
+        let parameters = cache.apply(Parameters::default(), &messages, true, true, true);
 
         assert!(!parameters.cache.is_empty());
         assert_eq!(
@@ -335,7 +442,7 @@ mod tests {
             Message::assistant("hi"),
             Message::system("live tail"),
         ];
-        let parameters = cache.apply(Parameters::default(), &messages, false, true);
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, true);
         let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
             panic!("expected explicit claude breakpoints");
         };
@@ -359,7 +466,7 @@ mod tests {
             Message::user("hello"),
             Message::system("live tail"),
         ];
-        let parameters = cache.apply(Parameters::default(), &messages, false, true);
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, true);
         let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
             panic!("expected explicit claude breakpoints");
         };
@@ -383,7 +490,7 @@ mod tests {
             Message::assistant("hi"),
             Message::system("live tail"),
         ];
-        let parameters = cache.apply(Parameters::default(), &messages, false, false);
+        let parameters = cache.apply(Parameters::default(), &messages, false, false, true);
         let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
             panic!("expected explicit claude breakpoints");
         };
@@ -404,7 +511,7 @@ mod tests {
             Message::system("more prefix"),
             Message::system("live tail"),
         ];
-        let parameters = cache.apply(Parameters::default(), &messages, false, true);
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, true);
         let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
             panic!("expected explicit claude breakpoints");
         };
@@ -412,11 +519,17 @@ mod tests {
     }
 
     #[test]
-    fn with_ttl_keeps_the_lifetime_coherent() {
-        let cache = PromptCache::new("s").with_ttl(ClaudePromptCacheTtl::FiveMinutes);
+    fn with_ttl_and_with_lifetime_stay_independent() {
+        let cache = PromptCache::new("s")
+            .with_lifetime(CacheLifetime::Permanent)
+            .with_ttl(ClaudePromptCacheTtl::FiveMinutes);
+        assert_eq!(cache.ttl(), ClaudePromptCacheTtl::FiveMinutes);
+        assert_eq!(cache.lifetime(), CacheLifetime::Permanent);
+
+        let default_lifetime = PromptCache::new("s").with_ttl(ClaudePromptCacheTtl::FiveMinutes);
         assert_eq!(
-            cache.lifetime(),
-            CacheLifetime::Limited(Duration::from_secs(300))
+            default_lifetime.lifetime(),
+            CacheLifetime::Limited(Duration::from_secs(3600))
         );
     }
 
@@ -424,10 +537,92 @@ mod tests {
     fn a_prefix_only_request_gets_no_message_breakpoint() {
         let cache = PromptCache::new("session-1");
         let messages = vec![Message::system("prefix")];
-        let parameters = cache.apply(Parameters::default(), &messages, false, true);
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, false);
         let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
             panic!("expected explicit claude breakpoints");
         };
         assert!(breakpoints.second.is_none());
+    }
+
+    #[test]
+    fn systemless_requests_omit_last_system_breakpoint() {
+        let cache = PromptCache::new("session-1");
+        let messages = vec![Message::user("hello")];
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::Message {
+                message_index: 0,
+                block_index: 0,
+            }
+        );
+        assert!(breakpoints.second.is_none());
+
+        let empty = cache.apply(Parameters::default(), &[], false, true, false);
+        assert!(empty.cache.claude.is_none());
+    }
+
+    #[test]
+    fn thinking_led_assistant_turns_target_last_cacheable_block() {
+        let cache = PromptCache::new("session-1");
+        let thinking = ReasoningState::new(
+            "claude",
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "step one",
+                "signature": "sig-1"
+            })
+            .to_string(),
+        );
+        let redacted = ReasoningState::new(
+            "claude",
+            serde_json::json!({
+                "type": "redacted_thinking",
+                "data": "cipher"
+            })
+            .to_string(),
+        );
+        let call = aither_core::llm::ToolCall::new("c1", "terminal", serde_json::json!({}));
+        let messages = vec![
+            Message::user("run"),
+            Message::assistant_with_reasoning(
+                "doing it",
+                vec![call],
+                vec![thinking.clone(), redacted],
+            ),
+        ];
+        // Blocks: [Thinking(0), RedactedThinking(1), Text(2), ToolUse(3)] -> last cacheable is 3.
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::Message {
+                message_index: 1,
+                block_index: 3,
+            }
+        );
+
+        // A thinking-only assistant turn has no cacheable block, so the
+        // breakpoint walks back to the preceding user message.
+        let thinking_only = vec![
+            Message::user("run"),
+            Message::assistant_with_reasoning("", Vec::new(), vec![thinking]),
+        ];
+        let parameters = cache.apply(Parameters::default(), &thinking_only, false, true, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::Message {
+                message_index: 0,
+                block_index: 0,
+            }
+        );
     }
 }

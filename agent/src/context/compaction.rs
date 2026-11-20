@@ -537,7 +537,7 @@ impl<D: HandoffSchema> CompactionFork<D> {
         if request
             .messages()
             .iter()
-            .all(|message| message.role() == Role::System)
+            .all(|message| matches!(message.role(), Role::System | Role::Configuration))
         {
             return Err(CompactionError::Empty);
         }
@@ -548,6 +548,27 @@ impl<D: HandoffSchema> CompactionFork<D> {
             attachments,
         });
         let mut messages = request.messages().to_vec();
+        let leading_system = messages
+            .iter()
+            .take_while(|message| message.role() == Role::System)
+            .count();
+        // Strip any trailing mid-conversation `Role::System` message (the
+        // volatile live tail) so the appended user instruction never follows a
+        // mid-conversation system turn (`system -> user` is rejected by Claude)
+        // and the fork replays only the cached prefix.
+        while messages.len() > leading_system {
+            if let Some(pos) = messages[leading_system..]
+                .iter()
+                .rposition(|message| message.role() != Role::Configuration)
+            {
+                let index = leading_system + pos;
+                if messages[index].role() == Role::System {
+                    messages.remove(index);
+                    continue;
+                }
+            }
+            break;
+        }
         messages.push(Message::user(instruction));
         Ok(Self {
             fork_point,
@@ -1210,10 +1231,18 @@ mod tests {
             &messages,
             false,
             false,
+            true,
         );
         let main = LLMRequest::new(messages).with_parameters(parameters);
         let fork =
             CompactionFork::<HandoffDocument>::new(&main, 0, &[], None, &[], &[]).expect("fork");
+        assert!(
+            fork.request()
+                .messages()
+                .iter()
+                .all(|message| message.content() != "live tail"),
+            "volatile live tail must be stripped before appending compaction instruction"
+        );
         let model = CapturingModel {
             seen: std::sync::Mutex::default(),
         };

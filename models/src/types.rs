@@ -122,6 +122,9 @@ pub struct Pricing {
     cache_write_per_token: Option<f64>,
     reasoning_per_token: Option<f64>,
     image_per_token: Option<f64>,
+    image_output_per_token: Option<f64>,
+    audio_per_token: Option<f64>,
+    audio_output_per_token: Option<f64>,
 }
 
 impl Pricing {
@@ -135,6 +138,9 @@ impl Pricing {
             cache_write_per_token: None,
             reasoning_per_token: None,
             image_per_token: None,
+            image_output_per_token: None,
+            audio_per_token: None,
+            audio_output_per_token: None,
         }
     }
 
@@ -174,6 +180,24 @@ impl Pricing {
         self.image_per_token
     }
 
+    /// Image output cost per token, if applicable.
+    #[must_use]
+    pub const fn image_output_per_token(&self) -> Option<f64> {
+        self.image_output_per_token
+    }
+
+    /// Audio input cost per token, if applicable.
+    #[must_use]
+    pub const fn audio_per_token(&self) -> Option<f64> {
+        self.audio_per_token
+    }
+
+    /// Audio output cost per token, if applicable.
+    #[must_use]
+    pub const fn audio_output_per_token(&self) -> Option<f64> {
+        self.audio_output_per_token
+    }
+
     /// Sets cache read cost per token.
     #[must_use]
     pub const fn with_cache_read(mut self, cost: f64) -> Self {
@@ -199,6 +223,27 @@ impl Pricing {
     #[must_use]
     pub const fn with_image(mut self, cost: f64) -> Self {
         self.image_per_token = Some(cost);
+        self
+    }
+
+    /// Sets image output cost per token.
+    #[must_use]
+    pub const fn with_image_output(mut self, cost: f64) -> Self {
+        self.image_output_per_token = Some(cost);
+        self
+    }
+
+    /// Sets audio input cost per token.
+    #[must_use]
+    pub const fn with_audio(mut self, cost: f64) -> Self {
+        self.audio_per_token = Some(cost);
+        self
+    }
+
+    /// Sets audio output cost per token.
+    #[must_use]
+    pub const fn with_audio_output(mut self, cost: f64) -> Self {
+        self.audio_output_per_token = Some(cost);
         self
     }
 }

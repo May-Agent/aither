@@ -23,8 +23,11 @@ pub struct RecoveryReport {
     pub outputs_spilled: usize,
 }
 
-/// Where spilled outputs go, relative to the working directory.
-const SPILL_DIR: &str = "outputs";
+/// Default subdirectory name used by [`AgentBuilder::restore_dir`](crate::AgentBuilder::restore_dir).
+pub const DEFAULT_SPILL_SUBDIR: &str = "outputs";
+
+/// Maximum length of the sanitized tool-call ID segment in a spilled filename.
+const MAX_ID_STEM_LEN: usize = 64;
 
 #[derive(Template)]
 #[template(path = "spilled_tool_output.txt", escape = "none")]
@@ -46,10 +49,10 @@ pub struct SpillLimits {
 
 /// Removes the alerts and reminders numbered below `fork_point` (the fork
 /// point of the compaction about to run) from `context`, and moves the tool
-/// outputs over `limits.threshold` into `working_dir`.
+/// outputs over `limits.threshold` into `spill_dir`.
 ///
-/// With no working directory there is nowhere the agent could read a file
-/// from, so outputs stay where they are and only the alerts go.
+/// With no spill directory there is nowhere the agent could read a file from,
+/// so outputs stay where they are and only the alerts go.
 ///
 /// # Errors
 ///
@@ -58,19 +61,23 @@ pub struct SpillLimits {
 pub async fn clean_for_recovery(
     context: &mut Context,
     fork_point: u64,
-    working_dir: Option<&Path>,
+    spill_dir: Option<&Path>,
+    first_root: Option<&Path>,
     limits: SpillLimits,
 ) -> std::io::Result<RecoveryReport> {
     let alerts_removed = context.prune_system_messages_below(fork_point);
     let mut outputs_spilled = 0;
-    if let Some(working_dir) = working_dir {
-        let dir = working_dir.join(SPILL_DIR);
+    if let Some(dir) = spill_dir {
         for output in context.long_tool_outputs(limits.threshold) {
-            async_fs::create_dir_all(&dir).await?;
-            let name = format!("compaction-{}.txt", file_stem(&output.tool_call_id));
+            async_fs::create_dir_all(dir).await?;
+            let name = format!(
+                "compaction-{}-{}.txt",
+                output.seq,
+                file_stem(&output.tool_call_id)
+            );
             let absolute = dir.join(&name);
             async_fs::write(&absolute, output.content.as_bytes()).await?;
-            let relative = format!("{SPILL_DIR}/{name}");
+            let relative = display_spill_path(&absolute, dir, first_root, &name);
             let replacement = SpilledToolOutput {
                 head: &truncate_on_char_boundary(&output.content, limits.head),
                 bytes: output.content.len(),
@@ -89,10 +96,29 @@ pub async fn clean_for_recovery(
     })
 }
 
-/// A tool call id as a file name stem: ids come from providers and may hold
-/// characters a path cannot.
+fn display_spill_path(
+    absolute: &Path,
+    spill_dir: &Path,
+    first_root: Option<&Path>,
+    name: &str,
+) -> String {
+    if let Some(root) = first_root
+        && let Ok(rel) = absolute.strip_prefix(root)
+    {
+        return rel.to_string_lossy().replace('\\', "/");
+    }
+    if let Some(dir_name) = spill_dir.file_name().and_then(|segment| segment.to_str()) {
+        return format!("{dir_name}/{name}");
+    }
+    name.to_string()
+}
+
+/// A tool call id as a bounded file name stem: ids come from providers and may
+/// hold characters or lengths a path cannot.
 fn file_stem(id: &str) -> String {
-    id.bytes()
+    let stem: String = id
+        .bytes()
+        .take(MAX_ID_STEM_LEN)
         .map(|byte| {
             if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
                 char::from(byte)
@@ -100,7 +126,12 @@ fn file_stem(id: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if stem.is_empty() {
+        "call".to_string()
+    } else {
+        stem
+    }
 }
 
 #[cfg(test)]
@@ -119,16 +150,23 @@ mod tests {
     #[tokio::test]
     async fn long_outputs_move_to_files_and_alerts_go() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let spill = dir.path().join(DEFAULT_SPILL_SUBDIR);
         let mut context = Context::new();
         context.push(Message::user("run it"));
         context.push(Message::system("<system-reminder>stale</system-reminder>"));
-        context.push(Message::tool("call/1", "é".repeat(200)));
+        let seq = context.push(Message::tool("call/1", "é".repeat(200)));
         context.push(Message::tool("call-2", "short"));
         context.mark_prefix_sent();
 
-        let report = clean_for_recovery(&mut context, u64::MAX, Some(dir.path()), limits())
-            .await
-            .expect("recovery");
+        let report = clean_for_recovery(
+            &mut context,
+            u64::MAX,
+            Some(&spill),
+            Some(dir.path()),
+            limits(),
+        )
+        .await
+        .expect("recovery");
 
         assert_eq!(
             report,
@@ -137,7 +175,8 @@ mod tests {
                 outputs_spilled: 1
             }
         );
-        let spilled = dir.path().join("outputs").join("compaction-call_1.txt");
+        let expected_name = format!("compaction-{seq}-call_1.txt");
+        let spilled = spill.join(&expected_name);
         assert_eq!(
             std::fs::read_to_string(&spilled).expect("spill file"),
             "é".repeat(200)
@@ -146,9 +185,42 @@ mod tests {
         assert_eq!(messages.len(), 3);
         let stub = messages[1].content();
         assert!(stub.starts_with("ééééé\n"), "short head kept: {stub}");
-        assert!(stub.contains("outputs/compaction-call_1.txt"));
+        assert!(stub.contains(&format!("outputs/{expected_name}")));
         assert!(stub.contains(&*spilled.to_string_lossy()));
         assert_eq!(messages[2].content(), "short");
+    }
+
+    #[tokio::test]
+    async fn colliding_or_overlong_ids_spill_to_distinct_bounded_filenames() {
+        let spill = tempfile::tempdir().expect("spill dir");
+        let mut context = Context::new();
+        let long_id = format!("call/{}", "x".repeat(400));
+        let first_seq = context.push(Message::tool(&long_id, "a".repeat(200)));
+        let second_seq = context.push(Message::tool(
+            format!("call:{}", "x".repeat(400)),
+            "b".repeat(200),
+        ));
+
+        let report = clean_for_recovery(&mut context, u64::MAX, Some(spill.path()), None, limits())
+            .await
+            .expect("recovery");
+        assert_eq!(report.outputs_spilled, 2);
+
+        let stem = format!("call_{}", "x".repeat(MAX_ID_STEM_LEN - 5));
+        let first_file = spill
+            .path()
+            .join(format!("compaction-{first_seq}-{stem}.txt"));
+        let second_file = spill
+            .path()
+            .join(format!("compaction-{second_seq}-{stem}.txt"));
+        assert_eq!(
+            std::fs::read_to_string(&first_file).expect("first spill"),
+            "a".repeat(200)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second_file).expect("second spill"),
+            "b".repeat(200)
+        );
     }
 
     #[tokio::test]
@@ -159,7 +231,7 @@ mod tests {
         let fork_point = context.fork_point();
         context.push(Message::system("new alert"));
 
-        let report = clean_for_recovery(&mut context, fork_point, None, limits())
+        let report = clean_for_recovery(&mut context, fork_point, None, None, limits())
             .await
             .expect("recovery");
 
@@ -175,7 +247,7 @@ mod tests {
         context.mark_prefix_sent();
         context.push(Message::system("undelivered alert"));
 
-        let report = clean_for_recovery(&mut context, u64::MAX, None, limits())
+        let report = clean_for_recovery(&mut context, u64::MAX, None, None, limits())
             .await
             .expect("recovery");
 
@@ -185,13 +257,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_working_directory_only_the_alerts_go() {
+    async fn without_a_spill_directory_only_the_alerts_go() {
         let mut context = Context::new();
         context.push(Message::system("alert"));
         context.push(Message::tool("call-1", "x".repeat(500)));
         context.mark_prefix_sent();
 
-        let report = clean_for_recovery(&mut context, u64::MAX, None, limits())
+        let report = clean_for_recovery(&mut context, u64::MAX, None, None, limits())
             .await
             .expect("recovery");
 

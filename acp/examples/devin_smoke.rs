@@ -1,79 +1,66 @@
 //! Smoke test for the ACP client against a real agent.
 //!
-//! Spawns `devin acp`, initializes, opens a session in `/tmp`, sets mode
-//! `bypass` and config option `model=swe-2-max`, then prompts the agent to
-//! reply with a single word, printing streamed text and the stop reason.
+//! Spawns `devin acp`, initializes, opens a session in `/tmp`, sets the
+//! `model` config option to `swe-2-max`, then prompts the agent to reply
+//! with a single word, printing streamed text and the stop reason.
 //!
 //! Requires an authenticated `devin` CLI on `PATH`.
 //!
 //! ```console
-//! cargo run -p aither-acp --example devin_smoke
+//! cargo run -p aither-acp --example devin_smoke --features process
 //! ```
 
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use aither_acp::{
-    AcpClient, ClientError, ClientHandler, ContentBlock, PromptParams, RequestPermissionOutcome,
-    RequestPermissionParams, RequestPermissionResult, SessionNewParams, SessionNotification,
-    SessionSetConfigOptionParams, SessionSetModeParams, SessionUpdate, TextContent, vendor,
+use aither_acp::client::{
+    Client, ClientError, MessageKind, NotificationHandler, PermissionHandler, SessionEvent,
 };
-use aither_mcp::protocol::{JsonRpcError, JsonRpcNotification};
+use aither_acp::domain::ids::ConfigId;
+use aither_acp::domain::{
+    ConfigValue, ConfigValueById, Implementation, PermissionOutcome, PermissionRequest,
+    SelectedOutcome,
+};
+use aither_acp::rpc::Notification;
+use aither_acp::vendor::devin;
+use futures_lite::StreamExt;
 
-/// Handler that prints streamed text and auto-approves permission requests.
-#[derive(Default)]
-struct SmokeHandler {
-    /// Accumulated agent message text.
-    text: Mutex<String>,
+/// Approves the first offered option of every permission request.
+struct Allow;
+
+impl PermissionHandler for Allow {
+    fn request(
+        &self,
+        request: PermissionRequest,
+    ) -> impl std::future::Future<Output = PermissionOutcome> + Send {
+        eprintln!("[permission] {}", request.title);
+        std::future::ready(PermissionOutcome::Selected(SelectedOutcome {
+            option_id: request
+                .options
+                .first()
+                .map_or_else(|| "deny".into(), |option| option.option_id.clone()),
+            meta: None,
+        }))
+    }
 }
 
-impl ClientHandler for SmokeHandler {
-    fn session_update(
-        &self,
-        notification: SessionNotification,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update
-            && let ContentBlock::Text(content) = &chunk.content
-        {
-            print!("{}", content.text);
-            self.text
-                .lock()
-                .expect("text poisoned")
-                .push_str(&content.text);
-        }
-        std::future::ready(())
-    }
+/// Prints devin's private notifications and accumulates agent text.
+#[derive(Clone, Default)]
+struct Printer {
+    /// Accumulated agent message text.
+    text: Arc<Mutex<String>>,
+}
 
-    fn request_permission(
-        &self,
-        params: RequestPermissionParams,
-    ) -> impl std::future::Future<Output = Result<RequestPermissionResult, JsonRpcError>> + Send
-    {
-        let option_id = params
-            .options
-            .first()
-            .map_or_else(|| "deny".to_string(), |o| o.option_id.clone());
-        eprintln!("[permission] {} -> {option_id}", params.tool_call.title);
-        async move {
-            Ok(RequestPermissionResult {
-                outcome: RequestPermissionOutcome::Selected { option_id },
-                meta: None,
-            })
-        }
-    }
-
-    fn notification(
-        &self,
-        notification: JsonRpcNotification,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        // Decode devin's private `_cognition.ai/*` notifications.
-        match vendor::devin::notification(&notification) {
-            Some(vendor::devin::DevinNotification::Output(output)) => {
+impl NotificationHandler for Printer {
+    fn notify(&self, notification: Notification) -> impl std::future::Future<Output = ()> + Send {
+        match devin::notification(&notification) {
+            Some(devin::DevinNotification::Output(output)) => {
                 eprintln!("[devin:{}] {}", output.channel, output.message);
             }
-            Some(vendor::devin::DevinNotification::McpServersChanged(_)) => {
+            Some(devin::DevinNotification::McpServersChanged(_)) => {
                 eprintln!("[devin] MCP servers changed");
             }
-            Some(vendor::devin::DevinNotification::Other { method, .. }) => {
+            Some(devin::DevinNotification::Other { method, .. }) => {
                 eprintln!("[devin] {method}");
             }
             None => eprintln!("[notification] {}", notification.method),
@@ -84,60 +71,56 @@ impl ClientHandler for SmokeHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
-    let handler = SmokeHandler::default();
-    let (client, connection) = AcpClient::spawn(
-        "devin",
-        &["acp"],
-        std::iter::empty::<(String, String)>(),
-        "/tmp",
-        handler,
-    )?;
+    let printer = Printer::default();
+    let (client, connection) = Client::builder(Implementation::new("devin-smoke", "0"))
+        .permissions(Allow)
+        .notification(printer.clone())
+        .spawn("devin", &["acp".to_string()], &[], Path::new("/tmp"))
+        .await?;
     let connection = tokio::spawn(connection);
 
-    let init = client.initialize().await?;
     eprintln!(
-        "[initialize] agent={} protocol={} load_session={}",
-        init.agent_info.as_ref().map_or("?", |i| i.name.as_str()),
-        init.protocol_version,
-        init.agent_capabilities.load_session,
+        "[initialize] agent={} protocol={}",
+        client.agent_info().map_or("?", |i| i.name.as_str()),
+        client.protocol_version(),
     );
-    if let Some(path) = vendor::devin::mcp_config_path(&init) {
-        eprintln!("[initialize] mcpConfigPath={path}");
-    }
 
-    let session = client.new_session(SessionNewParams::new("/tmp")).await?;
-    eprintln!("[session] {}", session.session_id);
+    let session = client.new_session("/tmp").open().await?;
+    eprintln!("[session] {}", session.id());
 
-    client
-        .set_mode(SessionSetModeParams::new(&session.session_id, "bypass"))
+    session
+        .set_config(
+            ConfigId::from_string("model"),
+            ConfigValue::Id(ConfigValueById {
+                value: "swe-2-max".into(),
+            }),
+        )
         .await?;
-    client
-        .set_config_option(SessionSetConfigOptionParams::new(
-            &session.session_id,
-            "model",
-            "swe-2-max",
-        ))
-        .await?;
+
+    let printer2 = printer.clone();
+    let mut events = session.subscribe();
+    let printer_task = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            if let SessionEvent::MessageDelta {
+                kind: MessageKind::Agent,
+                text: Some(text),
+                ..
+            } = &event
+            {
+                print!("{text}");
+                printer2.text.lock().expect("text").push_str(text);
+            }
+        }
+    });
 
     eprintln!("[prompt] streaming response:");
-    let result = client
-        .prompt(PromptParams::new(
-            &session.session_id,
-            vec![ContentBlock::Text(TextContent {
-                text: "Reply with the single word pong.".to_string(),
-                annotations: None,
-                meta: None,
-            })],
-        ))
+    let outcome = session
+        .prompt_run("Reply with the single word pong.")
         .await?;
+    eprintln!("\n[done] outcome={outcome:?}");
+    eprintln!("[done] full text: {}", printer.text.lock().unwrap());
 
-    eprintln!("\n[done] stop_reason={:?}", result.stop_reason);
-    eprintln!(
-        "[done] full text: {}",
-        client.handler().text.lock().unwrap()
-    );
-
-    client.close();
-    connection.await.expect("connection task panicked");
+    printer_task.abort();
+    connection.abort();
     Ok(())
 }

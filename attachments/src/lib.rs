@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use async_fs::File;
-use futures_lite::io::AsyncReadExt;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -62,9 +62,16 @@ impl CacheEntry {
     }
 }
 
+/// Structured key identifying an uploaded file for a specific provider.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct CacheKey {
+    path: PathBuf,
+    provider: String,
+}
+
 /// File cache for tracking uploaded files across providers.
 ///
-/// The cache stores file references keyed by `(file_path, provider)` pairs.
+/// The cache stores file references keyed by `(canonical_path, provider)` pairs.
 /// Each entry includes the content hash to detect file changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCache {
@@ -72,7 +79,8 @@ pub struct FileCache {
     #[serde(skip)]
     cache_dir: PathBuf,
     /// Map of (`canonical_path`, provider) -> `CacheEntry`.
-    entries: HashMap<String, CacheEntry>,
+    #[serde(with = "entries_serde")]
+    entries: HashMap<CacheKey, CacheEntry>,
 }
 
 impl FileCache {
@@ -85,22 +93,24 @@ impl FileCache {
     /// Returns an error when the cache file cannot be read or parsed.
     pub async fn open(cache_dir: PathBuf) -> std::io::Result<Self> {
         let cache_file = cache_dir.join(CACHE_FILE_NAME);
-        if async_fs::metadata(&cache_file).await.is_ok() {
-            let contents = async_fs::read_to_string(&cache_file).await?;
-            let cache: Self = serde_json::from_str(&contents)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            return Ok(Self {
+        match async_fs::read_to_string(&cache_file).await {
+            Ok(contents) => {
+                let cache: Self = serde_json::from_str(&contents)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(Self {
+                    cache_dir,
+                    entries: cache.entries,
+                })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
                 cache_dir,
-                entries: cache.entries,
-            });
+                entries: HashMap::new(),
+            }),
+            Err(err) => Err(err),
         }
-        Ok(Self {
-            cache_dir,
-            entries: HashMap::new(),
-        })
     }
 
-    /// Save cache to disk.
+    /// Save cache to disk atomically via a sibling temporary file and rename.
     ///
     /// # Errors
     ///
@@ -110,13 +120,56 @@ impl FileCache {
         let cache_file = self.cache_dir.join(CACHE_FILE_NAME);
         let contents = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        async_fs::write(cache_file, contents).await?;
+
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+
+        let (tmp_file, mut file) = {
+            let mut attempt = 0u32;
+            loop {
+                let candidate = self
+                    .cache_dir
+                    .join(format!(".{CACHE_FILE_NAME}.tmp.{pid}.{nanos}.{attempt}"));
+                match async_fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                    .await
+                {
+                    Ok(file) => break (candidate, file),
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < 64 => {
+                        attempt += 1;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        };
+
+        let write_result = async {
+            file.write_all(contents.as_bytes()).await?;
+            file.flush().await?;
+            drop(file);
+            async_fs::rename(&tmp_file, &cache_file).await
+        }
+        .await;
+
+        if let Err(err) = write_result {
+            let _ = async_fs::remove_file(&tmp_file).await;
+            return Err(err);
+        }
         Ok(())
     }
 
-    /// Generate a cache key from file path and provider.
-    fn cache_key(file_path: &Path, provider: &str) -> String {
-        format!("{}::{}", file_path.display(), provider)
+    /// Generate a canonical cache key from file path and provider.
+    async fn cache_key(file_path: &Path, provider: &str) -> std::io::Result<CacheKey> {
+        let path = async_fs::canonicalize(file_path).await?;
+        Ok(CacheKey {
+            path,
+            provider: provider.to_string(),
+        })
     }
 
     /// Get a cached entry for a file if it exists and is valid.
@@ -128,18 +181,18 @@ impl FileCache {
     ///
     /// # Errors
     ///
-    /// Returns an error when file hashing fails.
+    /// Returns an error when path canonicalization or file hashing fails.
     pub async fn get(
         &self,
         file_path: &Path,
         provider: &str,
     ) -> std::io::Result<Option<CacheEntry>> {
-        let key = Self::cache_key(file_path, provider);
+        let key = Self::cache_key(file_path, provider).await?;
         let Some(entry) = self.entries.get(&key) else {
             return Ok(None);
         };
 
-        let current_hash = hash_file(file_path).await?;
+        let current_hash = hash_file(&key.path).await?;
         if entry.is_valid(&current_hash) {
             Ok(Some(entry.clone()))
         } else {
@@ -153,7 +206,7 @@ impl FileCache {
     ///
     /// # Errors
     ///
-    /// Returns an error when file hashing fails.
+    /// Returns an error when path canonicalization or file hashing fails.
     pub async fn insert(
         &mut self,
         file_path: &Path,
@@ -161,17 +214,25 @@ impl FileCache {
         reference: String,
         expires_at: Option<SystemTime>,
     ) -> std::io::Result<()> {
-        let content_hash = hash_file(file_path).await?;
-        let key = Self::cache_key(file_path, provider);
+        let key = Self::cache_key(file_path, provider).await?;
+        let content_hash = hash_file(&key.path).await?;
         let entry = CacheEntry::new(content_hash, provider.to_string(), reference, expires_at);
         self.entries.insert(key, entry);
         Ok(())
     }
 
     /// Remove a cache entry.
-    pub fn remove(&mut self, file_path: &Path, provider: &str) -> Option<CacheEntry> {
-        let key = Self::cache_key(file_path, provider);
-        self.entries.remove(&key)
+    pub async fn remove(&mut self, file_path: &Path, provider: &str) -> Option<CacheEntry> {
+        if let Ok(key) = Self::cache_key(file_path, provider).await
+            && let Some(removed) = self.entries.remove(&key)
+        {
+            return Some(removed);
+        }
+        let fallback_key = CacheKey {
+            path: file_path.to_path_buf(),
+            provider: provider.to_string(),
+        };
+        self.entries.remove(&fallback_key)
     }
 
     /// Remove all expired entries from the cache.
@@ -207,7 +268,63 @@ async fn hash_file(path: &Path) -> std::io::Result<String> {
     Ok(const_hex::encode(result))
 }
 
-/// Serde support for Option<SystemTime>.
+mod entries_serde {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{CacheEntry, CacheKey};
+
+    #[derive(Serialize, Deserialize)]
+    struct StoredEntry {
+        path: PathBuf,
+        #[serde(flatten)]
+        entry: CacheEntry,
+    }
+
+    #[allow(clippy::implicit_hasher)]
+    pub fn serialize<S>(
+        entries: &HashMap<CacheKey, CacheEntry>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut items: Vec<StoredEntry> = entries
+            .iter()
+            .map(|(key, entry)| StoredEntry {
+                path: key.path.clone(),
+                entry: entry.clone(),
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| a.entry.provider.cmp(&b.entry.provider))
+        });
+        items.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<CacheKey, CacheEntry>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let items = Vec::<StoredEntry>::deserialize(deserializer)?;
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let key = CacheKey {
+                    path: item.path,
+                    provider: item.entry.provider.clone(),
+                };
+                (key, item.entry)
+            })
+            .collect())
+    }
+}
+
+/// Serde support for `Option<SystemTime>`.
 mod system_time_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -264,5 +381,139 @@ mod tests {
             .expect("get")
             .expect("entry");
         assert_eq!(entry.reference, "file-1");
+    }
+
+    #[tokio::test]
+    async fn test_file_cache_canonicalizes_dotdot_and_symlink_paths() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let cache_dir = dir.path().join("cache");
+        let sub_dir = dir.path().join("sub");
+        async_fs::create_dir_all(&sub_dir)
+            .await
+            .expect("create subdir");
+        let real_file = sub_dir.join("payload.bin");
+        async_fs::write(&real_file, b"content")
+            .await
+            .expect("write file");
+
+        let uncanonical = dir
+            .path()
+            .join("sub")
+            .join("..")
+            .join("sub")
+            .join("payload.bin");
+
+        let mut cache = FileCache::open(cache_dir.clone())
+            .await
+            .expect("open cache");
+        cache
+            .insert(&uncanonical, "gemini", "uri-1".to_string(), None)
+            .await
+            .expect("insert");
+
+        let hit = cache
+            .get(&real_file, "gemini")
+            .await
+            .expect("get real")
+            .expect("canonical hit");
+        assert_eq!(hit.reference, "uri-1");
+
+        #[cfg(unix)]
+        {
+            let link_path = dir.path().join("link.bin");
+            std::os::unix::fs::symlink(&real_file, &link_path).expect("symlink");
+            let link_hit = cache
+                .get(&link_path, "gemini")
+                .await
+                .expect("get link")
+                .expect("symlink hit");
+            assert_eq!(link_hit.reference, "uri-1");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_file_cache_structured_keys_avoid_delimiter_collisions() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let cache_dir = dir.path().join("cache");
+        let file_a = dir.path().join("a::b");
+        let file_b = dir.path().join("a");
+        async_fs::write(&file_a, b"same").await.expect("write a");
+        async_fs::write(&file_b, b"same").await.expect("write b");
+
+        let mut cache = FileCache::open(cache_dir.clone())
+            .await
+            .expect("open cache");
+        cache
+            .insert(&file_a, "c", "ref-a".to_string(), None)
+            .await
+            .expect("insert a");
+        cache
+            .insert(&file_b, "b::c", "ref-b".to_string(), None)
+            .await
+            .expect("insert b");
+        cache.save().await.expect("save");
+
+        let reloaded = FileCache::open(cache_dir).await.expect("reload");
+        assert_eq!(
+            reloaded
+                .get(&file_a, "c")
+                .await
+                .expect("get a")
+                .expect("entry a")
+                .reference,
+            "ref-a"
+        );
+        assert_eq!(
+            reloaded
+                .get(&file_b, "b::c")
+                .await
+                .expect("get b")
+                .expect("entry b")
+                .reference,
+            "ref-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_cache_save_is_atomic_without_leftover_temp_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let cache_dir = dir.path().join("cache");
+        let file_path = dir.path().join("file.txt");
+        async_fs::write(&file_path, b"hello")
+            .await
+            .expect("write file");
+
+        let mut cache = FileCache::open(cache_dir.clone())
+            .await
+            .expect("open cache");
+        cache
+            .insert(&file_path, "openai", "file-1".to_string(), None)
+            .await
+            .expect("insert 1");
+        cache.save().await.expect("save 1");
+
+        cache
+            .insert(&file_path, "openai", "file-2".to_string(), None)
+            .await
+            .expect("insert 2");
+        cache.save().await.expect("save 2");
+
+        let files: Vec<_> = std::fs::read_dir(&cache_dir)
+            .expect("read cache dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(files, vec![std::ffi::OsString::from(CACHE_FILE_NAME)]);
+
+        let reloaded = FileCache::open(cache_dir).await.expect("reload");
+        assert_eq!(
+            reloaded
+                .get(&file_path, "openai")
+                .await
+                .expect("get")
+                .expect("entry")
+                .reference,
+            "file-2"
+        );
     }
 }

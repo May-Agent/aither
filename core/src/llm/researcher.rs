@@ -351,6 +351,13 @@ macro_rules! impl_researcher {
                     T::research(self, request)
                 }
 
+                fn report(
+                    &self,
+                    request: &ResearchRequest,
+                ) -> impl Future<Output = crate::Result<ResearchReport>> + Send {
+                    T::report(self, request)
+                }
+
                 fn profile(&self) -> impl Future<Output = ResearcherProfile> + Send {
                     T::profile(self)
                 }
@@ -369,6 +376,13 @@ impl<T: Researcher> Researcher for &T {
         request: &ResearchRequest,
     ) -> impl Stream<Item = Result<ResearchEvent, Self::Error>> + Send {
         T::research(self, request)
+    }
+
+    fn report(
+        &self,
+        request: &ResearchRequest,
+    ) -> impl Future<Output = crate::Result<ResearchReport>> + Send {
+        T::report(self, request)
     }
 
     fn profile(&self) -> impl Future<Output = ResearcherProfile> + Send {

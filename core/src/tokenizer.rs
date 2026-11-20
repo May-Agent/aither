@@ -10,12 +10,17 @@
 extern crate std;
 
 use alloc::string::ToString;
-use std::io::Cursor;
+use alloc::vec::Vec;
+use std::io::{Cursor, Read as _};
 
-use base64::Engine as _;
 use num_traits::ToPrimitive as _;
 
 use crate::llm::LLMRequest;
+
+/// Upper bound on decoded bytes inspected to read an image attachment's header
+/// dimensions: covers PNG/GIF/WebP headers plus full 64 KiB JPEG APP1 EXIF/ICC
+/// segments without decoding multi-megabyte image payloads.
+const MAX_IMAGE_HEADER_BYTES: usize = 128 * 1024;
 
 /// Per-message chat framing, per `OpenAI`'s published recipe: the start,
 /// role and end markers of each message.
@@ -172,7 +177,7 @@ impl Vocabulary {
         for definition in request.tool_definitions() {
             total += self.count_text(definition.name())
                 + self.count_text(definition.description())
-                + self.count_text(&definition.arguments_openai_schema().to_string());
+                + self.count_text(definition.arguments_openai_schema_str());
         }
         total
     }
@@ -186,8 +191,9 @@ fn attachment_tokens(attachment: &crate::llm::Attachment) -> Option<u32> {
     Some(image_tokens(width, height))
 }
 
-/// Reads image dimensions out of a `data:` URL attachment. Remote or
-/// unparseable attachments return `None`.
+/// Reads image dimensions out of a `data:` URL attachment by streaming at most
+/// [`MAX_IMAGE_HEADER_BYTES`] of decoded bytes. Remote or unparseable
+/// attachments return `None`.
 fn attachment_dimensions(attachment: &crate::llm::Attachment) -> Option<(u32, u32)> {
     if !attachment
         .media_type()
@@ -203,10 +209,23 @@ fn attachment_dimensions(attachment: &crate::llm::Attachment) -> Option<(u32, u3
     }
     let path = url.path();
     let (_, data) = path.split_once(',')?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
+    image_dimensions_from_base64_prefix(data)
+}
+
+fn image_dimensions_from_base64_prefix(data: &str) -> Option<(u32, u32)> {
+    let estimated_len = (data.len() / 4)
+        .saturating_mul(3)
+        .min(MAX_IMAGE_HEADER_BYTES);
+    let mut header = Vec::with_capacity(estimated_len);
+    let decoder = base64::read::DecoderReader::new(
+        data.as_bytes(),
+        &base64::engine::general_purpose::STANDARD,
+    );
+    decoder
+        .take(MAX_IMAGE_HEADER_BYTES as u64)
+        .read_to_end(&mut header)
         .ok()?;
-    image::ImageReader::new(Cursor::new(bytes))
+    image::ImageReader::new(Cursor::new(header))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
@@ -245,9 +264,14 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::Message;
+    use crate::llm::{Message, Tool, ToolContext, ToolResult};
+    use alloc::borrow::Cow;
     use alloc::format;
+    use alloc::string::String;
     use alloc::vec::Vec;
+    use base64::Engine as _;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
     use url::Url;
 
     #[test]
@@ -402,5 +426,63 @@ mod tests {
             "application/pdf".parse().expect("mime"),
         );
         assert_eq!(attachment_tokens(&pdf), None);
+    }
+
+    #[test]
+    fn bounded_image_decode_stops_at_header_prefix_and_counts_tool_schemas() {
+        /// Counts lines in a file.
+        #[derive(JsonSchema, Deserialize)]
+        #[expect(dead_code, reason = "schema test")]
+        struct LineCountArgs {
+            path: String,
+        }
+
+        struct LineCounter;
+
+        impl Tool for LineCounter {
+            fn name(&self) -> Cow<'static, str> {
+                Cow::Borrowed("line_counter")
+            }
+            type Arguments = LineCountArgs;
+            type Res = ToolResult;
+
+            fn call(
+                &self,
+                _args: Self::Arguments,
+                _cx: ToolContext,
+            ) -> impl core::future::Future<Output = crate::Result<Self::Res>> + Send {
+                core::future::ready(Ok(ToolResult::Done))
+            }
+        }
+
+        // Build a PNG header followed by > 2 * MAX_IMAGE_HEADER_BYTES of body, then
+        // append non-base64 '!' markers past the prefix window: a full-buffer decode
+        // would fail on '!', whereas bounded prefix streaming stops at MAX_IMAGE_HEADER_BYTES.
+        let mut prefix_bytes = png_header(1024, 768);
+        prefix_bytes.resize(MAX_IMAGE_HEADER_BYTES * 2, 0xAA);
+        let mut encoded = base64::engine::general_purpose::STANDARD.encode(&prefix_bytes);
+        encoded.push_str("!!!!");
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&encoded)
+                .is_err(),
+            "full decode must fail on trailing sentinel"
+        );
+
+        let url = Url::parse(&format!("data:image/png;base64,{encoded}")).expect("data url");
+        let attachment = crate::llm::Attachment::new(url, "image/png".parse().expect("mime"));
+        assert_eq!(attachment_tokens(&attachment), Some(765));
+
+        let vocab = Vocabulary::for_model("gpt-4o").expect("o200k");
+        let bare = vocab.count_request(&LLMRequest::new([Message::user("hi")]));
+        let with_tool_and_image = vocab.count_request(
+            &LLMRequest::new([Message::user("hi").with_attachment(attachment)])
+                .with_tool(&LineCounter),
+        );
+        let def = crate::llm::tool::ToolDefinition::new(&LineCounter);
+        let expected_tool_tokens = vocab.count_text(def.name())
+            + vocab.count_text(def.description())
+            + vocab.count_text(def.arguments_openai_schema_str());
+        assert_eq!(with_tool_and_image, bare + 765 + expected_tool_tokens);
     }
 }

@@ -2,17 +2,17 @@
 //! advertisement and per-update metadata convention, spoken by e.g.
 //! codex-acp when the client is a `JetBrains` IDE.
 //!
-//! The shape is a single `_meta.jetbrains.air` object carrying a `version`
-//! and a `capabilities` array; individual session updates hang extra keys
-//! under the same `air` object (e.g. `air.asyncTasks.backgrounded` on a
-//! `tool_call_update`).
+//! The shape is a single `_meta.jetbrains.air` object carrying a
+//! `version` and a `capabilities` array; individual session updates hang
+//! extra keys under the same `air` object (e.g.
+//! `air.asyncTasks.backgrounded` on a `tool_call_update`).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::protocol::ClientCapabilities;
+use crate::domain::ClientCapabilities;
 
 /// The `_meta` key carrying the `JetBrains` namespace.
 pub const META_KEY: &str = "jetbrains";
@@ -44,8 +44,8 @@ pub mod capability {
     pub const RECOMMENDED_CONFIG_VALUE: &str = "recommendedValue";
 }
 
-/// The key under `air` marking a `tool_call_update` whose command moved to
-/// background execution: `air.asyncTasks.backgrounded`.
+/// The key under `air` marking a `tool_call_update` whose command moved
+/// to background execution: `air.asyncTasks.backgrounded`.
 pub const ASYNC_TASKS_KEY: &str = "asyncTasks";
 
 /// The `backgrounded` flag inside `air.asyncTasks`.
@@ -55,7 +55,8 @@ pub const BACKGROUNDED_KEY: &str = "backgrounded";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AirMeta {
-    /// AIR version; [`VERSION`] for agents this module interoperates with.
+    /// AIR version; [`VERSION`] for agents this module interoperates
+    /// with.
     pub version: u64,
     /// Capability keys the remote side supports.
     #[serde(default)]
@@ -92,8 +93,8 @@ pub fn backgrounded(meta: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
-/// Merge `key: value` into `_meta.jetbrains.air` of `meta`, preserving all
-/// other `_meta` content and setting `version` to [`VERSION`].
+/// Merge `key: value` into `_meta.jetbrains.air` of `meta`, preserving
+/// all other `_meta` content and setting `version` to [`VERSION`].
 ///
 /// Pass `None` for `meta` to build a fresh `_meta` object.
 #[must_use]
@@ -176,7 +177,8 @@ mod tests {
         assert_eq!(fresh["jetbrains"]["air"]["capabilities"], json!(["x"]));
     }
 
-    /// `advertise` writes the AIR capability list onto client capabilities.
+    /// `advertise` writes the AIR capability list onto client
+    /// capabilities.
     #[test]
     fn advertise_capabilities() {
         let mut caps = ClientCapabilities {
