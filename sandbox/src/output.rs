@@ -122,8 +122,9 @@ async fn cut_text_output(
     let text_owned = text.to_owned();
     let preview = blocking::unblock(move || {
         let wording: &dyn ShellWording = &*wording;
-        let folded = crate::output_compress::folded_code_content(&code_folder, &text_owned, wording)
-            .filter(|folded| folded.len() <= byte_budget);
+        let folded =
+            crate::output_compress::folded_code_content(&code_folder, &text_owned, wording)
+                .filter(|folded| folded.len() <= byte_budget);
         folded.unwrap_or_else(|| {
             crate::output_compress::stored_preview(&text_owned, max_lines, byte_budget, wording)
                 .trim_end_matches('\n')
@@ -238,7 +239,7 @@ impl OutputStore {
             ids,
             policy,
             wording,
-            code_folder: Arc::new(crate::output_compress::CodeFolder::default()),
+            code_folder: Arc::new(crate::output_compress::CodeFolder::new()),
             names: Mutex::new(Vec::new()),
             earlier: async_lock::OnceCell::new(),
         }))

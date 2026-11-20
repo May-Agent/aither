@@ -1,4 +1,4 @@
-//! Runtime-mutable filesystem grants of a [`Sandbox`](crate::Sandbox).
+//! Runtime-mutable filesystem grants of a [`Sandbox`].
 //!
 //! A [`Grants`] handle is cheap to clone and shares one store with every
 //! clone: a host keeps the handle, adds grants when a workspace request is

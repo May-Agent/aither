@@ -52,6 +52,7 @@ use crate::provider::Provider;
 use aither_cloud::CloudProvider;
 
 /// Interactive CLI for testing aither agents.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(name = "aither", version, about)]
 struct Args {
@@ -438,36 +439,36 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
 
     let mut buffer = String::new();
     loop {
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                match classify_line_key(key, buffer.is_empty()) {
-                    LineKeyAction::Cancel { interrupted } => {
-                        if interrupted {
-                            print!("^C\r\n");
-                        } else {
-                            print!("\r\n");
-                        }
-                        io::stdout().flush().ok();
-                        return Ok(None);
-                    }
-                    LineKeyAction::Submit => {
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            match classify_line_key(key, buffer.is_empty()) {
+                LineKeyAction::Cancel { interrupted } => {
+                    if interrupted {
+                        print!("^C\r\n");
+                    } else {
                         print!("\r\n");
-                        io::stdout().flush().ok();
-                        return Ok(Some(buffer));
                     }
-                    LineKeyAction::Backspace => {
-                        if buffer.pop().is_some() {
-                            print!("\u{8} \u{8}");
-                            io::stdout().flush().ok();
-                        }
-                    }
-                    LineKeyAction::Echo(c) => {
-                        buffer.push(c);
-                        print!("{c}");
-                        io::stdout().flush().ok();
-                    }
-                    LineKeyAction::Ignore => {}
+                    io::stdout().flush().ok();
+                    return Ok(None);
                 }
+                LineKeyAction::Submit => {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    return Ok(Some(buffer));
+                }
+                LineKeyAction::Backspace => {
+                    if buffer.pop().is_some() {
+                        print!("\u{8} \u{8}");
+                        io::stdout().flush().ok();
+                    }
+                }
+                LineKeyAction::Echo(c) => {
+                    buffer.push(c);
+                    print!("{c}");
+                    io::stdout().flush().ok();
+                }
+                LineKeyAction::Ignore => {}
             }
         }
     }
@@ -515,9 +516,9 @@ mod tests {
 
     #[test]
     fn args_parse_approve_flag() {
-        let args = Args::parse_from(["aither", "--approve", "hello"]);
+        let args = Args::parse_from(["aither", "--approve", "--prompt", "hello"]);
         assert!(args.approve);
-        let default_args = Args::parse_from(["aither", "hello"]);
+        let default_args = Args::parse_from(["aither", "--prompt", "hello"]);
         assert!(!default_args.approve);
     }
 }

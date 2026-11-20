@@ -10,7 +10,7 @@
 //! executions share this directory, but each execution gets a fresh sandbox
 //! (new TTY/process). The ids the model addresses — task ids, stored output
 //! names, subagent spaces — are leased from the terminal's
-//! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
+//! [`AnyIdAllocator`].
 
 use crate::foreground_wait::ForegroundWait;
 use crate::memory::{
@@ -305,7 +305,7 @@ fn runs_in_shell(script: &str) -> bool {
 /// A command killed because its `timeout` bound passed, with the UTC times it
 /// started and was killed at.
 ///
-/// [`ShellWording::command_killed`](crate::ShellWording::command_killed)
+/// [`ShellWording::command_killed`]
 /// renders the sentence the model reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutKill {
@@ -5647,10 +5647,10 @@ mod tests {
         ] {
             assert_eq!(direct_command(script).unwrap(), None, "{script}");
         }
-        for (script, arg) in [("echo '$HOME'", "$HOME"), ("echo \"\\$HOME\"", "$HOME")] {
+        for (script, arg) in [("env '$HOME'", "$HOME"), ("env \"\\$HOME\"", "$HOME")] {
             assert_eq!(
                 direct_command(script).unwrap(),
-                Some(("echo".to_string(), vec![arg.to_string()])),
+                Some(("env".to_string(), vec![arg.to_string()])),
                 "{script}"
             );
         }
@@ -5925,7 +5925,7 @@ mod tests {
         .expect("wrap script");
         assert!(wrapped.contains("tcp://host.containers.internal:43123"));
         assert!(wrapped.contains(
-            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"stdin_arg":null,"raw_args":false},"session":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"raw_args":false,"stdin_arg":null},"session":{"positional_args":[],"raw_args":false,"stdin_arg":null}}'"#
         ));
     }
 
@@ -5945,7 +5945,7 @@ mod tests {
         )
         .expect("wrap script");
         assert!(wrapped.contains(
-            r#"--commands '{"issue":{"positional_args":["number"],"stdin_arg":"body","raw_args":false}}'"#
+            r#"--commands '{"issue":{"positional_args":["number"],"raw_args":false,"stdin_arg":"body"}}'"#
         ));
         assert!(!wrapped.contains("printf"));
     }
@@ -9714,13 +9714,12 @@ mod tests {
         assert!(!is_shell_builtin("ripgrep"));
 
         let launch = crate::RemoteLaunch::new("/opt/aither/bin", "/opt/aither/bin/bash");
-        let wrapped = launch.wrap_script_with_exports(
-            "which rg",
-            &[("PATH".to_string(), "/usr/bin:/bin".to_string())],
-        );
+        let wrapped = launch
+            .wrap_script_with_exports("export PATH='/usr/bin:/bin'", "which rg")
+            .expect("wrap_script_with_exports renders");
         let export_pos = wrapped.find("export PATH=").expect("env export present");
         let prepend_pos = wrapped
-            .find("PATH='/opt/aither/bin'")
+            .find("PATH=/opt/aither/bin")
             .expect("bin_dir prepend present");
         assert!(
             prepend_pos > export_pos,

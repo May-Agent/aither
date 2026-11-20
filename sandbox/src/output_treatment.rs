@@ -5,7 +5,7 @@
 //! turns a JSON array of records into TSV. That fits command output, but a
 //! script that reads a file prints the file, and cleaning it hands the model
 //! text the file does not hold. Which scripts produce content of that kind is
-//! the embedder's judgement, so the [`ShellBuilder`](crate::ShellBuilder)
+//! the embedder's judgement, so the [`ShellBuilder`]
 //! takes a [`TreatOutput`] that sees each script before it runs and chooses
 //! its [`OutputTreatment`]. Without one every script's output is treated as
 //! [`Command`](OutputTreatment::Command) output.

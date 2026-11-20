@@ -31,8 +31,5 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal"] }
 executor-core = { version = "0.7", features = ["tokio"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
-[dev-dependencies]
-futures-lite = { version = "2.6", default-features = false, features = ["std"] }
-
 [lints]
 workspace = true

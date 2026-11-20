@@ -399,7 +399,7 @@ where
     ) -> std::result::Result<FetchResult, ProviderError> {
         match run_stage(&self.first, req, ctx).await {
             Ok(result) => Ok(result),
-            Err(first_err) if first_err.is_http_failure() => {
+            Err(first_err) if first_err.is_http_failure() && !ctx.remaining().is_zero() => {
                 run_stage(&self.second, req, ctx).await
             }
             Err(first_err) => Err(first_err),
@@ -444,10 +444,12 @@ where
     ) -> std::result::Result<FetchResult, ProviderError> {
         match run_stage(&self.first, req, ctx).await {
             Ok(result) => Ok(result),
-            Err(first_err) if first_err.is_http_failure() => {
+            Err(first_err) if first_err.is_http_failure() && !ctx.remaining().is_zero() => {
                 match run_stage(&self.second, req, ctx).await {
                     Ok(result) => Ok(result),
-                    Err(second_err) if second_err.is_http_failure() => {
+                    Err(second_err)
+                        if second_err.is_http_failure() && !ctx.remaining().is_zero() =>
+                    {
                         run_stage(&self.third, req, ctx).await
                     }
                     Err(second_err) => Err(second_err),
@@ -1158,7 +1160,7 @@ impl WebFetcher for JinaFetcher {
     ) -> std::result::Result<FetchResult, ProviderError> {
         guard::guard_url(&req.url)
             .await
-            .map_err(|err| ProviderError::invalid(self.name(), err))?;
+            .map_err(|err| ProviderError::http(self.name(), err))?;
         let jina_budget = ctx.stage_budget(JINA_STAGE_BUDGET);
         if jina_budget.is_zero() {
             return Err(ProviderError::http(
@@ -1200,7 +1202,7 @@ impl WebFetcher for StaticFetcher {
     ) -> std::result::Result<FetchResult, ProviderError> {
         guard::guard_url(&req.url)
             .await
-            .map_err(|err| ProviderError::invalid(self.name(), err))?;
+            .map_err(|err| ProviderError::http(self.name(), err))?;
         let static_budget = ctx.stage_budget(STATIC_STAGE_BUDGET);
         if static_budget.is_zero() {
             return Err(ProviderError::http(
@@ -1280,7 +1282,7 @@ impl WebFetcher for HeadlessFetcher {
     ) -> std::result::Result<FetchResult, ProviderError> {
         guard::guard_url(&req.url)
             .await
-            .map_err(|err| ProviderError::invalid(self.name(), err))?;
+            .map_err(|err| ProviderError::http(self.name(), err))?;
         let headless_budget = ctx.stage_budget(HEADLESS_STAGE_BUDGET);
         if headless_budget.is_zero() {
             return Err(ProviderError::http(

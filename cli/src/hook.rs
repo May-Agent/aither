@@ -32,6 +32,36 @@ impl CliHooks {
     pub const fn new(auto_approve: bool) -> Self {
         Self { auto_approve }
     }
+
+    fn decide(self, name: &str, arguments: &serde_json::Value) -> ToolDecision {
+        if self.auto_approve {
+            return ToolDecision::Allow;
+        }
+        match name {
+            COMMAND_TOOL => ToolDecision::Ask(
+                ApprovalRequest::new(ApprovalKind::new("command"), arguments.to_string())
+                    .with_reason("the agent wants to run a command"),
+            ),
+            FILESYSTEM_TOOL => {
+                if is_read_only_fs_operation(arguments) {
+                    ToolDecision::Allow
+                } else {
+                    ToolDecision::Ask(
+                        ApprovalRequest::new(
+                            ApprovalKind::new("filesystem"),
+                            arguments.to_string(),
+                        )
+                        .with_reason("the agent wants to modify the filesystem"),
+                    )
+                }
+            }
+            "websearch" | "webfetch" | "compact" => ToolDecision::Allow,
+            mcp_tool => ToolDecision::Ask(
+                ApprovalRequest::new(ApprovalKind::new("mcp"), format!("{mcp_tool} {arguments}"))
+                    .with_reason("the agent wants to invoke an MCP tool"),
+            ),
+        }
+    }
 }
 
 fn is_read_only_fs_operation(arguments: &serde_json::Value) -> bool {
@@ -48,38 +78,7 @@ impl Hooks for CliHooks {
         &self,
         call: &ToolInvocation<'_>,
     ) -> impl std::future::Future<Output = ToolDecision> + Send {
-        let decision = if self.auto_approve {
-            ToolDecision::Allow
-        } else {
-            match call.name {
-                COMMAND_TOOL => ToolDecision::Ask(
-                    ApprovalRequest::new(ApprovalKind::new("command"), call.arguments.to_string())
-                        .with_reason("the agent wants to run a command"),
-                ),
-                FILESYSTEM_TOOL => {
-                    if is_read_only_fs_operation(call.arguments) {
-                        ToolDecision::Allow
-                    } else {
-                        ToolDecision::Ask(
-                            ApprovalRequest::new(
-                                ApprovalKind::new("filesystem"),
-                                call.arguments.to_string(),
-                            )
-                            .with_reason("the agent wants to modify the filesystem"),
-                        )
-                    }
-                }
-                "websearch" | "webfetch" | "compact" => ToolDecision::Allow,
-                mcp_tool => ToolDecision::Ask(
-                    ApprovalRequest::new(
-                        ApprovalKind::new("mcp"),
-                        format!("{mcp_tool} {}", call.arguments),
-                    )
-                    .with_reason("the agent wants to invoke an MCP tool"),
-                ),
-            }
-        };
-        std::future::ready(decision)
+        std::future::ready(self.decide(call.name, call.arguments))
     }
 }
 
@@ -208,32 +207,18 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_core::llm::tool::{AgentIdentity, CallIdentity, ToolCallId};
-    use futures_lite::future::block_on;
-
-    fn decide(hooks: &CliHooks, name: &str, arguments: serde_json::Value) -> ToolDecision {
-        let call = CallIdentity::new(ToolCallId::new("call-1"), AgentIdentity::Main);
-        let invocation = ToolInvocation {
-            call: &call,
-            name,
-            arguments: &arguments,
-            turn: 1,
-            message_count: 1,
-        };
-        block_on(hooks.before_tool(&invocation))
-    }
 
     #[test]
     fn default_hooks_gate_command_mutating_fs_and_mcp_while_allowing_reads() {
         let hooks = CliHooks::new(false);
         assert!(matches!(
-            decide(&hooks, COMMAND_TOOL, serde_json::json!({"program": "ls"})),
+            hooks.decide(COMMAND_TOOL, &serde_json::json!({"program": "ls"})),
             ToolDecision::Ask(req) if req.kind().as_str() == "command"
         ));
         for op in ["write", "append", "delete"] {
             assert!(
                 matches!(
-                    decide(&hooks, FILESYSTEM_TOOL, serde_json::json!({"operation": op})),
+                    hooks.decide(FILESYSTEM_TOOL, &serde_json::json!({"operation": op})),
                     ToolDecision::Ask(req) if req.kind().as_str() == "filesystem"
                 ),
                 "filesystem {op} must ask"
@@ -242,26 +227,22 @@ mod tests {
         for op in ["read", "list", "glob"] {
             assert!(
                 matches!(
-                    decide(
-                        &hooks,
-                        FILESYSTEM_TOOL,
-                        serde_json::json!({"operation": op})
-                    ),
+                    hooks.decide(FILESYSTEM_TOOL, &serde_json::json!({"operation": op})),
                     ToolDecision::Allow
                 ),
                 "filesystem {op} should be allowed"
             );
         }
         assert!(matches!(
-            decide(&hooks, "websearch", serde_json::json!({})),
+            hooks.decide("websearch", &serde_json::json!({})),
             ToolDecision::Allow
         ));
         assert!(matches!(
-            decide(&hooks, "webfetch", serde_json::json!({})),
+            hooks.decide("webfetch", &serde_json::json!({})),
             ToolDecision::Allow
         ));
         assert!(matches!(
-            decide(&hooks, "context7_resolve", serde_json::json!({"query": "rust"})),
+            hooks.decide("context7_resolve", &serde_json::json!({"query": "rust"})),
             ToolDecision::Ask(req) if req.kind().as_str() == "mcp"
         ));
     }
@@ -274,7 +255,7 @@ mod tests {
             (FILESYSTEM_TOOL, serde_json::json!({"operation": "write"})),
             ("context7_resolve", serde_json::json!({})),
         ] {
-            assert!(matches!(decide(&hooks, name, args), ToolDecision::Allow));
+            assert!(matches!(hooks.decide(name, &args), ToolDecision::Allow));
         }
     }
 }

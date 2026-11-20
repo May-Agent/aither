@@ -38,7 +38,7 @@ fn with_path(
             .iter()
             .map(|(name, value)| (name.as_str(), shell_words::quote(value)))
             .collect(),
-        pre_path,
+        pre_path: pre_path.trim_end_matches('\n'),
         script,
     }
     .render()

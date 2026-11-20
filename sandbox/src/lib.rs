@@ -10,7 +10,7 @@
 //!   directory, jobs, waiting, output handling and [`ScriptPolicy`] checks
 //!   before a script runs.
 //! - [`ShellTool`] and the job control tools are ordinary
-//!   [`Tool`](aither_core::llm::Tool)s the embedder names and describes.
+//!   [`aither_core::llm::Tool`]s the embedder names and describes.
 //!
 //! The embedder owns the commands its scripts call back into, the programs
 //! its sandboxes run with and every sentence the model reads.

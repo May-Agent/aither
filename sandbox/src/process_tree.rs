@@ -63,7 +63,7 @@
 use std::time::Duration;
 
 /// The environment variable that marks every process of a job; its value is
-/// the job's [`JobMarker`].
+/// the job's `JobMarker`.
 pub const JOB_MARKER_VAR: &str = "AITHER_JOB";
 
 /// How often a job whose shell has exited is checked for remaining
@@ -193,7 +193,7 @@ impl Default for JobMarker {
 ///
 /// On Unix `pid` must lead its own process group (spawned with
 /// `process_group(0)`), and the group receives `SIGKILL`; descendants that
-/// left the group are [`JobTree`]'s business. On Windows `taskkill /F /T` ends
+/// left the group are `JobTree`'s business. On Windows `taskkill /F /T` ends
 /// the tree.
 ///
 /// # Errors
@@ -2077,9 +2077,15 @@ mod platform {
     /// escape between userspace scans.
     const FOLLOWED: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT | libc::NOTE_TRACK;
 
+    /// [`FOLLOWED`] without `NOTE_TRACK`, for a kernel that answers its
+    /// registration `ENOTSUP`; there scans alone attribute children.
+    const FOLLOWED_NO_TRACK: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT;
+
     /// A kqueue that signals when a watched process forks, execs or exits.
     pub(super) struct Watch {
         queue: Async<OwnedFd>,
+        /// The notes the kernel accepted on this queue.
+        fflags: u32,
         followed: HashSet<u32>,
         tracked_live: HashSet<u32>,
         /// Until when the watch rests after a scan.
@@ -2091,14 +2097,26 @@ mod platform {
         /// was spawned, it misses none of its forks.
         pub(super) fn new(root: u32) -> io::Result<Self> {
             let queue = new_queue()?;
+            // A kernel that does not track forks over kqueue answers the
+            // registration ENOTSUP; the watch then reports the root's own
+            // notes and table scans keep attributing children.
+            let (fflags, watched) = match register(&queue, root, FOLLOWED) {
+                Ok(watched) => (FOLLOWED, watched),
+                Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => (
+                    FOLLOWED_NO_TRACK,
+                    register(&queue, root, FOLLOWED_NO_TRACK)?,
+                ),
+                Err(error) => return Err(error),
+            };
             let mut followed = HashSet::new();
             let mut tracked_live = HashSet::new();
-            if register(&queue, root, FOLLOWED)? {
+            if watched {
                 followed.insert(root);
             }
             let _ = drain(&queue, &mut followed, &mut tracked_live)?;
             Ok(Self {
                 queue,
+                fflags,
                 followed,
                 tracked_live,
                 rest_until: None,
@@ -2128,7 +2146,7 @@ mod platform {
                     continue;
                 }
                 // A process that exited already is seen by the scan that follows.
-                if register(&self.queue, pid, FOLLOWED)? {
+                if register(&self.queue, pid, self.fflags)? {
                     self.followed.insert(pid);
                 }
                 added = true;

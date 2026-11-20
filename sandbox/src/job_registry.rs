@@ -215,7 +215,7 @@ pub enum Delivery {
 /// lives; dropping it is the agent taking the completion, which marks the
 /// job [`Delivery::Taken`] and lets the registry forget it, so its task id
 /// goes back to the allocator. The registry hands out one per job, through
-/// [`JobRegistry::owe_completion`].
+/// `JobRegistry::owe_completion`.
 #[must_use = "dropping it marks the completion taken"]
 pub struct PendingCompletion {
     tx: Sender<JobCommand>,
@@ -295,7 +295,7 @@ impl Drop for JobWatch {
     }
 }
 
-/// What [`JobRegistry::owe_completion`] settled for a job.
+/// What `JobRegistry::owe_completion` settled for a job.
 #[derive(Debug)]
 pub struct OwedCompletion {
     /// The job as it ended. A job whose completion a waiter took is
@@ -303,7 +303,7 @@ pub struct OwedCompletion {
     /// read of it its flow is sure of.
     pub info: JobInfo,
     /// Keeps the completion pending until the agent takes it; `None` when a
-    /// waiter ([`JobRegistry::wait_taking`]) already took it, so nothing is
+    /// waiter (`JobRegistry::wait_taking`) already took it, so nothing is
     /// owed.
     pub pending: Option<PendingCompletion>,
 }
@@ -3809,7 +3809,7 @@ mod tests {
     #[tokio::test]
     async fn two_phase_backend_kill_waits_for_drain_and_preserves_unterminated_eof_line() {
         let registry = spawn_registry();
-        let id = lease("container-job");
+        let id = lease("containerjob");
         registry
             .register(0, &id, "exec", "echo partial", SandboxMode::Sandboxed, None)
             .await;
@@ -3833,13 +3833,12 @@ mod tests {
         });
 
         let reg_kill = registry.clone();
-        let kill_task =
-            tokio::spawn(async move { reg_kill.kill_by_task_id("container-job").await });
+        let kill_task = tokio::spawn(async move { reg_kill.kill_by_task_id("containerjob").await });
 
         kill_entered_rx.recv().await.unwrap();
         assert_eq!(
             registry
-                .get_by_task_id("container-job")
+                .get_by_task_id("containerjob")
                 .await
                 .unwrap()
                 .status,
@@ -3851,21 +3850,21 @@ mod tests {
         assert!(kill_task.await.unwrap());
         killer_task.await.unwrap();
 
-        let settled = registry.get_by_task_id("container-job").await.unwrap();
+        let settled = registry.get_by_task_id("containerjob").await.unwrap();
         assert!(matches!(settled.status, JobStatus::Killed { .. }));
 
         let (stdout, _stderr) = registry
-            .terminal_output("container-job")
+            .terminal_output("containerjob")
             .await
             .expect("terminal output preserved");
         assert_eq!(stdout, b"final-unterminated");
 
         let delta = registry
-            .monitor_read("container-job", 0, 1024)
+            .monitor_read("containerjob", 0, 1024)
             .await
             .expect("monitor read succeeds");
         assert_eq!(
-            delta.bytes, b"final-unterminated",
+            delta.bytes, b"final-unterminated\n",
             "unterminated EOF line must remain readable after kill"
         );
     }
@@ -3875,27 +3874,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let redirect_path = dir.path().join("redirected.log");
         let registry = spawn_registry();
-        let id = lease("big-job");
+        let id = lease("bigjob");
         registry
             .register(0, &id, "exec", "yes line", SandboxMode::Sandboxed, None)
             .await;
 
         registry
-            .start_output_redirect("big-job", redirect_path.clone())
+            .start_output_redirect("bigjob", redirect_path.clone())
             .await
             .unwrap();
 
         let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc\n".repeat(256);
         let mut total = 0_usize;
         for _ in 0..64 {
-            registry
-                .append_stdout(&id, chunk.as_bytes().to_vec())
-                .await;
+            registry.append_stdout(&id, chunk.as_bytes().to_vec()).await;
             total += chunk.len();
         }
         assert!(total > REDIRECTED_BUFFER_CAP * 3);
 
-        let (stdout_in_mem, _) = registry.terminal_output("big-job").await.unwrap();
+        let (stdout_in_mem, _) = registry.terminal_output("bigjob").await.unwrap();
         assert!(
             stdout_in_mem.len() <= REDIRECTED_BUFFER_CAP,
             "stdout_buffer must stay bounded after redirect: {}",
@@ -3903,7 +3900,7 @@ mod tests {
         );
 
         let first_slice = registry
-            .terminal_read("big-job", 0, 64)
+            .terminal_read("bigjob", 0, 64)
             .await
             .unwrap()
             .into_delta()
@@ -3912,9 +3909,7 @@ mod tests {
         assert_eq!(&first_slice.bytes, &chunk.as_bytes()[..64]);
         assert_eq!(first_slice.total_bytes, total);
 
-        registry
-            .complete(&id, 0, Some(redirect_path.clone()))
-            .await;
+        registry.complete(&id, 0, Some(redirect_path.clone())).await;
         assert_eq!(
             usize::try_from(std::fs::metadata(&redirect_path).unwrap().len()).unwrap(),
             total

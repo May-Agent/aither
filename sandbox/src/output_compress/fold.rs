@@ -15,6 +15,12 @@ pub struct CodeFolder;
 
 #[cfg(not(feature = "code-folding"))]
 impl CodeFolder {
+    /// Creates an empty code folder.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
     /// Without the `code-folding` feature there is no content detector, so
     /// output is passed through rather than folded against a guessed grammar.
     #[allow(clippy::unused_self)]
@@ -52,9 +58,7 @@ mod enabled {
 
     impl Default for CodeFolder {
         fn default() -> Self {
-            let capacity = std::thread::available_parallelism()
-                .map(NonZero::get)
-                .unwrap_or(1);
+            let capacity = std::thread::available_parallelism().map_or(1, NonZero::get);
             Self {
                 sessions: Mutex::new(Vec::new()),
                 capacity,
@@ -74,7 +78,7 @@ mod enabled {
             f.debug_struct("CodeFolder")
                 .field("pooled", &pooled)
                 .field("capacity", &self.capacity)
-                .finish()
+                .finish_non_exhaustive()
         }
     }
 
@@ -185,17 +189,19 @@ mod enabled {
     }
 
     impl CodeFolder {
+        /// Creates a session pool sized to the host's available parallelism.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
         /// Folds `text` when it is recognisable source code and folding makes
         /// it smaller.
         ///
         /// Every emitted line carries its 1-based number in `text`, and each
         /// fold marker names the range it replaced, so the result lines up
         /// with the unfolded copy the orchestrator stores.
-        pub fn fold_source_code(
-            &self,
-            text: &str,
-            wording: &dyn ShellWording,
-        ) -> Option<String> {
+        pub fn fold_source_code(&self, text: &str, wording: &dyn ShellWording) -> Option<String> {
             let mut session = PooledSession::acquire(self)?;
             let label = session.identify_label(text.as_bytes())?;
             drop(session);

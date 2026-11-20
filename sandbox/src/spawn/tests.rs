@@ -620,7 +620,7 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
     assert!(script.starts_with("AITHER_IPC_BIN="), "{script}");
     assert!(
         script.contains(
-            r#"--commands '{"probe":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+            r#"--commands '{"probe":{"positional_args":[],"raw_args":false,"stdin_arg":null}}'"#
         ),
         "{script}"
     );

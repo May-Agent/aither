@@ -5,7 +5,7 @@
 //! [`MonitorStarted`], an [`OutputSaved`] and so on. The embedder's
 //! [`ShellWording`] turns each into the natural language its model reads;
 //! aither ships no implementation, so an embedder words every family itself.
-//! A [`ScriptPolicy`](crate::ScriptPolicy) refusal carries its own text and
+//! A [`ScriptPolicy`] refusal carries its own text and
 //! has no family here.
 
 use std::fmt;

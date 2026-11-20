@@ -1,4 +1,4 @@
-//! The handle on a process a [`Sandbox`](crate::Sandbox) spawned.
+//! The handle on a process a [`Sandbox`] spawned.
 
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
