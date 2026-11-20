@@ -599,8 +599,9 @@ mod tests {
 
             type Arguments = ();
             type Res = ToolResult;
+            type Error = core::convert::Infallible;
 
-            async fn call(&self, (): (), cx: ToolContext) -> crate::Result<ToolResult> {
+            async fn call(&self, (): (), cx: ToolContext) -> Result<ToolResult, Self::Error> {
                 assert!(!cx.cancellation().is_cancelled());
                 cx.cancellation().cancelled().await;
                 Ok(ToolResult::text("stopped on cancel"))

@@ -25,7 +25,8 @@ use aither_core::{
 use aither_gemini::Gemini;
 use aither_mem0::{Config as Mem0Config, InMemoryStore, Mem0, Memory};
 use aither_rag::{Document, Metadata, RagStore, SearchResult as RagSearchResult};
-use anyhow::{Context, Result, anyhow};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures_lite::{StreamExt, pin};
@@ -44,8 +45,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    let api_key =
-        std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("set GEMINI_API_KEY in your environment: {e}").into()
+        },
+    )?;
 
     let gemini = Gemini::new(api_key).with_text_model(MODEL);
     let embedder = gemini.clone();
@@ -224,12 +228,14 @@ async fn print_memories(mem0: &MemoryManager) -> Result<()> {
 
 async fn ingest_file(path: &str, rag: &Store) -> Result<usize> {
     let file_path = Path::new(path);
-    let content = fs::read_to_string(file_path)
-        .with_context(|| format!("failed to read file at {}", file_path.display()))?;
+    let content =
+        fs::read_to_string(file_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to read file at {}: {e}", file_path.display()).into()
+        })?;
 
     let chunks = chunk_text(&content, 1200);
     if chunks.is_empty() {
-        return Err(anyhow!("no content found in {}", file_path.display()));
+        return Err(format!("no content found in {}", file_path.display()).into());
     }
 
     for (idx, chunk) in chunks.iter().enumerate() {

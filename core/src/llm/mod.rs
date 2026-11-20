@@ -123,7 +123,7 @@ pub use tool::{
     Approver, ApproverFailure, CallIdentity, CancelSignal, Canceller, CommandOutcome,
     CommandResult, CommandStream, CommandWording, DefaultCommandWording, Interruption,
     InterruptionCause, IntoToolResult, StoredFile, SubagentIdentity, Tool, ToolCallId, ToolContext,
-    ToolResult, render_interruptions,
+    ToolDispatchError, ToolResult, render_interruptions,
 };
 
 use crate::llm::model::Profile;
@@ -302,13 +302,14 @@ impl<'tools> LLMRequestWithTools<'tools> {
     /// [`ToolContext`].
     ///
     /// # Errors
-    /// Returns an error if tool is not found or the tool call fails.
+    /// Returns a [`ToolDispatchError`] if the tool is not found, the arguments
+    /// do not parse, or the tool's own call fails.
     pub async fn call_tool(
         &mut self,
         name: &str,
         args_json: &str,
         cx: ToolContext,
-    ) -> crate::Result<ToolResult> {
+    ) -> Result<ToolResult, ToolDispatchError> {
         self.tools.call(name, args_json, cx).await
     }
 }

@@ -1,7 +1,7 @@
 //! Basic RAG flow using the HNSW index and a toy embedder.
 
 use aither_core::{
-    EmbeddingModel, Result,
+    EmbeddingModel,
     llm::{Tool, ToolContext},
 };
 use aither_rag::{IndexStage, Rag, RagToolArgs};
@@ -11,11 +11,16 @@ use std::{env, fs, path::PathBuf};
 struct DemoEmbedder;
 
 impl EmbeddingModel for DemoEmbedder {
+    type Error = core::convert::Infallible;
+
     fn dim(&self) -> usize {
         4
     }
 
-    fn embed(&self, text: &str) -> impl std::future::Future<Output = Result<Vec<f32>>> + Send {
+    fn embed(
+        &self,
+        text: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<f32>, Self::Error>> + Send {
         let mut vector = vec![0.0; self.dim()];
         for (idx, byte) in text.bytes().enumerate() {
             let bucket = idx % self.dim();
@@ -33,7 +38,7 @@ impl EmbeddingModel for DemoEmbedder {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let working_dir = prepare_source_tree()?;
     let index_path = working_dir.join("index.redb");
 
@@ -102,7 +107,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn prepare_source_tree() -> Result<PathBuf> {
+fn prepare_source_tree() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let base = env::temp_dir().join("aither-rag-demo");
     if base.exists() {
         fs::remove_dir_all(&base)?;

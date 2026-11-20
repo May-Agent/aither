@@ -29,7 +29,7 @@ async fn run_held(
     tool: &Terminal,
     background: bool,
     during: impl FnOnce() + Send + 'static,
-) -> aither_core::Result<ToolResult> {
+) -> Result<ToolResult, crate::terminal::ShellCallError> {
     let started = tool.working_dir().join("started");
     let release = tool.working_dir().join("release");
     tokio::spawn(async move {

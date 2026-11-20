@@ -16,7 +16,7 @@
 //! ```no_run
 //! use aither_webfetch::{fetch, FetchRequest, WebFetchTool, fetch_with_request};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Default provider chain fetch
 //! let result = fetch("https://example.com").await?;
 //! println!("Title: {:?}", result.title);
@@ -39,7 +39,7 @@
 //! ```no_run
 //! use aither_webfetch::fetch_image;
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Fetch image and convert to JPEG
 //! let (jpeg_data, mime) = fetch_image("https://example.com/image.webp").await?;
 //! println!("Image size: {} bytes, type: {}", jpeg_data.len(), mime);
@@ -61,7 +61,6 @@ use std::time::{Duration, Instant};
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
-use anyhow::{Result, anyhow};
 use askama::Template;
 use regex::Regex;
 use schemars::JsonSchema;
@@ -273,14 +272,14 @@ pub enum ProviderErrorKind {
 pub struct ProviderError {
     provider: &'static str,
     kind: ProviderErrorKind,
-    source: anyhow::Error,
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl ProviderError {
     fn new(
         provider: &'static str,
         kind: ProviderErrorKind,
-        source: impl Into<anyhow::Error>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
     ) -> Self {
         Self {
             provider,
@@ -289,15 +288,24 @@ impl ProviderError {
         }
     }
 
-    fn http(provider: &'static str, source: impl Into<anyhow::Error>) -> Self {
+    fn http(
+        provider: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
         Self::new(provider, ProviderErrorKind::HttpFailure, source)
     }
 
-    fn extraction(provider: &'static str, source: impl Into<anyhow::Error>) -> Self {
+    fn extraction(
+        provider: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
         Self::new(provider, ProviderErrorKind::ExtractionFailure, source)
     }
 
-    fn invalid(provider: &'static str, source: impl Into<anyhow::Error>) -> Self {
+    fn invalid(
+        provider: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
         Self::new(provider, ProviderErrorKind::InvalidResponse, source)
     }
 
@@ -324,7 +332,80 @@ impl std::fmt::Display for ProviderError {
     }
 }
 
-impl std::error::Error for ProviderError {}
+impl std::error::Error for ProviderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Why a `fetch*` function or a [`WebFetchTool`] call failed.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WebFetchError {
+    /// The fetch pipeline exhausted its stages; carries the last stage's
+    /// [`ProviderError`].
+    #[error("{0}")]
+    Provider(#[from] ProviderError),
+    /// The destination policy refused the URL.
+    #[error("{0}")]
+    Guard(#[from] guard::UrlPolicyError),
+    /// A plain HTTP fetch failed.
+    #[error("{0}")]
+    Http(#[from] FetchHttpError),
+    /// The URL could not be parsed.
+    #[error("invalid URL: {0}")]
+    InvalidUrl(#[from] url::ParseError),
+    /// Image decoding or JPEG encoding failed.
+    #[error("failed to convert the image: {0}")]
+    Image(#[from] image::ImageError),
+    /// An I/O step in the fetch failed.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    /// Readability extraction or HTML-to-markdown conversion failed.
+    #[error("content extraction failed: {0}")]
+    Extraction(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Rendering the tool's output failed.
+    #[error("{0}")]
+    Render(#[from] askama::Error),
+    /// The headless browser stage failed.
+    #[cfg(feature = "headless")]
+    #[error("{0}")]
+    Headless(#[from] HeadlessError),
+}
+
+/// Why a headless-browser fetch failed.
+#[cfg(feature = "headless")]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum HeadlessError {
+    /// The URL could not be parsed.
+    #[error("{0}")]
+    InvalidUrl(#[from] url::ParseError),
+    /// The destination policy refused the URL.
+    #[error("{0}")]
+    Policy(#[from] guard::UrlPolicyError),
+    /// The browser's guarded proxy failed to start.
+    #[error("failed to start the browser's proxy: {0}")]
+    Proxy(#[source] std::io::Error),
+    /// The browser profile could not be created.
+    #[error("failed to create the browser profile: {0}")]
+    Profile(#[source] std::io::Error),
+    /// A browser-driver call failed.
+    #[error("{0}")]
+    Cdp(#[from] chromiumoxide::error::CdpError),
+    /// Building the browser launch configuration failed.
+    #[error("{0}")]
+    Setup(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The guarded proxy refused the navigation.
+    #[error("Navigation refused: {0}")]
+    NavigationRefused(#[source] guard::UrlPolicyError),
+    /// The page has no main frame.
+    #[error("the page has no main frame")]
+    NoMainFrame,
+    /// The navigation budget ran out.
+    #[error("headless stage deadline exhausted")]
+    Deadline,
+}
 
 /// Async-first provider abstraction for web fetching.
 pub trait WebFetcher: Send + Sync {
@@ -468,7 +549,7 @@ async fn run_stage<F: WebFetcher>(
     let started = Instant::now();
 
     if ctx.remaining().is_zero() {
-        let err = ProviderError::http(fetcher.name(), anyhow!("pipeline deadline exhausted"));
+        let err = ProviderError::http(fetcher.name(), "pipeline deadline exhausted");
         ctx.push_trace(StageTrace {
             provider: fetcher.name().to_string(),
             elapsed_ms: 0,
@@ -515,7 +596,7 @@ async fn run_stage<F: WebFetcher>(
 ///
 /// Returns an error if the URL destination policy refuses the target or if all
 /// stages in the fetcher chain fail to retrieve or parse the content.
-pub async fn fetch(url: &str) -> Result<FetchResult> {
+pub async fn fetch(url: &str) -> Result<FetchResult, WebFetchError> {
     ensure_rustls_provider();
     fetch_with_request(FetchRequest::new(url)).await
 }
@@ -526,7 +607,7 @@ pub async fn fetch(url: &str) -> Result<FetchResult> {
 ///
 /// Returns an error if the URL is refused by the destination guard or if
 /// the fetch pipeline fails or exhausts its deadline.
-pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
+pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult, WebFetchError> {
     ensure_rustls_provider();
     guard::guard_url(&request.url).await?;
     let mut ctx = FetchContext::new(request.deadline);
@@ -534,7 +615,7 @@ pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
     let pipeline = default_fetcher();
     let result = pipeline.fetch(&request, &mut ctx).await;
 
-    result.map_err(anyhow::Error::from)
+    result.map_err(WebFetchError::from)
 }
 
 /// Fetches a web page using a headless browser (Chrome) for full JavaScript rendering.
@@ -551,14 +632,14 @@ pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
 /// Returns an error if the URL is refused by the destination guard, Chrome fails
 /// to start, or navigation fails.
 #[cfg(feature = "headless")]
-pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
+pub async fn fetch_with_browser(url: &str) -> Result<FetchResult, WebFetchError> {
     ensure_rustls_provider();
     guard::guard_url(url).await?;
     let mut ctx = FetchContext::new(DEFAULT_TOTAL_BUDGET);
     HeadlessFetcher
         .fetch(&FetchRequest::new(url), &mut ctx)
         .await
-        .map_err(anyhow::Error::from)
+        .map_err(WebFetchError::from)
 }
 
 /// Fetches raw HTML using a headless browser (for debugging).
@@ -568,7 +649,7 @@ pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
 /// Returns an error if the URL is refused by the destination guard or if headless
 /// browser navigation fails.
 #[cfg(feature = "headless")]
-pub async fn fetch_html_raw(url: &str) -> Result<String> {
+pub async fn fetch_html_raw(url: &str) -> Result<String, WebFetchError> {
     guard::guard_url(url).await?;
     fetch_html_headless(
         url,
@@ -577,6 +658,7 @@ pub async fn fetch_html_raw(url: &str) -> Result<String> {
         DEFAULT_TOTAL_BUDGET,
     )
     .await
+    .map_err(WebFetchError::from)
 }
 
 /// Smart fetch with strict fallback order:
@@ -588,7 +670,7 @@ pub async fn fetch_html_raw(url: &str) -> Result<String> {
 ///
 /// Returns an error if destination checks fail or fetching fails across all fallback stages.
 #[cfg(feature = "headless")]
-pub async fn fetch_smart(url: &str) -> Result<FetchResult> {
+pub async fn fetch_smart(url: &str) -> Result<FetchResult, WebFetchError> {
     fetch(url).await
 }
 
@@ -604,7 +686,7 @@ pub async fn fetch_smart(url: &str) -> Result<FetchResult> {
 /// # Returns
 ///
 /// A tuple of (JPEG data, MIME type).
-pub async fn fetch_image(url: &str) -> Result<(Vec<u8>, String)> {
+pub async fn fetch_image(url: &str) -> Result<(Vec<u8>, String), WebFetchError> {
     ensure_rustls_provider();
     let bytes = fetch_bytes(url).await?;
     blocking::unblock(move || convert_to_jpeg(&bytes)).await
@@ -615,7 +697,7 @@ pub async fn fetch_image(url: &str) -> Result<(Vec<u8>, String)> {
 /// # Errors
 ///
 /// Returns an error if fetching image bytes fails or image format conversion fails.
-pub async fn fetch_image_result(url: &str) -> Result<ImageResult> {
+pub async fn fetch_image_result(url: &str) -> Result<ImageResult, WebFetchError> {
     let (data, mime) = fetch_image(url).await?;
     Ok(ImageResult {
         url: url.to_string(),
@@ -625,21 +707,18 @@ pub async fn fetch_image_result(url: &str) -> Result<ImageResult> {
 }
 
 /// Convert image bytes to JPEG format.
-fn convert_to_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, String)> {
+fn convert_to_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, String), WebFetchError> {
     use image::ImageReader;
 
     // Try to decode the image
     let img = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| anyhow!("Failed to detect image format: {e}"))?
-        .decode()
-        .map_err(|e| anyhow!("Failed to decode image: {e}"))?;
+        .with_guessed_format()?
+        .decode()?;
 
     // Encode as JPEG
     let mut jpeg_data = Vec::new();
     let mut cursor = Cursor::new(&mut jpeg_data);
-    img.write_to(&mut cursor, image::ImageFormat::Jpeg)
-        .map_err(|e| anyhow!("Failed to encode JPEG: {e}"))?;
+    img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
 
     Ok((jpeg_data, "image/jpeg".to_string()))
 }
@@ -672,19 +751,19 @@ fn html_to_result_with_metadata(
     html: &str,
     content_type: Option<String>,
     content_signal: Option<String>,
-) -> Result<FetchResult> {
-    let parsed_url = url::Url::parse(url).map_err(|e| anyhow!("Invalid URL: {e}"))?;
+) -> Result<FetchResult, WebFetchError> {
+    let parsed_url = url::Url::parse(url)?;
 
     let mut readability = dom_smoothie::Readability::new(html, Some(parsed_url.as_str()), None)
-        .map_err(|e| anyhow!("Content extraction failed: {e}"))?;
+        .map_err(|e| WebFetchError::Extraction(e.into()))?;
     let extracted = readability
         .parse()
-        .map_err(|e| anyhow!("Content extraction failed: {e}"))?;
+        .map_err(|e| WebFetchError::Extraction(e.into()))?;
 
     // A page that marks its main content is converted whole: Readability picks
     // one article node and drops sibling sections of the same page.
     let article_html = main_landmark_html(html).unwrap_or_else(|| extracted.content.to_string());
-    let content = htmd::convert(&article_html).map_err(|e| anyhow!("{e}"))?;
+    let content = htmd::convert(&article_html).map_err(|e| WebFetchError::Extraction(e.into()))?;
 
     // If readability produces minimal content, try fallbacks
     let final_content = if content.len() < 200 {
@@ -769,7 +848,7 @@ fn get_user_agent(url: &str) -> &'static str {
 }
 
 /// Fetches raw bytes from a URL with browser-like headers.
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>, FetchHttpError> {
     ensure_rustls_provider();
     let user_agent = get_user_agent(url).to_string();
     let headers = [
@@ -797,7 +876,7 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
         guard::PublicOnly,
     )
     .await
-    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+    .map_err(classify_guarded_error)?;
     Ok(response.body)
 }
 
@@ -805,25 +884,34 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 enum FetchHttpErrorKind {
     Http,
     Decode,
+    Invalid,
 }
 
+/// A plain-HTTP fetch failure, classified for the fallback pipeline.
 #[derive(Debug)]
-struct FetchHttpError {
+pub struct FetchHttpError {
     kind: FetchHttpErrorKind,
-    source: anyhow::Error,
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl FetchHttpError {
-    fn http(source: impl Into<anyhow::Error>) -> Self {
+    fn http(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             kind: FetchHttpErrorKind::Http,
             source: source.into(),
         }
     }
 
-    fn decode(source: impl Into<anyhow::Error>) -> Self {
+    fn decode(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             kind: FetchHttpErrorKind::Decode,
+            source: source.into(),
+        }
+    }
+
+    fn invalid(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self {
+            kind: FetchHttpErrorKind::Invalid,
             source: source.into(),
         }
     }
@@ -835,7 +923,11 @@ impl std::fmt::Display for FetchHttpError {
     }
 }
 
-impl std::error::Error for FetchHttpError {}
+impl std::error::Error for FetchHttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
 
 impl From<zenwave::Error> for FetchHttpError {
     fn from(value: zenwave::Error) -> Self {
@@ -912,8 +1004,7 @@ where
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let body =
-        String::from_utf8(response.body).map_err(|e| FetchHttpError::decode(anyhow!("{e}")))?;
+    let body = String::from_utf8(response.body).map_err(FetchHttpError::decode)?;
 
     Ok(StaticFetchResponse {
         body,
@@ -923,8 +1014,8 @@ where
     })
 }
 
-fn classify_guarded_error(err: anyhow::Error) -> FetchHttpError {
-    if err.downcast_ref::<guard::DecodeFailure>().is_some() {
+fn classify_guarded_error(err: guard::GuardedGetError) -> FetchHttpError {
+    if matches!(err, guard::GuardedGetError::Decode(_)) {
         FetchHttpError::decode(err)
     } else {
         FetchHttpError::http(err)
@@ -956,7 +1047,7 @@ async fn fetch_document_jina(
     timeout: Duration,
 ) -> std::result::Result<StaticFetchResponse, FetchHttpError> {
     ensure_rustls_provider();
-    let jina_url = build_jina_url(url).map_err(FetchHttpError::decode)?;
+    let jina_url = build_jina_url(url)?;
     let mut headers = vec![
         (header::ACCEPT.as_str(), "text/markdown".to_string()),
         (
@@ -1000,8 +1091,7 @@ async fn fetch_document_jina(
         .get("content-signal")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body =
-        String::from_utf8(response.body).map_err(|e| FetchHttpError::decode(anyhow!("{e}")))?;
+    let body = String::from_utf8(response.body).map_err(FetchHttpError::decode)?;
 
     Ok(StaticFetchResponse {
         body,
@@ -1019,10 +1109,13 @@ const fn clamp_timeout(timeout: Duration) -> Duration {
     }
 }
 
-fn build_jina_url(url: &str) -> Result<String> {
-    let parsed = url::Url::parse(url).map_err(|e| anyhow!("invalid URL: {e}"))?;
+fn build_jina_url(url: &str) -> Result<String, FetchHttpError> {
+    let parsed = url::Url::parse(url).map_err(FetchHttpError::invalid)?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(anyhow!("unsupported URL scheme: {}", parsed.scheme()));
+        return Err(FetchHttpError::invalid(format!(
+            "unsupported URL scheme: {}",
+            parsed.scheme()
+        )));
     }
     Ok(format!("{JINA_API_BASE}{url}"))
 }
@@ -1030,7 +1123,9 @@ fn build_jina_url(url: &str) -> Result<String> {
 fn map_fetch_http_error(provider: &'static str, err: FetchHttpError) -> ProviderError {
     match err.kind {
         FetchHttpErrorKind::Http => ProviderError::http(provider, err),
-        FetchHttpErrorKind::Decode => ProviderError::invalid(provider, err),
+        FetchHttpErrorKind::Decode | FetchHttpErrorKind::Invalid => {
+            ProviderError::invalid(provider, err)
+        }
     }
 }
 
@@ -1165,7 +1260,7 @@ impl WebFetcher for JinaFetcher {
         if jina_budget.is_zero() {
             return Err(ProviderError::http(
                 self.name(),
-                anyhow!("jina stage deadline exhausted"),
+                "jina stage deadline exhausted",
             ));
         }
 
@@ -1207,7 +1302,7 @@ impl WebFetcher for StaticFetcher {
         if static_budget.is_zero() {
             return Err(ProviderError::http(
                 self.name(),
-                anyhow!("static stage deadline exhausted"),
+                "static stage deadline exhausted",
             ));
         }
 
@@ -1234,7 +1329,7 @@ impl WebFetcher for StaticFetcher {
         if html_budget.is_zero() {
             return Err(ProviderError::http(
                 self.name(),
-                anyhow!("static html fallback deadline exhausted"),
+                "static html fallback deadline exhausted",
             ));
         }
 
@@ -1287,7 +1382,7 @@ impl WebFetcher for HeadlessFetcher {
         if headless_budget.is_zero() {
             return Err(ProviderError::http(
                 self.name(),
-                anyhow!("headless stage deadline exhausted"),
+                "headless stage deadline exhausted",
             ));
         }
 
@@ -1351,7 +1446,7 @@ impl Drop for HeadlessSessionGuard {
 fn build_headless_config(
     proxy_addr: std::net::SocketAddr,
     profile_dir: &std::path::Path,
-) -> Result<chromiumoxide::browser::BrowserConfig> {
+) -> Result<chromiumoxide::browser::BrowserConfig, HeadlessError> {
     use chromiumoxide::browser::BrowserConfig;
     use chromiumoxide::handler::viewport::Viewport;
 
@@ -1399,7 +1494,7 @@ fn build_headless_config(
         .args(switches)
         .args(valued)
         .build()
-        .map_err(|e| anyhow!("Browser config error: {e}"))
+        .map_err(|e| HeadlessError::Setup(format!("browser config error: {e}").into()))
 }
 
 /// Fetches raw HTML using a headless Chrome browser with anti-detection measures.
@@ -1414,7 +1509,7 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
     resolver: R,
     policy: P,
     budget: Duration,
-) -> Result<String> {
+) -> Result<String, HeadlessError> {
     use chromiumoxide::browser::Browser;
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
     use futures_lite::StreamExt;
@@ -1430,7 +1525,7 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
 
     let mut proxy = proxy::Proxy::start(resolver, policy)
         .await
-        .map_err(|e| anyhow!("Failed to start the browser's proxy: {e}"))?;
+        .map_err(HeadlessError::Proxy)?;
 
     // A profile of its own: Chrome holds a singleton lock on its profile, so
     // fetches sharing one cannot run at the same time. It outlives `session`,
@@ -1438,12 +1533,10 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
     let profile = tempfile::Builder::new()
         .prefix("aither-webfetch-")
         .tempdir()
-        .map_err(|e| anyhow!("Failed to create the browser profile: {e}"))?;
+        .map_err(HeadlessError::Profile)?;
 
     let config = build_headless_config(proxy.addr(), profile.path())?;
-    let (browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|e| anyhow!("Failed to launch browser: {e}"))?;
+    let (browser, mut handler) = Browser::launch(config).await.map_err(HeadlessError::from)?;
 
     let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
     let session = HeadlessSessionGuard {
@@ -1457,7 +1550,7 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
         let page = browser_ref
             .new_page("about:blank")
             .await
-            .map_err(|e| anyhow!("Failed to create page: {e}"))?;
+            .map_err(HeadlessError::from)?;
 
         let stealth_js = r"
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -1478,9 +1571,9 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
             .into_iter()
             .find(|refusal| requested.contains(&refusal.authority))
         {
-            return Err(anyhow!("Navigation refused: {}", refusal.reason));
+            return Err(HeadlessError::NavigationRefused(refusal.reason));
         }
-        navigated.map_err(|e| anyhow!("Failed to navigate: {e}"))?;
+        navigated.map_err(HeadlessError::from)?;
 
         let remaining = stage_deadline.saturating_duration_since(Instant::now());
         let initial_settle = (remaining / 3).min(Duration::from_millis(500));
@@ -1495,14 +1588,12 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
             async_io::Timer::after(scroll_settle).await;
         }
 
-        page.content()
-            .await
-            .map_err(|e| anyhow!("Failed to get page content: {e}"))
+        page.content().await.map_err(HeadlessError::from)
     };
 
     let result = futures_lite::future::or(run_navigation, async {
         async_io::Timer::at(stage_deadline).await;
-        Err(anyhow!("headless stage deadline exhausted"))
+        Err(HeadlessError::Deadline)
     })
     .await;
     session.shutdown().await;
@@ -1659,12 +1750,13 @@ impl Tool for WebFetchTool {
 
     type Arguments = WebFetchArgs;
     type Res = ToolResult;
+    type Error = WebFetchError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let WebFetchArgs {
             url,
             jina_api_key,
@@ -1907,7 +1999,7 @@ description: Example
                 Err(kind) => Err(ProviderError::new(
                     self.name,
                     *kind,
-                    anyhow!("mock {} failure", self.name),
+                    format!("mock {} failure", self.name),
                 )),
             };
             std::future::ready(result)

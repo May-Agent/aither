@@ -10,7 +10,6 @@ use std::sync::Arc;
 use aither_core::embedding::EmbeddingModel;
 use aither_core::llm::ToolContext;
 use aither_core::llm::{LLMRequest, LanguageModel, Message, Role, Tool, ToolResult};
-use anyhow::Context;
 use askama::Template;
 use async_lock::{Mutex, RwLock};
 use llm::{Action, ExtractedFacts, MemoryDecision};
@@ -72,6 +71,7 @@ where
 
     type Arguments = String;
     type Res = ToolResult;
+    type Error = Mem0Error;
     fn name(&self) -> std::borrow::Cow<'static, str> {
         "search_memories".into()
     }
@@ -80,12 +80,8 @@ where
         &self,
         arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
-        let result = self
-            .inner
-            .retrieve_formatted(&arguments, 50)
-            .await
-            .context("Failed to retrieve memory")?;
+    ) -> std::result::Result<Self::Res, Self::Error> {
+        let result = self.inner.retrieve_formatted(&arguments, 50).await?;
         Ok(ToolResult::text(result))
     }
 }
@@ -111,6 +107,7 @@ where
 
     type Arguments = Vec<String>;
     type Res = ToolResult;
+    type Error = Mem0Error;
     fn name(&self) -> std::borrow::Cow<'static, str> {
         "add_fact".into()
     }
@@ -119,11 +116,8 @@ where
         &self,
         arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
-        self.inner
-            .add_fact(arguments)
-            .await
-            .context("Fail to add fact")?;
+    ) -> std::result::Result<Self::Res, Self::Error> {
+        self.inner.add_fact(arguments).await?;
         Ok(ToolResult::Done)
     }
 }
@@ -241,7 +235,7 @@ where
             .embedder
             .embed(query)
             .await
-            .map_err(Mem0Error::Embedding)?;
+            .map_err(|e| Mem0Error::Embedding(Box::new(e)))?;
         let filters = self.inner.filters();
         let store = self.inner.store.read().await;
         store.search(&embedding, limit, filters).await
@@ -309,7 +303,7 @@ where
                 .embedder
                 .embed(&fact)
                 .await
-                .map_err(Mem0Error::Embedding)?;
+                .map_err(|e| Mem0Error::Embedding(Box::new(e)))?;
 
             debug!("Embedding generated for fact: {}", fact);
 
@@ -347,7 +341,7 @@ where
                             .embedder
                             .embed(&content)
                             .await
-                            .map_err(Mem0Error::Embedding)?;
+                            .map_err(|e| Mem0Error::Embedding(Box::new(e)))?;
 
                         let mut store = self.store.write().await;
                         if let Some(mut existing) = store.get(id).await? {
@@ -394,7 +388,7 @@ async fn extract_facts<L: LanguageModel>(llm: &L, messages: &[Message]) -> Resul
     let extracted: ExtractedFacts = llm
         .generate(request)
         .await
-        .map_err(|err| Mem0Error::Llm(anyhow::Error::new(err)))?;
+        .map_err(|err| Mem0Error::Llm(Box::new(err)))?;
     Ok(extracted.facts)
 }
 
@@ -420,7 +414,7 @@ async fn decide_operation<L: LanguageModel>(
 
     llm.generate(request)
         .await
-        .map_err(|err| Mem0Error::Llm(anyhow::Error::new(err)))
+        .map_err(|err| Mem0Error::Llm(Box::new(err)))
 }
 
 #[cfg(test)]
@@ -526,14 +520,19 @@ mod tests {
     }
 
     impl EmbeddingModel for CountingEmbedder {
+        type Error = std::io::Error;
+
         fn dim(&self) -> usize {
             3
         }
 
-        fn embed(&self, text: &str) -> impl Future<Output = aither_core::Result<Vec<f32>>> + Send {
+        fn embed(
+            &self,
+            text: &str,
+        ) -> impl Future<Output = std::result::Result<Vec<f32>, Self::Error>> + Send {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let result = if self.fail_on_call == Some(call) {
-                Err(anyhow::Error::msg("embedder backend offline"))
+                Err(std::io::Error::other("embedder backend offline"))
             } else {
                 let len = u16::try_from(text.len()).map_or_else(|_| f32::from(u16::MAX), f32::from);
                 Ok(vec![1.0, len + 1.0, 0.5])

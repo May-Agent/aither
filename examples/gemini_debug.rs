@@ -14,7 +14,7 @@ use aither_core::{
     },
 };
 use aither_gemini::Gemini;
-use anyhow::{Context, Result};
+
 use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,9 +28,9 @@ struct SimpleStruct {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let api_key =
-        std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|e| format!("set GEMINI_API_KEY in your environment: {e}"))?;
     let gemini = Gemini::new(api_key).with_text_model(MODEL);
 
     println!("== Structured output test ==");
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn structured_output(gemini: &Gemini) -> Result<()> {
+async fn structured_output(gemini: &Gemini) -> Result<(), Box<dyn std::error::Error>> {
     let params = Parameters {
         structured_outputs: true,
         response_format: Some(schemars::schema_for!(SimpleStruct)),
@@ -87,18 +87,19 @@ impl Tool for EchoTool {
 
     type Arguments = EchoArgs;
     type Res = aither_core::llm::ToolResult;
+    type Error = core::convert::Infallible;
 
     fn call(
         &self,
         arguments: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
-    ) -> impl core::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+    ) -> impl core::future::Future<Output = Result<Self::Res, Self::Error>> + Send {
         let text = arguments.text;
         async move { Ok(aither_core::llm::ToolResult::text(format!("echo: {text}"))) }
     }
 }
 
-async fn tool_call(gemini: &Gemini) -> Result<()> {
+async fn tool_call(gemini: &Gemini) -> Result<(), Box<dyn std::error::Error>> {
     let mut tools = Tools::new();
     tools.register(EchoTool)?;
 

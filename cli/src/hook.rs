@@ -8,7 +8,8 @@ use aither_agent::{
     AgentEvent, Hooks, OutputKind, RunOutcome, TimedEvent, ToolDecision, ToolInvocation,
 };
 use aither_core::llm::tool::{Approval, ApprovalKind, ApprovalRequest, Approver, ApproverFailure};
-use anyhow::Result;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
@@ -87,7 +88,10 @@ impl Hooks for CliHooks {
 pub struct TerminalApprover;
 
 impl Approver for TerminalApprover {
-    async fn approve(&self, request: ApprovalRequest) -> Result<Approval, ApproverFailure> {
+    async fn approve(
+        &self,
+        request: ApprovalRequest,
+    ) -> std::result::Result<Approval, ApproverFailure> {
         eprintln!(
             "\n\x1b[33m⚠ Approval needed ({}):\x1b[0m {}",
             request.kind().as_str(),

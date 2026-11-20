@@ -13,7 +13,6 @@ categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
-anyhow = "1.0"
 askama = "0.16"
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
@@ -22,6 +21,7 @@ blocking = { version = "1.7", default-features = false }
 futures-lite = "2.6"
 glob = "0.3"
 arc-swap = "1.9"
+thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1.53", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

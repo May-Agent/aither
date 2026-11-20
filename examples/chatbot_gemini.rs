@@ -7,15 +7,19 @@ use std::io::{self, Write};
 use aither::llm::{Event, LLMRequest};
 use aither_core::{LanguageModel, llm::Message};
 use aither_gemini::Gemini;
-use anyhow::{Context, Result};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 use futures_lite::{StreamExt, pin};
 
 const MODEL: &str = "gemini-flash-latest";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api_key =
-        std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("set GEMINI_API_KEY in your environment: {e}").into()
+        },
+    )?;
 
     let model = Gemini::new(api_key).with_text_model(MODEL);
     let mut messages = vec![Message::system(

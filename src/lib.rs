@@ -18,7 +18,7 @@
 //! use aither::{LanguageModel, llm::{LLMRequest, Message, collect_text, model::Parameters}};
 //! use aither_openai::OpenAI;
 //!
-//! async fn demo(api_key: &str) -> aither::Result<String> {
+//! async fn demo(api_key: &str) -> Result<String, Box<dyn std::error::Error>> {
 //!     let model = OpenAI::new(api_key);
 //!     let request = LLMRequest::new([
 //!         Message::system("You are a creative assistant."),

@@ -394,12 +394,13 @@ where
 
     type Arguments = MonitorArgs;
     type Res = ToolResult;
+    type Error = crate::terminal::ShellCallError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let notices = self.terminal.wording();
         let interval_secs = self.interval_secs(&args);
         match self.start(args).await {

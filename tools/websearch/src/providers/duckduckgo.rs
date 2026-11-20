@@ -9,7 +9,7 @@
 //! ```no_run
 //! use aither_websearch::{DuckDuckGo, SearchProvider};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let provider = DuckDuckGo::new();
 //! let results = provider.search("rust programming language", 5).await?;
 //! for result in results {
@@ -19,8 +19,7 @@
 //! # }
 //! ```
 
-use crate::{SearchProvider, SearchResult};
-use anyhow::{Result, anyhow};
+use crate::{SearchError, SearchProvider, SearchResult};
 use serde::Deserialize;
 use zenwave::{Client, client, header};
 
@@ -46,7 +45,7 @@ impl DuckDuckGo {
 }
 
 impl SearchProvider for DuckDuckGo {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, SearchError> {
         let url = format!(
             "{}?q={}&format=json&no_html=1&skip_disambig=1",
             DDG_API_URL,
@@ -56,14 +55,14 @@ impl SearchProvider for DuckDuckGo {
         let mut backend = client();
         let response: DdgResponse = backend
             .get(&url)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::ACCEPT.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json()
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(SearchError::from)?;
 
         let mut results = Vec::new();
 

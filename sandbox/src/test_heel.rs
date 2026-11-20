@@ -47,7 +47,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// # Errors
 /// Fails when the pinned heel cannot be downloaded or fails its digest, or
 /// the binary is not the linked library's version.
-pub async fn binary() -> anyhow::Result<HeelBinary> {
+pub async fn binary() -> Result<HeelBinary, Box<dyn std::error::Error + Send + Sync>> {
     if std::env::var_os("HEEL_BIN").is_some() {
         return Ok(blocking::unblock(HeelBinary::locate).await?);
     }
@@ -62,7 +62,7 @@ fn target_dir() -> PathBuf {
     )
 }
 
-fn pin() -> anyhow::Result<Pin> {
+fn pin() -> Result<Pin, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-heel.json");
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(path)?)?;
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
@@ -72,16 +72,15 @@ fn pin() -> anyhow::Result<Pin> {
         .filter(|pin| pin.tool == "heel" && pin.target.os == os && pin.target.arch == arch);
     let pin = pins
         .next()
-        .ok_or_else(|| anyhow::anyhow!("no heel is pinned for {os} {arch}"))?;
-    anyhow::ensure!(
-        pins.next().is_none(),
-        "heel is pinned twice for {os} {arch}"
-    );
+        .ok_or_else(|| std::io::Error::other(format!("no heel is pinned for {os} {arch}")))?;
+    if pins.next().is_some() {
+        return Err(format!("heel is pinned twice for {os} {arch}").into());
+    }
     Ok(pin)
 }
 
 /// The pinned heel in the build directory's cache, downloaded when absent.
-async fn pinned() -> anyhow::Result<PathBuf> {
+async fn pinned() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let pin = pin()?;
     let name = if cfg!(windows) { "heel.exe" } else { "heel" };
     let directory = target_dir()
@@ -92,10 +91,9 @@ async fn pinned() -> anyhow::Result<PathBuf> {
         return Ok(path);
     }
     let bytes = download(&pin).await?;
-    anyhow::ensure!(
-        hex::encode(Sha256::digest(&bytes)) == pin.executable_sha256,
-        "the downloaded heel does not match its pinned digest"
-    );
+    if hex::encode(Sha256::digest(&bytes)) != pin.executable_sha256 {
+        return Err("the downloaded heel does not match its pinned digest".into());
+    }
     blocking::unblock(move || store(&directory, &path, &bytes)).await
 }
 
@@ -111,7 +109,11 @@ fn holds(path: &Path, bytes: &[u8]) -> bool {
 /// replaced: another process may be running it, and Windows refuses to
 /// replace an executable in use. A rename that loses the race to an identical
 /// file is success.
-fn store(directory: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+fn store(
+    directory: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(directory)?;
     if holds(path, bytes) {
         return Ok(path.to_path_buf());
@@ -127,17 +129,19 @@ fn store(directory: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf>
     if let Err(error) = renamed {
         let identical = holds(path, bytes);
         std::fs::remove_file(&partial)?;
-        anyhow::ensure!(
-            identical,
-            "cannot place the pinned heel at {}: {error}",
-            path.display()
-        );
+        if !identical {
+            return Err(format!(
+                "cannot place the pinned heel at {}: {error}",
+                path.display()
+            )
+            .into());
+        }
     }
     Ok(path.to_path_buf())
 }
 
 /// Downloads the pinned release, retrying transport failures.
-async fn download(pin: &Pin) -> anyhow::Result<Vec<u8>> {
+async fn download(pin: &Pin) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut backoff = Duration::from_secs(1);
     let mut attempt = 1;
     loop {
@@ -153,16 +157,13 @@ async fn download(pin: &Pin) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-async fn download_once(pin: &Pin) -> anyhow::Result<Vec<u8>> {
+async fn download_once(pin: &Pin) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     futures_lite::future::or(
         async {
             let response = zenwave::client().get(pin.url.as_str())?.await?;
-            anyhow::ensure!(
-                response.status().is_success(),
-                "{} answered {}",
-                pin.url,
-                response.status()
-            );
+            if !response.status().is_success() {
+                return Err(format!("{} answered {}", pin.url, response.status()).into());
+            }
             let mut bytes = Vec::new();
             response
                 .into_body()
@@ -170,17 +171,19 @@ async fn download_once(pin: &Pin) -> anyhow::Result<Vec<u8>> {
                 .take(pin.size.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .await?;
-            anyhow::ensure!(
-                bytes.len() as u64 == pin.size,
-                "the downloaded heel is {} bytes, pinned at {}",
-                bytes.len(),
-                pin.size
-            );
+            if bytes.len() as u64 != pin.size {
+                return Err(format!(
+                    "the downloaded heel is {} bytes, pinned at {}",
+                    bytes.len(),
+                    pin.size
+                )
+                .into());
+            }
             Ok(bytes)
         },
         async {
             async_io::Timer::after(ATTEMPT_TIMEOUT).await;
-            anyhow::bail!("downloading {} timed out", pin.url)
+            Err(format!("downloading {} timed out", pin.url).into())
         },
     )
     .await

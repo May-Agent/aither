@@ -8,7 +8,7 @@ use thiserror::Error;
 pub enum RagError {
     /// Embedding operation failed.
     #[error("embedding failed: {0}")]
-    Embedding(#[source] anyhow::Error),
+    Embedding(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Vector index operation failed.
     #[error("index error: {0}")]

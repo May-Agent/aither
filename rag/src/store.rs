@@ -30,7 +30,12 @@ pub async fn embed_batch<M: EmbeddingModel>(
     // `&str`, so texts are owned — an `&str` parameter would leak its region
     // into this future's opaque type and break higher-ranked callers.
     stream::iter(texts)
-        .map(|text| async move { embedder.embed(&text).await.map_err(RagError::Embedding) })
+        .map(|text| async move {
+            embedder
+                .embed(&text)
+                .await
+                .map_err(|e| RagError::Embedding(Box::new(e)))
+        })
         .buffered(MAX_CONCURRENT_EMBEDDINGS)
         .try_collect()
         .await
@@ -233,7 +238,7 @@ where
             .embedder
             .embed(query)
             .await
-            .map_err(RagError::Embedding)?;
+            .map_err(|e| RagError::Embedding(Box::new(e)))?;
 
         self.index
             .search_async(&embedding, top_k, self.config.similarity_threshold)
@@ -305,6 +310,8 @@ mod tests {
     }
 
     impl EmbeddingModel for MockEmbedder {
+        type Error = core::convert::Infallible;
+
         fn dim(&self) -> usize {
             self.dimension
         }
@@ -312,7 +319,8 @@ mod tests {
         fn embed(
             &self,
             text: &str,
-        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+        ) -> impl std::future::Future<Output = std::result::Result<Vec<f32>, Self::Error>> + Send
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {

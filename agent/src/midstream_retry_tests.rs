@@ -128,11 +128,13 @@ impl Tool for Probe {
     type Arguments = ProbeArgs;
     type Res = ToolResult;
 
+    type Error = core::convert::Infallible;
+
     fn call(
         &self,
         _arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+    ) -> impl std::future::Future<Output = Result<Self::Res, Self::Error>> + Send {
         *self.0.lock().unwrap() += 1;
         std::future::ready(Ok(ToolResult::text("probed")))
     }

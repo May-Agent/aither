@@ -562,7 +562,7 @@ mod tests {
     use std::pin::Pin;
     use std::time::Duration;
 
-    use aither_core::llm::tool::{ToolDefinition, ToolResult};
+    use aither_core::llm::tool::{ToolDefinition, ToolDispatchError, ToolResult};
     use serde_json::json;
 
     use super::*;
@@ -572,7 +572,7 @@ mod tests {
     type ToolHandler = dyn Fn(
             &str,
             ToolContext,
-        ) -> Pin<Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolDispatchError>> + Send>>
         + Send
         + Sync;
 
@@ -665,11 +665,19 @@ mod tests {
                 let reported = reported.clone();
                 Box::pin(async move {
                     cx.report_progress(Progress::new(1.0).with_total(2.0).with_message("first"))
-                        .await?;
+                        .await
+                        .map_err(|e| ToolDispatchError::Execution {
+                            tool: "slow".to_string(),
+                            source: Box::new(e),
+                        })?;
                     reported.send(()).await.expect("reported send");
                     gate.recv().await.expect("gate open");
                     cx.report_progress(Progress::new(2.0).with_total(2.0).with_message("second"))
-                        .await?;
+                        .await
+                        .map_err(|e| ToolDispatchError::Execution {
+                            tool: "slow".to_string(),
+                            source: Box::new(e),
+                        })?;
                     Ok(ToolResult::text("done"))
                 })
             }),
