@@ -846,6 +846,25 @@ pub struct CompactResult {
     pub summary: String,
 }
 
+/// The cheapest refresh worth paying for, in dollars: below this expected
+/// saving the entry is left to expire.
+const MINIMUM_EXPECTED_WARM_SAVINGS: f64 = 0.05;
+
+/// The arithmetic of one [`Agent::keep_warm_economics`] call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeepWarmEconomics {
+    /// Price of the refresh itself: a cached-prefix read plus one output
+    /// token.
+    pub warm_cost: f64,
+    /// Extra price the next real request pays on a cold entry over a warm
+    /// one.
+    pub miss_cost: f64,
+    /// `continuation_probability * miss_cost - warm_cost`.
+    pub expected_savings: f64,
+    /// Whether the refresh is expected to pay for itself.
+    pub warm: bool,
+}
+
 /// A stop hook's reminder, as the model reads it.
 #[derive(Template)]
 #[template(path = "system_reminder.txt", escape = "none")]
@@ -1711,9 +1730,9 @@ where
 
     /// Re-sends the last request to refresh the cache entry of an idle agent.
     ///
-    /// Re-sends the last request with no output (`max_tokens: 0`,
-    /// non-streaming, the same thinking and effort settings), so the
-    /// provider restarts the entry's lifetime. The history is untouched, the
+    /// Re-sends the last request with a one-token output cap
+    /// (`max_tokens: 1`, non-streaming, the same thinking and effort
+    /// settings), so the provider restarts the entry's lifetime. The history is untouched, the
     /// request's usage is recorded in [`cache_stats`](Self::cache_stats) and
     /// the entry's [`cache_warmth`](Self::cache_warmth) restarts. The caller
     /// decides when to call it, shortly before the entry goes cold.
@@ -1727,16 +1746,27 @@ where
     ///
     /// Returns the provider error when the keep-alive request fails.
     pub async fn keep_cache_warm(&mut self) -> Result<Option<aither_core::llm::Usage>, AgentError> {
-        if self.warmth.cold_in().is_none() {
-            return Ok(None);
+        // A refresh that lands after the entry expired buys a full-price
+        // write no one reads, so the request must leave with a margin.
+        const DISPATCH_MARGIN: Duration = Duration::from_secs(5);
+        let margin = match self.warmth.lifetime() {
+            crate::context::CacheLifetime::Limited(lifetime) => DISPATCH_MARGIN.min(lifetime / 4),
+            crate::context::CacheLifetime::Permanent => return Ok(None),
+        };
+        match self.warmth.cold_in() {
+            Some(remaining) if remaining > margin => {}
+            _ => return Ok(None),
         }
         let Some(last_request) = self.last_request.clone() else {
             return Ok(None);
         };
         let (messages, parameters, tool_definitions) = last_request.into_parts();
+        if !self.keep_warm_replayable(&parameters) {
+            return Ok(None);
+        }
         let request = LLMRequest::new(messages)
             .with_tool_definitions(tool_definitions)
-            .with_parameters(parameters.max_tokens(0).stream(false));
+            .with_parameters(parameters.max_tokens(1).stream(false));
         let stream = Self::respond_stream(&self.model, &self.connectivity, request);
         futures_lite::pin!(stream);
         let mut refreshed = aither_core::llm::Usage::default();
@@ -1752,6 +1782,40 @@ where
         }
         self.warmth.start_entry_now();
         Ok(Some(refreshed))
+    }
+
+    /// Whether refreshing the cache entry pays for itself, given the chance
+    /// that a real request arrives before it expires.
+    ///
+    /// The refresh costs a cached-prefix read plus one output token; losing
+    /// the entry costs the next request a full-prefix write (or read when
+    /// the model publishes no write price). `continuation_probability` is
+    /// the caller's estimate that another request lands in time — a running
+    /// background job is a near-certainty, an idle session much less.
+    /// `None` when the model publishes no pricing or no request has run.
+    #[must_use]
+    pub fn keep_warm_economics(&self, continuation_probability: f64) -> Option<KeepWarmEconomics> {
+        let pricing = self.profile.as_ref()?.pricing.as_ref()?;
+        let prompt_tokens = self.cache_stats.last_prompt_tokens();
+        if prompt_tokens == 0 {
+            return None;
+        }
+        #[expect(clippy::cast_precision_loss)]
+        let tokens = prompt_tokens as f64;
+        let warm_cost = pricing.input_cache_read.mul_add(tokens, pricing.completion);
+        let write_price = if pricing.input_cache_write > 0.0 {
+            pricing.input_cache_write
+        } else {
+            pricing.prompt
+        };
+        let miss_cost = (write_price - pricing.input_cache_read).max(0.0) * tokens;
+        let expected_savings = continuation_probability.mul_add(miss_cost, -warm_cost);
+        Some(KeepWarmEconomics {
+            warm_cost,
+            miss_cost,
+            expected_savings,
+            warm: expected_savings >= MINIMUM_EXPECTED_WARM_SAVINGS,
+        })
     }
 
     /// A shared handle on whether the provider's prompt-cache entry for this
@@ -2050,9 +2114,70 @@ where
         self.model = Arc::new(model);
         // Forget what belonged to the replaced model: its profile, fetched
         // again before the next request, and the last request, which a
-        // keep-alive would otherwise send it.
+        // keep-alive would otherwise send it. Its cache entry is its own:
+        // the warmth handle reports Cold from here.
         self.profile = None;
         self.last_request = None;
+        self.warmth.reset();
+    }
+
+    /// Whether replaying the request capped at one output token can reach
+    /// the recorded cache entry. Anthropic's budget thinking derives
+    /// `budget_tokens` from `max_tokens`, which the cache entry is keyed
+    /// on, so a reasoning request on a budget-thinking model is not
+    /// replayable (adaptive-thinking models — `PerMessageEffort` — are).
+    fn keep_warm_replayable(&self, parameters: &aither_core::llm::model::Parameters) -> bool {
+        if parameters.reasoning_effort.is_none() {
+            return true;
+        }
+        !self.profile.as_ref().is_some_and(|profile| {
+            profile.author == "Anthropic" && !profile.abilities.contains(&Ability::PerMessageEffort)
+        })
+    }
+
+    /// How long the entry `parameters` would write stays warm: the model's
+    /// published lifetime for the retention tier the cache controls ask
+    /// for, or the configured lifetime when the model publishes none.
+    fn entry_lifetime(
+        &self,
+        parameters: &aither_core::llm::model::Parameters,
+    ) -> crate::context::CacheLifetime {
+        use aither_core::llm::model::{ClaudePromptCacheTtl, OpenAIPromptCacheRetention};
+        let Some(tiers) = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.prompt_cache)
+        else {
+            return self.prompt_cache.lifetime();
+        };
+        let anthropic = self
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.author == "Anthropic");
+        let tier = if anthropic {
+            parameters
+                .cache
+                .claude
+                .as_ref()
+                .and_then(|cache| match cache.ttl {
+                    ClaudePromptCacheTtl::FiveMinutes => tiers.short,
+                    ClaudePromptCacheTtl::OneHour => tiers.long,
+                })
+        } else {
+            parameters
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|cache| cache.retention)
+                .and_then(|retention| match retention {
+                    OpenAIPromptCacheRetention::InMemory => tiers.short,
+                    OpenAIPromptCacheRetention::Hours24 => tiers.long,
+                })
+        };
+        tier.map_or_else(
+            || self.prompt_cache.lifetime(),
+            |seconds| crate::context::CacheLifetime::Limited(Duration::from_secs(seconds)),
+        )
     }
 
     /// Whether the agent's own model takes reasoning effort changes inside
@@ -3035,6 +3160,7 @@ where
             has_tools,
             self.takes_mid_conversation_system(),
         );
+        self.warmth.set_lifetime(self.entry_lifetime(&parameters));
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);

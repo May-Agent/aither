@@ -1209,7 +1209,7 @@ mod tests {
             Parameters::default(),
             &messages,
             false,
-            false,
+            true,
         );
         let main = LLMRequest::new(messages).with_parameters(parameters);
         let fork =

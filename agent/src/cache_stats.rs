@@ -32,6 +32,8 @@ pub struct CacheStats {
     cache_read_tokens: u64,
     /// Cumulative prompt tokens newly written to the KV cache.
     cache_write_tokens: u64,
+    /// Prompt size of the most recent request, as reported by the provider.
+    last_prompt: u64,
 }
 
 impl CacheStats {
@@ -43,6 +45,7 @@ impl CacheStats {
             prompt_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            last_prompt: 0,
         }
     }
 
@@ -55,6 +58,9 @@ impl CacheStats {
     /// faithful count of observed usage payloads.
     pub fn record(&mut self, usage: &Usage) {
         self.requests = self.requests.saturating_add(1);
+        self.last_prompt = u64::from(usage.prompt_tokens.unwrap_or(0))
+            .saturating_add(u64::from(usage.cache_read_tokens.unwrap_or(0)))
+            .saturating_add(u64::from(usage.cache_write_tokens.unwrap_or(0)));
         if let Some(prompt) = usage.prompt_tokens {
             self.prompt_tokens = self.prompt_tokens.saturating_add(u64::from(prompt));
         }
@@ -93,6 +99,12 @@ impl CacheStats {
     #[must_use]
     pub const fn cache_write_tokens(&self) -> u64 {
         self.cache_write_tokens
+    }
+
+    /// Returns the prompt size of the most recent request.
+    #[must_use]
+    pub const fn last_prompt_tokens(&self) -> u64 {
+        self.last_prompt
     }
 
     /// Returns the rolling cache-read share of prompt tokens.

@@ -1137,6 +1137,34 @@ impl ClaudePromptCacheTtl {
     }
 }
 
+/// Prompt-cache lifetimes a model publishes, per retention tier, in
+/// seconds.
+///
+/// Requests pick a tier through their cache controls
+/// ([`ClaudePromptCacheTtl`], [`OpenAIPromptCacheRetention`]); a tier left
+/// `None` means the provider publishes no lifetime for it, and a caller
+/// trusting the entry should fall back to its own estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct PromptCacheTiers {
+    /// Lifetime of an entry written at the default, short retention.
+    pub short: Option<u64>,
+    /// Lifetime of an entry written at the extended retention.
+    pub long: Option<u64>,
+}
+
+impl PromptCacheTiers {
+    /// Tiers where both retentions are published.
+    #[must_use]
+    pub const fn new(short: u64, long: u64) -> Self {
+        Self {
+            short: Some(short),
+            long: Some(long),
+        }
+    }
+}
+
 /// Claude prompt cache strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1361,6 +1389,10 @@ pub struct Profile {
     /// its vendor documents it; `None` when no default is recorded.
     #[cfg_attr(feature = "serde", serde(default))]
     pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// The prompt-cache lifetimes this model publishes per retention tier;
+    /// `None` when the vendor publishes none.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub prompt_cache: Option<PromptCacheTiers>,
 }
 
 /// Pricing information for a model's various capabilities (unit: USD).
@@ -1482,7 +1514,15 @@ impl Profile {
             context_length,
             pricing: None,
             default_reasoning_effort: None,
+            prompt_cache: None,
         }
+    }
+
+    /// Records the prompt-cache lifetimes this model publishes.
+    #[must_use]
+    pub const fn with_prompt_cache(mut self, tiers: PromptCacheTiers) -> Self {
+        self.prompt_cache = Some(tiers);
+        self
     }
 
     /// Records the reasoning effort the model runs at when a request sets
