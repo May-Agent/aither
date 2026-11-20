@@ -9,29 +9,77 @@ use aither_agent::{
 };
 use aither_core::llm::tool::{Approval, ApprovalKind, ApprovalRequest, Approver, ApproverFailure};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-/// The tool whose every call the user approves first.
+/// The command execution tool name.
 pub const COMMAND_TOOL: &str = "command";
 
-/// Asks the user before the agent runs a command.
+/// The filesystem tool name.
+pub const FILESYSTEM_TOOL: &str = "filesystem";
+
+/// Asks the user before the agent runs a command, mutates the filesystem, or
+/// invokes an MCP tool unless `--approve` was passed.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CliHooks;
+pub struct CliHooks {
+    auto_approve: bool,
+}
+
+impl CliHooks {
+    /// Creates CLI hooks; when `auto_approve` is `true`, tool calls proceed
+    /// without prompting.
+    #[must_use]
+    pub const fn new(auto_approve: bool) -> Self {
+        Self { auto_approve }
+    }
+}
+
+fn is_read_only_fs_operation(arguments: &serde_json::Value) -> bool {
+    matches!(
+        arguments
+            .get("operation")
+            .and_then(serde_json::Value::as_str),
+        Some("read" | "list" | "glob")
+    )
+}
 
 impl Hooks for CliHooks {
     fn before_tool(
         &self,
         call: &ToolInvocation<'_>,
     ) -> impl std::future::Future<Output = ToolDecision> + Send {
-        std::future::ready(if call.name == COMMAND_TOOL {
-            ToolDecision::Ask(
-                ApprovalRequest::new(ApprovalKind::new("command"), call.arguments.to_string())
-                    .with_reason("the agent wants to run a command"),
-            )
-        } else {
+        let decision = if self.auto_approve {
             ToolDecision::Allow
-        })
+        } else {
+            match call.name {
+                COMMAND_TOOL => ToolDecision::Ask(
+                    ApprovalRequest::new(ApprovalKind::new("command"), call.arguments.to_string())
+                        .with_reason("the agent wants to run a command"),
+                ),
+                FILESYSTEM_TOOL => {
+                    if is_read_only_fs_operation(call.arguments) {
+                        ToolDecision::Allow
+                    } else {
+                        ToolDecision::Ask(
+                            ApprovalRequest::new(
+                                ApprovalKind::new("filesystem"),
+                                call.arguments.to_string(),
+                            )
+                            .with_reason("the agent wants to modify the filesystem"),
+                        )
+                    }
+                }
+                "websearch" | "webfetch" | "compact" => ToolDecision::Allow,
+                mcp_tool => ToolDecision::Ask(
+                    ApprovalRequest::new(
+                        ApprovalKind::new("mcp"),
+                        format!("{mcp_tool} {}", call.arguments),
+                    )
+                    .with_reason("the agent wants to invoke an MCP tool"),
+                ),
+            }
+        };
+        std::future::ready(decision)
     }
 }
 
@@ -52,9 +100,8 @@ impl Approver for TerminalApprover {
         eprint!("\x1b[33mAllow? [y/N]: \x1b[0m");
         io::stderr().flush().ok();
 
-        let approved = tokio::task::spawn_blocking(read_yes_no)
+        let approved = blocking::unblock(read_yes_no)
             .await
-            .map_err(ApproverFailure::new)?
             .map_err(|error| ApproverFailure::new(std::io::Error::other(error.to_string())))?;
         eprintln!();
         Ok(if approved {
@@ -78,7 +125,13 @@ fn read_yes_no() -> Result<bool> {
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
-                    KeyCode::Char('y' | 'Y') => {
+                    KeyCode::Char('c' | 'C' | 'd' | 'D')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        eprint!("^C");
+                        return Ok(false);
+                    }
+                    KeyCode::Char('y' | 'Y') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         eprint!("y");
                         return Ok(true);
                     }
@@ -147,7 +200,81 @@ pub fn print_event(timed: &TimedEvent) {
 /// Truncates output to a maximum character count (UTF-8 safe).
 fn truncate_output(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
-        Some((byte_idx, _)) => format!("{}[...]", &s[..byte_idx]),
+        Some((byte_idx, _)) => format!("{}[...]", s.get(..byte_idx).unwrap_or_default()),
         None => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aither_core::llm::tool::{AgentIdentity, CallIdentity, ToolCallId};
+    use futures_lite::future::block_on;
+
+    fn decide(hooks: &CliHooks, name: &str, arguments: serde_json::Value) -> ToolDecision {
+        let call = CallIdentity::new(ToolCallId::new("call-1"), AgentIdentity::Main);
+        let invocation = ToolInvocation {
+            call: &call,
+            name,
+            arguments: &arguments,
+            turn: 1,
+            message_count: 1,
+        };
+        block_on(hooks.before_tool(&invocation))
+    }
+
+    #[test]
+    fn default_hooks_gate_command_mutating_fs_and_mcp_while_allowing_reads() {
+        let hooks = CliHooks::new(false);
+        assert!(matches!(
+            decide(&hooks, COMMAND_TOOL, serde_json::json!({"program": "ls"})),
+            ToolDecision::Ask(req) if req.kind().as_str() == "command"
+        ));
+        for op in ["write", "append", "delete"] {
+            assert!(
+                matches!(
+                    decide(&hooks, FILESYSTEM_TOOL, serde_json::json!({"operation": op})),
+                    ToolDecision::Ask(req) if req.kind().as_str() == "filesystem"
+                ),
+                "filesystem {op} must ask"
+            );
+        }
+        for op in ["read", "list", "glob"] {
+            assert!(
+                matches!(
+                    decide(
+                        &hooks,
+                        FILESYSTEM_TOOL,
+                        serde_json::json!({"operation": op})
+                    ),
+                    ToolDecision::Allow
+                ),
+                "filesystem {op} should be allowed"
+            );
+        }
+        assert!(matches!(
+            decide(&hooks, "websearch", serde_json::json!({})),
+            ToolDecision::Allow
+        ));
+        assert!(matches!(
+            decide(&hooks, "webfetch", serde_json::json!({})),
+            ToolDecision::Allow
+        ));
+        assert!(matches!(
+            decide(&hooks, "context7_resolve", serde_json::json!({"query": "rust"})),
+            ToolDecision::Ask(req) if req.kind().as_str() == "mcp"
+        ));
+    }
+
+    #[test]
+    fn approve_flag_allows_all_tools_without_prompting() {
+        let hooks = CliHooks::new(true);
+        for (name, args) in [
+            (COMMAND_TOOL, serde_json::json!({"program": "rm"})),
+            (FILESYSTEM_TOOL, serde_json::json!({"operation": "write"})),
+            ("context7_resolve", serde_json::json!({})),
+        ] {
+            assert!(matches!(decide(&hooks, name, args), ToolDecision::Allow));
+        }
     }
 }

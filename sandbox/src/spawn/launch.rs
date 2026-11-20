@@ -15,6 +15,7 @@ use crate::ContainerPath;
 struct PathTemplate<'a> {
     bin_dir: Cow<'a, str>,
     exports: Vec<(&'a str, Cow<'a, str>)>,
+    pre_path: &'a str,
     script: &'a str,
 }
 
@@ -28,6 +29,7 @@ struct ShellTemplate<'a> {
 fn with_path(
     bin_dir: &str,
     exports: &[(String, String)],
+    pre_path: &str,
     script: &str,
 ) -> Result<String, askama::Error> {
     PathTemplate {
@@ -36,6 +38,7 @@ fn with_path(
             .iter()
             .map(|(name, value)| (name.as_str(), shell_words::quote(value)))
             .collect(),
+        pre_path,
         script,
     }
     .render()
@@ -100,7 +103,7 @@ impl ContainerLaunch {
     /// # Errors
     /// Fails when the template cannot render.
     pub fn wrap_script(&self, script: &str) -> Result<String, askama::Error> {
-        with_path(self.bin_dir.as_str(), &[], script)
+        with_path(self.bin_dir.as_str(), &[], "", script)
     }
 
     /// A command line running `script` in the container's bash.
@@ -178,6 +181,16 @@ impl RemoteLaunch {
     /// # Errors
     /// Fails when the template cannot render.
     pub fn wrap_script(&self, script: &str) -> Result<String, askama::Error> {
-        with_path(&self.bin_dir, &self.exports, script)
+        with_path(&self.bin_dir, &self.exports, "", script)
+    }
+
+    /// `script` with `extra_exports` placed after [`Self::with_exports`] and
+    /// before `bin_dir` is prepended to `PATH`.
+    pub(crate) fn wrap_script_with_exports(
+        &self,
+        extra_exports: &str,
+        script: &str,
+    ) -> Result<String, askama::Error> {
+        with_path(&self.bin_dir, &self.exports, extra_exports, script)
     }
 }

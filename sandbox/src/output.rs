@@ -117,14 +117,20 @@ async fn cut_text_output(
         byte_budget,
     } = cut;
 
-    let wording: &dyn ShellWording = &**store.wording();
-    let folded = crate::output_compress::folded_code_content(text, wording)
-        .filter(|folded| folded.len() <= byte_budget);
-    let preview = folded.unwrap_or_else(|| {
-        crate::output_compress::stored_preview(text, max_lines, byte_budget, wording)
-            .trim_end_matches('\n')
-            .to_owned()
-    });
+    let wording = store.wording().clone();
+    let code_folder = store.code_folder().clone();
+    let text_owned = text.to_owned();
+    let preview = blocking::unblock(move || {
+        let wording: &dyn ShellWording = &*wording;
+        let folded = crate::output_compress::folded_code_content(&code_folder, &text_owned, wording)
+            .filter(|folded| folded.len() <= byte_budget);
+        folded.unwrap_or_else(|| {
+            crate::output_compress::stored_preview(&text_owned, max_lines, byte_budget, wording)
+                .trim_end_matches('\n')
+                .to_owned()
+        })
+    })
+    .await;
     let ext = extension_for_data(data, format);
 
     // Names a file of an earlier store holds stay leased until a free one is
@@ -192,6 +198,8 @@ struct StoreInner {
     policy: OutputPolicy,
     /// Renders the markers of the views this store cuts.
     wording: AnyShellWording,
+    /// Pooled content-detector sessions for source-code folding.
+    code_folder: Arc<crate::output_compress::CodeFolder>,
     /// The words of the files this store wrote.
     names: Mutex<Vec<IdLease>>,
     /// The words naming the files the directory held when this store first
@@ -230,9 +238,14 @@ impl OutputStore {
             ids,
             policy,
             wording,
+            code_folder: Arc::new(crate::output_compress::CodeFolder::default()),
             names: Mutex::new(Vec::new()),
             earlier: async_lock::OnceCell::new(),
         }))
+    }
+
+    pub(crate) fn code_folder(&self) -> &Arc<crate::output_compress::CodeFolder> {
+        &self.0.code_folder
     }
 
     /// The limits this store cuts outputs at.
@@ -315,8 +328,12 @@ impl OutputStore {
         match format {
             OutputFormat::Text | OutputFormat::Auto => save_text_output(self, data, format).await,
             OutputFormat::Image => {
-                let prepared =
-                    prepare_image_for_context(data, resolution, self.policy().get().media)?;
+                let raw = data.to_vec();
+                let media_bounds = self.policy().get().media;
+                let prepared = blocking::unblock(move || {
+                    prepare_image_for_context(&raw, resolution, media_bounds)
+                })
+                .await?;
                 let (url, path) = self.create(&prepared.bytes, format).await?;
                 Ok(CommandStream::Image {
                     media_type: prepared.media_type,
@@ -408,14 +425,25 @@ impl OutputStore {
                 path.display()
             ))
         })?;
-        let data = fs::read(path).await?;
         let policy = self.policy().get();
-        let text = String::from_utf8_lossy(&data);
-        if data.len() <= policy.inline_bytes {
-            return Ok(CommandStream::Inline {
-                text: text.into_owned(),
-            });
+        let file_len = fs::metadata(path).await?.len();
+        if file_len <= policy.inline_bytes as u64 {
+            let data = fs::read(path).await?;
+            let text = String::from_utf8_lossy(&data);
+            if data.len() <= policy.inline_bytes {
+                return Ok(CommandStream::Inline {
+                    text: text.into_owned(),
+                });
+            }
         }
+        let read_cap = policy.preview_bytes.saturating_add(4096) as u64;
+        let mut head = Vec::new();
+        {
+            use futures_lite::io::AsyncReadExt as _;
+            let file = fs::File::open(path).await?;
+            file.take(read_cap).read_to_end(&mut head).await?;
+        }
+        let text = String::from_utf8_lossy(&head);
         let mut preview = String::new();
         for line in text.lines() {
             if preview.len() + line.len() > policy.preview_bytes {
@@ -475,6 +503,21 @@ impl OutputStore {
     /// Returns an error if the file cannot be read.
     pub async fn read(&self, url: &str) -> std::io::Result<Vec<u8>> {
         let filename = url.strip_prefix("outputs/").unwrap_or(url);
+        if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid output file name: {url}"),
+            ));
+        }
+        let mut components = Path::new(filename).components();
+        let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        if !single_normal {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid output file name: {url}"),
+            ));
+        }
         let filepath = self.dir().join(filename);
         fs::read(&filepath).await
     }
@@ -1049,7 +1092,7 @@ mod tests {
             rendered.contains(&file.url) && rendered.contains(&file.path),
             "guidance must reference the saved file: {rendered}"
         );
-        assert!(rendered.contains("Use head/tail/rg"));
+        assert!(rendered.contains("[Partial view:"));
     }
 
     #[tokio::test]
@@ -1301,5 +1344,26 @@ mod tests {
         };
         assert_eq!(text, data);
         assert_eq!(stored_file_count(dir.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_traversal_and_nested_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let outputs_dir = dir.path().join("outputs");
+        std::fs::create_dir_all(&outputs_dir).unwrap();
+        std::fs::write(dir.path().join("secret.txt"), b"outside").unwrap();
+        std::fs::write(outputs_dir.join("valid.txt"), b"inside").unwrap();
+
+        let store = store(&outputs_dir);
+        assert_eq!(store.read("valid.txt").await.unwrap(), b"inside");
+
+        for invalid in ["../secret.txt", "sub/file.txt", ".", "..", ""] {
+            let err = store.read(invalid).await.unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{invalid:?} must be rejected as InvalidInput"
+            );
+        }
     }
 }

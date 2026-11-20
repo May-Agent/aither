@@ -296,7 +296,10 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
 
     /// The script the monitored job runs for `source` and its interpreter; an
     /// unreadable file is refused before anything spawns.
-    fn job_script(&self, source: &MonitorSource) -> Result<(String, Interpreter), MonitorRefusal> {
+    async fn job_script(
+        &self,
+        source: &MonitorSource,
+    ) -> Result<(String, Interpreter), MonitorRefusal> {
         match source {
             MonitorSource::Command {
                 command,
@@ -314,22 +317,56 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
                 if path.is_relative() {
                     path = self.terminal.working_dir().join(path);
                 }
-                let readable = std::fs::metadata(&path).is_ok_and(|meta| meta.is_file())
-                    && (path.starts_with(self.terminal.working_dir())
-                        || self
-                            .terminal
-                            .grants()
-                            .snapshot()
-                            .readable
-                            .iter()
-                            .any(|dir| path.starts_with(dir)));
-                if !readable {
+                let canonical = async_fs::canonicalize(&path)
+                    .await
+                    .map_err(|_| MonitorRefusal::UnreadableFile { file: file.clone() })?;
+                let is_file = async_fs::metadata(&canonical)
+                    .await
+                    .is_ok_and(|meta| meta.is_file());
+                if !is_file {
                     return Err(MonitorRefusal::UnreadableFile { file: file.clone() });
                 }
+                let mut allowed = async_fs::canonicalize(self.terminal.working_dir())
+                    .await
+                    .is_ok_and(|working_dir| canonical.starts_with(&working_dir));
+                if !allowed {
+                    let readable_dirs = self.terminal.grants().snapshot().readable.clone();
+                    for dir in &readable_dirs {
+                        if let Ok(canonical_dir) = async_fs::canonicalize(dir).await
+                            && canonical.starts_with(&canonical_dir)
+                        {
+                            allowed = true;
+                            break;
+                        }
+                    }
+                }
+                if !allowed {
+                    return Err(MonitorRefusal::UnreadableFile { file: file.clone() });
+                }
+                let target_path = match self.terminal.sandbox().backend() {
+                    crate::Backend::Container { runtime, .. } => {
+                        let mount = runtime
+                            .workspace_mount()
+                            .ok_or_else(|| MonitorRefusal::UnreadableFile { file: file.clone() })?;
+                        let canonical_host_root = async_fs::canonicalize(&mount.host_root)
+                            .await
+                            .unwrap_or_else(|_| mount.host_root.clone());
+                        let canonical_mount = crate::MountRoot::new(
+                            canonical_host_root,
+                            mount.container_root.clone(),
+                        );
+                        canonical_mount
+                            .container_path(&canonical)
+                            .map_err(|_| MonitorRefusal::UnreadableFile { file: file.clone() })?
+                            .as_str()
+                            .to_owned()
+                    }
+                    _ => canonical.to_string_lossy().into_owned(),
+                };
                 // `tail -F` follows appended lines and survives rotation
                 // (the name is reopened) and truncation.
                 Ok((
-                    format!("tail -Fn0 {}", single_quote(&path.to_string_lossy())),
+                    format!("tail -Fn0 {}", single_quote(&target_path)),
                     Interpreter::Shell,
                 ))
             }
@@ -408,7 +445,7 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
         };
         let filter = compile("filter", &args.filter)?;
         let stop_on = compile("stop_on", &args.stop_on)?;
-        let (script, interpreter) = self.job_script(&args.source)?;
+        let (script, interpreter) = self.job_script(&args.source).await?;
         let description = match &args.source {
             MonitorSource::Command { .. } => "monitored command".to_string(),
             MonitorSource::File { file } => format!("monitor file {file}"),
@@ -509,6 +546,20 @@ async fn watch_task(watch: Watch) {
                     }
                     if filter.as_ref().is_none_or(|re| re.is_match(&line)) {
                         lines.push(line);
+                    }
+                }
+                if stop.is_none()
+                    && !matches!(delta.status, JobStatus::Running)
+                    && !remainder.is_empty()
+                {
+                    let tail = String::from_utf8_lossy(&remainder)
+                        .trim_end_matches('\r')
+                        .to_string();
+                    remainder.clear();
+                    if stop_on.as_ref().is_some_and(|re| re.is_match(&tail)) {
+                        stop = Some(tail);
+                    } else if filter.as_ref().is_none_or(|re| re.is_match(&tail)) {
+                        lines.push(tail);
                     }
                 }
                 if !lines.is_empty() {

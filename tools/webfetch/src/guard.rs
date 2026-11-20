@@ -21,8 +21,14 @@
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::time::Duration;
 
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use url::{Host, Url};
+use zenwave::{Client as _, DefaultClient, Proxy, ResponseExt as _, Transport, header};
 
 /// Why a URL was refused before any request was made.
 #[derive(Debug, thiserror::Error)]
@@ -67,7 +73,7 @@ pub enum UrlPolicyError {
 /// private ranges, link-local (including the cloud metadata range), carrier-grade
 /// NAT, IPv6 unique-local and link-local, and IPv4-mapped forms of all of these.
 #[must_use]
-pub fn is_blocked(addr: IpAddr) -> bool {
+pub const fn is_blocked(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => is_blocked_v4(v4),
         IpAddr::V6(v6) => {
@@ -81,7 +87,7 @@ pub fn is_blocked(addr: IpAddr) -> bool {
     }
 }
 
-fn is_blocked_v4(addr: Ipv4Addr) -> bool {
+const fn is_blocked_v4(addr: Ipv4Addr) -> bool {
     addr.is_loopback()
         || addr.is_private()
         || addr.is_link_local()
@@ -92,13 +98,40 @@ fn is_blocked_v4(addr: Ipv4Addr) -> bool {
         // 100.64.0.0/10, carrier-grade NAT (Ipv4Addr::is_shared is unstable).
         || (addr.octets()[0] == 100 && (addr.octets()[1] & 0b1100_0000) == 64)
         // 192.0.0.0/24, IETF protocol assignments.
-        || addr.octets()[..3] == [192, 0, 0]
+        || matches!(addr.octets(), [192, 0, 0, _])
         // 240.0.0.0/4, reserved.
         || addr.octets()[0] >= 240
 }
 
 const fn is_blocked_v6(addr: Ipv6Addr) -> bool {
     let segments = addr.segments();
+    // 64:ff9b:1::/48, RFC 8215 local-use IPv4/IPv6 translation prefix.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        return true;
+    }
+    // 64:ff9b::/96, RFC 6052 well-known IPv4/IPv6 translation prefix.
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        if is_blocked_v4(Ipv4Addr::new(a, b, c, d)) {
+            return true;
+        }
+    }
+    // 2002::/16, RFC 3056 6to4 prefix carrying an embedded IPv4 in bits 16..47.
+    if segments[0] == 0x2002 {
+        let [a, b] = segments[1].to_be_bytes();
+        let [c, d] = segments[2].to_be_bytes();
+        if is_blocked_v4(Ipv4Addr::new(a, b, c, d)) {
+            return true;
+        }
+    }
+
     addr.is_loopback()
         || addr.is_unspecified()
         || addr.is_multicast()
@@ -231,12 +264,287 @@ pub async fn resolve_checked<R: Resolver, P: AddressPolicy>(
     Ok(addrs)
 }
 
+const MAX_REDIRECTS: usize = 10;
+const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) struct GuardedHttpResponse {
+    pub headers: header::HeaderMap,
+    pub body: Vec<u8>,
+}
+
+type ClientTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+async fn run_socks5_gate<R, P>(
+    listener: async_net::TcpListener,
+    resolver: R,
+    policy: P,
+    refusal: Arc<Mutex<Option<UrlPolicyError>>>,
+) -> Result<GuardedHttpResponse, anyhow::Error>
+where
+    R: Resolver,
+    P: AddressPolicy,
+{
+    use futures_lite::StreamExt as _;
+    let mut incoming = Box::pin(listener.incoming());
+    let mut active: Vec<ClientTask> = Vec::new();
+    std::future::poll_fn(|cx| {
+        while let Poll::Ready(Some(Ok(stream))) = incoming.as_mut().poll_next(cx) {
+            let resolver = resolver.clone();
+            let policy = policy.clone();
+            let refusal = Arc::clone(&refusal);
+            active.push(Box::pin(async move {
+                if let Err(policy_err) = handle_socks5_client(stream, resolver, policy).await {
+                    let mut slot = refusal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.is_none() {
+                        *slot = Some(policy_err);
+                    }
+                }
+            }));
+        }
+        active.retain_mut(|fut| fut.as_mut().poll(cx).is_pending());
+        Poll::<Result<GuardedHttpResponse, anyhow::Error>>::Pending
+    })
+    .await
+}
+
+/// Performs an HTTP `GET` where every hop (initial URL and any HTTP redirects)
+/// is checked against `resolver` and `policy`, the outbound TCP connection
+/// dials ONLY the validated [`SocketAddr`]s (preventing DNS rebinding and
+/// redirect-to-private SSRF), and the response body is read while the gate is
+/// active.
+pub(crate) async fn guarded_get<R, P>(
+    raw_url: &str,
+    headers: &[(&str, String)],
+    timeout: Duration,
+    resolver: R,
+    policy: P,
+) -> Result<GuardedHttpResponse, anyhow::Error>
+where
+    R: Resolver,
+    P: AddressPolicy,
+{
+    let initial = parse_http_url(raw_url)?;
+    let listener = async_net::TcpListener::bind("127.0.0.1:0").await?;
+    let gate_port = listener.local_addr()?.port();
+    let refusal: Arc<Mutex<Option<UrlPolicyError>>> = Arc::new(Mutex::new(None));
+
+    let proxy = Proxy::builder()
+        .all(format!("socks5h://127.0.0.1:{gate_port}"))
+        .build();
+    let transport = Transport::builder()
+        .proxy(proxy)
+        .build()
+        .map_err(|e| anyhow::anyhow!("transport build failed: {e}"))?;
+
+    let gate_future = run_socks5_gate(listener, resolver, policy, Arc::clone(&refusal));
+
+    let request_future = async {
+        let mut current = initial;
+        let initial_origin = current.origin();
+        for _hop in 0..=MAX_REDIRECTS {
+            let mut backend = DefaultClient::raw(transport.clone()).timeout(timeout);
+            let mut builder = backend
+                .get(current.as_str())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let same_origin = current.origin() == initial_origin;
+            for (name, value) in headers {
+                if !same_origin
+                    && (name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("x-api-key")
+                        || name.eq_ignore_ascii_case("cookie"))
+                {
+                    continue;
+                }
+                builder = builder
+                    .header(*name, value.clone())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            let response = match builder.await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let taken_refusal = refusal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(policy_err) = taken_refusal {
+                        return Err(policy_err.into());
+                    }
+                    return Err(anyhow::anyhow!("{err}"));
+                }
+            };
+
+            let code = response.status().as_u16();
+            if matches!(code, 301 | 302 | 303 | 307 | 308)
+                && let Some(loc) = response
+                    .headers()
+                    .get(header::LOCATION.as_str())
+                    .and_then(|v| v.to_str().ok())
+            {
+                let next = current.join(loc).map_err(UrlPolicyError::Invalid)?;
+                current = parse_http_url(next.as_str())?;
+                continue;
+            }
+            let response = response
+                .error_for_status()
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            let resp_headers = response.headers().clone();
+            let bytes = response
+                .into_bytes_with_limit(MAX_HTTP_BODY_BYTES)
+                .await
+                .map_err(|e| anyhow::Error::from(DecodeFailure(format!("{e}"))))?;
+            return Ok(GuardedHttpResponse {
+                headers: resp_headers,
+                body: bytes.to_vec(),
+            });
+        }
+        Err(anyhow::anyhow!("too many HTTP redirects"))
+    };
+
+    futures_lite::future::or(request_future, gate_future).await
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct DecodeFailure(pub String);
+
+fn parse_http_url(raw: &str) -> Result<Url, UrlPolicyError> {
+    let url = Url::parse(raw)?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(UrlPolicyError::UnsupportedScheme(scheme.to_string()));
+    }
+    if url.host().is_none() {
+        return Err(UrlPolicyError::MissingHost);
+    }
+    Ok(url)
+}
+
+async fn read_socks5_target(client: &mut async_net::TcpStream) -> Option<(String, u16)> {
+    let mut greeting = [0_u8; 2];
+    if client.read_exact(&mut greeting).await.is_err() || greeting[0] != 0x05 {
+        return None;
+    }
+    let mut methods = vec![0_u8; usize::from(greeting[1])];
+    if client.read_exact(&mut methods).await.is_err() {
+        return None;
+    }
+    if client.write_all(&[0x05, 0x00]).await.is_err() {
+        return None;
+    }
+
+    let mut head = [0_u8; 4];
+    if client.read_exact(&mut head).await.is_err() || head[0] != 0x05 || head[1] != 0x01 {
+        let _ = client
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return None;
+    }
+
+    let host_string = match head[3] {
+        0x01 => {
+            let mut octets = [0_u8; 4];
+            client.read_exact(&mut octets).await.ok()?;
+            Ipv4Addr::from(octets).to_string()
+        }
+        0x04 => {
+            let mut octets = [0_u8; 16];
+            client.read_exact(&mut octets).await.ok()?;
+            format!("[{}]", Ipv6Addr::from(octets))
+        }
+        0x03 => {
+            let mut len = [0_u8; 1];
+            client.read_exact(&mut len).await.ok()?;
+            let mut domain = vec![0_u8; usize::from(len[0])];
+            client.read_exact(&mut domain).await.ok()?;
+            let Ok(text) = String::from_utf8(domain) else {
+                let _ = client
+                    .write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                return None;
+            };
+            text
+        }
+        _ => {
+            let _ = client
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return None;
+        }
+    };
+
+    let mut port_bytes = [0_u8; 2];
+    client.read_exact(&mut port_bytes).await.ok()?;
+    Some((host_string, u16::from_be_bytes(port_bytes)))
+}
+
+async fn handle_socks5_client<R, P>(
+    mut client: async_net::TcpStream,
+    resolver: R,
+    policy: P,
+) -> Result<(), UrlPolicyError>
+where
+    R: Resolver,
+    P: AddressPolicy,
+{
+    let Some((host_string, port)) = read_socks5_target(&mut client).await else {
+        return Ok(());
+    };
+
+    let parsed_host = Host::parse(&host_string)?;
+    let host_ref = match &parsed_host {
+        Host::Domain(domain) => Host::Domain(domain.as_str()),
+        Host::Ipv4(addr) => Host::Ipv4(*addr),
+        Host::Ipv6(addr) => Host::Ipv6(*addr),
+    };
+    let addrs = match resolve_checked(&resolver, &policy, &host_ref, port).await {
+        Ok(addrs) => addrs,
+        Err(policy_err) => {
+            let _ = client
+                .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Err(policy_err);
+        }
+    };
+
+    let mut upstream = None;
+    for addr in &addrs {
+        if let Ok(conn) = async_net::TcpStream::connect(*addr).await {
+            upstream = Some(conn);
+            break;
+        }
+    }
+    let Some(upstream) = upstream else {
+        let _ = client
+            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return Ok(());
+    };
+
+    if client
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let (client_r, client_w) = futures_lite::io::split(client);
+    let (up_r, up_w) = futures_lite::io::split(upstream);
+    let _ = futures_lite::future::zip(
+        futures_lite::io::copy(client_r, up_w),
+        futures_lite::io::copy(up_r, client_w),
+    )
+    .await;
+    Ok(())
+}
+
 /// A resolver and a policy tests control.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::Resolver;
-    #[cfg(feature = "headless")]
-    use super::{AddressPolicy, UrlPolicyError};
+    use super::{AddressPolicy, Resolver, UrlPolicyError};
     use std::collections::HashMap;
     use std::future::Future;
     use std::net::SocketAddr;
@@ -291,11 +599,9 @@ pub(crate) mod testing {
     }
 
     /// Allows exactly one address, which stands in for a public one.
-    #[cfg(feature = "headless")]
     #[derive(Clone)]
     pub struct Only(pub(crate) SocketAddr);
 
-    #[cfg(feature = "headless")]
     impl AddressPolicy for Only {
         fn check(&self, host: &str, addr: SocketAddr) -> Result<(), UrlPolicyError> {
             if addr == self.0 {
@@ -418,6 +724,23 @@ mod tests {
     async fn rejects_localhost_literal() {
         let err = guard_url("http://127.0.0.1:8080/admin").await.unwrap_err();
         assert!(matches!(err, UrlPolicyError::BlockedAddress { .. }));
+    }
+
+    #[test]
+    fn blocks_nat64_and_6to4_embedded_private_addresses() {
+        for blocked in [
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b:1::1",
+            "2002:7f00:0001::1",
+            "2002:a9fe:a9fe::1",
+        ] {
+            assert!(is_blocked(ip(blocked)), "{blocked} should be blocked");
+        }
+        for public in ["64:ff9b::1.1.1.1", "2002:0101:0101::1"] {
+            assert!(!is_blocked(ip(public)), "{public} should be allowed");
+        }
     }
 
     #[tokio::test]

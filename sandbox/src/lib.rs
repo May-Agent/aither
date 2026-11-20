@@ -183,5 +183,5 @@ pub use terminal::{
 pub use wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
     JsonAsTsv, LineRange, MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines,
-    RunFailure, ShellWording, StoredBinaryPart,
+    RunFailure, RunningJob, ShellWording, StoredBinaryPart,
 };

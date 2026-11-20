@@ -1,0 +1,12 @@
+{% if let Some(title) = title %}# {{ title }}
+
+{% endif %}Source: {{ url }}
+
+{% if let Some(ct) = content_type %}Content-Type: {{ ct }}
+{% endif %}{% if let Some(tokens) = markdown_tokens %}X-Markdown-Tokens: {{ tokens }}
+{% endif %}{% if let Some(signal) = content_signal %}Content-Signal: {{ signal }}
+{% endif %}{% if let Some(ext) = extractor %}Extractor: {{ ext }}
+{% endif %}{% if let Some(score) = quality_score %}Quality-Score: {{ score }}
+{% endif %}{% if let Some(warn) = warnings_joined %}Warnings: {{ warn }}
+{% endif %}{% if has_metadata %}
+{% endif %}{{ content }}

@@ -173,6 +173,32 @@ pub struct RepeatedLines {
     pub count: usize,
 }
 
+/// One running job as [`ShellWording::running_jobs`] describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningJob<'a> {
+    /// Model-facing task identifier.
+    pub task_id: &'a str,
+    /// Process identifier at the job's execution place.
+    pub pid: u32,
+    /// Truncated preview of the job's script.
+    pub script_preview: &'a str,
+    /// Redirected output file path, when output is redirected.
+    pub output_path: Option<&'a str>,
+}
+
+#[derive(askama::Template)]
+#[template(path = "running_jobs.txt", escape = "none")]
+struct DefaultRunningJobsTemplate<'a> {
+    jobs: &'a [RunningJob<'a>],
+}
+
+pub fn render_default_running_jobs(jobs: &[RunningJob<'_>]) -> String {
+    use askama::Template as _;
+    DefaultRunningJobsTemplate { jobs }
+        .render()
+        .expect("running jobs template is infallible")
+}
+
 /// A call or run that did not get to an end, other than one refused before it
 /// ran: the failure as data, for the embedder to word.
 ///
@@ -253,6 +279,11 @@ pub trait ShellWording: Send + Sync + 'static {
 
     /// A run of identical lines a preview collapses.
     fn repeated_lines(&self, repeated: &RepeatedLines) -> String;
+
+    /// Summary of currently running jobs preserved across context compression.
+    fn running_jobs(&self, jobs: &[RunningJob<'_>]) -> String {
+        render_default_running_jobs(jobs)
+    }
 }
 
 /// A shared [`ShellWording`], cloned into every shell, store and tool that

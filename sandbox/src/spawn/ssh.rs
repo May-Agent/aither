@@ -28,17 +28,13 @@ struct SshToolExecutionTemplate<'a> {
     arguments: String,
 }
 
-/// The command line that runs `script` on a server: the managed shell under
-/// the server's `heel` when `heel` is given, directly otherwise.
-///
-/// # Errors
-/// Fails when a template cannot render.
-pub fn remote_command(
+fn remote_command_with_exports(
     launch: &RemoteLaunch,
     heel: Option<&str>,
+    extra_exports: &str,
     script: &str,
 ) -> Result<String, askama::Error> {
-    let script = launch.wrap_script(script)?;
+    let script = launch.wrap_script_with_exports(extra_exports, script)?;
     let (program, args) = shell_launch(launch.shell(), &script);
     let Some(binary) = heel else {
         return Ok(shell_words::join(
@@ -193,8 +189,10 @@ impl Sandbox {
         // even while the local client reads the null device.
         let script = script_reading(stdio.stdin, script)?;
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
-        let script = inject_env_exports(script, Some(&spec_env), &info).map_err(|e| failed(&e))?;
-        let remote = remote_command(launch, heel, &script).map_err(|e| failed(&e))?;
+        let extra_exports =
+            inject_env_exports(String::new(), Some(&spec_env), &info).map_err(|e| failed(&e))?;
+        let remote = remote_command_with_exports(launch, heel, &extra_exports, &script)
+            .map_err(|e| failed(&e))?;
         let pidfile = shell_words::quote(&format!(
             "/tmp/aither-spawn-{}.pgid",
             uuid::Uuid::new_v4().simple()
@@ -305,9 +303,16 @@ async fn pump(
     tx: async_channel::Sender<Vec<u8>>,
 ) {
     let mut buffer = vec![0_u8; 8192];
-    while let Ok(count) = reader.read(&mut buffer).await {
-        if count == 0 || tx.send(buffer[..count].to_vec()).await.is_err() {
-            break;
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(count) => {
+                if tx.send(buffer[..count].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
         }
     }
 }

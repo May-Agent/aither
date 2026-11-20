@@ -168,9 +168,7 @@ pub enum SearchToolError {
     #[error("search index is missing; run `search index <path>` again")]
     MissingIndexTable,
     /// No embedding model is available.
-    #[error(
-        "semantic search requires a global models.embedding_model and at least one enabled provider that supports it"
-    )]
+    #[error("semantic search requires a configured embedding model")]
     SemanticEmbeddingUnavailable,
     /// The semantic index was built with another embedding configuration.
     #[error(
@@ -218,9 +216,6 @@ pub enum SearchToolError {
         /// Source walk error.
         source: ignore::Error,
     },
-    /// Joining the file scan task failed.
-    #[error("failed to join searchable file scan task: {0}")]
-    JoinFileScan(#[source] tokio::task::JoinError),
     /// Filesystem I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -994,7 +989,16 @@ fn require_semantic_metadata<'a>(
 }
 
 fn matches_path_prefix(path_filter: Option<&str>, file_path: &str) -> bool {
-    path_filter.is_none_or(|prefix| file_path.starts_with(prefix))
+    path_filter.is_none_or(|prefix| {
+        let trimmed = prefix.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return file_path.starts_with(prefix);
+        }
+        file_path == trimmed
+            || file_path
+                .strip_prefix(trimmed)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+    })
 }
 
 async fn run_semantic_query<E>(
@@ -1079,13 +1083,7 @@ fn build_sql_filter(args: &SearchArgs) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        filters.push(SqlExpr::Like {
-            negated: false,
-            any: false,
-            expr: Box::new(identifier_sql_expr("file_path")),
-            pattern: Box::new(string_sql_expr(prefix_match_pattern(path))),
-            escape_char: None,
-        });
+        filters.push(path_prefix_sql_expr(path));
     }
     filters
         .into_iter()
@@ -1105,11 +1103,49 @@ fn string_sql_expr(value: String) -> SqlExpr {
     SqlExpr::value(SqlValue::SingleQuotedString(value))
 }
 
-fn prefix_match_pattern(value: &str) -> String {
-    let mut pattern = String::with_capacity(value.len() + 1);
-    pattern.push_str(value);
-    pattern.push('%');
-    pattern
+fn escape_sql_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '!' | '%' | '_') {
+            escaped.push('!');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn like_sql_expr(column: &str, pattern: String) -> SqlExpr {
+    SqlExpr::Like {
+        negated: false,
+        any: false,
+        expr: Box::new(identifier_sql_expr(column)),
+        pattern: Box::new(string_sql_expr(pattern)),
+        escape_char: Some(Box::new(string_sql_expr("!".to_string()))),
+    }
+}
+
+fn path_prefix_sql_expr(path: &str) -> SqlExpr {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return like_sql_expr("file_path", format!("{}%", escape_sql_like(path)));
+    }
+    let escaped = escape_sql_like(trimmed);
+    let exact = SqlExpr::BinaryOp {
+        left: Box::new(identifier_sql_expr("file_path")),
+        op: BinaryOperator::Eq,
+        right: Box::new(string_sql_expr(trimmed.to_string())),
+    };
+    let slash_children = like_sql_expr("file_path", format!("{escaped}/%"));
+    let backslash_children = like_sql_expr("file_path", format!("{escaped}\\%"));
+    SqlExpr::Nested(Box::new(SqlExpr::BinaryOp {
+        left: Box::new(SqlExpr::BinaryOp {
+            left: Box::new(exact),
+            op: BinaryOperator::Or,
+            right: Box::new(slash_children),
+        }),
+        op: BinaryOperator::Or,
+        right: Box::new(backslash_children),
+    }))
 }
 
 async fn run_plain_query(
@@ -1274,25 +1310,23 @@ async fn collect_searchable_files(
         }
 
         let root_path_clone = root_path.clone();
-        let files =
-            tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>, SearchToolError> {
-                let mut files = Vec::new();
-                let mut walk = WalkBuilder::new(&root_path_clone);
-                walk.standard_filters(true);
-                walk.hidden(false);
-                for entry in walk.build() {
-                    let entry = entry.map_err(|source| SearchToolError::WalkFiles {
-                        root: root_path_clone.clone(),
-                        source,
-                    })?;
-                    if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                        files.push(entry.into_path());
-                    }
+        let files = blocking::unblock(move || -> Result<Vec<PathBuf>, SearchToolError> {
+            let mut files = Vec::new();
+            let mut walk = WalkBuilder::new(&root_path_clone);
+            walk.standard_filters(true);
+            walk.hidden(false);
+            for entry in walk.build() {
+                let entry = entry.map_err(|source| SearchToolError::WalkFiles {
+                    root: root_path_clone.clone(),
+                    source,
+                })?;
+                if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    files.push(entry.into_path());
                 }
-                Ok(files)
-            })
-            .await
-            .map_err(SearchToolError::JoinFileScan)??;
+            }
+            Ok(files)
+        })
+        .await?;
 
         for file in files {
             if let Some(searchable) =
@@ -1444,13 +1478,12 @@ fn finalize_rows(
     args: &SearchArgs,
     meta: &SearchIndexMeta,
 ) -> ToolResult {
-    let start = args.offset.min(rows.len());
-    let end = (start + args.limit).min(rows.len());
-    let rows = &rows[start..end];
-
     let query = args.query.clone().expect("validated");
     let indexed_roots = meta.roots.join(", ");
     if args.output_mode == SearchOutputMode::Chunks {
+        let start = args.offset.min(rows.len());
+        let end = (start + args.limit).min(rows.len());
+        let rows = &rows[start..end];
         let items = rows
             .iter()
             .map(|row| ChunkResult {
@@ -1477,7 +1510,8 @@ fn finalize_rows(
             .expect("search query template must render"),
         );
     }
-    let items = {
+
+    let all_files = {
         let mut grouped = HashMap::<String, FileResult>::new();
         for row in rows {
             let entry = grouped
@@ -1516,6 +1550,10 @@ fn finalize_rows(
         });
         items
     };
+    let total_files = all_files.len();
+    let start = args.offset.min(total_files);
+    let end = (start + args.limit).min(total_files);
+    let items = &all_files[start..end];
 
     ToolResult::text(
         QueryFilesTemplate {
@@ -1523,9 +1561,9 @@ fn finalize_rows(
             search_mode: args.search_mode,
             output_mode: args.output_mode,
             indexed_roots: &indexed_roots,
-            total_matches,
+            total_matches: total_files,
             returned: items.len(),
-            results: &items,
+            results: items,
         }
         .render()
         .expect("search query template must render"),
@@ -1733,5 +1771,78 @@ mod tests {
         let ready = SearchEmbeddingResolution::Ready(NoopEmbedding);
         assert!(ready.ready().is_some());
         assert!(ready.clone_ready().is_some());
+    }
+
+    #[test]
+    fn files_mode_groups_chunks_before_applying_offset_and_limit() {
+        let rows = vec![
+            FileMatchRow {
+                file_path: "/repo/a.rs".into(),
+                relative_path: "a.rs".into(),
+                modified_at: "1".into(),
+                chunk_id: 0,
+                content: "alpha 0".into(),
+                score: 10.0,
+                matched_by: vec![SearchMode::Text],
+            },
+            FileMatchRow {
+                file_path: "/repo/a.rs".into(),
+                relative_path: "a.rs".into(),
+                modified_at: "1".into(),
+                chunk_id: 1,
+                content: "alpha 1".into(),
+                score: 9.0,
+                matched_by: vec![SearchMode::Text],
+            },
+            FileMatchRow {
+                file_path: "/repo/b.rs".into(),
+                relative_path: "b.rs".into(),
+                modified_at: "1".into(),
+                chunk_id: 0,
+                content: "beta 0".into(),
+                score: 8.0,
+                matched_by: vec![SearchMode::Text],
+            },
+            FileMatchRow {
+                file_path: "/repo/c.rs".into(),
+                relative_path: "c.rs".into(),
+                modified_at: "1".into(),
+                chunk_id: 0,
+                content: "gamma 0".into(),
+                score: 7.0,
+                matched_by: vec![SearchMode::Text],
+            },
+        ];
+        let mut args = base_args();
+        args.output_mode = SearchOutputMode::Files;
+        args.offset = 1;
+        args.limit = 2;
+        let meta = SearchIndexMeta {
+            roots: vec!["/repo".into()],
+            ..SearchIndexMeta::default()
+        };
+        let ToolResult::Text { text } = finalize_rows(&rows, rows.len(), &args, &meta) else {
+            panic!("expected text result");
+        };
+        assert!(text.contains("3 matches, showing 2"), "{text}");
+        assert!(
+            !text.contains("- a.rs "),
+            "offset=1 skips first file: {text}"
+        );
+        assert!(text.contains("- b.rs "), "{text}");
+        assert!(text.contains("- c.rs "), "{text}");
+    }
+
+    #[test]
+    fn path_prefix_filters_escape_wildcards_and_enforce_directory_boundaries() {
+        assert!(matches_path_prefix(Some("/repo/src"), "/repo/src"));
+        assert!(matches_path_prefix(Some("/repo/src"), "/repo/src/lib.rs"));
+        assert!(!matches_path_prefix(Some("/repo/src"), "/repo/src2/lib.rs"));
+
+        let mut args = base_args();
+        args.path = Some("/repo/100%_raw!".into());
+        let sql = build_sql_filter(&args).expect("sql filter");
+        assert!(sql.contains("100!%!_raw!!/%"), "{sql}");
+        assert!(sql.contains("ESCAPE '!'"), "{sql}");
     }
 }
