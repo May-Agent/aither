@@ -256,18 +256,26 @@ fn resolve_host_working_dir(
         .map_err(|_| "working directory is outside the container workspace mount")?;
 
     // Reject symlinks inside the workspace that escape the host mount root.
-    let canonical_root =
-        dunce::canonicalize(&workspace.host_root).unwrap_or_else(|_| workspace.host_root.clone());
+    let canonical_root = dunce::canonicalize(&workspace.host_root)
+        .map_err(|_| "container workspace mount root is not canonicalizable")?;
     let mut existing = mapped.as_path();
     while !existing.exists() {
+        // A dangling symlink reads as not existing, but a later command
+        // would still write through it, outside the workspace.
+        if existing
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err("working directory contains a dangling symlink");
+        }
         let Some(parent) = existing.parent() else {
             break;
         };
         existing = parent;
     }
-    if let Ok(canonical_existing) = dunce::canonicalize(existing)
-        && !canonical_existing.starts_with(&canonical_root)
-    {
+    let canonical_existing =
+        dunce::canonicalize(existing).map_err(|_| "working directory is not canonicalizable")?;
+    if !canonical_existing.starts_with(&canonical_root) {
         return Err("working directory escapes the container workspace mount");
     }
     Ok(mapped)
@@ -334,5 +342,35 @@ async fn connection(
         if !authorized {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A symlink inside the workspace whose target does not exist still
+    /// reads as absent, but a later command would write through it outside
+    /// the mount: it is rejected.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_in_the_workspace_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_root = dir.path().join("workspace");
+        std::fs::create_dir(&host_root).unwrap();
+        let outside = dir.path().join("outside").join("no-such-target");
+        std::os::unix::fs::symlink(&outside, host_root.join("escape_link")).unwrap();
+        let workspace = MountRoot::new(host_root, ContainerPath::new("/workspace").unwrap());
+
+        assert!(
+            resolve_host_working_dir(Some(&workspace), Path::new("/workspace/escape_link"),)
+                .is_err(),
+            "a dangling symlink must be rejected"
+        );
+        assert!(
+            resolve_host_working_dir(Some(&workspace), Path::new("/workspace/escape_link/subdir"),)
+                .is_err(),
+            "a dangling symlink mid-path must be rejected"
+        );
     }
 }
