@@ -659,8 +659,8 @@ mod tests {
     }
 
     /// A folding model puts the live tail inside `system`, so the
-    /// LastSystem breakpoint would cache a span that dies on every
-    /// request. LastTool still names a stable span.
+    /// `LastSystem` breakpoint would cache a span that dies on every
+    /// request. `LastTool` still names a stable span.
     #[test]
     fn folding_models_skip_the_last_system_breakpoint() {
         let cache = PromptCache::new("session-1");

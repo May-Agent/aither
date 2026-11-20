@@ -1918,15 +1918,16 @@ where
         if prompt_tokens == 0 {
             return None;
         }
+        #[expect(clippy::cast_precision_loss)]
         let tokens = prompt_tokens as f64;
-        let warm_cost = pricing.input_cache_read * tokens + pricing.completion;
+        let warm_cost = pricing.input_cache_read.mul_add(tokens, pricing.completion);
         let write_price = if pricing.input_cache_write > 0.0 {
             pricing.input_cache_write
         } else {
             pricing.prompt
         };
         let miss_cost = (write_price - pricing.input_cache_read).max(0.0) * tokens;
-        let expected_savings = continuation_probability * miss_cost - warm_cost;
+        let expected_savings = continuation_probability.mul_add(miss_cost, -warm_cost);
         Some(KeepWarmEconomics {
             warm_cost,
             miss_cost,
