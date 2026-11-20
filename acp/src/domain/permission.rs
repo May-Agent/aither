@@ -124,12 +124,11 @@ pub enum PermissionOptionKind {
 }
 open_tags!(PermissionOptionKind; None => ["allow_once", "allow_always", "reject_once", "reject_always"]);
 
-/// `session/request_permission` result.
+/// `session/request_permission` result (`{"outcome": {...}}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionResult {
     /// How the request resolved.
-    #[serde(flatten)]
     pub outcome: PermissionOutcome,
     /// Extension metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +200,21 @@ mod tests {
         let o: PermissionOutcome = serde_json::from_value(raw.clone()).expect("de");
         assert!(matches!(o, PermissionOutcome::Custom(_, _)));
         assert_eq!(serde_json::to_value(&o).expect("ser"), raw);
+    }
+
+    #[test]
+    fn result_nests_the_outcome() {
+        let raw = json!({"outcome": {"outcome": "selected", "optionId": "ok"}});
+        let r: PermissionResult = serde_json::from_value(raw.clone()).expect("de");
+        assert!(
+            matches!(r.outcome, PermissionOutcome::Selected(ref s) if s.option_id.as_str() == "ok")
+        );
+        assert_eq!(serde_json::to_value(&r).expect("ser"), raw);
+
+        let raw = json!({"outcome": {"outcome": "cancelled"}});
+        let r: PermissionResult = serde_json::from_value(raw.clone()).expect("de");
+        assert!(matches!(r.outcome, PermissionOutcome::Cancelled(_)));
+        assert_eq!(serde_json::to_value(&r).expect("ser"), raw);
     }
 
     #[test]

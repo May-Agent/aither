@@ -137,8 +137,8 @@ pub use server::{
 };
 pub use state::{SessionEvent, SessionReducer, SessionState};
 
-pub use server::AuthConfig;
 pub use server::ProtocolVersion;
+pub use server::{AuthConfig, AuthLoginRequest, AuthRequest};
 
 #[cfg(feature = "agent")]
 pub use aither::{AcpChildAgent, AitherHost, SessionSetup};

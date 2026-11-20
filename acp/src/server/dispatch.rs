@@ -33,7 +33,9 @@ use crate::wire::{v1, v2};
 
 use super::context::{AgentHooks, AnyAgentHooks, ProtocolVersion, SessionContext};
 use super::error::PromptError;
-use super::host::{AnySessionHost, AuthConfig, AuthRequest, ResumeRequest, SessionHost};
+use super::host::{
+    AnySessionHost, AuthConfig, AuthLoginRequest, AuthRequest, ResumeRequest, SessionHost,
+};
 use super::prompt::{PendingPrompt, PromptTicket};
 use super::table::{QueuedItem, SessionEntry, SessionShared, TurnState};
 
@@ -637,13 +639,13 @@ impl ServerCore {
     /// # Errors
     ///
     /// `method not found` when no auth methods are configured.
-    pub async fn auth_login(&self, method_id: AuthMethodId) -> Result<(), RpcError> {
+    pub async fn auth_login(&self, request: AuthLoginRequest) -> Result<(), RpcError> {
         let auth = self
             .auth
             .as_ref()
             .filter(|a| !a.methods.is_empty())
             .ok_or_else(|| RpcError::method_not_found("auth/login"))?;
-        (auth.handler)(AuthRequest::Login(method_id)).await
+        (auth.handler)(AuthRequest::Login(request)).await
     }
 
     /// `auth/logout` (`logout` on v1).
@@ -986,17 +988,32 @@ impl WireAdapter {
             "authenticate" if v1_mode => {
                 let p: v1::AuthenticateParams = decode(params)?;
                 self.core
-                    .auth_login(AuthMethodId::from(p.method_id))
+                    .auth_login(AuthLoginRequest {
+                        method_id: AuthMethodId::from(p.method_id),
+                        meta: p.meta,
+                        extra: BTreeMap::new(),
+                    })
                     .await?;
                 encode(&serde_json::json!({}))
             }
             "auth/login" => {
                 let p: v2::AuthLoginParams = decode(params)?;
-                self.core.auth_login(p.method_id).await?;
+                self.core
+                    .auth_login(AuthLoginRequest {
+                        method_id: p.method_id,
+                        meta: p.meta,
+                        extra: p.extra,
+                    })
+                    .await?;
                 encode(&serde_json::json!({}))
             }
             "logout" | "auth/logout" => {
-                self.core.auth_logout(None).await?;
+                let method_id = params
+                    .as_ref()
+                    .and_then(|p| p.get("methodId"))
+                    .and_then(Value::as_str)
+                    .map(AuthMethodId::from);
+                self.core.auth_logout(method_id).await?;
                 encode(&serde_json::json!({}))
             }
             // ---- extensions ------------------------------------------------------------------

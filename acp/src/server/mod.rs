@@ -68,7 +68,10 @@ pub use context::{
 };
 pub use dispatch::{ExtHandler, InitializeParams, ServerCore, UnknownHandler, WireAdapter};
 pub use error::{PromptError, PromptRejected, ServerError};
-pub use host::{AnySessionHost, AuthConfig, AuthRequest, ReplaySink, ResumeRequest, SessionHost};
+pub use host::{
+    AnySessionHost, AuthConfig, AuthLoginRequest, AuthRequest, ReplaySink, ResumeRequest,
+    SessionHost,
+};
 pub use prompt::{PendingPrompt, PromptTicket};
 pub use session::{AnySession, Session};
 pub use turn::{MessageStream, ToolCallBuilder, ToolCallHandle, Turn};

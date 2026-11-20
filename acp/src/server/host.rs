@@ -366,10 +366,25 @@ impl AnySessionHost {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthRequest {
     /// `auth/login` / `authenticate`: run this method.
-    Login(crate::domain::AuthMethodId),
+    Login(AuthLoginRequest),
     /// `auth/logout` / `logout`: end this method's session, or the
     /// current login when `None`.
     Logout(Option<crate::domain::AuthMethodId>),
+}
+
+/// One `auth/login` (`authenticate` on v1) request, verbatim.
+///
+/// `meta` carries the client's `_meta` — inline credentials and other
+/// method-specific payloads ride there — and `extra` preserves any
+/// vendor fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthLoginRequest {
+    /// Method to run.
+    pub method_id: crate::domain::AuthMethodId,
+    /// `_meta` from the request (inline payloads, hints).
+    pub meta: Option<serde_json::Value>,
+    /// Vendor fields preserved verbatim.
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// The handler inside [`AuthConfig`]: an [`AuthRequest`] in, a boxed

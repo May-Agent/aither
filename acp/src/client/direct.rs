@@ -496,7 +496,13 @@ impl DirectCore for DirectServer {
     }
 
     async fn authenticate(&self, method: AuthMethodId) -> Result<(), RpcError> {
-        self.core.auth_login(method).await
+        self.core
+            .auth_login(crate::server::AuthLoginRequest {
+                method_id: method,
+                meta: None,
+                extra: std::collections::BTreeMap::new(),
+            })
+            .await
     }
 
     async fn logout(&self, method: Option<AuthMethodId>) -> Result<(), RpcError> {
