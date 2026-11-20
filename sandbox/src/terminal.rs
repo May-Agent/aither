@@ -372,6 +372,63 @@ pub struct ShellArgs {
     pub background: bool,
 }
 
+/// The arguments of [`Shell::run_service`]: [`ShellArgs`] without the bounds
+/// a session-scoped service does not take — it is always detached and never
+/// times out.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ServiceArgs {
+    /// A short, human-readable explanation of what this command does.
+    pub description: String,
+    /// The source to run.
+    pub script: String,
+    /// The interpreter the source runs under.
+    #[serde(default)]
+    pub interpreter: Interpreter,
+    /// How the command runs.
+    #[serde(default)]
+    pub sandbox: SandboxMode,
+    /// Where the command runs.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// The resolution media in the output is delivered at.
+    #[serde(default)]
+    pub resolution: MediaResolution,
+    /// The most output lines to include inline.
+    #[serde(default)]
+    pub max_lines: Option<u32>,
+    /// Whether the output is returned verbatim.
+    #[serde(default)]
+    pub raw: bool,
+}
+
+impl From<ServiceArgs> for ShellArgs {
+    fn from(arguments: ServiceArgs) -> Self {
+        let ServiceArgs {
+            description,
+            script,
+            interpreter,
+            sandbox,
+            location,
+            resolution,
+            max_lines,
+            raw,
+        } = arguments;
+        Self {
+            description,
+            script,
+            interpreter,
+            sandbox,
+            location,
+            resolution,
+            max_lines,
+            raw,
+            // Unused by a service spawn: it runs detached and unbounded.
+            timeout: 0,
+            background: true,
+        }
+    }
+}
+
 /// Time bounds applied to every execution this terminal spawns.
 #[derive(Debug, Clone)]
 struct TerminalLimits {
@@ -1748,8 +1805,10 @@ where
         let (taken_tx, taken_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         let background_startup = BackgroundStartup::new(startup_tx);
-        self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
-        self.spawn_long_job_alert(&task_id);
+        if let Some(timeout) = timeout {
+            self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
+            self.spawn_long_job_alert(&task_id);
+        }
 
         let info = crate::LaunchInfo::new(task_id.to_string(), call.clone(), mode);
         let lifetime = if background {
@@ -1961,7 +2020,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             max_lines: prepared.max_lines,
             stdout: StdoutTreatment::of_call(arguments.raw, prepared.treatment),
             background: arguments.background,
-            timeout,
+            timeout: Some(timeout),
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
@@ -2376,6 +2435,62 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             Execution::Finished(_) => unreachable!("a background call detaches its job"),
         }
     }
+
+    /// Runs `arguments`' script as a detached background job with no time
+    /// bound: the job runs until it ends, the shell does, or
+    /// [`crate::Jobs::kill`] reaches it, for embedders that offer
+    /// session-scoped services such as preview servers. No kill watchdog or
+    /// long-running alert is armed, and the job is announced as a
+    /// background task like one of [`Self::run_background`].
+    ///
+    /// # Errors
+    ///
+    /// Fails the way a `terminal` call does apart from a `timeout`, which
+    /// `ServiceArgs` does not take: a refused permission, a blocked command
+    /// or a spawn failure.
+    pub async fn run_service(&self, arguments: ServiceArgs) -> aither_core::Result<crate::Job> {
+        let arguments = ShellArgs::from(arguments);
+        if !self.interpreters.contains(&arguments.interpreter) {
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::InterpreterNotConfigured {
+                    interpreter: arguments.interpreter,
+                },
+            ));
+        }
+        let prepared = self
+            .prepare_execution(&arguments, &mut ToolContext::new())
+            .await?;
+        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
+            target: prepared.target,
+            task_id: prepared.task_id.clone(),
+            execution_id: prepared.execution_id,
+            script: arguments.script,
+            interpreter: arguments.interpreter,
+            expect: OutputFormat::Auto,
+            resolution: arguments.resolution,
+            max_lines: prepared.max_lines,
+            stdout: StdoutTreatment::of_call(arguments.raw, prepared.treatment),
+            background: true,
+            timeout: None,
+            carry: None,
+            call: None,
+        });
+        wait_for_background_startup(&spawned.startup, &**self.wording()).await?;
+        let detached = detach_job(
+            &self.job_registry,
+            &prepared.outputs,
+            &prepared.task_id,
+            prepared.max_lines,
+            &self.events_tx,
+        )
+        .await?;
+        Ok(crate::Job::new(
+            self.jobs(),
+            detached.task_id,
+            detached.watch,
+        ))
+    }
 }
 
 impl<E> Shell<E>
@@ -2686,7 +2801,7 @@ where
             max_lines: prepared.max_lines,
             stdout: StdoutTreatment::Cleaned(prepared.treatment),
             background: false,
-            timeout: run.timeout,
+            timeout: Some(run.timeout),
             carry: Some(start),
             call: None,
         });
@@ -3176,7 +3291,8 @@ struct TerminalSpawnRequest {
     max_lines: usize,
     stdout: StdoutTreatment,
     background: bool,
-    timeout: Duration,
+    /// The bound the job runs under; `None` for a job that never times out.
+    timeout: Option<Duration>,
     carry: Option<CwdCarry>,
     /// The `terminal` call this execution belongs to.
     call: Option<CallIdentity>,
@@ -3216,8 +3332,8 @@ struct SpawnedTerminalTask<E> {
     info: crate::LaunchInfo,
     execution_id: String,
     background: bool,
-    /// The bound the job runs under.
-    timeout: Duration,
+    /// The bound the job runs under; `None` for a job that never times out.
+    timeout: Option<Duration>,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
@@ -3280,7 +3396,9 @@ where
         outages,
     } = task;
     // Before the job registers, so the registry reports the bound it runs under.
-    job_registry.bound_by_timeout(&task_id, timeout).await;
+    if let Some(timeout) = timeout {
+        job_registry.bound_by_timeout(&task_id, timeout).await;
+    }
     // Before the process starts, so a command it calls over IPC can already
     // append to this job's output.
     job_registry.launching(&task_id).await;
