@@ -10,12 +10,14 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "redb-persistence")]
+//! # {
 //! use aither_rag::{Rag, Document};
 //! use aither_core::EmbeddingModel;
 //!
 //! async fn example<E: EmbeddingModel + Send + Sync + 'static>(embedder: E) {
 //!     // Create RAG instance with defaults
-//!     let mut rag = Rag::new(embedder);
+//!     let rag = Rag::new(embedder);
 //!
 //!     // Index a directory
 //!     let _count = rag.index_directory("./docs").await.unwrap();
@@ -26,11 +28,14 @@
 //!         println!("{}: {:.2}", result.chunk.id, result.score);
 //!     }
 //! }
+//! # }
 //! ```
 //!
 //! # Custom Configuration
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "redb-persistence")]
+//! # {
 //! use aither_rag::{Rag, Document};
 //! use aither_rag::chunking::SentenceChunker;
 //! use aither_core::EmbeddingModel;
@@ -45,6 +50,7 @@
 //!         .build()
 //!         .unwrap();
 //! }
+//! # }
 //! ```
 //!
 //! # Architecture
@@ -75,7 +81,9 @@ mod tool;
 pub mod types;
 
 // Re-exports for convenience
-pub use chunking::{Chunker, CodeChunker, FixedSizeChunker, ParagraphChunker, SentenceChunker};
+#[cfg(feature = "code-chunking")]
+pub use chunking::CodeChunker;
+pub use chunking::{Chunker, FixedSizeChunker, ParagraphChunker, SentenceChunker};
 pub use cleaning::{BasicCleaner, Cleaner};
 pub use config::{RagConfig, RagConfigBuilder};
 pub use error::{RagError, Result};
@@ -83,8 +91,14 @@ pub use index::{HnswIndex, VectorIndex};
 pub use indexing::{IndexProgress, IndexStage};
 #[cfg(feature = "lancedb-persistence")]
 pub use persistence::LanceDbPersistence;
-pub use persistence::{Persistence, RedbPersistence, RkyvPersistence};
+pub use persistence::Persistence;
+#[cfg(feature = "redb-persistence")]
+pub use persistence::RedbPersistence;
+#[cfg(feature = "rkyv-persistence")]
+pub use persistence::RkyvPersistence;
+#[cfg(not(feature = "redb-persistence"))]
+pub use rag::NoPersistence;
 pub use rag::{Rag, RagBuilder};
-pub use store::RagStore;
+pub use store::{RagStore, embed_batch};
 pub use tool::{RagToolArgs, RagToolResponse};
 pub use types::{Chunk, Document, IndexEntry, Metadata, SearchResult};

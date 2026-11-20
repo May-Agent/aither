@@ -13,6 +13,11 @@ categories = ["api-bindings", "database"]
 [dependencies]
 aither-core.workspace = true
 askama = "0.16"
+async-fs = "2"
+async-lock = "3"
+blocking = "1"
+futures-lite = "2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 schemars = { version = "1.2", features = ["derive"] }
@@ -24,8 +29,8 @@ unicode-segmentation = "1.13"
 # Pinned to 0.22: `rs-tree-sitter-languages` (used by aither-sandbox) links the
 # native `tree-sitter` library at this version, and Cargo permits only one
 # package in the graph to set `links = "tree-sitter"`.
-tree-sitter = "0.22.6"
-tree-sitter-rust = "0.21.2"
+tree-sitter = { version = "0.22.6", optional = true }
+tree-sitter-rust = { version = "0.21.2", optional = true }
 
 # HNSW Index
 instant-distance = "0.6.1"
@@ -33,8 +38,8 @@ arc-swap = "1.9"
 ordered-float = "5.4"
 
 # Persistence
-rkyv = { version = "0.8", features = ["bytecheck"] }
-redb = "2.6"
+rkyv = { version = "0.8", features = ["bytecheck"], optional = true }
+redb = { version = "2.6", optional = true }
 # `remote` is required even for local-only use: lancedb 0.40's `job.rs`
 # references `Error::Http` unconditionally, so the crate does not compile
 # without it.
@@ -43,15 +48,16 @@ lancedb = { version = "0.40", default-features = false, features = ["remote"], o
 # types are nominally distinct and its traits do not apply.
 arrow-array = { version = "58.4", optional = true }
 arrow-schema = { version = "58.4", optional = true }
-futures = { version = "0.3", optional = true }
-tokio = { version = "1.53", features = ["rt-multi-thread"], optional = true }
 
 # Deduplication
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [features]
-default = []
-lancedb-persistence = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures", "dep:tokio"]
+default = ["code-chunking", "redb-persistence", "rkyv-persistence"]
+code-chunking = ["dep:tree-sitter", "dep:tree-sitter-rust"]
+redb-persistence = ["dep:redb"]
+rkyv-persistence = ["dep:rkyv"]
+lancedb-persistence = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros"] }

@@ -244,7 +244,7 @@ mod session;
 pub mod vendor;
 
 #[cfg(feature = "agent")]
-pub use adapter::SessionUpdateMapper;
+pub use adapter::{SessionUpdateMapper, ToolMetadata};
 #[cfg(feature = "agent")]
 pub use child::{AcpChildAgent, UpdateSink, UpdateSource};
 pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};

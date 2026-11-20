@@ -1,9 +1,10 @@
 //! HNSW-based vector index using instant-distance.
 
 use arc_swap::{ArcSwap, Guard};
+use async_lock::Mutex;
 use instant_distance::{Builder, HnswMap, Point, Search};
 use ordered_float::OrderedFloat;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{RagError, Result};
@@ -45,8 +46,8 @@ struct IndexState {
     entries: Vec<IndexEntry>,
     /// Map from chunk ID to index in entries.
     id_to_index: HashMap<String, usize>,
-    /// Set of content hashes for deduplication.
-    content_hashes: HashMap<u64, String>,
+    /// Reference-counted content hashes for deduplication.
+    content_hashes: HashMap<u64, usize>,
     /// The HNSW index (rebuilt after modifications).
     hnsw: Option<HnswMap<EmbeddingPoint, usize>>,
     /// Whether the index needs rebuilding.
@@ -61,6 +62,33 @@ impl IndexState {
             content_hashes: HashMap::new(),
             hnsw: None,
             dirty: false,
+        }
+    }
+
+    fn increment_hash(&mut self, hash: u64) {
+        *self.content_hashes.entry(hash).or_insert(0) += 1;
+    }
+
+    fn decrement_hash(&mut self, hash: u64) {
+        if let Some(count) = self.content_hashes.get_mut(&hash) {
+            *count -= 1;
+            if *count == 0 {
+                self.content_hashes.remove(&hash);
+            }
+        }
+    }
+
+    fn upsert_entry(&mut self, chunk: Chunk, embedding: Vec<f32>) {
+        if let Some(&idx) = self.id_to_index.get(&chunk.id) {
+            let old_hash = self.entries[idx].chunk.content_hash;
+            self.decrement_hash(old_hash);
+            self.increment_hash(chunk.content_hash);
+            self.entries[idx] = IndexEntry::new(chunk, embedding);
+        } else {
+            let idx = self.entries.len();
+            self.id_to_index.insert(chunk.id.clone(), idx);
+            self.increment_hash(chunk.content_hash);
+            self.entries.push(IndexEntry::new(chunk, embedding));
         }
     }
 
@@ -92,12 +120,10 @@ impl IndexState {
         let mut state = Self::new();
         for (idx, entry) in entries.into_iter().enumerate() {
             state.id_to_index.insert(entry.chunk.id.clone(), idx);
-            state
-                .content_hashes
-                .insert(entry.chunk.content_hash, entry.chunk.id.clone());
+            state.increment_hash(entry.chunk.content_hash);
             state.entries.push(entry);
         }
-        state.dirty = true;
+        state.dirty = !state.entries.is_empty();
         state
     }
 
@@ -110,6 +136,39 @@ impl IndexState {
             dirty: true,
         }
     }
+}
+
+fn search_on_state(
+    state: &IndexState,
+    query: &[f32],
+    top_k: usize,
+    threshold: f32,
+) -> Vec<SearchResult> {
+    let Some(ref hnsw) = state.hnsw else {
+        return Vec::new();
+    };
+    let query_point = EmbeddingPoint {
+        embedding: query.to_vec(),
+    };
+
+    let mut search = Search::default();
+    let mut results = Vec::new();
+
+    for candidate in hnsw.search(&query_point, &mut search).take(top_k) {
+        let idx = *candidate.value;
+        let entry = &state.entries[idx];
+
+        let similarity = 1.0 - candidate.distance;
+        if similarity >= threshold {
+            results.push(SearchResult {
+                chunk: entry.chunk.clone(),
+                score: similarity,
+            });
+        }
+    }
+
+    results.sort_by_key(|r| std::cmp::Reverse(OrderedFloat(r.score)));
+    results
 }
 
 /// HNSW-based vector index for approximate nearest neighbor search.
@@ -130,6 +189,8 @@ impl IndexState {
 pub struct HnswIndex {
     dimension: usize,
     state: ArcSwap<IndexState>,
+    /// Coordinates single-flight HNSW graph rebuilds across concurrent searchers.
+    rebuild_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for HnswIndex {
@@ -138,7 +199,7 @@ impl std::fmt::Debug for HnswIndex {
         f.debug_struct("HnswIndex")
             .field("dimension", &self.dimension)
             .field("len", &state.entries.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -149,34 +210,180 @@ impl HnswIndex {
         Self {
             dimension,
             state: ArcSwap::from_pointee(IndexState::new()),
+            rebuild_lock: Mutex::new(()),
         }
+    }
+
+    const fn validate_dimension(&self, actual: usize) -> Result<()> {
+        if actual != self.dimension {
+            return Err(RagError::DimensionMismatch {
+                expected: self.dimension,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks whether `hash` is held by at least one chunk outside `excluded_sources`.
+    pub(crate) fn contains_hash_outside_sources(
+        &self,
+        hash: u64,
+        excluded_sources: &HashSet<String>,
+    ) -> bool {
+        let state = self.state.load();
+        if !state.content_hashes.contains_key(&hash) {
+            return false;
+        }
+        if excluded_sources.is_empty() {
+            return true;
+        }
+        state.entries.iter().any(|entry| {
+            entry.chunk.content_hash == hash
+                && !excluded_sources.contains(&entry.chunk.source_id)
+                && !excluded_sources.contains(&entry.chunk.id)
+        })
+    }
+
+    /// Atomically removes all prior chunks belonging to `sources` and inserts
+    /// `entries` in a single copy-on-write transition.
+    pub(crate) fn replace_sources_and_insert(
+        &self,
+        sources: &HashSet<String>,
+        entries: &[(Chunk, Vec<f32>)],
+    ) -> Result<()> {
+        for (_, embedding) in entries {
+            self.validate_dimension(embedding.len())?;
+        }
+
+        if sources.is_empty() && entries.is_empty() {
+            return Ok(());
+        }
+
+        self.state.rcu(|state| {
+            let mut kept: Vec<IndexEntry> = if sources.is_empty() {
+                state.entries.clone()
+            } else {
+                state
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        !sources.contains(&entry.chunk.source_id)
+                            && !sources.contains(&entry.chunk.id)
+                    })
+                    .cloned()
+                    .collect()
+            };
+
+            let removed_any = kept.len() != state.entries.len();
+            if !removed_any && entries.is_empty() {
+                return Arc::clone(state);
+            }
+
+            let mut next = if removed_any {
+                IndexState::from_entries(std::mem::take(&mut kept))
+            } else {
+                state.clone_without_index()
+            };
+
+            for (chunk, embedding) in entries {
+                next.upsert_entry(chunk.clone(), embedding.clone());
+            }
+            next.dirty = !next.entries.is_empty();
+            Arc::new(next)
+        });
+
+        Ok(())
+    }
+
+    fn ensure_ready_sync(&self) -> Arc<IndexState> {
+        let fast = self.state.load_full();
+        if fast.entries.is_empty() || (!fast.dirty && fast.hnsw.is_some()) {
+            return fast;
+        }
+
+        let rebuild_guard = self.rebuild_lock.lock_blocking();
+        let ready = loop {
+            let current = self.state.load_full();
+            if current.entries.is_empty() || (!current.dirty && current.hnsw.is_some()) {
+                break current;
+            }
+
+            let rebuilt = Arc::new(current.rebuilt());
+            let previous =
+                Guard::into_inner(self.state.compare_and_swap(&current, Arc::clone(&rebuilt)));
+            if Arc::ptr_eq(&current, &previous) {
+                break rebuilt;
+            }
+        };
+        drop(rebuild_guard);
+        ready
+    }
+
+    async fn ensure_ready_async(&self) -> Arc<IndexState> {
+        let fast = self.state.load_full();
+        if fast.entries.is_empty() || (!fast.dirty && fast.hnsw.is_some()) {
+            return fast;
+        }
+
+        let rebuild_guard = self.rebuild_lock.lock().await;
+        let ready = loop {
+            let current = self.state.load_full();
+            if current.entries.is_empty() || (!current.dirty && current.hnsw.is_some()) {
+                break current;
+            }
+
+            let snapshot = Arc::clone(&current);
+            let rebuilt = blocking::unblock(move || Arc::new(snapshot.rebuilt())).await;
+            let previous =
+                Guard::into_inner(self.state.compare_and_swap(&current, Arc::clone(&rebuilt)));
+            if Arc::ptr_eq(&current, &previous) {
+                break rebuilt;
+            }
+        };
+        drop(rebuild_guard);
+        ready
+    }
+
+    /// Searches asynchronously, offloading HNSW graph construction (single-flight)
+    /// and nearest-neighbor traversal onto the blocking pool.
+    pub(crate) async fn search_async(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        threshold: f32,
+    ) -> Result<Vec<SearchResult>> {
+        self.validate_dimension(query.len())?;
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let state = self.ensure_ready_async().await;
+        if state.entries.is_empty() || state.hnsw.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let query_vec = query.to_vec();
+        Ok(blocking::unblock(move || search_on_state(&state, &query_vec, top_k, threshold)).await)
     }
 }
 
 impl VectorIndex for HnswIndex {
     fn insert(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()> {
-        if embedding.len() != self.dimension {
-            return Err(RagError::DimensionMismatch {
-                expected: self.dimension,
-                actual: embedding.len(),
-            });
+        self.insert_batch(vec![(chunk, embedding)])
+    }
+
+    fn insert_batch(&self, entries: Vec<(Chunk, Vec<f32>)>) -> Result<()> {
+        for (_, embedding) in &entries {
+            self.validate_dimension(embedding.len())?;
+        }
+        if entries.is_empty() {
+            return Ok(());
         }
 
         self.state.rcu(|state| {
             let mut next = state.clone_without_index();
-            if let Some(&idx) = next.id_to_index.get(&chunk.id) {
-                let old_hash = next.entries[idx].chunk.content_hash;
-                next.content_hashes.remove(&old_hash);
-                next.content_hashes
-                    .insert(chunk.content_hash, chunk.id.clone());
-                next.entries[idx] = IndexEntry::new(chunk.clone(), embedding.clone());
-            } else {
-                let idx = next.entries.len();
-                next.id_to_index.insert(chunk.id.clone(), idx);
-                next.content_hashes
-                    .insert(chunk.content_hash, chunk.id.clone());
-                next.entries
-                    .push(IndexEntry::new(chunk.clone(), embedding.clone()));
+            for (chunk, embedding) in &entries {
+                next.upsert_entry(chunk.clone(), embedding.clone());
             }
             next
         });
@@ -195,7 +402,7 @@ impl VectorIndex for HnswIndex {
             found = true;
             let mut next = state.clone_without_index();
             let hash = next.entries[idx].chunk.content_hash;
-            next.content_hashes.remove(&hash);
+            next.decrement_hash(hash);
 
             let removed = next.entries.swap_remove(idx);
             next.id_to_index.remove(&removed.chunk.id);
@@ -204,6 +411,7 @@ impl VectorIndex for HnswIndex {
                 let swapped_id = next.entries[idx].chunk.id.clone();
                 next.id_to_index.insert(swapped_id, idx);
             }
+            next.dirty = !next.entries.is_empty();
 
             Arc::new(next)
         });
@@ -229,63 +437,13 @@ impl VectorIndex for HnswIndex {
     }
 
     fn search(&self, query: &[f32], top_k: usize, threshold: f32) -> Result<Vec<SearchResult>> {
-        if query.len() != self.dimension {
-            return Err(RagError::DimensionMismatch {
-                expected: self.dimension,
-                actual: query.len(),
-            });
-        }
-
+        self.validate_dimension(query.len())?;
         if top_k == 0 {
             return Ok(Vec::new());
         }
 
-        let state = loop {
-            let current = self.state.load_full();
-            if current.entries.is_empty() {
-                return Ok(Vec::new());
-            }
-            if !current.dirty && current.hnsw.is_some() {
-                break current;
-            }
-
-            let rebuilt = Arc::new(current.rebuilt());
-            let previous =
-                Guard::into_inner(self.state.compare_and_swap(&current, Arc::clone(&rebuilt)));
-            if Arc::ptr_eq(&current, &previous) {
-                break rebuilt;
-            }
-        };
-
-        let Some(ref hnsw) = state.hnsw else {
-            return Ok(Vec::new());
-        };
-        let query_point = EmbeddingPoint {
-            embedding: query.to_vec(),
-        };
-
-        let mut search = Search::default();
-        let mut results = Vec::new();
-
-        for candidate in hnsw.search(&query_point, &mut search).take(top_k) {
-            let idx = *candidate.value;
-            let entry = &state.entries[idx];
-
-            // Convert distance back to similarity
-            let similarity = 1.0 - candidate.distance;
-
-            if similarity >= threshold {
-                results.push(SearchResult {
-                    chunk: entry.chunk.clone(),
-                    score: similarity,
-                });
-            }
-        }
-
-        // Sort by score descending
-        results.sort_by_key(|r| std::cmp::Reverse(OrderedFloat(r.score)));
-
-        Ok(results)
+        let state = self.ensure_ready_sync();
+        Ok(search_on_state(&state, query, top_k, threshold))
     }
 
     fn dimension(&self) -> usize {
@@ -305,14 +463,8 @@ impl VectorIndex for HnswIndex {
     }
 
     fn load(&self, entries: Vec<IndexEntry>) -> Result<()> {
-        if let Some(entry) = entries
-            .iter()
-            .find(|entry| entry.embedding.len() != self.dimension)
-        {
-            return Err(RagError::DimensionMismatch {
-                expected: self.dimension,
-                actual: entry.embedding.len(),
-            });
+        for entry in &entries {
+            self.validate_dimension(entry.embedding.len())?;
         }
 
         self.state
@@ -405,13 +557,86 @@ mod tests {
     }
 
     #[test]
+    fn content_hashes_are_reference_counted_across_duplicates_and_updates() {
+        let index = HnswIndex::new(2);
+        let shared_text = "shared chunk";
+        let shared_hash = crate::dedup::content_hash(shared_text);
+        let other_text = "other chunk";
+        let other_hash = crate::dedup::content_hash(other_text);
+
+        index
+            .insert_batch(vec![
+                (
+                    Chunk::new("doc1#0", shared_text, "doc1", 0, shared_hash),
+                    vec![1.0, 0.0],
+                ),
+                (
+                    Chunk::new("doc2#0", shared_text, "doc2", 0, shared_hash),
+                    vec![0.8, 0.2],
+                ),
+            ])
+            .unwrap();
+
+        assert!(index.contains_hash(shared_hash));
+
+        // Removing the first duplicate must keep the shared hash alive for doc2#0.
+        assert!(index.remove("doc1#0"));
+        assert!(
+            index.contains_hash(shared_hash),
+            "hash must remain while doc2#0 still holds it"
+        );
+
+        // Updating doc2#0 to new content drops shared_hash's refcount to zero.
+        index
+            .insert(
+                Chunk::new("doc2#0", other_text, "doc2", 0, other_hash),
+                vec![0.0, 1.0],
+            )
+            .unwrap();
+        assert!(!index.contains_hash(shared_hash));
+        assert!(index.contains_hash(other_hash));
+
+        assert!(index.remove("doc2#0"));
+        assert!(!index.contains_hash(other_hash));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_insert_and_concurrent_async_search_rebuild_cleanly() {
+        let index = Arc::new(HnswIndex::new(4));
+        let batch: Vec<(Chunk, Vec<f32>)> = (0..64usize)
+            .map(|i| {
+                let id = format!("chunk_{i}");
+                let chunk = make_chunk(&id, &id);
+                #[allow(clippy::cast_precision_loss)]
+                let emb = vec![1.0, (i as f32) * 0.01, 0.25, 0.5];
+                (chunk, emb)
+            })
+            .collect();
+        index.insert_batch(batch).unwrap();
+        assert_eq!(index.len(), 64);
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let idx = Arc::clone(&index);
+            tasks.push(tokio::spawn(async move {
+                idx.search_async(&[1.0, 0.0, 0.25, 0.5], 5, 0.0)
+                    .await
+                    .unwrap()
+            }));
+        }
+        for task in tasks {
+            let results = task.await.unwrap();
+            assert_eq!(results.len(), 5);
+        }
+    }
+
+    #[test]
     fn update_existing() {
         let index = HnswIndex::new(4);
 
         let chunk1 = make_chunk("c1", "hello");
         index.insert(chunk1, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
 
-        // Update with same ID
         let chunk2 = make_chunk("c1", "world");
         index.insert(chunk2, vec![0.0, 1.0, 0.0, 0.0]).unwrap();
 
@@ -426,7 +651,7 @@ mod tests {
         let index = HnswIndex::new(4);
         let chunk = make_chunk("c1", "hello");
 
-        let result = index.insert(chunk, vec![1.0, 0.0]); // Wrong dimension
+        let result = index.insert(chunk, vec![1.0, 0.0]);
         assert!(matches!(result, Err(RagError::DimensionMismatch { .. })));
     }
 
@@ -440,7 +665,6 @@ mod tests {
         index.insert(chunk1, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
         index.insert(chunk2, vec![0.0, 1.0, 0.0, 0.0]).unwrap();
 
-        // High threshold should filter out low-similarity results
         let results = index.search(&[1.0, 0.0, 0.0, 0.0], 10, 0.9).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, "c1");

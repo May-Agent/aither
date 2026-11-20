@@ -3,6 +3,7 @@
 use redb::{Database, ReadableTable, TableDefinition};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::{RagError, Result};
 use crate::types::IndexEntry;
@@ -14,7 +15,7 @@ const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entrie
 /// Embedded database persistence using redb.
 ///
 /// This backend provides durable storage using redb, a pure-Rust embedded
-/// key-value database. It supports incremental updates and crash recovery.
+/// key-value database. It supports atomic full-snapshot replacement and crash recovery.
 ///
 /// # Example
 ///
@@ -22,12 +23,12 @@ const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entrie
 /// use aither_rag::persistence::{Persistence, RedbPersistence};
 ///
 /// let persistence = RedbPersistence::new("./index.redb").unwrap();
-/// // persistence.save(&entries)?;
-/// // let loaded = persistence.load()?;
+/// // persistence.save(&entries).await?;
+/// // let loaded = persistence.load().await?;
 /// ```
 pub struct RedbPersistence {
     path: PathBuf,
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl std::fmt::Debug for RedbPersistence {
@@ -56,24 +57,26 @@ impl RedbPersistence {
 
         let db = Database::create(&path).map_err(|e| RagError::Database(e.to_string()))?;
 
-        Ok(Self { path, db })
+        Ok(Self {
+            path,
+            db: Arc::new(db),
+        })
     }
 
-    fn save_entries(&self, entries: &[IndexEntry]) -> Result<()> {
-        let write_txn = self
-            .db
+    fn save_entries_sync(db: &Database, entries: &[IndexEntry]) -> Result<()> {
+        let write_txn = db
             .begin_write()
             .map_err(|e| RagError::Database(e.to_string()))?;
 
-        {
+        match write_txn.delete_table(ENTRIES_TABLE) {
+            Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(RagError::Database(e.to_string())),
+        }
+
+        if !entries.is_empty() {
             let mut table = write_txn
                 .open_table(ENTRIES_TABLE)
                 .map_err(|e| RagError::Database(e.to_string()))?;
-
-            // Clear existing entries
-            // Note: redb doesn't have a clear method, so we need to delete each key
-            // For simplicity, we'll just overwrite - old entries will be garbage collected
-            // In a production system, you might want to track and remove stale entries
 
             for entry in entries {
                 let serialized = serde_json::to_vec(entry)
@@ -92,9 +95,8 @@ impl RedbPersistence {
         Ok(())
     }
 
-    fn load_entries(&self) -> Result<Vec<IndexEntry>> {
-        let read_txn = self
-            .db
+    fn load_entries_sync(db: &Database) -> Result<Vec<IndexEntry>> {
+        let read_txn = db
             .begin_read()
             .map_err(|e| RagError::Database(e.to_string()))?;
 
@@ -125,11 +127,14 @@ impl Persistence for RedbPersistence {
         &'a self,
         entries: &'a [IndexEntry],
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        std::future::ready(self.save_entries(entries))
+        let db = Arc::clone(&self.db);
+        let owned = entries.to_vec();
+        blocking::unblock(move || Self::save_entries_sync(&db, &owned))
     }
 
     fn load(&self) -> impl std::future::Future<Output = Result<Vec<IndexEntry>>> + Send + '_ {
-        std::future::ready(self.load_entries())
+        let db = Arc::clone(&self.db);
+        blocking::unblock(move || Self::load_entries_sync(&db))
     }
 
     fn extension(&self) -> &'static str {
@@ -165,7 +170,6 @@ mod tests {
         let loaded = persistence.load().await.unwrap();
         assert_eq!(loaded.len(), 2);
 
-        // Entries might not be in the same order
         let ids: Vec<_> = loaded.iter().map(|e| e.chunk.id.as_str()).collect();
         assert!(ids.contains(&"c1"));
         assert!(ids.contains(&"c2"));
@@ -198,16 +202,44 @@ mod tests {
         let path = dir.path().join("test.redb");
         let persistence = RedbPersistence::new(&path).unwrap();
 
-        // Save initial entries
         let entries1 = vec![make_entry("c1", "hello")];
         persistence.save(&entries1).await.unwrap();
 
-        // Save updated entries with same ID
         let entries2 = vec![make_entry("c1", "world")];
         persistence.save(&entries2).await.unwrap();
 
         let loaded = persistence.load().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].chunk.text, "world");
+    }
+
+    #[tokio::test]
+    async fn save_removes_deleted_keys_and_clears_when_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("delete_stale.redb");
+        let persistence = RedbPersistence::new(&path).unwrap();
+
+        persistence
+            .save(&[
+                make_entry("c1", "first"),
+                make_entry("c2", "second"),
+                make_entry("c3", "third"),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(persistence.load().await.unwrap().len(), 3);
+
+        // Save with c1 and c3 removed: only c2 must remain.
+        persistence
+            .save(&[make_entry("c2", "second")])
+            .await
+            .unwrap();
+        let remaining = persistence.load().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].chunk.id, "c2");
+
+        // Save empty slice: database must load empty.
+        persistence.save(&[]).await.unwrap();
+        assert!(persistence.load().await.unwrap().is_empty());
     }
 }

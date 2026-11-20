@@ -137,6 +137,10 @@ pub enum McpError {
     #[error("Request timeout")]
     Timeout,
 
+    /// The request was cancelled before a response arrived.
+    #[error("Request cancelled")]
+    Cancelled,
+
     /// Invalid configuration.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),

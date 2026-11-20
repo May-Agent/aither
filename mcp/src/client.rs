@@ -19,9 +19,11 @@ mod toolset;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use aither_core::llm::tool::CancelSignal;
 use arc_swap::ArcSwapOption;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
+use futures_lite::future;
 use serde::de::DeserializeOwned;
 use tracing::debug;
 
@@ -35,28 +37,34 @@ use connection::Command;
 
 use crate::protocol::{
     CallToolParams, CallToolResult, InitializeParams, InitializeResult, JsonRpcNotification,
-    JsonRpcRequest, ListToolsResult, McpError, McpToolDefinition, Resource, ResourceContents,
-    ServerCapabilities, ServerInfo,
+    JsonRpcRequest, ListToolsResult, McpError, McpToolDefinition, RequestId, Resource,
+    ResourceContents, ServerCapabilities, ServerInfo,
 };
 use crate::transport::BidirectionalTransport;
 
+/// Removes an in-flight request from the receive loop's `pending` map and
+/// issues `notifications/cancelled` if its awaiting future is dropped or
+/// cancelled before receiving a reply.
+struct RequestGuard<'a> {
+    commands: &'a Sender<Command>,
+    id: Option<RequestId>,
+    notify: bool,
+    reason: Option<String>,
+}
+
+impl Drop for RequestGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = self.commands.try_send(Command::Cancel {
+                id,
+                notify: self.notify,
+                reason: self.reason.take(),
+            });
+        }
+    }
+}
+
 /// MCP client for connecting to and interacting with MCP servers.
-///
-/// # Example
-///
-/// ```ignore
-/// use aither_mcp::{McpClient, ChildProcessTransport};
-/// use executor_core::tokio::TokioGlobal;
-///
-/// let transport = ChildProcessTransport::spawn("npx", &["-y", "@mcp/server"])?;
-/// let client = McpClient::connect(&TokioGlobal, transport, ()).await?;
-///
-/// // List available tools
-/// let tools = client.list_tools().await?;
-///
-/// // Call a tool
-/// let result = client.call_tool("my_tool", serde_json::json!({"arg": "value"})).await?;
-/// ```
 #[derive(Debug)]
 pub struct McpClient {
     /// Requests and notifications for the receive loop to write.
@@ -65,9 +73,7 @@ pub struct McpClient {
     finished: Receiver<()>,
     /// Next request ID; the receive loop draws from it for its own requests.
     next_id: Arc<AtomicI64>,
-    /// The server's tools as last listed. Only the receive loop replaces it
-    /// once the connection is up, always with a complete list, so a reader
-    /// sees the list before or after a refresh and never a mixture.
+    /// The server's tools as last listed.
     tools: Arc<ArcSwapOption<Vec<McpToolDefinition>>>,
     server_info: ServerInfo,
     capabilities: ServerCapabilities,
@@ -75,14 +81,6 @@ pub struct McpClient {
 
 impl McpClient {
     /// Connect to an MCP server and perform initialization.
-    ///
-    /// `executor` runs the connection's receive loop, which takes ownership of
-    /// `transport`. The loop ends with the connection: when the transport
-    /// reports EOF or fails, or when [`close`](Self::close) is called or the
-    /// client is dropped. Requests pending at that point fail with an error
-    /// that says why.
-    ///
-    /// `handler` receives the server's notifications.
     ///
     /// # Errors
     ///
@@ -101,8 +99,6 @@ impl McpClient {
             .spawn(connection::run(
                 transport,
                 command_rx,
-                // Weak, so the loop's own handle does not keep the
-                // connection open after the client is dropped.
                 commands.downgrade(),
                 Arc::new(handler),
                 connection::ToolCache {
@@ -128,7 +124,6 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Perform MCP initialization handshake.
     async fn initialize(&mut self) -> Result<(), McpError> {
         let result: InitializeResult = self
             .request("initialize", Some(InitializeParams::default()))
@@ -143,7 +138,6 @@ impl McpClient {
         self.server_info = result.server_info;
         self.capabilities = result.capabilities;
 
-        // Send initialized notification
         let (reply, sent) = async_channel::bounded(1);
         self.commands
             .send(Command::Notification {
@@ -155,26 +149,66 @@ impl McpClient {
         sent.recv().await.map_err(|_| McpError::ConnectionClosed)?
     }
 
-    /// Send a request through the receive loop and decode its result.
     async fn request<P, R>(&self, method: &str, params: Option<P>) -> Result<R, McpError>
     where
         P: serde::Serialize,
         R: DeserializeOwned,
     {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut request = JsonRpcRequest::new(id, method);
+        self.request_with_cancel(method, params, &CancelSignal::never())
+            .await
+    }
+
+    async fn request_with_cancel<P, R>(
+        &self,
+        method: &str,
+        params: Option<P>,
+        cancel: &CancelSignal,
+    ) -> Result<R, McpError>
+    where
+        P: serde::Serialize,
+        R: DeserializeOwned,
+    {
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
+
+        let raw_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = RequestId::Number(raw_id);
+        let mut request = JsonRpcRequest::new(id.clone(), method);
         request.params = params.map(serde_json::to_value).transpose()?;
 
         let (reply, response) = async_channel::bounded(1);
         self.commands
-            .send(Command::Request { request, reply })
-            .await
+            .try_send(Command::Request { request, reply })
             .map_err(|_| McpError::ConnectionClosed)?;
-        let response = response
-            .recv()
-            .await
-            .map_err(|_| McpError::ConnectionClosed)??;
 
+        // Per the MCP specification, `initialize` must not be cancelled.
+        let mut guard = RequestGuard {
+            commands: &self.commands,
+            id: Some(id),
+            notify: method != "initialize",
+            reason: None,
+        };
+
+        let outcome = future::or(async { Ok(response.recv().await) }, async {
+            cancel.cancelled().await;
+            Err(McpError::Cancelled)
+        })
+        .await;
+
+        let received = match outcome {
+            Ok(received) => received,
+            Err(cancelled) => {
+                guard.reason = Some("Request cancelled".to_string());
+                return Err(cancelled);
+            }
+        };
+
+        // The receive loop either answered or failed this request and removed
+        // it from `pending`, so no cancel command is needed on drop.
+        guard.id = None;
+
+        let response = received.map_err(|_| McpError::ConnectionClosed)??;
         Ok(serde_json::from_value(
             response.into_result().map_err(McpError::JsonRpc)?,
         )?)
@@ -205,18 +239,11 @@ impl McpClient {
     }
 
     /// The server's tools as of the latest listing the client holds.
-    ///
-    /// Empty until a listing is stored. [`McpConnection`] stores the first
-    /// one when it connects; from then on the receive loop re-lists the tools
-    /// whenever the server sends `notifications/tools/list_changed` and
-    /// replaces the whole list at once.
     #[must_use]
     pub fn tools(&self) -> Arc<Vec<McpToolDefinition>> {
         self.tools.load_full().unwrap_or_default()
     }
 
-    /// Store `tools` as the cached list unless a refresh already stored a
-    /// newer one.
     fn seed_tools(&self, tools: Vec<McpToolDefinition>) {
         let tools = Arc::new(tools);
         self.tools
@@ -225,10 +252,8 @@ impl McpClient {
 
     /// Call a tool on the server.
     ///
-    /// # Arguments
-    ///
-    /// * `name` - The tool name.
-    /// * `arguments` - The tool arguments as a JSON value.
+    /// Dropping the returned future before the server answers removes the
+    /// pending entry and sends `notifications/cancelled`.
     ///
     /// # Errors
     ///
@@ -238,12 +263,31 @@ impl McpClient {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
+        self.call_tool_with_cancel(name, arguments, &CancelSignal::never())
+            .await
+    }
+
+    /// Call a tool on the server, aborting with `notifications/cancelled` if
+    /// `cancel` fires before the response arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Cancelled`] if `cancel` fires, or an error if the
+    /// request fails.
+    pub async fn call_tool_with_cancel(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        cancel: &CancelSignal,
+    ) -> Result<CallToolResult, McpError> {
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
             meta: None,
         };
-        let result: CallToolResult = self.request("tools/call", Some(params)).await?;
+        let result: CallToolResult = self
+            .request_with_cancel("tools/call", Some(params), cancel)
+            .await?;
 
         debug!(
             "Tool {} returned {} content items",
@@ -272,10 +316,6 @@ impl McpClient {
 
     /// Read a resource from the server.
     ///
-    /// # Arguments
-    ///
-    /// * `uri` - The resource URI.
-    ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
@@ -303,13 +343,8 @@ impl McpClient {
     }
 
     /// Close the client connection.
-    ///
-    /// Stops the receive loop, which closes the transport (terminating a
-    /// child process) and fails every request still pending, and waits for it
-    /// to finish. Closing an already closed connection does nothing.
     pub async fn close(&self) {
         self.commands.close();
-        // The loop drops its end when it is done; nothing is ever sent.
         let _ = self.finished.recv().await;
     }
 }

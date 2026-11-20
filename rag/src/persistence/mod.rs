@@ -5,12 +5,16 @@
 
 #[cfg(feature = "lancedb-persistence")]
 mod lancedb_backend;
+#[cfg(feature = "redb-persistence")]
 mod redb_backend;
+#[cfg(feature = "rkyv-persistence")]
 mod rkyv_backend;
 
 #[cfg(feature = "lancedb-persistence")]
 pub use lancedb_backend::LanceDbPersistence;
+#[cfg(feature = "redb-persistence")]
 pub use redb_backend::RedbPersistence;
+#[cfg(feature = "rkyv-persistence")]
 pub use rkyv_backend::RkyvPersistence;
 
 use crate::error::Result;

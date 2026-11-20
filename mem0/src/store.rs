@@ -127,8 +127,7 @@ impl MemoryStore for InMemoryStore {
     }
 
     fn get(&self, id: Uuid) -> impl Future<Output = Result<Option<Memory>>> + Send {
-        let memories = self.memories.clone();
-        ready(Ok(memories.iter().find(|m| m.id == id).cloned()))
+        ready(Ok(self.memories.iter().find(|m| m.id == id).cloned()))
     }
 
     fn update(&mut self, memory: Memory) -> impl Future<Output = Result<()>> + Send {
@@ -160,11 +159,15 @@ impl MemoryStore for InMemoryStore {
         limit: usize,
         filters: SearchFilters,
     ) -> impl Future<Output = Result<Vec<SearchResult>>> + Send {
-        let memories = self.memories.clone();
+        if limit == 0 {
+            return ready(Ok(Vec::new()));
+        }
 
-        let mut scored_memories: Vec<SearchResult> = memories
+        let mut scored_indices: Vec<(usize, f32)> = self
+            .memories
             .iter()
-            .filter(|m| {
+            .enumerate()
+            .filter(|(_, m)| {
                 if let Some(uid) = &filters.user_id
                     && m.user_id.as_ref() != Some(uid)
                 {
@@ -177,23 +180,23 @@ impl MemoryStore for InMemoryStore {
                 }
                 true
             })
-            .map(|m| {
-                let score = cosine_similarity(&m.embedding, query_embedding);
-                SearchResult {
-                    memory: m.clone(),
-                    score,
-                }
+            .map(|(idx, m)| (idx, cosine_similarity(&m.embedding, query_embedding)))
+            .collect();
+
+        // Sort by score descending before cloning only the winning entries.
+        scored_indices
+            .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
+
+        let results = scored_indices
+            .into_iter()
+            .take(limit)
+            .map(|(idx, score)| SearchResult {
+                memory: self.memories[idx].clone(),
+                score,
             })
             .collect();
 
-        // Sort by score descending
-        scored_memories.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(core::cmp::Ordering::Equal)
-        });
-
-        ready(Ok(scored_memories.into_iter().take(limit).collect()))
+        ready(Ok(results))
     }
 }
 

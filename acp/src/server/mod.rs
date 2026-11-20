@@ -20,7 +20,7 @@ pub use error::ServerError;
 pub use handler::AgentHandler;
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -448,6 +448,8 @@ impl<R: DeserializeOwned> Future for ServerResponseFuture<R> {
     }
 }
 
+type InFlightServerTask = Pin<Box<dyn Future<Output = Option<JsonRpcResponse>> + Send>>;
+
 /// Drives a bidirectional ACP server transport until EOF, [`ClientPeer::close`],
 /// or a fatal transport error.
 async fn drive_transport<T, H>(
@@ -473,9 +475,8 @@ where
 
     let mut pending: HashMap<RequestId, Sender<Result<JsonRpcResponse, ServerError>>> =
         HashMap::new();
-    let mut in_flight: FuturesUnordered<
-        Pin<Box<dyn Future<Output = Option<JsonRpcResponse>> + Send>>,
-    > = FuturesUnordered::new();
+    let mut in_flight: FuturesUnordered<InFlightServerTask> = FuturesUnordered::new();
+    let mut in_flight_ids: HashSet<RequestId> = HashSet::new();
 
     let outcome = loop {
         let event = or(
@@ -484,8 +485,6 @@ where
                 async {
                     match in_flight.next().await {
                         Some(response) => Event::Handled(response),
-                        // An empty `FuturesUnordered` resolves to `None`
-                        // immediately; park instead of spinning the loop.
                         None => std::future::pending::<Event>().await,
                     }
                 },
@@ -504,21 +503,11 @@ where
                 break Ok(());
             }
             Event::Handled(Some(response)) => {
-                // Flush any notifications or requests queued by the handler
-                // before it resolved so causal wire order holds (e.g.
-                // `session/update` notifications precede `PromptResult`).
-                let mut flush_err = None;
-                while let Ok(item) = outbound.try_recv() {
-                    if let Err(error) = send_outbound(transport, &mut pending, item).await {
-                        flush_err = Some(error);
-                        break;
-                    }
-                }
-                if let Some(error) = flush_err {
+                in_flight_ids.remove(&response.id);
+                if let Err(error) =
+                    flush_and_respond(transport, &outbound, &mut pending, response).await
+                {
                     break Err(error);
-                }
-                if let Err(error) = transport.respond(response).await {
-                    break Err(ServerError::Transport(error.to_string()));
                 }
             }
             Event::Handled(None) => {}
@@ -530,6 +519,16 @@ where
                 }
             }
             Event::Incoming(Ok(Some(JsonRpcMessage::Request(request)))) => {
+                if !in_flight_ids.insert(request.id.clone()) {
+                    let duplicate = JsonRpcResponse::error(
+                        request.id,
+                        JsonRpcError::invalid_request("Request ID is already in flight"),
+                    );
+                    if let Err(error) = transport.respond(duplicate).await {
+                        break Err(ServerError::Transport(error.to_string()));
+                    }
+                    continue;
+                }
                 let handler = handler.clone();
                 let peer = peer.clone();
                 in_flight.push(Box::pin(async move {
@@ -553,6 +552,34 @@ where
     outbound.close();
     drop(peer);
     drop(in_flight);
+    finish_server_shutdown(transport, &outbound, pending, outcome).await
+}
+
+/// Flushes any outbound notifications or requests queued by the handler before
+/// writing `response` so causal wire order holds (e.g. `session/update`
+/// notifications precede `PromptResult`).
+async fn flush_and_respond<T: BidirectionalTransport>(
+    transport: &mut T,
+    outbound: &Receiver<Outbound>,
+    pending: &mut HashMap<RequestId, Sender<Result<JsonRpcResponse, ServerError>>>,
+    response: JsonRpcResponse,
+) -> Result<(), ServerError> {
+    while let Ok(item) = outbound.try_recv() {
+        send_outbound(transport, pending, item).await?;
+    }
+    transport
+        .respond(response)
+        .await
+        .map_err(|error| ServerError::Transport(error.to_string()))
+}
+
+/// Closes the transport and fails any remaining outbound or pending requests.
+async fn finish_server_shutdown<T: BidirectionalTransport>(
+    transport: &mut T,
+    outbound: &Receiver<Outbound>,
+    pending: HashMap<RequestId, Sender<Result<JsonRpcResponse, ServerError>>>,
+    outcome: Result<(), ServerError>,
+) -> Result<(), ServerError> {
     let _ = transport.close().await;
 
     let terminal = match &outcome {

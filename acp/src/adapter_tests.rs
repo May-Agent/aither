@@ -4,13 +4,13 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use aither_agent::Agent;
+use aither_core::llm::tool::{Progress, ToolDefinition};
 use aither_core::llm::{
     Classify, Event, Failure, LLMRequest, LanguageModel, RetryPolicy, ToolCall, model::Profile,
 };
 use futures_lite::Stream;
 
 use super::*;
-use aither_core::llm::tool::Progress;
 
 #[derive(Debug)]
 struct Broken;
@@ -69,10 +69,30 @@ impl LanguageModel for Scripted {
     }
 }
 
-/// Runs `script` through an agent and maps every event of the main agent.
-async fn updates(script: Vec<Response>) -> Vec<SessionUpdate> {
+fn configured_mapper() -> SessionUpdateMapper {
+    let def = ToolDefinition::from_parts(
+        "shell_exec".into(),
+        "Executes a command".into(),
+        serde_json::json!({
+            "type": "object",
+            "x-acp-kind": "execute",
+            "x-acp-title": "Shell command",
+            "x-acp-title-field": "summary",
+            "properties": {
+                "summary": {"type": "string"},
+                "cmd": {"type": "string"}
+            }
+        }),
+    )
+    .expect("valid definition");
+    SessionUpdateMapper::from_definitions([&def])
+}
+
+async fn updates_with_mapper(
+    script: Vec<Response>,
+    mut mapper: SessionUpdateMapper,
+) -> Vec<SessionUpdate> {
     let mut agent = Agent::builder(Scripted::new(script)).build();
-    let mut mapper = SessionUpdateMapper::default();
     let mut collected = Vec::new();
     let _ = agent
         .run("go", [])
@@ -89,14 +109,18 @@ async fn updates(script: Vec<Response>) -> Vec<SessionUpdate> {
     collected
 }
 
+async fn updates(script: Vec<Response>) -> Vec<SessionUpdate> {
+    updates_with_mapper(script, configured_mapper()).await
+}
+
 fn call(arguments: serde_json::Value) -> Event {
-    Event::ToolCall(ToolCall::new("call-1", "terminal", arguments))
+    Event::ToolCall(ToolCall::new("call-1", "shell_exec", arguments))
 }
 
 fn delta(fragment: &str) -> Event {
     Event::ToolCallDelta {
         id: "call-1".to_string(),
-        name: "terminal".to_string(),
+        name: "shell_exec".to_string(),
         arguments_fragment: fragment.to_string(),
     }
 }
@@ -128,11 +152,11 @@ async fn text_and_reasoning_become_message_and_thought_chunks() {
 }
 
 #[tokio::test]
-async fn a_tool_call_is_announced_and_then_completed() {
+async fn a_tool_call_reads_kind_and_title_from_definition_metadata() {
     let updates = updates(vec![
         vec![Ok(call(serde_json::json!({
-            "description": "List files",
-            "script": "ls -la",
+            "summary": "List files",
+            "cmd": "ls -la",
         })))],
         vec![Ok(Event::Text("done".to_string()))],
     ])
@@ -153,19 +177,38 @@ async fn a_tool_call_is_announced_and_then_completed() {
         panic!("expected ToolCallUpdate, got {:?}", updates[2]);
     };
     assert_eq!(ended.tool_call_id, "call-1");
-    // The terminal tool is not registered, so the call ends in an error.
     assert_eq!(ended.status, Some(ToolCallStatus::Failed));
 }
 
-/// `ToolCallDelta` fragments are incremental; the mapper accumulates them so
-/// every `ToolCallUpdate` still carries the arguments so far.
+#[tokio::test]
+async fn unset_metadata_falls_back_gracefully_without_hardcoded_terminal_names() {
+    let updates = updates_with_mapper(
+        vec![
+            vec![Ok(Event::ToolCall(ToolCall::new(
+                "call-1",
+                "terminal",
+                serde_json::json!({"description": "List files"}),
+            )))],
+            vec![Ok(Event::Text("done".to_string()))],
+        ],
+        SessionUpdateMapper::default(),
+    )
+    .await;
+
+    let SessionUpdate::ToolCall(started) = &updates[0] else {
+        panic!("expected ToolCall, got {:?}", updates[0]);
+    };
+    assert_eq!(started.title, "Running terminal");
+    assert_eq!(started.kind, Some(ToolKind::Other));
+}
+
 #[tokio::test]
 async fn tool_call_deltas_accumulate() {
     let updates = updates(vec![
         vec![
-            Ok(delta(r#"{"description""#)),
+            Ok(delta(r#"{"summary""#)),
             Ok(delta(r#":"List files"}"#)),
-            Ok(call(serde_json::json!({"description": "List files"}))),
+            Ok(call(serde_json::json!({"summary": "List files"}))),
         ],
         vec![Ok(Event::Text("done".to_string()))],
     ])
@@ -177,7 +220,7 @@ async fn tool_call_deltas_accumulate() {
     assert_eq!(
         last_delta.raw_input,
         Some(serde_json::Value::String(
-            r#"{"description":"List files"}"#.to_string()
+            r#"{"summary":"List files"}"#.to_string()
         ))
     );
     assert_eq!(last_delta.title.as_deref(), Some("List files"));
@@ -186,9 +229,9 @@ async fn tool_call_deltas_accumulate() {
 #[tokio::test]
 async fn a_response_retry_drops_the_broken_attempts_arguments() {
     let updates = updates(vec![
-        vec![Ok(delta(r#"{"description":"bro"#)), Err(Broken)],
+        vec![Ok(delta(r#"{"summary":"bro"#)), Err(Broken)],
         vec![
-            Ok(delta(r#"{"description":"whole"}"#)),
+            Ok(delta(r#"{"summary":"whole"}"#)),
             Ok(Event::Text("done".to_string())),
         ],
     ])
@@ -200,49 +243,61 @@ async fn a_response_retry_drops_the_broken_attempts_arguments() {
     assert_eq!(
         replacement.raw_input,
         Some(serde_json::Value::String(
-            r#"{"description":"whole"}"#.to_string()
+            r#"{"summary":"whole"}"#.to_string()
         ))
     );
 }
 
-/// Arguments without a usable description fall back to a generic title.
 #[test]
 fn tool_title_fallbacks() {
+    let meta = ToolMetadata::new().with_title_field("summary");
     assert_eq!(
-        format_tool_title(&AgentPath::main(), "terminal", "{}"),
-        "Running terminal"
+        format_tool_title(&AgentPath::main(), "runner", "{}", Some(&meta)),
+        "Running runner"
     );
     assert_eq!(
         format_tool_title(
             &AgentPath::main(),
-            "terminal",
-            r#"{"description":"","script":"true"}"#
+            "runner",
+            r#"{"summary":"","cmd":"true"}"#,
+            Some(&meta),
         ),
-        "Running terminal"
+        "Running runner"
     );
     assert_eq!(
-        format_tool_title(&AgentPath::main(), "terminal", "not json"),
-        "Running terminal"
+        format_tool_title(&AgentPath::main(), "runner", "not json", Some(&meta)),
+        "Running runner"
     );
-    assert_eq!(infer_tool_kind("unknown_tool"), ToolKind::Other);
+
+    let titled = meta.with_title("Static label");
+    assert_eq!(
+        format_tool_title(&AgentPath::main(), "runner", "{}", Some(&titled)),
+        "Static label"
+    );
+    assert_eq!(
+        format_tool_title(&AgentPath::main(), "unknown_tool", "{}", None),
+        "Running unknown_tool"
+    );
 }
 
-/// Titles are cut on a char boundary: a multi-byte description longer than
-/// the limit must not panic on byte slicing.
 #[test]
 fn tool_title_truncates_on_char_boundary() {
-    let description = "あ".repeat(TOOL_TITLE_MAX_CHARS + 10);
-    let arguments = serde_json::json!({"description": description}).to_string();
-    let title = format_tool_title(&AgentPath::main(), "terminal", &arguments);
-    assert_eq!(title, format!("{}...", "あ".repeat(TOOL_TITLE_MAX_CHARS)));
+    let meta = ToolMetadata::new().with_title_field("summary");
+    // CJK (Chinese, Japanese, Korean) coverage
+    let cjk = "中文あ한".repeat(20);
+    let arguments = serde_json::json!({"summary": cjk}).to_string();
+    let title = format_tool_title(&AgentPath::main(), "runner", &arguments, Some(&meta));
+    let expected_prefix: String = cjk.chars().take(TOOL_TITLE_MAX_CHARS).collect();
+    assert_eq!(title, format!("{expected_prefix}..."));
 
     let boundary_case = serde_json::json!({
-        "description": format!("{:46}é{}", "x", "y".repeat(20)),
+        "summary": format!("{:46}é{}", "x", "y".repeat(20)),
     })
     .to_string();
-    let title = format_tool_title(&AgentPath::main(), "terminal", &boundary_case);
+    let title = format_tool_title(&AgentPath::main(), "runner", &boundary_case, Some(&meta));
     assert!(title.contains('é'));
-    assert_eq!(title.chars().count(), TOOL_TITLE_MAX_CHARS + 3);
+    assert!(title.char_indices().nth(TOOL_TITLE_MAX_CHARS + 3).is_none());
+    assert!(title.char_indices().nth(TOOL_TITLE_MAX_CHARS + 2).is_some());
     assert!(title.ends_with("..."));
 }
 
@@ -253,8 +308,8 @@ fn timed(agent: &AgentPath, event: AgentEvent) -> TimedEvent {
 fn started(id: &str) -> AgentEvent {
     AgentEvent::tool_call_started(
         aither_core::llm::ToolCallId::new(id),
-        "terminal".to_string(),
-        serde_json::json!({"description": "List files"}),
+        "shell_exec".to_string(),
+        serde_json::json!({"summary": "List files"}),
         ToolOrigin::Local,
     )
 }
@@ -270,7 +325,7 @@ fn tool_update(update: Option<SessionUpdate>) -> ToolCallUpdate {
 fn a_decision_progress_and_end_update_the_same_call() {
     let main = AgentPath::main();
     let id = || aither_core::llm::ToolCallId::new("call-1");
-    let mut mapper = SessionUpdateMapper::default();
+    let mut mapper = configured_mapper();
     let _ = mapper.map(&timed(&main, started("call-1")));
 
     let allowed = tool_update(mapper.map(&timed(
@@ -318,14 +373,13 @@ fn a_decision_progress_and_end_update_the_same_call() {
 fn a_childs_calls_are_namespaced_and_its_text_is_dropped() {
     let main = AgentPath::main();
     let child = main.child("researcher");
-    let mut mapper = SessionUpdateMapper::default();
+    let mut mapper = configured_mapper();
 
     let Some(SessionUpdate::ToolCall(call)) = mapper.map(&timed(&child, started("call-1"))) else {
         panic!("a child's tool call is announced");
     };
     assert_eq!(call.tool_call_id, "researcher:call-1");
     assert_eq!(call.title, "[researcher] List files");
-    // The parent's call of the same id is a different call.
     let Some(SessionUpdate::ToolCall(parent_call)) = mapper.map(&timed(&main, started("call-1")))
     else {
         panic!("the parent's tool call is announced");
@@ -344,7 +398,6 @@ fn a_childs_calls_are_namespaced_and_its_text_is_dropped() {
 
 #[tokio::test]
 async fn a_subagent_is_a_tool_call_from_start_to_end() {
-    // The registry announces a child on the parent's stream.
     let runs = aither_agent::SubagentRuns::default();
     let started_by = aither_core::llm::CallIdentity::new(
         aither_core::llm::ToolCallId::new("c1"),

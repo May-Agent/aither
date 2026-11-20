@@ -13,7 +13,7 @@ mod handler;
 pub use error::ClientError;
 pub use handler::ClientHandler;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -555,6 +555,9 @@ impl<R: DeserializeOwned> Future for ResponseFuture<R> {
     }
 }
 
+type InFlightAgentRequest = Pin<Box<dyn Future<Output = JsonRpcResponse> + Send>>;
+type ActiveNotification = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// The connection task: sole owner of the transport and router of every
 /// message in both directions.
 ///
@@ -563,10 +566,11 @@ impl<R: DeserializeOwned> Future for ResponseFuture<R> {
 /// the peer's exit status and fails every pending request.
 ///
 /// Agent-to-client requests (`session/request_permission`, `fs/*`,
-/// `terminal/*`) are not answered inline: they are long-lived — a permission
-/// prompt waits on a human, `terminal/wait_for_exit` waits on a process — so
-/// each is pushed into `in_flight` and polled alongside the other sources,
-/// and its response is written when the handler future completes.
+/// `terminal/*`) and notifications (`session/update`, `elicitation/complete`)
+/// are never awaited inline: requests are polled concurrently inside
+/// `in_flight`, and notifications are polled sequentially in FIFO arrival order
+/// alongside outbound sends and inbound reads so a re-entrant [`AcpClient`]
+/// call inside a handler never deadlocks the connection loop.
 async fn drive<T, H>(mut transport: T, outbound: Receiver<Outbound>, handler: Arc<H>)
 where
     T: BidirectionalTransport,
@@ -580,27 +584,35 @@ where
         Outbound(Result<Outbound, async_channel::RecvError>),
         /// A handler future finished and produced the response to write back.
         Handled(JsonRpcResponse),
+        /// The active notification handler finished.
+        NotificationDone,
     }
 
     let mut pending: HashMap<RequestId, Sender<Result<JsonRpcResponse, ClientError>>> =
         HashMap::new();
-    // Agent requests currently being answered by the handler.
-    let mut in_flight: FuturesUnordered<Pin<Box<dyn Future<Output = JsonRpcResponse> + Send>>> =
-        FuturesUnordered::new();
+    let mut in_flight: FuturesUnordered<InFlightAgentRequest> = FuturesUnordered::new();
+    let mut pending_notifications: VecDeque<JsonRpcNotification> = VecDeque::new();
+    let mut active_notification: Option<ActiveNotification> = None;
 
     let terminal = loop {
         let event = or(
             or(async { Event::Outbound(outbound.recv().await) }, async {
-                Event::Incoming(transport.recv().await)
-            }),
-            async {
-                match in_flight.next().await {
-                    Some(response) => Event::Handled(response),
-                    // An empty `FuturesUnordered` resolves to `None`
-                    // immediately; park instead of spinning the loop.
-                    None => std::future::pending::<Event>().await,
+                if let Some(active) = active_notification.as_mut() {
+                    active.await;
+                    Event::NotificationDone
+                } else {
+                    std::future::pending::<Event>().await
                 }
-            },
+            }),
+            or(
+                async {
+                    match in_flight.next().await {
+                        Some(response) => Event::Handled(response),
+                        None => std::future::pending::<Event>().await,
+                    }
+                },
+                async { Event::Incoming(transport.recv().await) },
+            ),
         )
         .await;
 
@@ -630,7 +642,22 @@ where
                 in_flight.push(Box::pin(handle_agent_request(handler.clone(), request)));
             }
             Event::Incoming(Ok(Some(JsonRpcMessage::Notification(notification)))) => {
-                handle_agent_notification(handler.as_ref(), notification).await;
+                if active_notification.is_none() {
+                    active_notification = Some(Box::pin(handle_agent_notification(
+                        handler.clone(),
+                        notification,
+                    )));
+                } else {
+                    pending_notifications.push_back(notification);
+                }
+            }
+            Event::NotificationDone => {
+                active_notification =
+                    pending_notifications
+                        .pop_front()
+                        .map(|next| -> ActiveNotification {
+                            Box::pin(handle_agent_notification(handler.clone(), next))
+                        });
             }
             Event::Handled(response) => {
                 if let Err(error) = transport.respond(response).await {
@@ -641,10 +668,19 @@ where
         }
     };
 
-    // Shutdown: drop the in-flight handler futures, collect the peer's exit
-    // status (reaping a child that is still running), close the transport,
-    // and fail everything still in flight so no caller hangs.
+    drop(active_notification);
     drop(in_flight);
+    finish_client_shutdown(transport, outbound, pending, terminal).await;
+}
+
+/// Closes the transport, collects exit status, and fails any remaining pending
+/// or queued requests so no caller hangs.
+async fn finish_client_shutdown<T: BidirectionalTransport>(
+    mut transport: T,
+    outbound: Receiver<Outbound>,
+    pending: HashMap<RequestId, Sender<Result<JsonRpcResponse, ClientError>>>,
+    terminal: ClientError,
+) {
     let status = transport.exit_status().await;
     let _ = transport.close().await;
 
@@ -734,7 +770,7 @@ where
 
 /// Dispatch an agent-to-client notification to the handler.
 async fn handle_agent_notification<H: ClientHandler>(
-    handler: &H,
+    handler: Arc<H>,
     notification: JsonRpcNotification,
 ) {
     match notification.method.as_str() {

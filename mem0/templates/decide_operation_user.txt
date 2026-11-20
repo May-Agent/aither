@@ -1,0 +1,11 @@
+New Fact: {{ fact }}
+
+Existing Memories:
+{% for result in existing_memories -%}
+{% if !loop.first %}
+---
+{% endif -%}
+ID: {{ result.memory.id }}
+Content: {{ result.memory.content }}
+{% endfor %}
+Decide the operation.
