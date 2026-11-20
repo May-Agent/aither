@@ -476,12 +476,17 @@ mod tests {
             &self,
             request: LLMRequest,
         ) -> impl Stream<Item = std::result::Result<Event, Self::Error>> + Send {
-            if let Some(last) = request.messages().last() {
-                self.prompts
-                    .lock()
-                    .expect("prompts lock")
-                    .push(last.content().to_string());
-            }
+            // `generate` appends a schema-instruction message after the
+            // rendered prompt, so record the whole request, not just its
+            // last message.
+            self.prompts.lock().expect("prompts lock").push(
+                request
+                    .messages()
+                    .iter()
+                    .map(|m| m.content().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n---\n"),
+            );
             let next = self
                 .responses
                 .lock()
@@ -568,10 +573,12 @@ mod tests {
 
         let captured = prompts.lock().expect("prompts").clone();
         assert!(
-            captured[0].starts_with("Extract facts from the following conversation:\n\nUser: ")
+            captured[0].contains("Extract facts from the following conversation:\n\nUser: "),
+            "captured[0] was: {:?}",
+            captured[0]
         );
-        assert!(captured[1].starts_with("New Fact: "));
-        assert!(captured[1].ends_with("Decide the operation."));
+        assert!(captured[1].contains("New Fact: "));
+        assert!(captured[1].contains("Decide the operation."));
 
         let formatted = mem0.retrieve_formatted("tea", 5).await.unwrap();
         assert_eq!(formatted, format!("Relevant Memories:\n- {first_fact}"));

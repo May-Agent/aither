@@ -1,0 +1,1 @@
+Embedded binary resource {{ uri }}{% if let Some(mime) = mime_type %} ({{ mime }}){% endif %} ({{ byte_len }} bytes).

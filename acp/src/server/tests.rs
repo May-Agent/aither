@@ -614,3 +614,138 @@ async fn v2_prompts_run_in_fifo_order() {
         vec!["end_turn".to_string(), "end_turn".to_string()]
     );
 }
+
+/// A non-`initialize` request ahead of the handshake is answered
+/// `-32600`, and `initialize` must be the literal first request — a
+/// later one is rejected too. A second `initialize` on a clean
+/// connection is `-32600` as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_before_initialize_and_duplicate_initialize_are_rejected() {
+    // On this connection `session/new` runs ahead of the handshake.
+    let (peer, _cap, conn) = wire(TestHost::echo());
+    tokio::spawn(conn);
+    match peer
+        .request::<Value, Value>("session/new", &setup_params())
+        .await
+    {
+        Err(rpc::PeerError::Rejected(e)) => assert_eq!(e.code(), rpc::INVALID_REQUEST),
+        other => panic!("expected -32600, got {other:?}"),
+    }
+    // `initialize` is only ever the first request: even now it is -32600.
+    match peer
+        .request::<Value, Value>(
+            "initialize",
+            &json!({"protocolVersion": 2, "capabilities": {}}),
+        )
+        .await
+    {
+        Err(rpc::PeerError::Rejected(e)) => assert_eq!(e.code(), rpc::INVALID_REQUEST),
+        other => panic!("expected -32600 for a late initialize, got {other:?}"),
+    }
+    drop(peer);
+
+    // On a clean connection a repeated initialize is rejected.
+    let (peer, _cap, conn) = wire(TestHost::echo());
+    tokio::spawn(conn);
+    peer.request::<Value, Value>(
+        "initialize",
+        &json!({"protocolVersion": 2, "capabilities": {}}),
+    )
+    .await
+    .expect("initialize");
+    match peer
+        .request::<Value, Value>(
+            "initialize",
+            &json!({"protocolVersion": 2, "capabilities": {}}),
+        )
+        .await
+    {
+        Err(rpc::PeerError::Rejected(e)) => assert_eq!(e.code(), rpc::INVALID_REQUEST),
+        other => panic!("expected -32600, got {other:?}"),
+    }
+}
+
+/// `session/cancel` also fails prompts still waiting in the session's
+/// queue, not just the running turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v1_cancel_fails_queued_prompts() {
+    let (gate_tx, gate_rx) = async_channel::bounded::<()>(1);
+    let prompt_count = Arc::new(AtomicUsize::new(0));
+    let (peer, _cap, conn) = wire(TestHost {
+        prompt_count: prompt_count.clone(),
+        wait_cancel: true,
+        first_cancel: false,
+        gate: Some((gate_tx, gate_rx)),
+        replayed: Mutex::new(Vec::new()),
+        sessions: AtomicUsize::new(0),
+    });
+    tokio::spawn(conn);
+
+    peer.request::<_, Value>(
+        "initialize",
+        &v1::InitializeParams {
+            protocol_version: 1,
+            client_capabilities: v1::ClientCapabilities::default(),
+            client_info: None,
+            meta: None,
+        },
+    )
+    .await
+    .expect("initialize");
+    let new: Value = peer
+        .request("session/new", &setup_params())
+        .await
+        .expect("session/new");
+    let session_id = new["sessionId"].as_str().expect("sessionId").to_string();
+
+    // Prompt 1 parks on cancellation; prompt 2 sits behind it in the
+    // session queue.
+    let first = tokio::spawn({
+        let peer = peer.clone();
+        let session_id = session_id.clone();
+        async move {
+            peer.request::<Value, Value>(
+                "session/prompt",
+                &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "one"}]}),
+            )
+            .await
+        }
+    });
+    cap_wait_until_one(&prompt_count).await;
+    let second = tokio::spawn({
+        let peer = peer.clone();
+        let session_id = session_id.clone();
+        async move {
+            peer.request::<Value, Value>(
+                "session/prompt",
+                &json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "two"}]}),
+            )
+            .await
+        }
+    });
+    // Let prompt 2 land in the queue, then cancel the session.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    peer.notify("session/cancel", &json!({"sessionId": session_id}))
+        .await
+        .expect("cancel");
+
+    // The queued prompt fails `request cancelled` (-32800); the running
+    // prompt reports `stopReason: cancelled`.
+    match second.await.expect("second") {
+        Err(rpc::PeerError::Rejected(e)) => assert_eq!(e.code(), rpc::REQUEST_CANCELLED),
+        other => panic!("expected -32800 for the queued prompt, got {other:?}"),
+    }
+    let first = first.await.expect("first").expect("first prompt response");
+    assert_eq!(first["stopReason"], "cancelled");
+}
+
+/// Wait until the host has taken one prompt.
+async fn cap_wait_until_one(count: &Arc<AtomicUsize>) {
+    for _ in 0..200 {
+        if count.load(Ordering::SeqCst) >= 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for the first prompt");
+}
