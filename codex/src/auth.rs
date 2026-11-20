@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use zenwave::{Client as _, client};
 
 use crate::constant::{
-    AUTHORIZE_URL, CLIENT_ID, DEVICE_CODE_URL, DEVICE_TOKEN_URL, OAUTH_PORT, OAUTH_SCOPES,
-    REDIRECT_URI, TOKEN_URL,
+    AUTHORIZE_URL, CLIENT_ID, DEFAULT_OAUTH_SUCCESS_HTML, DEVICE_CODE_URL, DEVICE_TOKEN_URL,
+    OAUTH_PORT, OAUTH_SCOPES, REDIRECT_URI, TOKEN_URL,
 };
 use crate::error::CodexError;
 
@@ -32,11 +32,20 @@ use crate::error::CodexError;
 const CALLBACK_BUF: usize = 8192;
 
 /// PKCE verifier/challenge pair plus the OAuth `state` nonce.
-#[derive(Debug)]
 pub struct Pkce {
     verifier: String,
     challenge: String,
     state: String,
+}
+
+impl std::fmt::Debug for Pkce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pkce")
+            .field("verifier", &"[REDACTED]")
+            .field("challenge", &self.challenge)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 impl Pkce {
@@ -112,11 +121,33 @@ impl Pkce {
 /// - [`CodexError::StateMismatch`] if the returned `state` does not match.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn listen_for_callback(expected_state: &str) -> Result<String, CodexError> {
-    use futures_lite::{AsyncReadExt, AsyncWriteExt};
+    listen_for_callback_with_html(expected_state, DEFAULT_OAUTH_SUCCESS_HTML).await
+}
 
+/// Listen on `localhost:1455` for a single OAuth callback and serve custom
+/// `success_html` when authorization succeeds.
+///
+/// # Errors
+///
+/// Same as [`listen_for_callback`].
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn listen_for_callback_with_html(
+    expected_state: &str,
+    success_html: &str,
+) -> Result<String, CodexError> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], OAUTH_PORT));
     let listener = async_io::Async::<std::net::TcpListener>::bind(addr)?;
     tracing::info!(port = OAUTH_PORT, "waiting for OAuth callback");
+    accept_callback_on(&listener, expected_state, success_html).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn accept_callback_on(
+    listener: &async_io::Async<std::net::TcpListener>,
+    expected_state: &str,
+    success_html: &str,
+) -> Result<String, CodexError> {
+    use futures_lite::{AsyncReadExt, AsyncWriteExt};
 
     let (mut stream, _) = listener.accept().await?;
     let mut buf = vec![0u8; CALLBACK_BUF];
@@ -133,12 +164,7 @@ pub async fn listen_for_callback(expected_state: &str) -> Result<String, CodexEr
             "400 Bad Request",
             "<html><body><h1>Login failed</h1><p>Return to the terminal for details.</p></body></html>",
         ),
-        |_| {
-            (
-                "200 OK",
-                "<html><body><h1>Logged in</h1><p>You may close this tab and return to May.</p></body></html>",
-            )
-        },
+        |_| ("200 OK", success_html),
     );
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -226,6 +252,13 @@ pub async fn exchange_code(code: &str, verifier: &str) -> Result<CodexCredential
 ///
 /// Same as [`exchange_code`].
 pub async fn refresh_tokens(refresh_token: &str) -> Result<CodexCredentials, CodexError> {
+    refresh_tokens_at(refresh_token, TOKEN_URL).await
+}
+
+pub(crate) async fn refresh_tokens_at(
+    refresh_token: &str,
+    token_url: &str,
+) -> Result<CodexCredentials, CodexError> {
     #[derive(Serialize)]
     struct RefreshRequest<'a> {
         grant_type: &'a str,
@@ -233,9 +266,16 @@ pub async fn refresh_tokens(refresh_token: &str) -> Result<CodexCredentials, Cod
         client_id: &'a str,
     }
 
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err(CodexError::Api(
+            "cannot refresh ChatGPT access token: no refresh token is configured".into(),
+        ));
+    }
+
     let mut backend = client();
     let response: TokenResponse = backend
-        .post(TOKEN_URL)?
+        .post(token_url)?
         .json_body(&RefreshRequest {
             grant_type: "refresh_token",
             refresh_token,
@@ -243,7 +283,11 @@ pub async fn refresh_tokens(refresh_token: &str) -> Result<CodexCredentials, Cod
         })?
         .json()
         .await?;
-    Ok(response.into_credentials())
+    let mut creds = response.into_credentials();
+    if creds.refresh_token.is_none() {
+        creds.refresh_token = Some(refresh_token.to_string());
+    }
+    Ok(creds)
 }
 
 /// Begin the device-authorization flow (for SSH/headless environments where a
@@ -316,16 +360,38 @@ pub async fn poll_device_code(
     }
 }
 
+fn normalize_optional_token(token: Option<String>) -> Option<String> {
+    token.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+fn deserialize_optional_refresh_token<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(normalize_optional_token(Option::<String>::deserialize(
+        deserializer,
+    )?))
+}
+
 /// Persisted `ChatGPT` OAuth credentials.
 ///
 /// `account_id` and `residency` are decoded from the JWT claims of the
 /// access/ID tokens at construction time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CodexCredentials {
     /// Short-lived bearer token sent as `Authorization`.
     pub access_token: String,
     /// Long-lived token for [`refresh_tokens`]; rotated on every refresh.
-    pub refresh_token: String,
+    /// `None` when only an access token is available.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_refresh_token"
+    )]
+    pub refresh_token: Option<String>,
     /// `OpenID` ID token; a source of the account ID claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
@@ -343,14 +409,31 @@ pub struct CodexCredentials {
     pub earliest_refresh_at: Option<u64>,
 }
 
+impl std::fmt::Debug for CodexCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexCredentials")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
+            .field("account_id", &self.account_id)
+            .field("residency", &self.residency)
+            .field("expires_at", &self.expires_at)
+            .field("earliest_refresh_at", &self.earliest_refresh_at)
+            .finish()
+    }
+}
+
 impl CodexCredentials {
     /// Build credentials from raw token strings, decoding `account_id` and
     /// `residency` from the JWT claims.
     #[must_use]
-    pub fn new(access_token: impl Into<String>, refresh_token: impl Into<String>) -> Self {
+    pub fn new(access_token: impl Into<String>, refresh_token: impl Into<Option<String>>) -> Self {
         let mut credentials = Self {
             access_token: access_token.into(),
-            refresh_token: refresh_token.into(),
+            refresh_token: normalize_optional_token(refresh_token.into()),
             id_token: None,
             account_id: None,
             residency: None,
@@ -359,6 +442,27 @@ impl CodexCredentials {
         };
         credentials.fill_claims();
         credentials
+    }
+
+    /// Build non-refreshable credentials from an access token alone.
+    #[must_use]
+    pub fn access_only(access_token: impl Into<String>) -> Self {
+        Self::new(access_token, None)
+    }
+
+    /// The configured refresh token when present and non-whitespace.
+    #[must_use]
+    pub fn refresh_token_opt(&self) -> Option<&str> {
+        self.refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
+
+    /// Whether a refresh token is available to rotate expired access tokens.
+    #[must_use]
+    pub fn can_refresh(&self) -> bool {
+        self.refresh_token_opt().is_some()
     }
 
     /// Attach an ID token (a source of the account-ID claim) and re-decode.
@@ -389,7 +493,7 @@ impl CodexCredentials {
 }
 
 /// Response shape of `POST /api/accounts/deviceauth/usercode`.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DeviceCodeResponse {
     /// Server-side authorization session id used while polling.
     pub device_auth_id: String,
@@ -400,11 +504,22 @@ pub struct DeviceCodeResponse {
     pub interval: Option<String>,
 }
 
+impl std::fmt::Debug for DeviceCodeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeResponse")
+            .field("device_auth_id", &self.device_auth_id)
+            .field("user_code", &"[REDACTED]")
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
 /// Token endpoint response (both grants share the shape).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
     #[serde(default)]
@@ -427,7 +542,7 @@ impl TokenResponse {
             .or(expires_at);
         let mut creds = CodexCredentials {
             access_token: self.access_token,
-            refresh_token: self.refresh_token,
+            refresh_token: normalize_optional_token(self.refresh_token),
             id_token: self.id_token,
             account_id: None,
             residency: None,
@@ -595,10 +710,85 @@ mod tests {
 
     #[test]
     fn credentials_roundtrip() {
-        let creds = CodexCredentials::new("at", "rt").with_expires_at(42);
+        let creds = CodexCredentials::new("at", "rt".to_string()).with_expires_at(42);
         let json = serde_json::to_string(&creds).unwrap();
         let back: CodexCredentials = serde_json::from_str(&json).unwrap();
         assert_eq!(back.access_token, "at");
+        assert_eq!(back.refresh_token.as_deref(), Some("rt"));
         assert_eq!(back.expires_at, Some(42));
+
+        let blank_refresh = CodexCredentials::new("at-blank", "   ".to_string());
+        assert_eq!(blank_refresh.refresh_token, None);
+        assert!(!blank_refresh.can_refresh());
+
+        let access_only = CodexCredentials::access_only("at-only");
+        assert_eq!(access_only.refresh_token, None);
+        assert!(!access_only.can_refresh());
+        let json_only = serde_json::to_string(&access_only).unwrap();
+        assert!(!json_only.contains("refresh_token"));
+        let parsed_only: CodexCredentials = serde_json::from_str(&json_only).unwrap();
+        assert_eq!(parsed_only.access_token, "at-only");
+        assert_eq!(parsed_only.refresh_token, None);
+        assert!(!parsed_only.can_refresh());
+
+        // Legacy JSON carrying empty or null refresh_token deserializes to None.
+        for raw in [
+            r#"{"access_token":"at-legacy","refresh_token":""}"#,
+            r#"{"access_token":"at-legacy","refresh_token":"   "}"#,
+            r#"{"access_token":"at-legacy","refresh_token":null}"#,
+            r#"{"access_token":"at-legacy"}"#,
+        ] {
+            let parsed: CodexCredentials = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed.refresh_token, None, "{raw}");
+            assert!(!parsed.can_refresh(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn debug_redacts_codex_credentials_and_pkce() {
+        let creds = CodexCredentials::new("secret-access-jwt", "secret-refresh-token".to_string())
+            .with_id_token("secret-id-jwt");
+        let dbg = format!("{creds:?}");
+        assert!(!dbg.contains("secret-access-jwt"), "{dbg}");
+        assert!(!dbg.contains("secret-refresh-token"), "{dbg}");
+        assert!(!dbg.contains("secret-id-jwt"), "{dbg}");
+
+        let pkce = Pkce::generate();
+        let verifier = pkce.verifier().to_string();
+        assert!(!format!("{pkce:?}").contains(&verifier));
+    }
+
+    #[tokio::test]
+    async fn callback_listener_serves_configured_html() {
+        use futures_lite::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = async_io::Async::<std::net::TcpListener>::bind(std::net::SocketAddr::from(
+            ([127, 0, 0, 1], 0),
+        ))
+        .expect("bind");
+        let port = listener.get_ref().local_addr().expect("addr").port();
+        let custom_html = "<html><body>Custom Portal Complete</body></html>";
+
+        let server_fut = accept_callback_on(&listener, "expected-state", custom_html);
+        let client_fut = async move {
+            let mut conn = async_io::Async::<std::net::TcpStream>::connect(
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+            .await
+            .expect("connect");
+            conn.write_all(
+                b"GET /auth/callback?code=auth-code-7&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("write");
+            let mut resp = Vec::new();
+            conn.read_to_end(&mut resp).await.expect("read");
+            String::from_utf8(resp).expect("utf8")
+        };
+
+        let (code, response) = futures_lite::future::zip(server_fut, client_fut).await;
+        assert_eq!(code.expect("code"), "auth-code-7");
+        assert!(response.contains(custom_html), "{response}");
+        assert!(!DEFAULT_OAUTH_SUCCESS_HTML.contains("May"));
     }
 }

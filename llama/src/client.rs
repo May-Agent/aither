@@ -123,40 +123,45 @@ impl EmbeddingModel for Llama {
         text: &str,
     ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
         let model = self.model.clone();
+        let backend = self.backend.clone();
         let cfg = self.inner.clone();
         let input = text.to_owned();
 
         async move {
-            let mut context = create_context(&model, &self.backend, &cfg, true)?;
+            let embedding = blocking::unblock(move || -> Result<Vec<f32>, LlamaError> {
+                let mut context = create_context(&model, &backend, &cfg, true)?;
 
-            let tokens = model
-                .str_to_token(&input, AddBos::Never)
-                .map_err(|err| LlamaError::Token(err.to_string()))?;
-            if tokens.is_empty() {
-                return Err(LlamaError::Unsupported(
-                    "cannot embed empty token sequence".to_string(),
-                )
-                .into());
-            }
+                let tokens = model
+                    .str_to_token(&input, AddBos::Never)
+                    .map_err(|err| LlamaError::Token(err.to_string()))?;
+                if tokens.is_empty() {
+                    return Err(LlamaError::Unsupported(
+                        "cannot embed empty token sequence".to_string(),
+                    ));
+                }
 
-            let mut batch = LlamaBatch::new(tokens.len(), 1);
-            batch
-                .add_sequence(&tokens, 0, true)
-                .map_err(|err| LlamaError::Decode(err.to_string()))?;
-            context
-                .decode(&mut batch)
-                .map_err(|err| LlamaError::Decode(err.to_string()))?;
+                let mut batch = LlamaBatch::new(tokens.len(), 1);
+                batch
+                    .add_sequence(&tokens, 0, true)
+                    .map_err(|err| LlamaError::Decode(err.to_string()))?;
+                context
+                    .decode(&mut batch)
+                    .map_err(|err| LlamaError::Decode(err.to_string()))?;
 
-            if let Ok(embedding) = context.embeddings_seq_ith(0) {
-                return Ok(embedding.to_vec());
-            }
+                if let Ok(embedding) = context.embeddings_seq_ith(0) {
+                    return Ok(embedding.to_vec());
+                }
 
-            let last_index = i32::try_from(tokens.len() - 1)
-                .map_err(|_| LlamaError::Unsupported("token sequence is too long".to_string()))?;
-            let embedding = context
-                .embeddings_ith(last_index)
-                .map_err(|err| LlamaError::Decode(err.to_string()))?;
-            Ok(embedding.to_vec())
+                let last_index = i32::try_from(tokens.len() - 1).map_err(|_| {
+                    LlamaError::Unsupported("token sequence is too long".to_string())
+                })?;
+                let embedding = context
+                    .embeddings_ith(last_index)
+                    .map_err(|err| LlamaError::Decode(err.to_string()))?;
+                Ok(embedding.to_vec())
+            })
+            .await?;
+            Ok(embedding)
         }
     }
 }
@@ -184,16 +189,25 @@ pub struct Builder {
     backend: Option<Arc<LlamaBackend>>,
 }
 
+fn default_threads() -> i32 {
+    thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .ok()
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(1)
+}
+
 impl Builder {
     fn new(model_path: impl AsRef<Path>) -> Self {
+        let threads = default_threads();
         Self {
             model_path: model_path.as_ref().to_path_buf(),
             n_gpu_layers: 0,
             use_mlock: false,
             n_ctx: None,
             chat_template: None,
-            n_threads: 4,
-            n_threads_batch: 4,
+            n_threads: threads,
+            n_threads_batch: threads,
             backend: None,
         }
     }
@@ -272,13 +286,16 @@ impl Builder {
     }
 }
 
+/// Bounded buffer between the blocking llama.cpp generation thread and async stream consumers.
+const RESPONSE_STREAM_BUFFER: usize = 64;
+
 fn response_stream(
     model: Arc<LlamaModel>,
     backend: Arc<LlamaBackend>,
     cfg: Arc<LlamaConfig>,
     request: LLMRequest,
 ) -> impl Stream<Item = Result<Event, LlamaError>> + Send {
-    let (sender, receiver) = async_channel::unbounded();
+    let (sender, receiver) = async_channel::bounded(RESPONSE_STREAM_BUFFER);
     let worker_sender = sender.clone();
     match thread::Builder::new()
         .name("aither-llama-respond".to_string())
@@ -716,8 +733,17 @@ mod tests {
             model_path: PathBuf::from("model.gguf"),
             chat_template: None,
             n_ctx,
-            n_threads: 4,
-            n_threads_batch: 4,
+            n_threads: default_threads(),
+            n_threads_batch: default_threads(),
         }
+    }
+
+    #[test]
+    fn builder_sizes_threads_to_available_parallelism() {
+        let builder = Llama::builder("model.gguf");
+        let expected = default_threads();
+        assert!(expected >= 1);
+        assert_eq!(builder.n_threads, expected);
+        assert_eq!(builder.n_threads_batch, expected);
     }
 }

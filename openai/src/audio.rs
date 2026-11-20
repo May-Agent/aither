@@ -1,15 +1,13 @@
 use crate::{
     client::{Config, OpenAI},
     error::OpenAIError,
+    files::encode_multipart_parts,
 };
 use aither_core::audio::{AudioGenerator, AudioTranscriber, Data};
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use zenwave::{
-    Client, client, header,
-    multipart::{MultipartPart, encode as encode_multipart},
-};
+use zenwave::{Client, client, header, multipart::MultipartPart};
 
 impl AudioGenerator for OpenAI {
     type Error = OpenAIError;
@@ -91,7 +89,7 @@ async fn transcribe_once(cfg: Arc<Config>, audio: Vec<u8>) -> Result<String, Ope
         MultipartPart::binary("file", "audio.wav", "application/octet-stream", audio),
     ];
 
-    let (boundary, body) = encode_multipart(parts);
+    let (boundary, body) = encode_multipart_parts(parts)?;
     let response: TranscriptionResponse = builder
         .header(
             header::CONTENT_TYPE.as_str(),

@@ -8,7 +8,7 @@ use thiserror::Error;
 pub enum OrtError {
     /// Failed to load or run the ONNX model.
     #[error("onnx runtime error: {0}")]
-    Ort(ort::Error),
+    Ort(#[source] ort::Error),
 
     /// Failed to load the tokenizer.
     #[error("failed to load tokenizer from {path}: {message}")]
@@ -32,7 +32,7 @@ pub enum OrtError {
     ModelNotFound(PathBuf),
 
     /// Output tensor shape mismatch.
-    #[error("unexpected output shape: expected 3 dimensions, got {0}")]
+    #[error("unexpected output shape: expected 2 or 3 dimensions, got {0}")]
     InvalidOutputShape(usize),
 
     /// Tokenization failed.

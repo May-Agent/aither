@@ -27,6 +27,12 @@ pub enum ResponsesStreamEvent {
     /// Response completed
     #[serde(rename = "response.completed")]
     ResponseCompleted { response: ResponsesStreamResponse },
+    /// Response ended early (e.g., `max_output_tokens` or `content_filter`)
+    #[serde(rename = "response.incomplete")]
+    ResponseIncomplete {
+        #[serde(default)]
+        response: ResponsesStreamResponse,
+    },
     /// Response failed
     #[serde(rename = "response.failed")]
     ResponseFailed {
@@ -93,7 +99,9 @@ pub enum ResponsesStreamEvent {
     /// Function call arguments delta
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta {
+        #[serde(default)]
         delta: String,
+        #[serde(default)]
         item_id: String,
         #[serde(default)]
         output_index: usize,
@@ -101,7 +109,9 @@ pub enum ResponsesStreamEvent {
     /// Function call arguments done
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgumentsDone {
+        #[serde(default)]
         arguments: String,
+        #[serde(default)]
         item_id: String,
         #[serde(default)]
         output_index: usize,
@@ -131,6 +141,16 @@ pub struct ResponsesStreamResponse {
     /// Why the response failed, on `response.failed`.
     #[serde(default)]
     pub error: Option<ResponsesError>,
+    /// Why the response stopped early, on `response.incomplete`.
+    #[serde(default)]
+    pub incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+/// Details explaining why a response ended in `incomplete` status.
+#[derive(Debug, Deserialize, Default)]
+pub struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

@@ -5,21 +5,20 @@
 //!
 //! See: <https://ai.google.dev/api/files>
 
+use std::future::IntoFuture as _;
 use std::time::SystemTime;
 
 #[cfg(not(target_arch = "wasm32"))]
 use async_fs;
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
+use url::Url;
 use zenwave::{Client, client, header};
 
+use crate::client::within_idle;
 use crate::config::{AuthMode, GeminiConfig, USER_AGENT};
 use crate::error::GeminiError;
-
-/// The base URL for the Files API upload endpoint.
-const UPLOAD_BASE_URL: &str = "https://generativelanguage.googleapis.com/upload/v1beta/files";
 
 /// Gemini file state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +103,60 @@ pub struct ListFilesResponse {
     pub next_page_token: Option<String>,
 }
 
+fn csprng_boundary() -> Result<String, GeminiError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|err| {
+        GeminiError::Api(format!(
+            "failed to generate CSPRNG multipart boundary: {err}"
+        ))
+    })?;
+    let rand_u128 = u128::from_be_bytes(bytes);
+    Ok(format!("----aither-{rand_u128:032x}"))
+}
+
+fn build_related_multipart(
+    file_name: &str,
+    mime_type: &str,
+    data: &[u8],
+) -> Result<(String, Vec<u8>), GeminiError> {
+    if file_name.is_empty() || file_name.bytes().any(|b| b.is_ascii_control()) {
+        return Err(GeminiError::Api(
+            "invalid upload file_name: must be non-empty without control characters".to_string(),
+        ));
+    }
+    if mime_type.is_empty()
+        || mime_type
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b'"' | b'\\'))
+    {
+        return Err(GeminiError::Api(
+            "invalid upload mime_type: must be non-empty without control characters, quotes, or backslashes".to_string(),
+        ));
+    }
+
+    let boundary = csprng_boundary()?;
+    let metadata = serde_json::json!({
+        "file": {
+            "displayName": file_name
+        }
+    });
+    let metadata_json = serde_json::to_string(&metadata).map_err(GeminiError::Json)?;
+
+    let mut body = Vec::with_capacity(metadata_json.len() + data.len() + 256);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
+    body.extend_from_slice(metadata_json.as_bytes());
+    body.extend_from_slice(b"\r\n");
+
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(format!("Content-Type: {mime_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\r\n");
+
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    Ok((boundary, body))
+}
+
 /// Upload raw bytes to the Gemini Files API.
 ///
 /// This is the cross-platform upload entry point (including wasm).
@@ -118,16 +171,8 @@ pub async fn upload_bytes(
     mime_type: &str,
     data: Vec<u8>,
 ) -> Result<GeminiFile, GeminiError> {
-    // Build upload URL
-    let upload_url = build_upload_url(cfg);
-
-    // For simplicity, we use the simple (non-resumable) upload for files < 20MB
-    // Resumable uploads would require more complex handling
-    let metadata = serde_json::json!({
-        "file": {
-            "displayName": file_name
-        }
-    });
+    let upload_url = build_upload_url(cfg)?;
+    let (boundary, body) = build_related_multipart(file_name, mime_type, &data)?;
 
     let mut backend = client();
     let mut builder = backend
@@ -144,40 +189,15 @@ pub async fn upload_bytes(
             .map_err(GeminiError::from_http)?;
     }
 
-    // Build multipart body
-    let boundary = format!(
-        "----aither{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-
-    let mut body = Vec::new();
-
-    // Part 1: Metadata (JSON)
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
-    let metadata_json = serde_json::to_string(&metadata).map_err(GeminiError::Json)?;
-    body.extend_from_slice(metadata_json.as_bytes());
-    body.extend_from_slice(b"\r\n");
-
-    // Part 2: File content
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(format!("Content-Type: {mime_type}\r\n\r\n").as_bytes());
-    body.extend_from_slice(&data);
-    body.extend_from_slice(b"\r\n");
-
-    // End boundary
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-
     let content_type = format!("multipart/related; boundary={boundary}");
     let builder = builder
         .header(header::CONTENT_TYPE.as_str(), &content_type)
         .map_err(GeminiError::from_http)?
         .bytes_body(body);
 
-    let response: UploadFileResponse = builder.json().await.map_err(GeminiError::from_http)?;
+    let response: UploadFileResponse = within_idle(cfg.idle_timeout, builder.json())
+        .await?
+        .map_err(GeminiError::from_http)?;
 
     Ok(response.file)
 }
@@ -198,9 +218,7 @@ pub async fn upload_bytes(
 pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, GeminiError> {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let mime_type = crate::mime::mime_from_path(path).unwrap_or("application/octet-stream");
-    let data = async_fs::read(path)
-        .await
-        .map_err(|e| GeminiError::Parse(format!("Failed to read file: {e}")))?;
+    let data = async_fs::read(path).await?;
 
     upload_bytes(cfg, file_name, mime_type, data).await
 }
@@ -230,7 +248,9 @@ pub async fn delete_file(cfg: &GeminiConfig, name: &str) -> Result<(), GeminiErr
             .map_err(GeminiError::from_http)?;
     }
 
-    let _response = builder.await.map_err(GeminiError::from_http)?;
+    let _response = within_idle(cfg.idle_timeout, builder.into_future())
+        .await?
+        .map_err(GeminiError::from_http)?;
     Ok(())
 }
 
@@ -259,7 +279,28 @@ pub async fn get_file(cfg: &GeminiConfig, name: &str) -> Result<GeminiFile, Gemi
             .map_err(GeminiError::from_http)?;
     }
 
-    builder.json().await.map_err(GeminiError::from_http)
+    within_idle(cfg.idle_timeout, builder.json())
+        .await?
+        .map_err(GeminiError::from_http)
+}
+
+fn build_list_files_url(
+    cfg: &GeminiConfig,
+    page_size: Option<u32>,
+    page_token: Option<&str>,
+) -> Result<String, GeminiError> {
+    let mut url = Url::parse(&cfg.endpoint("files"))
+        .map_err(|err| GeminiError::Api(format!("invalid Gemini files endpoint URL: {err}")))?;
+    if page_size.is_some() || page_token.is_some() {
+        let mut pairs = url.query_pairs_mut();
+        if let Some(size) = page_size {
+            pairs.append_pair("pageSize", &size.to_string());
+        }
+        if let Some(token) = page_token {
+            pairs.append_pair("pageToken", token);
+        }
+    }
+    Ok(url.to_string())
 }
 
 /// List uploaded files.
@@ -277,14 +318,7 @@ pub async fn list_files(
     page_size: Option<u32>,
     page_token: Option<&str>,
 ) -> Result<ListFilesResponse, GeminiError> {
-    let mut url = cfg.endpoint("files");
-
-    if let Some(size) = page_size {
-        write!(url, "&pageSize={size}").expect("write to String cannot fail");
-    }
-    if let Some(token) = page_token {
-        write!(url, "&pageToken={token}").expect("write to String cannot fail");
-    }
+    let url = build_list_files_url(cfg, page_size, page_token)?;
 
     let mut backend = client();
     let mut builder = backend
@@ -299,17 +333,31 @@ pub async fn list_files(
             .map_err(GeminiError::from_http)?;
     }
 
-    builder.json().await.map_err(GeminiError::from_http)
+    within_idle(cfg.idle_timeout, builder.json())
+        .await?
+        .map_err(GeminiError::from_http)
 }
 
-/// Build the upload URL with authentication.
-fn build_upload_url(cfg: &GeminiConfig) -> String {
-    let mut url = UPLOAD_BASE_URL.to_string();
+/// Build the upload URL from `cfg.base_url` and `cfg.auth`.
+fn build_upload_url(cfg: &GeminiConfig) -> Result<String, GeminiError> {
+    let mut url = Url::parse(&cfg.base_url)
+        .map_err(|err| GeminiError::Api(format!("invalid Gemini base_url: {err}")))?;
+    let trimmed = url.path().trim_end_matches('/').to_string();
+    let upload_path = if trimmed.is_empty() {
+        "/upload/v1beta/files".to_string()
+    } else if trimmed.starts_with("/upload/") {
+        format!("{trimmed}/files")
+    } else if let Some(pos) = trimmed.rfind("/v1") {
+        let (prefix, version) = trimmed.split_at(pos);
+        format!("{prefix}/upload{version}/files")
+    } else {
+        format!("/upload{trimmed}/files")
+    };
+    url.set_path(&upload_path);
     if cfg.auth == AuthMode::Query {
-        url.push_str("?key=");
-        url.push_str(&cfg.api_key);
+        url.query_pairs_mut().append_pair("key", &cfg.api_key);
     }
-    url
+    Ok(url.to_string())
 }
 
 /// Parse an RFC 3339 timestamp to `SystemTime`.
@@ -366,5 +414,50 @@ mod tests {
             crate::mime::mime_from_path(Path::new("/path/to/unknown.aither_unknown")),
             None
         );
+    }
+
+    #[test]
+    fn upload_and_list_urls_respect_base_url_and_auth_modes() {
+        let header_client = crate::Gemini::new("sec+key");
+        assert_eq!(
+            build_upload_url(header_client.config()).expect("upload url"),
+            "https://generativelanguage.googleapis.com/upload/v1beta/files"
+        );
+        assert_eq!(
+            build_list_files_url(header_client.config(), Some(25), Some("next+tok"))
+                .expect("list url"),
+            "https://generativelanguage.googleapis.com/v1beta/files?pageSize=25&pageToken=next%2Btok"
+        );
+        assert_eq!(
+            build_list_files_url(header_client.config(), None, None).expect("bare list url"),
+            "https://generativelanguage.googleapis.com/v1beta/files"
+        );
+
+        let proxy_query = crate::Gemini::new("sec+key")
+            .with_base_url("http://127.0.0.1:9090/gemini/v1beta")
+            .with_auth_mode(AuthMode::Query);
+        assert_eq!(
+            build_upload_url(proxy_query.config()).expect("proxy upload url"),
+            "http://127.0.0.1:9090/gemini/upload/v1beta/files?key=sec%2Bkey"
+        );
+        assert_eq!(
+            build_list_files_url(proxy_query.config(), Some(10), None).expect("proxy list url"),
+            "http://127.0.0.1:9090/gemini/v1beta/files?key=sec%2Bkey&pageSize=10"
+        );
+    }
+
+    #[test]
+    fn related_multipart_rejects_header_injection() {
+        assert!(build_related_multipart("bad\r\nname.pdf", "application/pdf", b"x").is_err());
+        assert!(build_related_multipart("ok.pdf", "application/pdf\r\nX-Inject: 1", b"x").is_err());
+        assert!(build_related_multipart("ok.pdf", "application/\"pdf\"", b"x").is_err());
+
+        let (b1, body) =
+            build_related_multipart("doc.pdf", "application/pdf", b"hello").expect("valid");
+        let b2 = csprng_boundary().expect("second boundary");
+        assert_ne!(b1, b2);
+        let rendered = String::from_utf8_lossy(&body);
+        assert!(rendered.contains("\"displayName\":\"doc.pdf\""));
+        assert!(rendered.contains("Content-Type: application/pdf"));
     }
 }

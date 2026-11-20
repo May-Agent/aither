@@ -1,28 +1,35 @@
 //! Error types for the Claude API client.
 
-use core::fmt;
-
 use aither_core::llm::{
     Classify, Failure, FailureKind,
-    failure::zenwave::{body_failure, failure as http_failure, sse_failure},
+    failure::zenwave::{body_failure, failure as http_failure, io_is_network, sse_failure},
 };
 use serde::Deserialize;
 use zenwave::{BodyError, Error as ZenwaveError, sse::ParseError as SseParseError};
 
 /// Errors that can arise when calling the Claude API.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ClaudeError {
     /// HTTP layer errors.
-    Http(ZenwaveError),
+    #[error("HTTP error: {0}")]
+    Http(#[from] ZenwaveError),
     /// Response body parsing failures.
-    Body(BodyError),
+    #[error("Body error: {0}")]
+    Body(#[from] BodyError),
     /// SSE parsing failures.
-    Stream(SseParseError),
+    #[error("SSE error: {0}")]
+    Stream(#[from] SseParseError),
     /// JSON serialization/deserialization errors.
-    Json(serde_json::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Local I/O errors (e.g., reading `file://` attachments).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// API contract violations or unsupported operations.
+    #[error("{0}")]
     Api(String),
     /// The API reported an error in an `error` event of an open stream.
+    #[error("{message}")]
     StreamEvent {
         /// The error's `type`, such as `overloaded_error`.
         error_type: String,
@@ -30,28 +37,12 @@ pub enum ClaudeError {
         message: String,
     },
     /// The response stream sent nothing for the client's idle timeout.
+    #[error("the response stream was silent for {idle:?}")]
     IdleTimeout {
         /// How long the stream stayed silent.
         idle: core::time::Duration,
     },
 }
-
-impl fmt::Display for ClaudeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(err) => write!(f, "HTTP error: {err}"),
-            Self::Body(err) => write!(f, "Body error: {err}"),
-            Self::Stream(err) => write!(f, "SSE error: {err}"),
-            Self::Json(err) => write!(f, "JSON error: {err}"),
-            Self::Api(message) | Self::StreamEvent { message, .. } => write!(f, "{message}"),
-            Self::IdleTimeout { idle } => {
-                write!(f, "the response stream was silent for {idle:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ClaudeError {}
 
 /// The `error.type` of an Anthropic error body, `{"type":"error","error":{"type":...}}`.
 fn body_error_type(body: &str) -> Option<String> {
@@ -105,32 +96,10 @@ impl Classify for ClaudeError {
                 Failure::new(kind_of_error_type(error_type).unwrap_or(FailureKind::Permanent))
             }
             Self::IdleTimeout { .. } => Failure::network(),
-            Self::Json(_) | Self::Api(_) => Failure::permanent(),
+            Self::Json(err) if err.is_eof() => Failure::network(),
+            Self::Io(err) if io_is_network(err.kind()) => Failure::network(),
+            Self::Json(_) | Self::Io(_) | Self::Api(_) => Failure::permanent(),
         }
-    }
-}
-
-impl From<ZenwaveError> for ClaudeError {
-    fn from(value: ZenwaveError) -> Self {
-        Self::Http(value)
-    }
-}
-
-impl From<BodyError> for ClaudeError {
-    fn from(value: BodyError) -> Self {
-        Self::Body(value)
-    }
-}
-
-impl From<SseParseError> for ClaudeError {
-    fn from(value: SseParseError) -> Self {
-        Self::Stream(value)
-    }
-}
-
-impl From<serde_json::Error> for ClaudeError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
     }
 }
 
@@ -296,5 +265,18 @@ mod tests {
                 .idle_timeout,
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn error_source_is_preserved() {
+        use std::error::Error as _;
+
+        let json_err =
+            ClaudeError::from(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
+        assert!(json_err.source().is_some());
+
+        let io_err =
+            ClaudeError::from(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+        assert!(io_err.source().is_some());
     }
 }

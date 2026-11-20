@@ -20,7 +20,7 @@ pub enum PoolingStrategy {
     /// A common choice for encoder models that produces robust embeddings.
     Mean,
 
-    /// Use the first token's hidden state (typically [CLS] token).
+    /// Use the first token's hidden state (typically `[CLS]` token).
     ///
     /// Traditional approach for BERT-style encoder models.
     Cls,
@@ -37,16 +37,19 @@ impl PoolingStrategy {
     /// A vector of `hidden_dim` floats representing the pooled embedding.
     #[must_use]
     pub fn apply(&self, hidden_states: &ArrayView3<f32>, attention_mask: &[u32]) -> Vec<f32> {
-        let seq_len = hidden_states.shape()[1];
-        let hidden_dim = hidden_states.shape()[2];
+        let shape = hidden_states.shape();
+        let batch = shape[0];
+        let seq_len = shape[1];
+        let hidden_dim = shape[2];
+        if batch == 0 || seq_len == 0 {
+            return vec![0.0; hidden_dim];
+        }
+        let mask = attention_mask.get(..seq_len).unwrap_or(attention_mask);
 
         match self {
             Self::LastToken => {
-                // Find the last non-padding token
-                let last_idx = attention_mask
-                    .iter()
-                    .rposition(|&m| m != 0)
-                    .unwrap_or(seq_len - 1);
+                // Find the last non-padding token within the tensor's sequence bounds.
+                let last_idx = mask.iter().rposition(|&m| m != 0).unwrap_or(seq_len - 1);
 
                 // Extract the hidden state at that position
                 (0..hidden_dim)
@@ -59,8 +62,8 @@ impl PoolingStrategy {
                 // what was actually summed.
                 let mut result = vec![0.0; hidden_dim];
                 let mut valid_count = 0.0_f32;
-                for (seq_idx, &mask) in attention_mask.iter().enumerate() {
-                    if mask == 0 {
+                for (seq_idx, &m) in mask.iter().enumerate() {
+                    if m == 0 {
                         continue;
                     }
                     valid_count += 1.0;
@@ -159,5 +162,29 @@ mod tests {
 
         let result = PoolingStrategy::Cls.apply(&hidden.view(), &mask);
         assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn empty_sequence_and_oversized_mask_do_not_panic() {
+        let empty = Array3::<f32>::from_shape_vec((1, 0, 4), Vec::new()).unwrap();
+        for strategy in [
+            PoolingStrategy::LastToken,
+            PoolingStrategy::Mean,
+            PoolingStrategy::Cls,
+        ] {
+            assert_eq!(strategy.apply(&empty.view(), &[]), vec![0.0; 4]);
+            assert_eq!(strategy.apply(&empty.view(), &[1, 1]), vec![0.0; 4]);
+        }
+
+        let single = Array3::from_shape_vec((1, 1, 2), vec![3.0, 4.0]).unwrap();
+        let long_mask = vec![1, 1, 1, 1, 1];
+        assert_eq!(
+            PoolingStrategy::LastToken.apply(&single.view(), &long_mask),
+            vec![3.0, 4.0]
+        );
+        assert_eq!(
+            PoolingStrategy::Mean.apply(&single.view(), &long_mask),
+            vec![3.0, 4.0]
+        );
     }
 }

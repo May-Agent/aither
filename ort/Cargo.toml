@@ -19,6 +19,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ndarray = "0.17"
 thiserror = "2.0"
 async-channel = "2.5"
+blocking = "1.7"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt"] }
