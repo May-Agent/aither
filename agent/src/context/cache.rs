@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use aither_core::llm::model::Parameters;
 use aither_core::llm::model::{
-    CacheOptions, ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoint,
-    ClaudeExplicitCacheBreakpoints, ClaudePromptCache, ClaudePromptCacheTtl,
+    ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoint, ClaudeExplicitCacheBreakpoints,
+    ClaudePromptCache, ClaudePromptCacheTtl,
 };
 use aither_core::llm::{Message, ReasoningState, Role};
 
@@ -50,6 +50,12 @@ pub struct PromptCache {
     ttl: ClaudePromptCacheTtl,
     /// How long the conversation's cache stays warm, across providers.
     lifetime: CacheLifetime,
+    /// Whether the agent's requests may write cache entries.
+    ///
+    /// Read-only agents — a `/btw` fork answering a side question — keep
+    /// the routing key so they still reach the session's shard, but emit
+    /// no breakpoints: the span they would write is never read back.
+    read_only: bool,
 }
 
 impl PromptCache {
@@ -66,7 +72,26 @@ impl PromptCache {
             fingerprint: None,
             ttl: ClaudePromptCacheTtl::OneHour,
             lifetime: CacheLifetime::Limited(Duration::from_secs(3600)),
+            read_only: false,
         }
+    }
+
+    /// Marks the agent's requests unable to write cache entries.
+    #[must_use]
+    pub const fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Whether requests may write cache entries.
+    #[must_use]
+    pub const fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Updates whether requests may write cache entries.
+    pub const fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     /// Overrides the Claude cache breakpoint retention without altering
@@ -171,15 +196,15 @@ impl PromptCache {
         mid_conversation_system: bool,
         has_tail: bool,
     ) -> Parameters {
-        parameters.cache = CacheOptions {
-            openai: Some(aither_core::llm::model::OpenAIPromptCache {
-                key: Some(self.key()),
-                retention: Some(aither_core::llm::model::OpenAIPromptCacheRetention::Hours24),
-            }),
-            claude: Self::breakpoints(messages, has_tools, mid_conversation_system, has_tail)
-                .map(|breakpoints| ClaudePromptCache::explicit(self.ttl, breakpoints)),
-            gemini: None,
-        };
+        parameters.cache.openai = Some(aither_core::llm::model::OpenAIPromptCache {
+            key: Some(self.key()),
+            retention: Some(aither_core::llm::model::OpenAIPromptCacheRetention::Hours24),
+        });
+        if !self.read_only {
+            parameters.cache.claude =
+                Self::breakpoints(messages, has_tools, mid_conversation_system, has_tail)
+                    .map(|breakpoints| ClaudePromptCache::explicit(self.ttl, breakpoints));
+        }
         parameters
     }
 
@@ -200,7 +225,13 @@ impl PromptCache {
         if has_tools {
             targets.push(ClaudeCacheBreakpointTarget::LastTool);
         }
-        if has_non_empty_claude_system(messages, mid_conversation_system) {
+        // On a model that folds system messages into the top-level
+        // `system`, the live tail folds in last and sits inside the
+        // LastSystem span: the breakpoint would write an entry each
+        // request and never read one back.
+        if has_non_empty_claude_system(messages, mid_conversation_system)
+            && (mid_conversation_system || !has_tail)
+        {
             targets.push(ClaudeCacheBreakpointTarget::LastSystem);
         }
         if let Some((message_index, block_index)) =
@@ -495,12 +526,13 @@ mod tests {
             panic!("expected explicit claude breakpoints");
         };
         assert_eq!(
-            breakpoints.second.map(|point| point.target),
-            Some(ClaudeCacheBreakpointTarget::Message {
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::Message {
                 message_index: 1,
                 block_index: 0,
-            })
+            }
         );
+        assert!(breakpoints.second.is_none());
     }
 
     #[test]
@@ -623,6 +655,72 @@ mod tests {
                 message_index: 0,
                 block_index: 0,
             }
+        );
+    }
+
+    /// A folding model puts the live tail inside `system`, so the
+    /// LastSystem breakpoint would cache a span that dies on every
+    /// request. LastTool still names a stable span.
+    #[test]
+    fn folding_models_skip_the_last_system_breakpoint() {
+        let cache = PromptCache::new("session-1");
+        let messages = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::system("live tail"),
+        ];
+        let parameters = cache.apply(Parameters::default(), &messages, true, false, true);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::LastTool
+        );
+        assert_ne!(
+            breakpoints.second.map(|point| point.target),
+            Some(ClaudeCacheBreakpointTarget::LastSystem)
+        );
+
+        // Without a tail every system block is stable, so the breakpoint
+        // is worth writing even on a folding model.
+        let parameters = cache.apply(Parameters::default(), &messages, true, false, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.second.map(|point| point.target),
+            Some(ClaudeCacheBreakpointTarget::LastSystem)
+        );
+    }
+
+    /// Host-set cache options the agent does not own (a Gemini
+    /// cached-content resource, custom routing) survive `apply`.
+    #[test]
+    fn apply_preserves_cache_options_it_does_not_own() {
+        use aither_core::llm::model::{GeminiPromptCache, OpenAIPromptCache};
+
+        let cache = PromptCache::new("session-1");
+        let mut parameters = Parameters::default();
+        parameters.cache.gemini = Some(GeminiPromptCache::new("cached-content-1"));
+        parameters.cache.openai = Some(OpenAIPromptCache {
+            key: Some("host-key".into()),
+            retention: None,
+        });
+        let messages = vec![Message::user("hello")];
+        let parameters = cache.apply(parameters, &messages, false, true, false);
+        assert!(
+            parameters.cache.gemini.is_some(),
+            "a host-set Gemini cache resource must survive apply"
+        );
+        assert_eq!(
+            parameters
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.key.as_deref()),
+            Some("session-1:0"),
+            "the agent still writes the key it owns"
         );
     }
 }
