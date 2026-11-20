@@ -1236,6 +1236,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.set_nodelay(true);
             let mut buf = [0u8; 2048];
             let _ = stream.read(&mut buf);
             stream
@@ -1249,9 +1250,19 @@ mod tests {
                 )
                 .expect("reasoning 1");
             stream.flush().expect("flush");
-            for _ in 0..4 {
-                std::thread::sleep(Duration::from_millis(35));
-                stream.write_all(b"data: \n\n").expect("keepalive");
+            // 14 frames spaced 50 ms apart outlast the 500 ms idle timeout while
+            // leaving a 450 ms scheduling margin per gap on loaded CI runners.
+            for idx in 0..14 {
+                std::thread::sleep(Duration::from_millis(50));
+                if idx % 2 == 0 {
+                    stream.write_all(b"data: \n\n").expect("keepalive");
+                } else {
+                    stream
+                        .write_all(
+                            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"step\"},\"finish_reason\":null}]}\n\n",
+                        )
+                        .expect("reasoning keepalive");
+                }
                 stream.flush().expect("flush");
             }
             stream
@@ -1272,8 +1283,8 @@ mod tests {
         let collected: Vec<Event> = stream_chat_completion_events_with_timeouts(
             sse,
             true,
-            Duration::from_millis(90),
-            Duration::from_millis(90),
+            Duration::from_millis(500),
+            Duration::from_millis(500),
         )
         .map(|res| res.expect("keepalives prevent false timeout"))
         .collect()
