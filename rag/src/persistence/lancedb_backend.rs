@@ -8,7 +8,7 @@ use arrow_array::{
     UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use futures::StreamExt;
+use futures_lite::StreamExt;
 use lancedb::connect;
 use lancedb::query::ExecutableQuery;
 

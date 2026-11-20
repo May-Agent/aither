@@ -23,6 +23,20 @@ pub trait VectorIndex: Send + Sync {
     /// Returns an error if the embedding's dimension does not match the index.
     fn insert(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()>;
 
+    /// Inserts or updates a batch of chunks with their embedding vectors.
+    ///
+    /// Implementations should apply the batch in a single index state update
+    /// rather than cloning index structures once per chunk.
+    /// # Errors
+    ///
+    /// Returns an error if any embedding's dimension does not match the index.
+    fn insert_batch(&self, entries: Vec<(Chunk, Vec<f32>)>) -> Result<()> {
+        for (chunk, embedding) in entries {
+            self.insert(chunk, embedding)?;
+        }
+        Ok(())
+    }
+
     /// Removes a chunk by its ID.
     ///
     /// Returns `true` if a chunk was removed, `false` if not found.
@@ -58,7 +72,7 @@ pub trait VectorIndex: Send + Sync {
     /// Clears all entries from the index.
     fn clear(&self);
 
-    /// Returns an iterator over all index entries.
+    /// Returns all index entries.
     fn entries(&self) -> Vec<IndexEntry>;
 
     /// Loads entries into the index, replacing existing content.

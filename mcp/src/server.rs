@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aither_core::llm::tool::{
-    Progress, ProgressSink, ToolContext, ToolResult, ToolResultPart, Tools,
+    Canceller, Progress, ProgressSink, ToolContext, ToolResult, ToolResultPart, Tools,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_lite::future;
@@ -21,19 +21,16 @@ use crate::protocol::{
 };
 use crate::transport::{BidirectionalTransport, StdioTransport};
 
-/// A `tools/call` execution that resolves to its request ID and response, or
-/// to [`Aborted`] once a `notifications/cancelled` notification names its ID.
-type InFlightCall = Abortable<BoxFuture<'static, (RequestId, JsonRpcResponse)>>;
+/// A `tools/call` execution that resolves to its request ID, execution slot,
+/// and response, or to [`Aborted`] once a `notifications/cancelled`
+/// notification names its ID.
+type InFlightCall = Abortable<BoxFuture<'static, (RequestId, CallSlot, JsonRpcResponse)>>;
 
 /// The `tools/call` executions currently running, resolved in any order.
 type InFlightCalls = FuturesUnordered<InFlightCall>;
 
 /// How many progress reports may wait for the server loop to write them
 /// before a reporting tool's [`ToolContext::report_progress`] waits too.
-///
-/// The loop drains reports whenever it is not itself writing, so this only
-/// absorbs bursts; a tool that reports faster than the transport writes is
-/// slowed to the transport's pace instead of growing an unbounded queue.
 const PROGRESS_BACKLOG: usize = 32;
 
 /// Distinguishes one `tools/call` execution from every other one this server
@@ -45,6 +42,9 @@ struct CallSlot(u64);
 struct InFlight {
     /// Drops the call's future on `notifications/cancelled`.
     abort: AbortHandle,
+    /// Fires the call's [`ToolContext::cancellation`] signal so work outliving
+    /// the call's future stops as well.
+    canceller: Canceller,
     /// This execution's identity, which progress reports quote.
     slot: CallSlot,
 }
@@ -78,8 +78,6 @@ impl ProgressSink for CallProgress {
                 message: progress.message().map(str::to_owned),
             },
         };
-        // The server loop holds a sender of its own, so the channel closes
-        // only once the loop has returned, taking the client with it.
         if self.reports.send(report).await.is_err() {
             debug!("Server stopped; dropping progress for {:?}", self.request);
         }
@@ -91,7 +89,7 @@ enum ServerEvent {
     /// The client sent a message, closed the connection, or the transport failed.
     Message(Result<Option<JsonRpcMessage>, McpError>),
     /// An in-flight `tools/call` produced its response or was aborted.
-    Call(Result<(RequestId, JsonRpcResponse), Aborted>),
+    Call(Result<(RequestId, CallSlot, JsonRpcResponse), Aborted>),
     /// A tool reported progress.
     Progress(ProgressReport),
 }
@@ -129,15 +127,6 @@ impl<T: BidirectionalTransport> std::fmt::Debug for McpServer<T> {
 
 impl McpServer<StdioTransport> {
     /// Create an MCP server using stdio transport.
-    ///
-    /// This is the standard way to create an MCP server that communicates
-    /// via stdin/stdout (e.g., when run by Claude Desktop).
-    ///
-    /// # Arguments
-    ///
-    /// * `tools` - The aither tools to expose.
-    /// * `name` - The server name.
-    /// * `version` - The server version.
     #[must_use]
     pub fn stdio(tools: Tools, name: impl Into<String>, version: impl Into<String>) -> Self {
         Self::new(StdioTransport::new(), tools, name, version)
@@ -146,15 +135,6 @@ impl McpServer<StdioTransport> {
 
 impl<T: BidirectionalTransport + Sync> McpServer<T> {
     /// Create a new MCP server with a custom transport.
-    ///
-    /// For most use cases, prefer [`McpServer::stdio`] instead.
-    ///
-    /// # Arguments
-    ///
-    /// * `transport` - The transport to use for communication.
-    /// * `tools` - The aither tools to expose.
-    /// * `name` - The server name.
-    /// * `version` - The server version.
     #[must_use]
     pub fn new(
         transport: T,
@@ -184,20 +164,9 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
     /// Run the server main loop.
     ///
     /// Processes incoming messages until the connection is closed.
-    /// `tools/call` requests execute concurrently: each becomes an in-flight
-    /// future raced against the next incoming message, and its response is
-    /// written as soon as the call completes, in any order. A
-    /// `notifications/cancelled` notification drops the in-flight call whose
-    /// request ID it carries; per the MCP specification no response is then
-    /// sent for it.
-    ///
-    /// A `tools/call` whose `_meta` carries a `progressToken` runs with a
-    /// [`ToolContext`] that turns each progress report into a
-    /// `notifications/progress` for that token, written between the other
-    /// traffic while the call runs. Reports a call made before it finished are
-    /// written before its response; reports that arrive after it has answered
-    /// or been cancelled are dropped, because progress may only reference an
-    /// active request.
+    /// Requests other than `initialize` and `ping` are rejected before
+    /// `initialize` completes, and duplicate in-flight request IDs are
+    /// rejected without disturbing the running execution.
     ///
     /// # Errors
     ///
@@ -206,19 +175,17 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
     /// # Panics
     ///
     /// Panics only on an internal bug: the in-flight call set is polled only
-    /// while it is non-empty, in which case it always yields a completed call,
-    /// and the progress channel cannot close while this loop holds a sender.
+    /// while it is non-empty, and the progress channel cannot close while this
+    /// loop holds a sender.
     pub async fn run(&mut self) -> Result<(), McpError> {
         debug!("MCP server starting: {}", self.info.name);
 
         let mut calls = InFlightCalls::new();
         let mut in_flight: HashMap<RequestId, InFlight> = HashMap::new();
-        // The loop keeps `reports_tx` for as long as it runs, so `recv` below
-        // never sees a closed channel.
         let (reports_tx, reports_rx) = async_channel::bounded(PROGRESS_BACKLOG);
         let mut next_slot = 0;
 
-        loop {
+        let outcome = loop {
             let incoming = future::race(
                 async { ServerEvent::Message(self.transport.recv().await) },
                 async {
@@ -240,12 +207,31 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
             };
 
             match event {
-                ServerEvent::Message(Ok(Some(JsonRpcMessage::Request(req))))
-                    if req.method == "tools/call" =>
-                {
-                    let slot = CallSlot(next_slot);
-                    next_slot += 1;
-                    self.enqueue_call(req, slot, &reports_tx, &calls, &mut in_flight);
+                ServerEvent::Message(Ok(Some(JsonRpcMessage::Request(req)))) => {
+                    if in_flight.contains_key(&req.id) {
+                        let response = JsonRpcResponse::error(
+                            req.id,
+                            JsonRpcError::invalid_request("Request ID is already in flight"),
+                        );
+                        self.transport.respond(response).await?;
+                        continue;
+                    }
+                    if !self.initialized && req.method != "initialize" && req.method != "ping" {
+                        let response = JsonRpcResponse::error(
+                            req.id,
+                            JsonRpcError::invalid_request("Server not initialized"),
+                        );
+                        self.transport.respond(response).await?;
+                        continue;
+                    }
+                    if req.method == "tools/call" {
+                        let slot = CallSlot(next_slot);
+                        next_slot += 1;
+                        self.enqueue_call(req, slot, &reports_tx, &calls, &mut in_flight);
+                    } else {
+                        let response = self.handle_request(req);
+                        self.transport.respond(response).await?;
+                    }
                 }
                 ServerEvent::Message(Ok(Some(msg))) => {
                     if let Err(e) = self.handle_message(msg, &mut in_flight).await {
@@ -254,34 +240,42 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
                 }
                 ServerEvent::Message(Ok(None)) => {
                     debug!("Connection closed");
-                    break;
+                    break Ok(());
                 }
-                ServerEvent::Message(Err(e)) => return Err(e),
-                ServerEvent::Call(Ok((id, response))) => {
-                    // Progress the call reported before it finished is already
-                    // queued; it goes out ahead of the response, while the
-                    // call still counts as active.
+                ServerEvent::Message(Err(e)) => break Err(e),
+                ServerEvent::Call(Ok((id, slot, response))) => {
+                    let still_active = in_flight.get(&id).is_some_and(|call| call.slot == slot);
+                    if !still_active {
+                        continue;
+                    }
                     while let Ok(report) = reports_rx.try_recv() {
-                        self.forward_progress(report, &in_flight).await?;
+                        if let Err(err) = self.forward_progress(report, &in_flight).await {
+                            cancel_all_in_flight(&mut in_flight);
+                            return Err(err);
+                        }
                     }
                     in_flight.remove(&id);
-                    self.transport.respond(response).await?;
+                    if let Err(err) = self.transport.respond(response).await {
+                        cancel_all_in_flight(&mut in_flight);
+                        return Err(err);
+                    }
                 }
                 ServerEvent::Call(Err(Aborted)) => {
                     debug!("In-flight tool call was cancelled");
                 }
                 ServerEvent::Progress(report) => {
-                    self.forward_progress(report, &in_flight).await?;
+                    if let Err(err) = self.forward_progress(report, &in_flight).await {
+                        cancel_all_in_flight(&mut in_flight);
+                        return Err(err);
+                    }
                 }
             }
-        }
+        };
 
-        Ok(())
+        cancel_all_in_flight(&mut in_flight);
+        outcome
     }
 
-    /// Write `report` as a `notifications/progress`, or drop it when the call
-    /// that made it is no longer active: it has answered or been cancelled,
-    /// and progress may only reference an active request's token.
     async fn forward_progress(
         &mut self,
         report: ProgressReport,
@@ -303,11 +297,6 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
         }
     }
 
-    /// Push a `tools/call` request onto the in-flight set and track it in
-    /// `in_flight` for `notifications/cancelled` and progress.
-    ///
-    /// Synchronous so that `&calls` — which is not [`Sync`] — never crosses an
-    /// await point and the server loop's future stays `Send`.
     fn enqueue_call(
         &self,
         req: JsonRpcRequest,
@@ -317,11 +306,11 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
         in_flight: &mut HashMap<RequestId, InFlight>,
     ) {
         let (abort, registration) = AbortHandle::new_pair();
+        let canceller = Canceller::new();
         let id = req.id;
-        let call: BoxFuture<'static, (RequestId, JsonRpcResponse)> =
+        let call: BoxFuture<'static, (RequestId, CallSlot, JsonRpcResponse)> =
             match parse_call_params(req.params) {
                 Ok(params) => {
-                    // Without a token nobody listens, so reporting is a no-op.
                     let cx = params
                         .meta
                         .and_then(|meta| meta.progress_token)
@@ -332,7 +321,8 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
                                 token,
                                 reports: reports.clone(),
                             })
-                        });
+                        })
+                        .with_cancellation(canceller.signal());
                     let tools = Arc::clone(&self.tools);
                     let call_id = id.clone();
                     Box::pin(async move {
@@ -344,21 +334,25 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
                             cx,
                         )
                         .await;
-                        (call_id, response)
+                        (call_id, slot, response)
                     })
                 }
                 Err(error) => {
                     let response = JsonRpcResponse::error(id.clone(), error);
-                    Box::pin(future::ready((id.clone(), response)))
+                    Box::pin(future::ready((id.clone(), slot, response)))
                 }
             };
         calls.push(Abortable::new(call, registration));
-        in_flight.insert(id, InFlight { abort, slot });
+        in_flight.insert(
+            id,
+            InFlight {
+                abort,
+                canceller,
+                slot,
+            },
+        );
     }
 
-    /// Handle an incoming JSON-RPC message other than a `tools/call` request,
-    /// which [`run`](Self::run) enqueues before this is reached. Every other
-    /// request is answered inline through the transport before this returns.
     async fn handle_message(
         &mut self,
         msg: JsonRpcMessage,
@@ -373,30 +367,23 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
                 Self::handle_notification(notif, in_flight);
             }
             JsonRpcMessage::Response(_) => {
-                // We don't expect responses as a server
                 debug!("Unexpected response message");
             }
         }
         Ok(())
     }
 
-    /// Handle an incoming request other than `tools/call`, which
-    /// [`run`](Self::run) enqueues before this is reached.
     fn handle_request(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         debug!("Handling request: {}", req.method);
 
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req),
+            "ping" => JsonRpcResponse::success(req.id, serde_json::json!({})),
             "tools/list" => self.handle_list_tools(req),
             method => JsonRpcResponse::error(req.id, JsonRpcError::method_not_found(method)),
         }
     }
 
-    /// Handle an incoming JSON-RPC notification.
-    ///
-    /// `notifications/cancelled` aborts the in-flight `tools/call` whose
-    /// request ID it names. Cancelling an unknown or already-finished request
-    /// is ignored, as the specification allows.
     fn handle_notification(
         notif: JsonRpcNotification,
         in_flight: &mut HashMap<RequestId, InFlight>,
@@ -416,6 +403,7 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
                     Ok(Some(params)) => {
                         if let Some(call) = in_flight.remove(&params.request_id) {
                             debug!("Cancelling tool call {:?}", params.request_id);
+                            call.canceller.cancel();
                             call.abort.abort();
                         } else {
                             debug!("No in-flight call {:?}", params.request_id);
@@ -429,8 +417,14 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
         }
     }
 
-    /// Handle initialize request.
     fn handle_initialize(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+        if self.initialized {
+            return JsonRpcResponse::error(
+                req.id,
+                JsonRpcError::invalid_request("Server is already initialized"),
+            );
+        }
+
         let _params: InitializeParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(p) => p.unwrap_or_default(),
             Err(e) => {
@@ -453,7 +447,6 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
         JsonRpcResponse::success(req.id, result)
     }
 
-    /// Handle tools/list request.
     fn handle_list_tools(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         let definitions = self.tools.definitions();
 
@@ -474,10 +467,6 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
         JsonRpcResponse::success(req.id, result)
     }
 
-    /// Handle tools/call request.
-    ///
-    /// Takes the shared tool table rather than `&self` so the returned future
-    /// owns no borrow of the server and can run inside the in-flight set.
     async fn handle_call_tool(
         tools: &Tools,
         id: RequestId,
@@ -510,7 +499,13 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
     }
 }
 
-/// Parse the parameters of a `tools/call` request.
+fn cancel_all_in_flight(in_flight: &mut HashMap<RequestId, InFlight>) {
+    for (_, call) in in_flight.drain() {
+        call.canceller.cancel();
+        call.abort.abort();
+    }
+}
+
 fn parse_call_params(params: Option<serde_json::Value>) -> Result<CallToolParams, JsonRpcError> {
     match params.map(serde_json::from_value).transpose() {
         Ok(Some(params)) => Ok(params),
@@ -519,11 +514,6 @@ fn parse_call_params(params: Option<serde_json::Value>) -> Result<CallToolParams
     }
 }
 
-/// Map a tool output to the MCP content items the client receives.
-///
-/// [`ToolResult::Parts`] emits one content item per part so a call that
-/// returns text alongside a screenshot keeps both; every other result maps
-/// to a single item.
 fn contents_for(output: &ToolResult) -> Vec<Content> {
     match output {
         ToolResult::Parts { parts } => parts.iter().map(content_for_part).collect(),
@@ -531,10 +521,6 @@ fn contents_for(output: &ToolResult) -> Vec<Content> {
     }
 }
 
-/// A binary payload whose MIME type's top-level type is `image` is delivered
-/// as [`Content::Image`] carrying the standard-base64 bytes and the MIME
-/// essence; every other payload keeps the text representation
-/// `render_for_model` produces.
 fn content_for(output: &ToolResult) -> Content {
     if let ToolResult::Binary { mime, content } = output
         && let Some(image) = image_content(mime, content)
@@ -580,9 +566,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::protocol::ErrorCode;
     use crate::transport::{DuplexTransport, Transport};
 
-    /// The handler signature accepted by [`Tools::register_dyn`].
     type ToolHandler = dyn Fn(
             &str,
             ToolContext,
@@ -590,7 +576,6 @@ mod tests {
         + Send
         + Sync;
 
-    /// Sends once dropped, marking that the future holding it was dropped.
     struct DropMarker(async_channel::Sender<()>);
 
     impl Drop for DropMarker {
@@ -599,7 +584,6 @@ mod tests {
         }
     }
 
-    /// Register `name` running `handler` on the JSON arguments string.
     fn register(tools: &mut Tools, name: &'static str, handler: Box<ToolHandler>) {
         let definition = ToolDefinition::from_parts(
             name.into(),
@@ -610,7 +594,6 @@ mod tests {
         tools.register_dyn(definition, handler).expect("registers");
     }
 
-    /// A `tools/call` request for `name` with empty arguments.
     fn call(id: i64, name: &str) -> JsonRpcRequest {
         JsonRpcRequest::with_params(
             id,
@@ -623,8 +606,6 @@ mod tests {
         )
     }
 
-    /// A `tools/call` request for `name` asking for progress under `token`,
-    /// spelled as a client sends it on the wire.
     fn call_with_progress(id: i64, name: &str, token: &str) -> JsonRpcRequest {
         JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -638,12 +619,30 @@ mod tests {
         }
     }
 
-    /// Receive the next message arriving at `client`, whatever its kind.
     async fn next_message(client: &mut DuplexTransport) -> JsonRpcMessage {
         client.recv().await.expect("recv").expect("connection open")
     }
 
-    /// The `params` of `message`, which must be a `notifications/progress`.
+    async fn next_response(client: &mut DuplexTransport) -> JsonRpcResponse {
+        match client.recv().await.expect("recv") {
+            Some(JsonRpcMessage::Response(response)) => response,
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    async fn initialize_server(client: &mut DuplexTransport) {
+        client
+            .send_request(JsonRpcRequest::with_params(
+                0i64,
+                "initialize",
+                InitializeParams::default(),
+            ))
+            .await
+            .expect("send initialize");
+        let response = next_response(client).await;
+        assert!(!response.is_error(), "{response:?}");
+    }
+
     fn progress_params(message: JsonRpcMessage) -> serde_json::Value {
         match message {
             JsonRpcMessage::Notification(notif) if notif.method == "notifications/progress" => {
@@ -653,9 +652,6 @@ mod tests {
         }
     }
 
-    /// Register `slow`, which reports progress 1, waits for `gate`, reports
-    /// progress 2, and answers. `reported` fires once the first report is
-    /// handed to the context.
     fn register_slow(
         tools: &mut Tools,
         gate: async_channel::Receiver<()>,
@@ -680,10 +676,115 @@ mod tests {
         );
     }
 
-    /// A call carrying a progress token produces spec-shaped
-    /// `notifications/progress` while it is still running — the first arrives
-    /// before the call is allowed to finish — and every one of them precedes
-    /// the call's response.
+    #[tokio::test]
+    async fn rejects_requests_before_initialize_and_duplicate_initialize() {
+        let mut tools = Tools::new();
+        register(
+            &mut tools,
+            "echo",
+            Box::new(|_args, _cx| Box::pin(async { Ok(ToolResult::text("ok")) })),
+        );
+
+        let (mut client, transport) = DuplexTransport::pair();
+        let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
+        let server_task = tokio::spawn(async move { server.run().await });
+
+        // Pre-initialize tools/list and tools/call must fail with INVALID_REQUEST.
+        client
+            .send_request(JsonRpcRequest::new(10, "tools/list"))
+            .await
+            .expect("send");
+        let pre_list = next_response(&mut client).await;
+        assert_eq!(
+            pre_list.error.as_ref().map(|e| e.code),
+            Some(ErrorCode::INVALID_REQUEST)
+        );
+
+        client.send_request(call(11, "echo")).await.expect("send");
+        let pre_call = next_response(&mut client).await;
+        assert_eq!(
+            pre_call.error.as_ref().map(|e| e.code),
+            Some(ErrorCode::INVALID_REQUEST)
+        );
+
+        // Ping is permitted before initialize.
+        client
+            .send_request(JsonRpcRequest::new(12, "ping"))
+            .await
+            .expect("send");
+        assert!(!next_response(&mut client).await.is_error());
+
+        initialize_server(&mut client).await;
+
+        // Duplicate initialize is rejected.
+        client
+            .send_request(JsonRpcRequest::with_params(
+                13,
+                "initialize",
+                InitializeParams::default(),
+            ))
+            .await
+            .expect("send");
+        let dup_init = next_response(&mut client).await;
+        assert_eq!(
+            dup_init.error.as_ref().map(|e| e.code),
+            Some(ErrorCode::INVALID_REQUEST)
+        );
+
+        client.close().await.expect("close");
+        server_task.await.expect("join").expect("run");
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_in_flight_request_id_without_clobbering_original_call() {
+        let (gate_tx, gate_rx) = async_channel::unbounded::<()>();
+        let (started_tx, started_rx) = async_channel::unbounded::<()>();
+
+        let mut tools = Tools::new();
+        register(
+            &mut tools,
+            "hold",
+            Box::new(move |_args, _cx| {
+                let gate_rx = gate_rx.clone();
+                let started_tx = started_tx.clone();
+                Box::pin(async move {
+                    started_tx.send(()).await.expect("started");
+                    gate_rx.recv().await.expect("gate");
+                    Ok(ToolResult::text("original-finished"))
+                })
+            }),
+        );
+
+        let (mut client, transport) = DuplexTransport::pair();
+        let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
+        let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
+
+        client.send_request(call(1, "hold")).await.expect("send");
+        started_rx.recv().await.expect("started");
+
+        // Send a duplicate request with ID 1 while the first is still running.
+        client
+            .send_request(call(1, "hold"))
+            .await
+            .expect("send dup");
+        let dup_resp = next_response(&mut client).await;
+        assert_eq!(dup_resp.id, RequestId::Number(1));
+        assert_eq!(
+            dup_resp.error.as_ref().map(|e| e.code),
+            Some(ErrorCode::INVALID_REQUEST)
+        );
+
+        // Release the original call; it still completes normally.
+        gate_tx.send(()).await.expect("release");
+        let orig_resp = next_response(&mut client).await;
+        assert_eq!(orig_resp.id, RequestId::Number(1));
+        assert!(!orig_resp.is_error());
+
+        client.close().await.expect("close");
+        server_task.await.expect("join").expect("run");
+    }
+
     #[tokio::test]
     async fn progress_notifications_precede_the_response() {
         let (gate_tx, gate_rx) = async_channel::unbounded::<()>();
@@ -694,6 +795,7 @@ mod tests {
         let (mut client, transport) = DuplexTransport::pair();
         let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
         let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
 
         client
             .send_request(call_with_progress(1, "slow", "tok-1"))
@@ -701,8 +803,6 @@ mod tests {
             .expect("send");
         reported_rx.recv().await.expect("reported");
 
-        // The call is blocked on the gate, so this notification was written
-        // while it was in flight.
         assert_eq!(
             progress_params(next_message(&mut client).await),
             json!({
@@ -732,9 +832,6 @@ mod tests {
         server_task.await.expect("join").expect("run");
     }
 
-    /// A call without a progress token gets a context whose reports go
-    /// nowhere: the same tool reports twice, and the client receives only
-    /// the response.
     #[tokio::test]
     async fn no_progress_notifications_without_a_token() {
         let (gate_tx, gate_rx) = async_channel::unbounded::<()>();
@@ -745,6 +842,7 @@ mod tests {
         let (mut client, transport) = DuplexTransport::pair();
         let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
         let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
 
         client.send_request(call(1, "slow")).await.expect("send");
         reported_rx.recv().await.expect("reported");
@@ -760,8 +858,6 @@ mod tests {
         server_task.await.expect("join").expect("run");
     }
 
-    /// A report made after the call has answered references a token that is
-    /// no longer active, so the server drops it instead of writing it.
     #[tokio::test]
     async fn progress_after_the_response_is_dropped() {
         let (late_gate_tx, late_gate_rx) = async_channel::unbounded::<()>();
@@ -773,7 +869,6 @@ mod tests {
             Box::new(move |_args, mut cx| {
                 let late_gate_rx = late_gate_rx.clone();
                 let late_done_tx = late_done_tx.clone();
-                // The context outlives the call in a task of its own.
                 tokio::spawn(async move {
                     late_gate_rx.recv().await.expect("late gate open");
                     cx.report_progress(Progress::new(1.0))
@@ -788,6 +883,7 @@ mod tests {
         let (mut client, transport) = DuplexTransport::pair();
         let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
         let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
 
         client
             .send_request(call_with_progress(1, "detached", "tok-late"))
@@ -798,8 +894,6 @@ mod tests {
         late_gate_tx.send(()).await.expect("late gate send");
         late_done_rx.recv().await.expect("late report handed over");
 
-        // The server has the late report; the next thing it writes is the
-        // answer to this request, not a notification for the finished call.
         client
             .send_request(JsonRpcRequest::new(2, "tools/list"))
             .await
@@ -811,17 +905,6 @@ mod tests {
         server_task.await.expect("join").expect("run");
     }
 
-    /// Receive the next response arriving at `client`.
-    async fn next_response(client: &mut DuplexTransport) -> JsonRpcResponse {
-        match client.recv().await.expect("recv") {
-            Some(JsonRpcMessage::Response(response)) => response,
-            other => panic!("expected a response, got {other:?}"),
-        }
-    }
-
-    /// Two `tools/call` requests execute concurrently: the call blocked on the
-    /// gate answers only after the second call opens it, so the second
-    /// request's response arrives first.
     #[tokio::test]
     async fn tool_calls_run_concurrently() {
         let (gate_tx, gate_rx) = async_channel::unbounded::<()>();
@@ -853,6 +936,7 @@ mod tests {
         let (mut client, transport) = DuplexTransport::pair();
         let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
         let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
 
         client.send_request(call(1, "wait")).await.expect("send");
         client.send_request(call(2, "release")).await.expect("send");
@@ -864,23 +948,27 @@ mod tests {
         server_task.await.expect("join").expect("run");
     }
 
-    /// `notifications/cancelled` drops the in-flight call: the wait tool's
-    /// future is dropped while it blocks on the gate, and no response is
-    /// written for it even though a later call opens the gate.
     #[tokio::test]
-    async fn cancelled_call_is_dropped() {
+    async fn cancelled_call_fires_context_cancellation_and_is_dropped() {
         let (gate_tx, gate_rx) = async_channel::unbounded::<()>();
         let (started_tx, started_rx) = async_channel::unbounded::<()>();
         let (dropped_tx, dropped_rx) = async_channel::unbounded::<()>();
+        let (signal_fired_tx, signal_fired_rx) = async_channel::unbounded::<()>();
 
         let mut tools = Tools::new();
         register(
             &mut tools,
             "wait",
-            Box::new(move |_args, _cx| {
+            Box::new(move |_args, cx| {
                 let gate_rx = gate_rx.clone();
                 let started_tx = started_tx.clone();
                 let dropped_tx = dropped_tx.clone();
+                let signal_fired_tx = signal_fired_tx.clone();
+                let signal = cx.cancellation().clone();
+                tokio::spawn(async move {
+                    signal.cancelled().await;
+                    let _ = signal_fired_tx.send(()).await;
+                });
                 Box::pin(async move {
                     let _marker = DropMarker(dropped_tx);
                     started_tx.send(()).await.expect("started send");
@@ -904,11 +992,9 @@ mod tests {
         let (mut client, transport) = DuplexTransport::pair();
         let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
         let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
 
         client.send_request(call(1, "wait")).await.expect("send");
-
-        // Wait until the call is actually in flight and blocked on the gate,
-        // so the cancel drops a running future rather than a pending one.
         started_rx.recv().await.expect("started");
 
         client
@@ -925,21 +1011,21 @@ mod tests {
 
         assert_eq!(next_response(&mut client).await.id, RequestId::Number(2));
 
-        // The call was dropped rather than left running: its marker fired.
         tokio::time::timeout(Duration::from_secs(5), dropped_rx.recv())
             .await
             .expect("call dropped")
             .expect("marker channel");
+        tokio::time::timeout(Duration::from_secs(5), signal_fired_rx.recv())
+            .await
+            .expect("ToolContext::cancellation() fired")
+            .expect("signal channel");
 
-        // And no response for it was ever written, though the gate was opened.
         assert!(future::poll_once(client.recv()).await.is_none());
 
         client.close().await.expect("close");
         server_task.await.expect("join").expect("run");
     }
 
-    /// An image `ToolResult` arrives at the client as `Content::Image` with
-    /// the bytes standard-base64-encoded, not as a text placeholder.
     #[tokio::test]
     async fn image_tool_result_is_image_content() {
         let bytes = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
@@ -958,6 +1044,7 @@ mod tests {
         let (mut client, transport) = DuplexTransport::pair();
         let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
         let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
 
         client.send_request(call(1, "png")).await.expect("send");
         let response = next_response(&mut client).await;
@@ -980,8 +1067,6 @@ mod tests {
         server_task.await.expect("join").expect("run");
     }
 
-    /// A `Parts` result arrives as one content item per part — the text stays
-    /// `Content::Text` and the image stays `Content::Image`, in order.
     #[tokio::test]
     async fn parts_tool_result_becomes_multiple_content_items() {
         let bytes = vec![0x89, b'P', b'N', b'G'];
@@ -1005,6 +1090,7 @@ mod tests {
         let (mut client, transport) = DuplexTransport::pair();
         let mut server = McpServer::new(transport, tools, "test-server", "0.0.0");
         let server_task = tokio::spawn(async move { server.run().await });
+        initialize_server(&mut client).await;
 
         client
             .send_request(call(1, "snapshot"))

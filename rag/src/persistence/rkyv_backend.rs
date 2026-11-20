@@ -78,8 +78,8 @@ impl From<EntryData> for IndexEntry {
 /// use aither_rag::persistence::{Persistence, RkyvPersistence};
 ///
 /// let persistence = RkyvPersistence::new("./index.rkyv");
-/// // persistence.save(&entries)?;
-/// // let loaded = persistence.load()?;
+/// // persistence.save(&entries).await?;
+/// // let loaded = persistence.load().await?;
 /// ```
 #[derive(Debug)]
 pub struct RkyvPersistence {
@@ -96,36 +96,35 @@ impl RkyvPersistence {
         Self { path: path.into() }
     }
 
-    fn save_entries(&self, entries: &[IndexEntry]) -> Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = self.path.parent() {
+    fn save_entries_sync(path: &Path, entries: Vec<EntryData>) -> Result<()> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let wrapper = EntriesWrapper {
-            entries: entries.iter().map(EntryData::from).collect(),
-        };
+        let wrapper = EntriesWrapper { entries };
 
         let bytes =
             to_bytes::<RkyvError>(&wrapper).map_err(|e| RagError::Serialization(e.to_string()))?;
 
-        fs::write(&self.path, &bytes).map_err(|e| RagError::Persistence {
-            path: self.path.clone(),
+        fs::write(path, &bytes).map_err(|e| RagError::Persistence {
+            path: path.to_path_buf(),
             source: e,
         })?;
 
         Ok(())
     }
 
-    fn load_entries(&self) -> Result<Vec<IndexEntry>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let bytes = fs::read(&self.path).map_err(|e| RagError::Persistence {
-            path: self.path.clone(),
-            source: e,
-        })?;
+    fn load_entries_sync(path: &Path) -> Result<Vec<IndexEntry>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(RagError::Persistence {
+                    path: path.to_path_buf(),
+                    source: e,
+                });
+            }
+        };
 
         if bytes.is_empty() {
             return Ok(Vec::new());
@@ -143,11 +142,14 @@ impl Persistence for RkyvPersistence {
         &'a self,
         entries: &'a [IndexEntry],
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        std::future::ready(self.save_entries(entries))
+        let path = self.path.clone();
+        let entry_data: Vec<EntryData> = entries.iter().map(EntryData::from).collect();
+        blocking::unblock(move || Self::save_entries_sync(&path, entry_data))
     }
 
     fn load(&self) -> impl std::future::Future<Output = Result<Vec<IndexEntry>>> + Send + '_ {
-        std::future::ready(self.load_entries())
+        let path = self.path.clone();
+        blocking::unblock(move || Self::load_entries_sync(&path))
     }
 
     fn extension(&self) -> &'static str {

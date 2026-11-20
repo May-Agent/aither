@@ -399,7 +399,7 @@ struct Engine<T, H> {
     /// The shared outbound queue.
     outbound: Receiver<Envelope>,
     /// Our requests awaiting a response: id -> reply channel.
-    pending: HashMap<RequestId, Sender<Result<Response, PeerError>>>,
+    pending: HashMap<RequestId, PendingEntry>,
     /// In-flight inbound handler futures: request id -> cancel handle.
     /// Dropping the sender resolves the handler's race with a `-32800`
     /// response and drops the handler future itself.
@@ -422,31 +422,53 @@ struct Engine<T, H> {
 /// the client to see the updates first; otherwise turn consumers can
 /// close before the trailing chunks land and drop them).
 ///
-/// `spawned` counts notification futures dispatched so far; `done`
-/// counts the ones that ran to completion. An inbound response snapshots
-/// `spawned` at arrival and its resolution is deferred through
-/// `in_flight` until `done` catches up with that snapshot — notifications
-/// dispatched *after* the response do not delay it.
+/// An outbound request awaiting its response.
+struct PendingEntry {
+    /// Resolves the request's [`ResponseFuture`] with its response.
+    reply: Sender<Result<Response, PeerError>>,
+    /// The [`NotificationOrder::spawned`] count recorded when the
+    /// request went out. A response waits only for notifications
+    /// dispatched *after* that point: earlier ones can never be its own
+    /// era's work, and waiting for the handler that issued the request
+    /// would deadlock.
+    sent_spawn: usize,
+}
+
+/// `spawned` assigns each notification handler a monotonically
+/// increasing index; `outstanding` holds the indices of the ones still
+/// running. An inbound response snapshots `spawned` at arrival and its
+/// resolution is deferred through `in_flight` until the handlers in the
+/// snapshot's range complete — notifications dispatched *after* the
+/// response do not delay it.
+///
+/// The range a response waits on starts at the [`spawned`] count
+/// recorded when its request was sent: notifications already dispatched
+/// before the request went out do not gate it — one of them could be
+/// the handler that issued the request, and waiting for it would
+/// deadlock against itself.
 #[derive(Debug, Default)]
 struct NotificationOrder {
-    /// Notification handler futures dispatched so far.
+    /// Notification handler futures dispatched so far; also the next
+    /// handler's index.
     spawned: AtomicUsize,
-    /// Notification handler futures that completed.
-    done: AtomicUsize,
-    /// One-shot wakers for response futures parked on `done`.
+    /// Spawn indices of notification handlers still running.
+    outstanding: Mutex<std::collections::BTreeSet<usize>>,
+    /// One-shot wakers for response futures parked on a completion.
     waiters: Mutex<Vec<Sender<()>>>,
 }
 
 impl NotificationOrder {
-    /// Record a dispatched notification handler.
-    fn track_spawn(&self) {
-        self.spawned.fetch_add(1, Ordering::AcqRel);
+    /// Record a dispatched notification handler; returns its index.
+    fn track_spawn(&self) -> usize {
+        let index = self.spawned.fetch_add(1, Ordering::AcqRel);
+        self.outstanding.lock().expect("outstanding").insert(index);
+        index
     }
 
     /// Record one notification handler's completion and wake every
-    /// parked response so each can re-check `done` against its snapshot.
-    fn track_done(&self) {
-        self.done.fetch_add(1, Ordering::AcqRel);
+    /// parked response so each can re-check its range.
+    fn track_done(&self, index: usize) {
+        self.outstanding.lock().expect("outstanding").remove(&index);
         for waiter in self.waiters.lock().expect("waiters").drain(..) {
             let _ = waiter.try_send(());
         }
@@ -458,12 +480,21 @@ impl NotificationOrder {
         self.spawned.load(Ordering::Acquire)
     }
 
-    /// Sleep until every notification handler dispatched before the
-    /// snapshot was taken has completed. Parks on the `waiters` list —
+    /// Sleep until no notification handler with a spawn index in
+    /// `[from, until)` is still running. Parks on the `waiters` list —
     /// never spins.
-    async fn wait_for(&self, snapshot: usize) {
+    async fn wait_for(&self, from: usize, until: usize) {
+        let clear = |order: &Self| {
+            order
+                .outstanding
+                .lock()
+                .expect("outstanding")
+                .range(from..until)
+                .next()
+                .is_none()
+        };
         loop {
-            if self.done.load(Ordering::Acquire) >= snapshot {
+            if clear(self) {
                 return;
             }
             let (tx, rx) = async_channel::bounded(1);
@@ -471,7 +502,7 @@ impl NotificationOrder {
             // Re-check after registering: a completion that landed
             // between the first check and the `push` would otherwise
             // leave this waiter parked forever.
-            if self.done.load(Ordering::Acquire) >= snapshot {
+            if clear(self) {
                 return;
             }
             let _ = rx.recv().await;
@@ -560,7 +591,13 @@ impl<T: Transport, H: Handler> Engine<T, H> {
     async fn send_envelope(&mut self, item: Envelope) -> Result<(), PeerError> {
         match item {
             Envelope::Request { request, reply } => {
-                self.pending.insert(request.id.clone(), reply);
+                self.pending.insert(
+                    request.id.clone(),
+                    PendingEntry {
+                        reply,
+                        sent_spawn: self.notifications.spawned_now(),
+                    },
+                );
                 self.send(&Outbound::Request(request)).await
             }
             Envelope::Message(message) => self.send(&message).await,
@@ -582,6 +619,18 @@ impl<T: Transport, H: Handler> Engine<T, H> {
         match inbound {
             Inbound::Request(request) => {
                 let id = request.id.clone();
+                if self.cancellers.contains_key(&id) {
+                    // A request reusing an id already in flight is
+                    // rejected rather than clobbering the running call's
+                    // cancellation slot.
+                    return self
+                        .send(&Outbound::Response(Response::error(
+                            Some(id),
+                            RpcError::invalid_request()
+                                .data(serde_json::json!("request id is already in flight")),
+                        )))
+                        .await;
+                }
                 let (cancel_tx, cancel_rx) = async_channel::bounded(1);
                 self.cancellers.insert(id.clone(), cancel_tx);
                 let cx = RequestContext {
@@ -611,10 +660,10 @@ impl<T: Transport, H: Handler> Engine<T, H> {
                 } else {
                     let handler = self.handler.clone();
                     let order = self.notifications.clone();
-                    order.track_spawn();
+                    let index = order.track_spawn();
                     self.in_flight.push(Box::pin(async move {
                         handler.notification(notification).await;
-                        order.track_done();
+                        order.track_done(index);
                         Handled::Notification
                     }));
                 }
@@ -641,9 +690,11 @@ impl<T: Transport, H: Handler> Engine<T, H> {
             warn!(params = ?notification.params, "ignoring $/cancel_request without an id");
             return;
         };
-        if let Some(reply) = self.pending.remove(&id) {
+        if let Some(entry) = self.pending.remove(&id) {
             // The peer aborted a request we sent: fail its waiter.
-            let _ = reply.try_send(Err(PeerError::Rejected(RpcError::request_cancelled())));
+            let _ = entry
+                .reply
+                .try_send(Err(PeerError::Rejected(RpcError::request_cancelled())));
         } else if let Some(canceller) = self.cancellers.remove(&id) {
             // The peer aborted a request it sent: dropping the sender ends
             // the handler race with a `-32800` response.
@@ -653,18 +704,27 @@ impl<T: Transport, H: Handler> Engine<T, H> {
         }
     }
 
-    /// Defer a response behind every notification dispatched before it.
+    /// Defer a response behind the notifications dispatched after its
+    /// request went out.
     ///
     /// The waiter runs inside `in_flight` like any handler future so the
     /// loop stays single-owner: it sleeps on [`NotificationOrder`] until
-    /// the notification handlers the snapshot covers complete, then
-    /// reports [`Handled::Response`], which routes the response to its
-    /// pending request.
+    /// the notification handlers spawned between the request's send and
+    /// the response's arrival complete, then reports
+    /// [`Handled::Response`], which routes the response to its pending
+    /// request. Starting the range at the request's send is what lets a
+    /// notification handler issue its own request without deadlocking
+    /// against the response it awaits.
     fn defer_response(&self, response: Response) {
         let order = self.notifications.clone();
-        let snapshot = order.spawned_now();
+        let from = response
+            .id
+            .as_ref()
+            .and_then(|id| self.pending.get(id))
+            .map_or(0, |entry| entry.sent_spawn);
+        let until = order.spawned_now();
         self.in_flight.push(Box::pin(async move {
-            order.wait_for(snapshot).await;
+            order.wait_for(from, until).await;
             Handled::Response(response)
         }));
     }
@@ -675,8 +735,8 @@ impl<T: Transport, H: Handler> Engine<T, H> {
             warn!("ignoring response with null id");
             return;
         };
-        if let Some(reply) = self.pending.remove(&id) {
-            let _ = reply.try_send(Ok(response));
+        if let Some(entry) = self.pending.remove(&id) {
+            let _ = entry.reply.try_send(Ok(response));
         } else {
             debug!(id = %id, "ignoring response with no pending request");
         }
@@ -718,8 +778,8 @@ impl<T: Transport, H: Handler> Engine<T, H> {
                 let _ = reply.try_send(Err(terminal.clone()));
             }
         }
-        for (_, reply) in self.pending.drain() {
-            let _ = reply.try_send(Err(terminal.clone()));
+        for (_, entry) in self.pending.drain() {
+            let _ = entry.reply.try_send(Err(terminal.clone()));
         }
     }
 }
@@ -738,7 +798,7 @@ mod tests {
     use futures_lite::future::zip;
     use serde_json::json;
 
-    use super::super::error::REQUEST_CANCELLED;
+    use super::super::error::{INVALID_REQUEST, REQUEST_CANCELLED};
     use super::super::transport::Memory;
     use super::*;
 
@@ -822,6 +882,104 @@ mod tests {
             std::future::pending::<Response>().await
         }
         async fn notification(&self, _: Notification) {}
+    }
+
+    /// A second request reusing an in-flight id is answered `-32600`
+    /// while the original keeps running.
+    #[tokio::test]
+    async fn duplicate_in_flight_request_id_is_rejected() {
+        let (a, mut b) = Memory::pair();
+        let (_peer, conn) = connection(a, Park);
+        run(conn, async move {
+            b.send(&Outbound::Request(Request::new("dup", "slow")))
+                .await
+                .unwrap();
+            // The parked handler's notification proves the first request
+            // is in flight; then the duplicate lands.
+            let Some(Inbound::Notification(_)) = b.recv().await.unwrap() else {
+                panic!("expected the parked handler's notification");
+            };
+            b.send(&Outbound::Request(Request::new("dup", "faster")))
+                .await
+                .unwrap();
+            let Some(Inbound::Response(response)) = b.recv().await.unwrap() else {
+                panic!("expected the duplicate's rejection");
+            };
+            assert_eq!(response.id, Some(RequestId::String("dup".to_owned())));
+            assert_eq!(response.into_result().unwrap_err().code(), INVALID_REQUEST);
+            // The original is still in flight: cancelling it produces the
+            // -32800 answer, so the duplicate did not clobber the slot.
+            b.send(&Outbound::Notification(Notification::cancel_request("dup")))
+                .await
+                .unwrap();
+            let Some(Inbound::Response(response)) = b.recv().await.unwrap() else {
+                panic!("expected the cancelled original's response");
+            };
+            assert_eq!(
+                response.into_result().unwrap_err().code(),
+                REQUEST_CANCELLED
+            );
+            drop(b);
+        })
+        .await;
+    }
+
+    /// A notification handler runs concurrently inside the connection:
+    /// it can issue its own request through a captured [`Peer`] without
+    /// deadlocking the loop that delivers the answer.
+    #[tokio::test]
+    async fn notification_handlers_may_call_back_in() {
+        /// On `ping`, asks the peer `echo` and reports the answer on `done`.
+        struct Reentrant {
+            done: async_channel::Sender<Value>,
+            peer: std::sync::Arc<std::sync::Mutex<Option<Peer>>>,
+        }
+        impl Handler for Reentrant {
+            fn request(&self, req: Request, _: RequestContext) -> impl Future<Output = Response> {
+                std::future::ready(Response::success(req.id, json!({ "seen": req.method })))
+            }
+            async fn notification(&self, n: Notification) {
+                if n.method != "ping" {
+                    return;
+                }
+                let peer = self.peer.lock().unwrap().clone().unwrap();
+                let answer: Value = peer.request("echo", &json!({})).await.unwrap();
+                let _ = self.done.send(answer).await;
+            }
+        }
+
+        let (a, mut b) = Memory::pair();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (done_tx, done_rx) = async_channel::bounded(1);
+        let (peer, conn) = connection(
+            a,
+            Reentrant {
+                done: done_tx,
+                peer: slot.clone(),
+            },
+        );
+        // The handler sees its own peer only once `connection` returns it.
+        *slot.lock().unwrap() = Some(peer.clone());
+        run(conn, async move {
+            b.send(&Outbound::Notification(Notification::new("ping")))
+                .await
+                .unwrap();
+            // The handler's re-entrant `echo` request reaches us; answer it.
+            let Some(Inbound::Request(req)) = b.recv().await.unwrap() else {
+                panic!("expected the re-entrant request");
+            };
+            assert_eq!(req.method, "echo");
+            b.send(&Outbound::Response(Response::success(
+                req.id,
+                json!({ "echo": true }),
+            )))
+            .await
+            .unwrap();
+            assert_eq!(done_rx.recv().await.unwrap(), json!({ "echo": true }));
+            drop(b);
+            drop(peer);
+        })
+        .await;
     }
 
     /// A request round trip: `Peer::request` reaches the peer and its

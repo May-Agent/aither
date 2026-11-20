@@ -29,6 +29,9 @@ pub struct StdioTransport {
     /// Bytes already consumed from stdin that do not yet form a complete
     /// message, keeping `recv` cancellation-safe.
     read_buf: Vec<u8>,
+    /// Whether a rejected oversized frame is still being drained until its
+    /// newline, persisting between `recv` calls.
+    discarding_oversized: bool,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -58,6 +61,7 @@ impl StdioTransport {
             stdin: BufReader::new(Unblock::new(std::io::stdin())),
             stdout: Unblock::new(std::io::stdout()),
             read_buf: Vec::new(),
+            discarding_oversized: false,
             next_id: AtomicI64::new(1),
             closed: false,
         }
@@ -81,7 +85,12 @@ impl StdioTransport {
 
     /// Read a message from stdin.
     async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>> {
-        read_message(&mut self.stdin, &mut self.read_buf).await
+        read_message(
+            &mut self.stdin,
+            &mut self.read_buf,
+            &mut self.discarding_oversized,
+        )
+        .await
     }
 }
 
@@ -204,15 +213,16 @@ mod tests {
             eof_reported: false,
         });
         let mut read_buf = Vec::new();
+        let mut discarding = false;
 
         assert!(
-            read_message(&mut reader, &mut read_buf)
+            read_message(&mut reader, &mut read_buf, &mut discarding)
                 .await
                 .unwrap()
                 .is_some()
         );
         assert!(
-            read_message(&mut reader, &mut read_buf)
+            read_message(&mut reader, &mut read_buf, &mut discarding)
                 .await
                 .unwrap()
                 .is_none()
@@ -224,15 +234,16 @@ mod tests {
         let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
         let mut reader = BufReader::new(Cursor::new(input));
         let mut read_buf = Vec::new();
+        let mut discarding = false;
 
         assert!(
-            read_message(&mut reader, &mut read_buf)
+            read_message(&mut reader, &mut read_buf, &mut discarding)
                 .await
                 .unwrap()
                 .is_some()
         );
         assert!(
-            read_message(&mut reader, &mut read_buf)
+            read_message(&mut reader, &mut read_buf, &mut discarding)
                 .await
                 .unwrap()
                 .is_none()
@@ -245,15 +256,16 @@ mod tests {
             let input = b"\n  \r\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
             let mut reader = BufReader::new(Cursor::new(input));
             let mut read_buf = Vec::new();
+            let mut discarding = false;
 
             assert!(
-                read_message(&mut reader, &mut read_buf)
+                read_message(&mut reader, &mut read_buf, &mut discarding)
                     .await
                     .unwrap()
                     .is_some()
             );
             assert!(
-                read_message(&mut reader, &mut read_buf)
+                read_message(&mut reader, &mut read_buf, &mut discarding)
                     .await
                     .unwrap()
                     .is_none()
@@ -268,10 +280,15 @@ mod tests {
                 b"not json\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
             let mut reader = BufReader::new(Cursor::new(input));
             let mut read_buf = Vec::new();
+            let mut discarding = false;
 
-            assert!(read_message(&mut reader, &mut read_buf).await.is_err());
             assert!(
-                read_message(&mut reader, &mut read_buf)
+                read_message(&mut reader, &mut read_buf, &mut discarding)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                read_message(&mut reader, &mut read_buf, &mut discarding)
                     .await
                     .unwrap()
                     .is_some()

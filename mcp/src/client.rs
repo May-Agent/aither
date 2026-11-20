@@ -19,9 +19,11 @@ mod toolset;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use aither_core::llm::tool::CancelSignal;
 use arc_swap::ArcSwapOption;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
+use futures_lite::future;
 use serde::de::DeserializeOwned;
 use tracing::debug;
 
@@ -35,10 +37,32 @@ use connection::Command;
 
 use crate::protocol::{
     CallToolParams, CallToolResult, InitializeParams, InitializeResult, JsonRpcNotification,
-    JsonRpcRequest, ListToolsResult, McpError, McpToolDefinition, Resource, ResourceContents,
-    ServerCapabilities, ServerInfo,
+    JsonRpcRequest, ListToolsResult, McpError, McpToolDefinition, RequestId, Resource,
+    ResourceContents, ServerCapabilities, ServerInfo,
 };
 use crate::transport::BidirectionalTransport;
+
+/// Removes an in-flight request from the receive loop's `pending` map and
+/// issues `notifications/cancelled` if its awaiting future is dropped or
+/// cancelled before receiving a reply.
+struct RequestGuard<'a> {
+    commands: &'a Sender<Command>,
+    id: Option<RequestId>,
+    notify: bool,
+    reason: Option<String>,
+}
+
+impl Drop for RequestGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = self.commands.try_send(Command::Cancel {
+                id,
+                notify: self.notify,
+                reason: self.reason.take(),
+            });
+        }
+    }
+}
 
 /// MCP client for connecting to and interacting with MCP servers.
 ///
@@ -161,20 +185,61 @@ impl McpClient {
         P: serde::Serialize,
         R: DeserializeOwned,
     {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut request = JsonRpcRequest::new(id, method);
+        self.request_with_cancel(method, params, &CancelSignal::never())
+            .await
+    }
+
+    async fn request_with_cancel<P, R>(
+        &self,
+        method: &str,
+        params: Option<P>,
+        cancel: &CancelSignal,
+    ) -> Result<R, McpError>
+    where
+        P: serde::Serialize,
+        R: DeserializeOwned,
+    {
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
+
+        let raw_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = RequestId::Number(raw_id);
+        let mut request = JsonRpcRequest::new(id.clone(), method);
         request.params = params.map(serde_json::to_value).transpose()?;
 
         let (reply, response) = async_channel::bounded(1);
         self.commands
-            .send(Command::Request { request, reply })
-            .await
+            .try_send(Command::Request { request, reply })
             .map_err(|_| McpError::ConnectionClosed)?;
-        let response = response
-            .recv()
-            .await
-            .map_err(|_| McpError::ConnectionClosed)??;
 
+        // Per the MCP specification, `initialize` must not be cancelled.
+        let mut guard = RequestGuard {
+            commands: &self.commands,
+            id: Some(id),
+            notify: method != "initialize",
+            reason: None,
+        };
+
+        let outcome = future::or(async { Ok(response.recv().await) }, async {
+            cancel.cancelled().await;
+            Err(McpError::Cancelled)
+        })
+        .await;
+
+        let received = match outcome {
+            Ok(received) => received,
+            Err(cancelled) => {
+                guard.reason = Some("Request cancelled".to_string());
+                return Err(cancelled);
+            }
+        };
+
+        // The receive loop either answered or failed this request and removed
+        // it from `pending`, so no cancel command is needed on drop.
+        guard.id = None;
+
+        let response = received.map_err(|_| McpError::ConnectionClosed)??;
         Ok(serde_json::from_value(
             response.into_result().map_err(McpError::JsonRpc)?,
         )?)
@@ -230,6 +295,9 @@ impl McpClient {
     /// * `name` - The tool name.
     /// * `arguments` - The tool arguments as a JSON value.
     ///
+    /// Dropping the returned future before the server answers removes the
+    /// pending entry and sends `notifications/cancelled`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
@@ -238,12 +306,31 @@ impl McpClient {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
+        self.call_tool_with_cancel(name, arguments, &CancelSignal::never())
+            .await
+    }
+
+    /// Call a tool on the server, aborting with `notifications/cancelled` if
+    /// `cancel` fires before the response arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Cancelled`] if `cancel` fires, or an error if the
+    /// request fails.
+    pub async fn call_tool_with_cancel(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        cancel: &CancelSignal,
+    ) -> Result<CallToolResult, McpError> {
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
             meta: None,
         };
-        let result: CallToolResult = self.request("tools/call", Some(params)).await?;
+        let result: CallToolResult = self
+            .request_with_cancel("tools/call", Some(params), cancel)
+            .await?;
 
         debug!(
             "Tool {} returned {} content items",

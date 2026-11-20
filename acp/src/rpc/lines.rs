@@ -5,13 +5,30 @@
 //! between `recv` calls, so a `recv` future dropped mid-line resumes the
 //! same message on the next call.
 
-use futures_lite::AsyncBufReadExt;
+use std::pin::Pin;
+use std::task::{Poll, ready};
+
+use futures_lite::AsyncBufRead;
+use futures_lite::future;
 use futures_lite::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::debug;
 
 use super::error::RpcError;
 use super::message::{Inbound, Outbound};
 use super::transport::Transport;
+
+/// Maximum byte length of a single newline-delimited JSON-RPC frame (16 MiB).
+///
+/// Accommodates multi-megabyte base64 image or resource payloads while
+/// bounding memory against a peer that streams without a newline.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The error for a frame exceeding `max_bytes`.
+fn oversized_error(max_bytes: usize) -> RpcError {
+    RpcError::internal_error(format!(
+        "JSON-RPC message exceeds maximum frame size of {max_bytes} bytes"
+    ))
+}
 
 /// A transport framing JSON-RPC messages as newline-delimited JSON over an
 /// [`AsyncRead`]/[`AsyncWrite`] pair.
@@ -24,6 +41,10 @@ pub struct Lines<R, W> {
     reader: BufReader<R>,
     /// Bytes consumed but not yet forming a complete line.
     read_buf: Vec<u8>,
+    /// Whether an oversized frame is being discarded until its terminating
+    /// newline. Persists between calls so a future dropped mid-drain resumes
+    /// discarding instead of re-reading the frame's tail as a new message.
+    discarding_oversized: bool,
     /// Write half.
     writer: W,
     /// Whether the transport has been closed.
@@ -49,35 +70,94 @@ where
         Self {
             reader: BufReader::new(reader),
             read_buf: Vec::new(),
+            discarding_oversized: false,
             writer,
             closed: false,
         }
     }
 
     /// Read one complete line, resuming a partial line staged in
-    /// `read_buf`.
+    /// `read_buf`, bounded by [`MAX_MESSAGE_BYTES`].
     ///
     /// Returns `None` on EOF, skips blank lines, and treats an
-    /// unterminated final line as a complete message. Assembled with
-    /// `read_until`, which polls the reader once per chunk — `fill_buf`
-    /// polls `poll_fill_buf` twice and panics on a second `Pending`,
-    /// which is exactly what a `BufReader<Unblock<Stdin>>` produces after
-    /// EOF, because every fresh poll hands another read to the blocking
-    /// pool.
+    /// unterminated final line as a complete message. A frame over the
+    /// cap is consumed, the staging buffer released, and the error
+    /// reported — the next read resumes on the following line.
+    ///
+    /// `poll_fill_buf` is polled directly once per chunk rather than
+    /// through `read_until`, which loops internally until the delimiter
+    /// and so cannot be bounded mid-line, or `fill_buf`, which polls
+    /// `poll_fill_buf` twice and panics when the second poll returns
+    /// `Pending` — exactly what a `BufReader<Unblock<Stdin>>` produces
+    /// after EOF, because every fresh poll hands another read to the
+    /// blocking pool.
     async fn read_line(&mut self) -> Result<Option<Vec<u8>>, RpcError> {
+        self.read_line_bounded(MAX_MESSAGE_BYTES).await
+    }
+
+    /// `read_line` with the frame cap set to `max_bytes` (tests use a
+    /// small bound).
+    async fn read_line_bounded(&mut self, max_bytes: usize) -> Result<Option<Vec<u8>>, RpcError> {
         loop {
-            let read = self.reader.read_until(b'\n', &mut self.read_buf).await?;
-            let complete = self.read_buf.last() == Some(&b'\n');
-            if read == 0 && !complete {
-                // EOF: whatever is staged is the final, unterminated line.
-                if self.read_buf.iter().all(u8::is_ascii_whitespace) {
-                    self.read_buf.clear();
-                    return Ok(None);
+            let reached_eof = future::poll_fn(|cx| {
+                loop {
+                    let available = ready!(Pin::new(&mut self.reader).poll_fill_buf(cx))
+                        .map_err(RpcError::from)?;
+                    if available.is_empty() {
+                        if self.discarding_oversized {
+                            // EOF reached while draining a rejected frame —
+                            // the whole frame is consumed, so report the error.
+                            self.discarding_oversized = false;
+                            return Poll::Ready(Err(oversized_error(max_bytes)));
+                        }
+                        return Poll::Ready(Ok::<bool, RpcError>(true));
+                    }
+                    if self.discarding_oversized {
+                        // Draining a rejected frame: discard chunks without
+                        // buffering until its terminating newline arrives.
+                        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+                            Pin::new(&mut self.reader).consume(newline_pos + 1);
+                            self.discarding_oversized = false;
+                            return Poll::Ready(Err(oversized_error(max_bytes)));
+                        }
+                        let chunk_len = available.len();
+                        Pin::new(&mut self.reader).consume(chunk_len);
+                        continue;
+                    }
+                    if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+                        if self.read_buf.len().saturating_add(newline_pos) > max_bytes {
+                            Pin::new(&mut self.reader).consume(newline_pos + 1);
+                            self.read_buf.clear();
+                            self.read_buf.shrink_to(0);
+                            return Poll::Ready(Err(oversized_error(max_bytes)));
+                        }
+                        self.read_buf.extend_from_slice(&available[..=newline_pos]);
+                        Pin::new(&mut self.reader).consume(newline_pos + 1);
+                        return Poll::Ready(Ok(false));
+                    }
+                    let chunk_len = available.len();
+                    if self.read_buf.len().saturating_add(chunk_len) > max_bytes {
+                        // The line is oversized before any newline: free the
+                        // staged bytes immediately and drain the rest of the
+                        // frame unbuffered so the next read resumes on the
+                        // following line.
+                        Pin::new(&mut self.reader).consume(chunk_len);
+                        self.read_buf.clear();
+                        self.read_buf.shrink_to(0);
+                        self.discarding_oversized = true;
+                        continue;
+                    }
+                    self.read_buf.extend_from_slice(available);
+                    Pin::new(&mut self.reader).consume(chunk_len);
                 }
-            } else if !complete {
-                // The previous future was dropped mid-line; keep reading.
-                continue;
+            })
+            .await?;
+
+            if reached_eof && self.read_buf.iter().all(u8::is_ascii_whitespace) {
+                self.read_buf.clear();
+                return Ok(None);
             }
+
             let mut line = std::mem::take(&mut self.read_buf);
             while matches!(line.last(), Some(byte) if byte.is_ascii_whitespace()) {
                 line.pop();
@@ -248,5 +328,54 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// A frame over the cap is rejected without buffering it whole, and
+    /// the next well-formed line still reads.
+    #[tokio::test]
+    async fn oversized_frame_is_rejected_and_the_next_line_reads() {
+        let mut input = vec![b'x'; 256];
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"method\":\"ok\"}\n");
+        let mut transport = lines(&[]);
+        transport.reader = BufReader::new(Cursor::new(input.leak() as &'static [u8]));
+
+        let error = transport.read_line_bounded(64).await.unwrap_err();
+        assert!(error.message.contains("maximum frame size"), "{error}");
+        assert_eq!(transport.read_buf, [] as [u8; 0]);
+        assert_eq!(transport.read_buf.capacity(), 0);
+
+        let line = transport.read_line_bounded(64).await.unwrap().unwrap();
+        assert_eq!(line, b"{\"method\":\"ok\"}");
+    }
+
+    /// A frame over the cap spanning several fill chunks fails once and the
+    /// read resumes on the following line, not on the rejected frame's tail.
+    #[tokio::test]
+    async fn oversized_frame_spanning_chunks_drains_to_the_next_line() {
+        let mut input = vec![b'x'; 60];
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"method\":\"ok\"}\n");
+        let mut transport = lines(&[]);
+        // An 8-byte fill buffer splits the 60-byte frame across chunks.
+        transport.reader = BufReader::with_capacity(8, Cursor::new(input.leak() as &'static [u8]));
+
+        let error = transport.read_line_bounded(24).await.unwrap_err();
+        assert!(error.message.contains("maximum frame size"), "{error}");
+        assert!(!transport.discarding_oversized);
+        assert_eq!(transport.read_buf, [] as [u8; 0]);
+
+        let line = transport.read_line_bounded(24).await.unwrap().unwrap();
+        assert_eq!(line, b"{\"method\":\"ok\"}");
+    }
+
+    /// An unterminated stream over the cap fails instead of growing
+    /// `read_buf` until EOF.
+    #[tokio::test]
+    async fn unterminated_stream_over_the_cap_fails() {
+        let mut transport = lines(&[]);
+        transport.reader = BufReader::new(Cursor::new(vec![b'y'; 512].leak() as &'static [u8]));
+        let error = transport.read_line_bounded(64).await.unwrap_err();
+        assert!(error.message.contains("maximum frame size"), "{error}");
     }
 }

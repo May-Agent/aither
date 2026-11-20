@@ -3,6 +3,7 @@
 //! This module provides the [`Chunker`] trait and implementations for
 //! splitting documents into smaller, indexable chunks.
 
+#[cfg(feature = "code-chunking")]
 mod code;
 mod fixed;
 #[cfg(test)]
@@ -10,6 +11,7 @@ mod fixed_tests;
 mod paragraph;
 mod sentence;
 
+#[cfg(feature = "code-chunking")]
 pub use code::CodeChunker;
 pub use fixed::FixedSizeChunker;
 pub use paragraph::ParagraphChunker;

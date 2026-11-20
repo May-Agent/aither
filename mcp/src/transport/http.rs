@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::fmt::Display;
 use std::future::{self, Future};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::task::Poll;
 
@@ -19,12 +20,14 @@ use futures_util::stream::FuturesUnordered;
 use serde_json::Value;
 use tracing::{debug, warn};
 use zenwave::sse::SseStream;
-use zenwave::{Client, ResponseExt, client, header};
+use zenwave::{
+    Client, DefaultClient, ResponseExt, Transport as HttpClientTransport, client_with, header,
+};
 
 use super::traits::{BidirectionalTransport, Result, Transport};
 use crate::protocol::{
-    InitializeResult, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    McpError, RequestId,
+    InitializeResult, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, McpError, RequestId,
 };
 
 /// MCP session ID header name.
@@ -32,6 +35,16 @@ const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
 /// MCP protocol version header name.
 const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+
+/// An open SSE response stream paired with the request ID whose POST opened it.
+struct ResponseStream {
+    id: RequestId,
+    answered: bool,
+    events: Pin<Box<SseStream>>,
+}
+
+/// An in-flight HTTP POST driven by [`HttpTransport::recv`].
+type InFlightPost = Pin<Box<dyn Future<Output = (RequestId, Result<Sent>)> + Send>>;
 
 /// HTTP transport for MCP communication (Streamable HTTP).
 ///
@@ -51,8 +64,12 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 pub struct HttpTransport {
     /// Base URL of the MCP server.
     base_url: String,
+    /// Shared HTTP connection pool and TLS configuration reused across calls.
+    connector: HttpClientTransport,
+    /// Reusable client used by `&mut self` calls.
+    client: DefaultClient,
     /// Headers sent with every request, such as authorization.
-    headers: Vec<(String, String)>,
+    headers: Arc<Vec<(String, String)>>,
     /// Session ID returned by server during initialization.
     session_id: Option<String>,
     /// Protocol version negotiated by `initialize`, sent on every later request.
@@ -62,11 +79,11 @@ pub struct HttpTransport {
     /// Messages read off a response but not yet handed to `recv`.
     inbound: VecDeque<JsonRpcMessage>,
     /// SSE responses still open, polled by `recv`.
-    streams: Vec<Pin<Box<SseStream>>>,
+    streams: Vec<ResponseStream>,
     /// Requests handed to `send_request` whose reply has not arrived yet,
     /// driven by `recv` so that waiting on one never blocks the others or the
     /// server's own messages.
-    sending: FuturesUnordered<Pin<Box<dyn Future<Output = Result<Sent>> + Send>>>,
+    sending: FuturesUnordered<InFlightPost>,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -100,7 +117,8 @@ enum Reply {
 /// in flight while the transport itself is used.
 struct Endpoint {
     url: String,
-    headers: Vec<(String, String)>,
+    connector: HttpClientTransport,
+    headers: Arc<Vec<(String, String)>>,
     session_id: Option<String>,
     protocol_version: Option<String>,
 }
@@ -108,9 +126,9 @@ struct Endpoint {
 /// What `recv` was woken by.
 enum Arrived<E> {
     /// A queued request's reply.
-    Sent(Result<Sent>),
-    /// An event on an open SSE stream.
-    Event(E),
+    Sent((RequestId, Result<Sent>)),
+    /// An event on an open SSE stream at `index`.
+    Event(usize, E),
     /// Nothing is in flight any more.
     Idle,
 }
@@ -150,9 +168,13 @@ impl HttpTransport {
     /// * `base_url` - The base URL of the MCP server.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
+        let connector = HttpClientTransport::system();
+        let client = client_with(connector.clone());
         Self {
             base_url: base_url.into(),
-            headers: Vec::new(),
+            connector,
+            client,
+            headers: Arc::new(Vec::new()),
             session_id: None,
             protocol_version: None,
             initialize_id: None,
@@ -173,7 +195,7 @@ impl HttpTransport {
     /// Send a header with every request.
     #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        Arc::make_mut(&mut self.headers).push((name.into(), value.into()));
         self
     }
 
@@ -186,7 +208,8 @@ impl HttpTransport {
     fn endpoint(&self) -> Endpoint {
         Endpoint {
             url: self.base_url.clone(),
-            headers: self.headers.clone(),
+            connector: self.connector.clone(),
+            headers: Arc::clone(&self.headers),
             session_id: self.session_id.clone(),
             protocol_version: self.protocol_version.clone(),
         }
@@ -198,13 +221,17 @@ impl HttpTransport {
             return Err(McpError::ConnectionClosed);
         }
         debug!("MCP HTTP TX: {:?}", req);
+        let id = req.id.clone();
         if req.method == "initialize" {
-            self.initialize_id = Some(req.id.clone());
+            self.initialize_id = Some(id.clone());
         }
-        self.sending.push(Box::pin(Self::send(
-            self.endpoint(),
-            serde_json::to_value(req)?,
-        )));
+        let endpoint = self.endpoint();
+        let body = serde_json::to_value(req)?;
+        self.sending.push(Box::pin(async move {
+            let mut client = client_with(endpoint.connector.clone());
+            let result = Self::send_with_client(&mut client, &endpoint, &body).await;
+            (id, result)
+        }));
         Ok(())
     }
 
@@ -215,12 +242,13 @@ impl HttpTransport {
         }
     }
 
-    /// POST a message and classify the reply by its status and `Content-Type`.
-    ///
-    /// Owns everything it needs, so it can wait on the server while the
-    /// transport does other work.
-    async fn send(endpoint: Endpoint, body: Value) -> Result<Sent> {
-        let (response, session_id) = Self::post(&endpoint, &body).await?;
+    /// POST a message using `client` and classify the reply by its status and `Content-Type`.
+    async fn send_with_client(
+        client: &mut DefaultClient,
+        endpoint: &Endpoint,
+        body: &Value,
+    ) -> Result<Sent> {
+        let (response, session_id) = Self::post_with_client(client, endpoint, body).await?;
         let response = response
             .error_for_status()
             .await
@@ -259,9 +287,10 @@ impl HttpTransport {
         Ok(())
     }
 
-    /// POST `body` with the endpoint's headers; also returns the session ID
-    /// the server handed out, if any.
-    async fn post(
+    /// POST `body` with the endpoint's headers using `backend`; also returns
+    /// the session ID the server handed out, if any.
+    async fn post_with_client(
+        backend: &mut DefaultClient,
         endpoint: &Endpoint,
         body: &Value,
     ) -> Result<(zenwave::Response, Option<String>)> {
@@ -269,7 +298,6 @@ impl HttpTransport {
             McpError::Transport(format!("HTTP request failed: {e}"))
         }
 
-        let mut backend = client();
         let mut builder = backend
             .post(&endpoint.url)
             .map_err(|e| failed(&e))?
@@ -283,7 +311,7 @@ impl HttpTransport {
             .header(header::USER_AGENT.as_str(), "aither-mcp/0.1")
             .map_err(|e| failed(&e))?;
 
-        for (name, value) in &endpoint.headers {
+        for (name, value) in endpoint.headers.as_ref() {
             builder = builder
                 .header(name.clone(), value.clone())
                 .map_err(|e| failed(&e))?;
@@ -318,6 +346,81 @@ impl HttpTransport {
 
         Ok((response, session_id))
     }
+
+    fn handle_sent(&mut self, id: RequestId, sent: Result<Sent>) {
+        match sent {
+            Ok(sent) => {
+                self.adopt_session(sent.session_id);
+                match sent.reply {
+                    Reply::Json(response) => {
+                        self.inbound.push_back(JsonRpcMessage::Response(response));
+                    }
+                    Reply::Events(events) => self.streams.push(ResponseStream {
+                        id,
+                        answered: false,
+                        events,
+                    }),
+                    Reply::Accepted => {
+                        self.inbound
+                            .push_back(JsonRpcMessage::Response(JsonRpcResponse::error(
+                                id,
+                                JsonRpcError::internal_error(
+                                    "request answered 202 Accepted without a response",
+                                ),
+                            )));
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(?id, %error, "MCP HTTP POST failed for single request");
+                self.inbound
+                    .push_back(JsonRpcMessage::Response(JsonRpcResponse::error(
+                        id,
+                        JsonRpcError::internal_error(error.to_string()),
+                    )));
+            }
+        }
+    }
+
+    fn handle_sse_event(
+        &mut self,
+        stream_index: usize,
+        event: std::result::Result<zenwave::sse::Event, zenwave::sse::ParseError>,
+    ) -> Result<()> {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let failed = self.streams.swap_remove(stream_index);
+                warn!(id = ?failed.id, %error, "SSE stream failed");
+                if !failed.answered {
+                    self.inbound
+                        .push_back(JsonRpcMessage::Response(JsonRpcResponse::error(
+                            failed.id,
+                            JsonRpcError::internal_error(format!("SSE parse failed: {error}")),
+                        )));
+                }
+                return Ok(());
+            }
+        };
+
+        match parse_event(&event) {
+            Ok(Some(message)) => {
+                if let JsonRpcMessage::Response(resp) = &message
+                    && let Some(stream) = self.streams.get_mut(stream_index)
+                    && resp.id == stream.id
+                {
+                    stream.answered = true;
+                }
+                self.inbound.push_back(message);
+            }
+            Ok(None) => {}
+            Err(McpError::Serialization(error)) => {
+                warn!(%error, "ignoring invalid JSON-RPC input");
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
 }
 
 impl Transport for HttpTransport {
@@ -331,7 +434,9 @@ impl Transport for HttpTransport {
 
         debug!("MCP HTTP TX: {:?}", req);
 
-        let sent = Self::send(self.endpoint(), serde_json::to_value(&req)?).await?;
+        let endpoint = self.endpoint();
+        let body = serde_json::to_value(&req)?;
+        let sent = Self::send_with_client(&mut self.client, &endpoint, &body).await?;
         self.adopt_session(sent.session_id);
         let result = match sent.reply {
             Reply::Json(response) => response,
@@ -369,9 +474,14 @@ impl Transport for HttpTransport {
 
         debug!("MCP HTTP notify: {:?}", notif);
 
-        // A notification expects no response body (the server answers 202);
-        // the request still has to be driven, and the body is discarded.
-        let (_, session_id) = Self::post(&self.endpoint(), &serde_json::to_value(&notif)?).await?;
+        let endpoint = self.endpoint();
+        let body = serde_json::to_value(&notif)?;
+        let (response, session_id) =
+            Self::post_with_client(&mut self.client, &endpoint, &body).await?;
+        response
+            .error_for_status()
+            .await
+            .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
         self.adopt_session(session_id);
 
         Ok(())
@@ -392,7 +502,8 @@ impl BidirectionalTransport for HttpTransport {
     /// A message can only arrive on the response to a POST, so with no queued
     /// message and no open stream this waits until the caller drops it, like a
     /// quiet pipe would. Streams are polled in place, so a dropped future
-    /// loses nothing.
+    /// loses nothing. A failed POST or prematurely terminated SSE stream fails
+    /// only that single request without closing the transport.
     async fn recv(&mut self) -> Result<Option<JsonRpcMessage>> {
         loop {
             if self.closed {
@@ -413,21 +524,27 @@ impl BidirectionalTransport for HttpTransport {
 
             let streams = &mut self.streams;
             let sending = &mut self.sending;
+            let mut unanswered_closed = Vec::new();
             let arrived = future::poll_fn(|cx| {
                 if let Poll::Ready(Some(sent)) = Pin::new(&mut *sending).poll_next(cx) {
                     return Poll::Ready(Arrived::Sent(sent));
                 }
                 let mut index = 0;
                 while index < streams.len() {
-                    match streams[index].as_mut().poll_next(cx) {
-                        Poll::Ready(Some(event)) => return Poll::Ready(Arrived::Event(event)),
+                    match streams[index].events.as_mut().poll_next(cx) {
+                        Poll::Ready(Some(event)) => {
+                            return Poll::Ready(Arrived::Event(index, event));
+                        }
                         Poll::Ready(None) => {
-                            streams.swap_remove(index);
+                            let finished = streams.swap_remove(index);
+                            if !finished.answered {
+                                unanswered_closed.push(finished.id);
+                            }
                         }
                         Poll::Pending => index += 1,
                     }
                 }
-                if streams.is_empty() && sending.is_empty() {
+                if !unanswered_closed.is_empty() || (streams.is_empty() && sending.is_empty()) {
                     Poll::Ready(Arrived::Idle)
                 } else {
                     Poll::Pending
@@ -435,31 +552,26 @@ impl BidirectionalTransport for HttpTransport {
             })
             .await;
 
-            let event = match arrived {
+            for id in unanswered_closed {
+                self.inbound
+                    .push_back(JsonRpcMessage::Response(JsonRpcResponse::error(
+                        id,
+                        JsonRpcError::internal_error(
+                            "SSE response stream ended before delivering a response",
+                        ),
+                    )));
+            }
+
+            let (stream_index, event) = match arrived {
                 Arrived::Idle => continue,
-                Arrived::Sent(sent) => {
-                    let sent = sent?;
-                    self.adopt_session(sent.session_id);
-                    match sent.reply {
-                        Reply::Json(response) => {
-                            self.inbound.push_back(JsonRpcMessage::Response(response));
-                        }
-                        Reply::Events(events) => self.streams.push(events),
-                        Reply::Accepted => {}
-                    }
+                Arrived::Sent((id, sent)) => {
+                    self.handle_sent(id, sent);
                     continue;
                 }
-                Arrived::Event(event) => event,
+                Arrived::Event(index, event) => (index, event),
             };
-            let event = event.map_err(|e| McpError::Transport(format!("SSE parse failed: {e}")))?;
-            match parse_event(&event) {
-                Ok(Some(message)) => self.inbound.push_back(message),
-                Ok(None) => {}
-                Err(McpError::Serialization(error)) => {
-                    warn!(%error, "ignoring invalid JSON-RPC input");
-                }
-                Err(error) => return Err(error),
-            }
+
+            self.handle_sse_event(stream_index, event)?;
         }
     }
 
@@ -468,20 +580,22 @@ impl BidirectionalTransport for HttpTransport {
             return Err(McpError::ConnectionClosed);
         }
         debug!("MCP HTTP respond: {:?}", response);
-        // The server acknowledges a response with 202 and no body.
+        let endpoint = self.endpoint();
+        let body = serde_json::to_value(&response)?;
         let (reply, session_id) =
-            Self::post(&self.endpoint(), &serde_json::to_value(&response)?).await?;
-        self.adopt_session(session_id);
+            Self::post_with_client(&mut self.client, &endpoint, &body).await?;
         reply
             .error_for_status()
             .await
             .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
+        self.adopt_session(session_id);
         Ok(())
     }
 
     /// Queue the request; `recv` performs the POST and reads its reply, so
     /// the request is only on the wire while `recv` is being polled. A failed
-    /// POST ends the connection through `recv`'s error.
+    /// POST surfaces as an error response for that request alone without
+    /// tearing down the transport.
     fn send_request(&mut self, req: JsonRpcRequest) -> impl Future<Output = Result<()>> + Send {
         std::future::ready(self.queue_request(&req))
     }
@@ -490,9 +604,30 @@ impl BidirectionalTransport for HttpTransport {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
     use crate::test_server::{serve, sse};
+
+    async fn serve_status_replies(replies: Vec<(&'static str, &'static str, String)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for (status, extra_headers, body) in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        url
+    }
 
     #[tokio::test]
     async fn json_response() {
@@ -507,6 +642,58 @@ mod tests {
 
         assert_eq!(response.id, RequestId::Number(1));
         assert_eq!(response.result, Some(json!({"ok": true})));
+    }
+
+    #[tokio::test]
+    async fn notify_checks_http_error_status() {
+        let url = serve_status_replies(vec![(
+            "500 Internal Server Error",
+            "Content-Type: text/plain\r\nMcp-Session-Id: bad\r\n",
+            "boom".to_string(),
+        )])
+        .await;
+        let mut transport = HttpTransport::new(url);
+
+        let err = transport
+            .notify(JsonRpcNotification::new("notifications/initialized"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::Transport(_)), "{err:?}");
+        assert_eq!(transport.session_id, None);
+    }
+
+    #[tokio::test]
+    async fn single_failed_post_does_not_tear_down_transport_recv() {
+        let ok_body = json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}).to_string();
+        let url = serve_status_replies(vec![
+            (
+                "503 Service Unavailable",
+                "Content-Type: text/plain\r\n",
+                "overloaded".to_string(),
+            ),
+            ("200 OK", "Content-Type: application/json\r\n", ok_body),
+        ])
+        .await;
+        let mut transport = HttpTransport::new(url);
+
+        transport
+            .send_request(JsonRpcRequest::new(1i64, "tools/call"))
+            .await
+            .unwrap();
+        let first = transport.recv().await.unwrap().expect("error response");
+        let resp1 = first.as_response().expect("response for 1");
+        assert_eq!(resp1.id, RequestId::Number(1));
+        assert!(resp1.is_error());
+
+        // Subsequent request on the same transport succeeds.
+        transport
+            .send_request(JsonRpcRequest::new(2i64, "tools/list"))
+            .await
+            .unwrap();
+        let second = transport.recv().await.unwrap().expect("ok response");
+        let resp2 = second.as_response().expect("response for 2");
+        assert_eq!(resp2.id, RequestId::Number(2));
+        assert!(!resp2.is_error());
     }
 
     #[tokio::test]
@@ -527,7 +714,6 @@ mod tests {
 
         assert_eq!(response.id, RequestId::Number(1));
         assert_eq!(response.result, Some(json!({"ok": true})));
-        // `request` discards what is not its response.
         assert!(transport.inbound.is_empty());
         assert!(transport.streams.is_empty());
     }
@@ -551,7 +737,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Every message on the stream is delivered, in order.
         let Some(JsonRpcMessage::Notification(notification)) = transport.recv().await.unwrap()
         else {
             panic!("expected the notification first");
@@ -566,7 +751,6 @@ mod tests {
         };
         assert_eq!(response.id, RequestId::Number(5));
 
-        // The ping is answered with a POST of the response.
         transport
             .respond(JsonRpcResponse::success(ping.id, json!({})))
             .await
@@ -631,7 +815,6 @@ mod tests {
             .request(JsonRpcRequest::new(0i64, "initialize"))
             .await
             .unwrap();
-        // The 202-style notification reply has no body to parse.
         transport
             .notify(JsonRpcNotification::new("notifications/initialized"))
             .await

@@ -1,0 +1,4 @@
+Relevant Memories:
+{% for result in results -%}
+- {{ result.memory.content }}{% if !loop.last %}
+{% endif %}{% endfor %}

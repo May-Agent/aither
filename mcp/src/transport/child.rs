@@ -33,6 +33,9 @@ pub struct ChildProcessTransport {
     /// makes `recv` cancellation-safe: dropping the future mid-line loses
     /// nothing.
     read_buf: Vec<u8>,
+    /// Whether a rejected oversized frame is still being drained until its
+    /// newline, persisting between `recv` calls.
+    discarding_oversized: bool,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -110,6 +113,7 @@ impl ChildProcessTransport {
             stdin,
             stdout: BufReader::new(stdout),
             read_buf: Vec::new(),
+            discarding_oversized: false,
             next_id: AtomicI64::new(1),
             closed: false,
         })
@@ -133,7 +137,12 @@ impl ChildProcessTransport {
 
     /// Read a message from the child's stdout.
     async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>> {
-        read_message(&mut self.stdout, &mut self.read_buf).await
+        read_message(
+            &mut self.stdout,
+            &mut self.read_buf,
+            &mut self.discarding_oversized,
+        )
+        .await
     }
 }
 
