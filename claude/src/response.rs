@@ -314,18 +314,25 @@ pub struct MessagesResponse {
     pub usage: Option<Usage>,
 }
 
+/// Upper bound on SSE content block indices so a malformed or hostile stream
+/// cannot trigger unbounded memory growth via `content_block_start`.
+const MAX_CONTENT_BLOCKS: usize = 1024;
+
 /// Projects a non-streaming [`MessagesResponse`] into the same event stream a
 /// streaming response would have produced.
 ///
 /// Each block is replayed through the same start/delta/stop handling the SSE
 /// parser drives, so every block type the stream can carry is projected by
 /// construction rather than re-implemented here.
-#[must_use]
-pub fn response_events(response: MessagesResponse) -> Vec<LLMEvent> {
+///
+/// # Errors
+///
+/// Returns [`ClaudeError::Api`] if the response exceeds [`MAX_CONTENT_BLOCKS`].
+pub fn response_events(response: MessagesResponse) -> Result<Vec<LLMEvent>, ClaudeError> {
     let mut state = StreamState::new();
     let mut events = Vec::new();
     for (index, block) in response.content.into_iter().enumerate() {
-        events.extend(state.replay_block(index, block));
+        events.extend(state.replay_block(index, block)?);
     }
     if let Some(usage) = response.usage {
         state.uncached_input_tokens = Some(usage.input_tokens);
@@ -339,7 +346,7 @@ pub fn response_events(response: MessagesResponse) -> Vec<LLMEvent> {
     for call in state.tool_calls {
         events.push(LLMEvent::tool_call(call.id, call.name, call.input));
     }
-    events
+    Ok(events)
 }
 
 /// State for tracking content blocks during streaming.
@@ -467,7 +474,7 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
             state.apply_message_start(serde_json::from_str(data)?);
             Ok(Vec::new())
         }
-        "content_block_start" => Ok(state.begin_block(serde_json::from_str(data)?)),
+        "content_block_start" => state.begin_block(serde_json::from_str(data)?),
         "content_block_delta" => Ok(state.apply_block_delta(serde_json::from_str(data)?)),
         "content_block_stop" => {
             #[derive(Deserialize)]
@@ -530,19 +537,19 @@ impl StreamState {
     }
 
     /// Opens a content block, emitting whatever text arrived with it.
-    fn begin_block(&mut self, ev: ContentBlockStartEvent) -> Vec<LLMEvent> {
-        ensure_block_capacity(self, ev.index);
+    fn begin_block(&mut self, ev: ContentBlockStartEvent) -> Result<Vec<LLMEvent>, ClaudeError> {
+        ensure_block_capacity(self, ev.index)?;
 
         // Server tool results carry their payload whole at block start.
         if let Some((tool, tool_use_id, content)) = ev.content_block.server_tool_result() {
-            return vec![LLMEvent::builtin_result(
+            return Ok(vec![LLMEvent::builtin_result(
                 tool_use_id,
                 tool,
                 server_tool_result_text(tool, content),
-            )];
+            )]);
         }
 
-        match ev.content_block {
+        let events = match ev.content_block {
             ContentBlockType::Text { text } => {
                 self.blocks[ev.index] = BlockState::Text(text.clone());
                 if text.is_empty() {
@@ -596,7 +603,8 @@ impl StreamState {
             }
             // Server tool results were handled above; unknown blocks drop.
             _ => Vec::new(),
-        }
+        };
+        Ok(events)
     }
 
     /// Appends a delta to its block, emitting it if it is text the caller sees.
@@ -750,7 +758,11 @@ impl StreamState {
     ///
     /// Tool input travels as `input_json_delta` events on a block that opens
     /// with an empty `input`, and a missing input means the stream sent none.
-    fn replay_block(&mut self, index: usize, block: ContentBlockType) -> Vec<LLMEvent> {
+    fn replay_block(
+        &mut self,
+        index: usize,
+        block: ContentBlockType,
+    ) -> Result<Vec<LLMEvent>, ClaudeError> {
         let input_json = match &block {
             ContentBlockType::ToolUse { input, .. }
             | ContentBlockType::ServerToolUse { input, .. }
@@ -763,7 +775,7 @@ impl StreamState {
         let mut events = self.begin_block(ContentBlockStartEvent {
             index,
             content_block: block,
-        });
+        })?;
         if let Some(partial_json) = input_json {
             events.extend(self.apply_block_delta(ContentBlockDeltaEvent {
                 index,
@@ -771,15 +783,21 @@ impl StreamState {
             }));
         }
         events.extend(self.finish_block(index));
-        events
+        Ok(events)
     }
 }
 
-/// Ensure the blocks vector has capacity for the given index.
-fn ensure_block_capacity(state: &mut StreamState, index: usize) {
+/// Ensure the blocks vector has capacity for the given index, bounded by [`MAX_CONTENT_BLOCKS`].
+fn ensure_block_capacity(state: &mut StreamState, index: usize) -> Result<(), ClaudeError> {
+    if index >= MAX_CONTENT_BLOCKS {
+        return Err(ClaudeError::Api(format!(
+            "Claude content block index {index} exceeds maximum ({MAX_CONTENT_BLOCKS})"
+        )));
+    }
     while state.blocks.len() <= index {
         state.blocks.push(BlockState::Text(String::new()));
     }
+    Ok(())
 }
 
 /// Check if an SSE event should be skipped.
@@ -873,9 +891,11 @@ mod tests {
     #[test]
     fn server_tool_use_emits_builtin_call_at_block_close() {
         let mut state = StreamState::new();
-        let events = state.begin_block(block_start(
-            r#"{"index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
-        ));
+        let events = state
+            .begin_block(block_start(
+                r#"{"index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+            ))
+            .expect("begin_block");
         assert!(events.is_empty());
 
         let events = state.apply_block_delta(
@@ -905,6 +925,7 @@ mod tests {
             .begin_block(block_start(
                 r#"{"index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"web_search_result_block","content":[{"type":"web_search_result","title":"t","url":"u"}]}}}"#,
             ))
+            .expect("begin_block")
             .as_slice()
         {
             [LLMEvent::BuiltInToolResult { id, tool, result }] => {
@@ -919,10 +940,25 @@ mod tests {
     #[test]
     fn unknown_block_types_are_tolerated() {
         let mut state = StreamState::new();
-        let events = state.begin_block(block_start(
-            r#"{"index":0,"content_block":{"type":"some_future_block","id":"x"}}"#,
-        ));
+        let events = state
+            .begin_block(block_start(
+                r#"{"index":0,"content_block":{"type":"some_future_block","id":"x"}}"#,
+            ))
+            .expect("begin_block");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn oversized_content_block_index_is_rejected() {
+        let mut state = StreamState::new();
+        let err = parse_event(
+            &Event::from_data(r#"{"index":100000,"content_block":{"type":"text","text":"boom"}}"#)
+                .with_event("content_block_start"),
+            &mut state,
+        )
+        .expect_err("unbounded block index must fail");
+        assert!(err.to_string().contains("exceeds maximum"), "{err}");
+        assert!(state.blocks.is_empty());
     }
 
     #[test]
@@ -1078,7 +1114,7 @@ mod tests {
                 .any(|event| matches!(event, LLMEvent::BuiltInToolResult { .. }))
         );
         assert_eq!(
-            format!("{:?}", response_events(response)),
+            format!("{:?}", response_events(response).expect("response_events")),
             format!("{expected:?}")
         );
     }

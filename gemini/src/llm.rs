@@ -11,7 +11,10 @@ use futures_core::Stream;
 use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tracing::debug;
 
 use crate::PROVIDER_NAME;
@@ -79,7 +82,7 @@ impl LanguageModel for Gemini {
                 .map_err(GenerateError::Provider)?;
             serde_json::from_str::<T>(&text).map_err(|source| GenerateError::Parse {
                 source,
-                response: text.chars().take(500).collect(),
+                response: truncate_utf8(&text, 500),
             })
         }
     }
@@ -93,21 +96,25 @@ impl LanguageModel for Gemini {
         async move {
             let model_name = cfg.text_model.trim_start_matches("models/").to_string();
 
-            // Fetch actual context window from API, fallback to models database
-            let context_length = match crate::client::get_model_info(&cfg, &cfg.text_model).await {
-                Ok(info) => info.input_token_limit,
-                Err(e) => {
-                    tracing::debug!("API did not return context_length: {e}");
-                    // Fallback to models database
-                    aither_models::lookup(&model_name)
-                        .and_then(aither_models::ModelEntry::max_input_tokens)
-                        .ok_or_else(|| {
-                            GeminiError::Api(format!(
-                                "cannot determine context length for model '{model_name}': \
-                                 model info request failed ({e}) and aither-models has no entry"
-                            ))
-                        })?
-                }
+            let context_length = if let Some(&cached) = cfg.cached_context_length.get() {
+                cached
+            } else if let Some(known) = aither_models::lookup(&model_name)
+                .or_else(|| aither_models::lookup(&cfg.text_model))
+                .and_then(aither_models::ModelEntry::max_input_tokens)
+            {
+                let _ = cfg.cached_context_length.set(known);
+                known
+            } else {
+                let info = crate::client::get_model_info(&cfg, &cfg.text_model)
+                    .await
+                    .map_err(|e| {
+                        GeminiError::Api(format!(
+                            "cannot determine context length for model '{model_name}': \
+                             model info request failed ({e}) and aither-models has no entry"
+                        ))
+                    })?;
+                let _ = cfg.cached_context_length.set(info.input_token_limit);
+                info.input_token_limit
             };
 
             let mut profile = Profile::new(
@@ -224,7 +231,7 @@ async fn build_generate_request(
 
 /// Turns one candidate's content into the events it represents, in wire order:
 /// reasoning, then text, then built-in tool output, then function calls.
-fn events_from_content(content: &GeminiContent) -> Vec<Event> {
+fn events_from_content(content: &GeminiContent, tool_call_seq: &AtomicU64) -> Vec<Event> {
     let mut events = Vec::new();
 
     events.extend(content.reasoning_chunks().into_iter().map(Event::Reasoning));
@@ -262,7 +269,7 @@ fn events_from_content(content: &GeminiContent) -> Vec<Event> {
                 // Gemini signs each function call rather than the turn, so the
                 // signature rides on the call it belongs to.
                 Event::ToolCall(aither_core::llm::ToolCall {
-                    id: tool_call_id(),
+                    id: next_tool_call_id(tool_call_seq),
                     name: call.name,
                     arguments: call.args,
                     reasoning_state: signature
@@ -306,7 +313,7 @@ fn respond_stream_inner(
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(e);
-                    continue;
+                    return;
                 }
             };
 
@@ -321,6 +328,7 @@ fn respond_stream_inner(
                 // blocked prompt is reported this way and must not pass silently.
                 if let Some(feedback) = &response.prompt_feedback {
                     yield Err(GeminiError::Api(format_prompt_feedback(feedback)));
+                    return;
                 }
                 continue;
             };
@@ -333,7 +341,7 @@ fn respond_stream_inner(
                 continue;
             };
 
-            for event in events_from_content(content) {
+            for event in events_from_content(content, &cfg.tool_call_seq) {
                 yield Ok(event);
             }
 
@@ -355,17 +363,17 @@ fn respond_stream_inner(
     }
 }
 
-/// Simple UUID v4 generator for tool call IDs.
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{timestamp:032x}")
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    let end = text.floor_char_boundary(max_bytes);
+    text.get(..end).unwrap_or(text).to_string()
 }
 
-fn tool_call_id() -> String {
-    format!("gemini_{}", uuid_v4())
+fn next_tool_call_id(seq: &AtomicU64) -> String {
+    let mut bytes = [0u8; 16];
+    let _ = getrandom::fill(&mut bytes);
+    let rand_u128 = u128::from_be_bytes(bytes);
+    let counter = seq.fetch_add(1, Ordering::Relaxed);
+    format!("gemini_{rand_u128:032x}_{counter:x}")
 }
 
 fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Option<String>)> {
@@ -624,7 +632,7 @@ async fn messages_to_gemini(
     Ok((system_instruction, contents))
 }
 
-fn format_prompt_feedback(feedback: &PromptFeedback) -> String {
+pub fn format_prompt_feedback(feedback: &PromptFeedback) -> String {
     let reason = feedback
         .block_reason
         .as_deref()
@@ -784,12 +792,7 @@ async fn read_file_to_part(url: &url::Url, media_type: &str) -> Result<Part, Gem
     let path = url.to_file_path().map_err(|()| {
         GeminiError::Api("Attachment file URL could not be converted to a path".to_string())
     })?;
-    let data = async_fs::read(&path).await.map_err(|error| {
-        GeminiError::Api(format!(
-            "Failed to read attachment '{}': {error}",
-            path.display()
-        ))
-    })?;
+    let data = async_fs::read(&path).await?;
     Ok(Part::inline_media(media_type, data))
 }
 
@@ -1017,7 +1020,81 @@ mod tests {
 
     #[tokio::test]
     async fn generated_tool_call_ids_carry_no_smuggled_signature() {
-        assert!(!tool_call_id().contains("|ts|"));
+        let seq = AtomicU64::new(0);
+        assert!(!next_tool_call_id(&seq).contains("|ts|"));
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_receive_unique_ids() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let seq = Arc::new(AtomicU64::new(0));
+        let content = GeminiContent::with_parts(
+            "model",
+            (0..64)
+                .map(|i| {
+                    Part::function_call_with_signature(
+                        format!("tool_{i}"),
+                        serde_json::json!({ "idx": i }),
+                        None,
+                    )
+                })
+                .collect(),
+        );
+        let events = events_from_content(&content, &seq);
+        let mut ids = HashSet::new();
+        for event in events {
+            if let Event::ToolCall(tc) = event {
+                assert!(
+                    ids.insert(tc.id.clone()),
+                    "duplicate tool-call ID: {}",
+                    tc.id
+                );
+            }
+        }
+        assert_eq!(ids.len(), 64);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let shared_seq = seq.clone();
+            handles.push(tokio::spawn(async move {
+                (0..32)
+                    .map(|_| next_tool_call_id(&shared_seq))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for handle in handles {
+            for id in handle.await.expect("task completes") {
+                assert!(ids.insert(id.clone()), "duplicate concurrent ID: {id}");
+            }
+        }
+        assert_eq!(ids.len(), 64 + 16 * 32);
+    }
+
+    #[tokio::test]
+    async fn profile_uses_registry_and_caches_fetched_context_length() {
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let known = Gemini::new("key")
+            .with_base_url(format!("http://127.0.0.1:{closed_port}"))
+            .with_text_model("gemini-2.5-flash");
+        let p = known.profile().await.expect("registry lookup succeeds");
+        assert!(p.context_length > 0);
+
+        let (base_url, _rx) = responding_server(
+            r#"{"name":"models/custom-gemini","inputTokenLimit":131072,"outputTokenLimit":8192}"#,
+        );
+        let custom = Gemini::new("key")
+            .with_base_url(base_url)
+            .with_text_model("custom-gemini");
+        let p1 = custom.profile().await.expect("first fetch");
+        let p2 = custom.profile().await.expect("second uses cache");
+        assert_eq!(p1.context_length, 131_072);
+        assert_eq!(p2.context_length, 131_072);
     }
 
     /// Signatures are Gemini's; another provider's state must not be replayed.

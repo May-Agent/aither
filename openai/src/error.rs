@@ -1,28 +1,37 @@
-use std::fmt;
 use std::time::Duration;
 
 use aither_core::llm::{
     Classify, Failure, FailureKind,
-    failure::zenwave::{body_failure, failure as http_failure, sse_failure},
+    failure::zenwave::{body_failure, failure as http_failure, io_is_network, sse_failure},
 };
 use zenwave::{BodyError, Error as ZenwaveError, sse::ParseError as SseParseError};
 
 /// Errors that can arise when calling the `OpenAI` API.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OpenAIError {
     /// HTTP layer errors.
-    Http(ZenwaveError),
+    #[error("HTTP error: {0}")]
+    Http(#[source] ZenwaveError),
     /// Response body parsing failures.
-    Body(BodyError),
+    #[error("Body error: {0}")]
+    Body(#[from] BodyError),
     /// SSE parsing failures.
-    Stream(SseParseError),
+    #[error("SSE error: {0}")]
+    Stream(#[from] SseParseError),
     /// JSON serialization/deserialization errors.
-    Json(serde_json::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     /// Base64 decoding failures (e.g., image payloads).
-    Decode(base64::DecodeError),
+    #[error("Base64 decode error: {0}")]
+    Decode(#[from] base64::DecodeError),
+    /// Local I/O failures (e.g., reading attachments or cache files).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// API contract violations or unsupported operations.
+    #[error("{0}")]
     Api(String),
     /// Rate limit exceeded (HTTP 429).
+    #[error("Rate limit exceeded: {message}{}", retry_after.map_or_default(|d| format!(" (retry after {}s)", d.as_secs())))]
     RateLimit {
         /// Message from the API.
         message: String,
@@ -31,11 +40,13 @@ pub enum OpenAIError {
     },
     /// The account's quota or billing limit is exhausted (HTTP 429
     /// `insufficient_quota`).
+    #[error("Quota exceeded: {message}")]
     QuotaExceeded {
         /// Message from the API.
         message: String,
     },
     /// Server error (HTTP 5xx).
+    #[error("Server error {status}: {message}")]
     ServerError {
         /// HTTP status code.
         status: u16,
@@ -45,6 +56,7 @@ pub enum OpenAIError {
         retry_after: Option<Duration>,
     },
     /// The API reported an error in an event of an open stream.
+    #[error("{message}")]
     StreamEvent {
         /// The error's `type`, such as `server_error`.
         error_type: Option<String>,
@@ -54,45 +66,12 @@ pub enum OpenAIError {
         message: String,
     },
     /// The response did not start, or the response stream sent nothing, for the client's idle timeout.
+    #[error("the response was silent for {idle:?}")]
     IdleTimeout {
         /// How long the client waited.
         idle: Duration,
     },
 }
-
-impl fmt::Display for OpenAIError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(err) => write!(f, "HTTP error: {err}"),
-            Self::Body(err) => write!(f, "Body error: {err}"),
-            Self::Stream(err) => write!(f, "SSE error: {err}"),
-            Self::Json(err) => write!(f, "JSON error: {err}"),
-            Self::Decode(err) => write!(f, "Base64 decode error: {err}"),
-            Self::Api(message) | Self::StreamEvent { message, .. } => write!(f, "{message}"),
-            Self::RateLimit {
-                message,
-                retry_after,
-            } => {
-                write!(f, "Rate limit exceeded: {message}")?;
-                if let Some(delay) = retry_after {
-                    write!(f, " (retry after {}s)", delay.as_secs())?;
-                }
-                Ok(())
-            }
-            Self::QuotaExceeded { message } => write!(f, "Quota exceeded: {message}"),
-            Self::ServerError {
-                status, message, ..
-            } => {
-                write!(f, "Server error {status}: {message}")
-            }
-            Self::IdleTimeout { idle } => {
-                write!(f, "the response was silent for {idle:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for OpenAIError {}
 
 /// The `error` object of an `OpenAI` error body, `{"error":{"type":..,"code":..}}`.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -196,7 +175,8 @@ impl Classify for OpenAIError {
             Self::Stream(err) => sse_failure(err),
             // An EOF while parsing JSON is a body cut off mid-response.
             Self::Json(err) if err.is_eof() => Failure::network(),
-            Self::Json(_) | Self::Decode(_) | Self::Api(_) => Failure::permanent(),
+            Self::Io(err) if io_is_network(err.kind()) => Failure::network(),
+            Self::Json(_) | Self::Decode(_) | Self::Io(_) | Self::Api(_) => Failure::permanent(),
             Self::RateLimit { retry_after, .. } | Self::ServerError { retry_after, .. } => {
                 Failure::transient().with_retry_after(*retry_after)
             }
@@ -213,36 +193,6 @@ impl Classify for OpenAIError {
                 Failure::new(object.kind().unwrap_or(FailureKind::Permanent))
             }
         }
-    }
-}
-
-impl From<BodyError> for OpenAIError {
-    fn from(value: BodyError) -> Self {
-        Self::Body(value)
-    }
-}
-
-impl From<SseParseError> for OpenAIError {
-    fn from(value: SseParseError) -> Self {
-        Self::Stream(value)
-    }
-}
-
-impl From<serde_json::Error> for OpenAIError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
-    }
-}
-
-impl From<base64::DecodeError> for OpenAIError {
-    fn from(value: base64::DecodeError) -> Self {
-        Self::Decode(value)
-    }
-}
-
-impl From<std::io::Error> for OpenAIError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Api(format!("IO error: {value}"))
     }
 }
 
@@ -345,6 +295,25 @@ mod tests {
             OpenAIError::Json(error).failure().kind,
             FailureKind::Network
         );
+    }
+
+    #[test]
+    fn error_source_is_preserved() {
+        use std::error::Error as _;
+
+        let json_err =
+            OpenAIError::from(serde_json::from_str::<serde_json::Value>("!").unwrap_err());
+        assert!(json_err.source().is_some());
+
+        let io_err = OpenAIError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(io_err.source().is_some());
+        assert_eq!(io_err.failure().kind, FailureKind::Network);
+
+        let http_err = raw_http(500, &[], "");
+        assert!(http_err.source().is_some());
     }
 
     #[tokio::test]

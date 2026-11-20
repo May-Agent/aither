@@ -40,7 +40,10 @@ pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CLIENT_VERSION: &str = "0.160.0";
 
 /// `originator` header value identifying this client to the backend.
-pub const ORIGINATOR: &str = "may";
+pub const ORIGINATOR: &str = "aither";
+
+/// Default HTML body served to the browser after a successful loopback OAuth callback.
+pub const DEFAULT_OAUTH_SUCCESS_HTML: &str = "<html><body><h1>Logged in</h1><p>You may close this tab and return to the application.</p></body></html>";
 
 /// The header carrying the `ChatGPT` account identifier.
 pub const ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";

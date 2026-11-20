@@ -34,12 +34,18 @@ pub use error::OrtError;
 pub use pooling::PoolingStrategy;
 
 use async_channel::Sender;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use aither_core::EmbeddingModel;
-use ndarray::{ArrayD, Axis, Ix2, Ix3};
+use ndarray::{ArrayD, Ix2, Ix3};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use tokenizers::Tokenizer;
+
+/// Bounded queue depth for pending embedding requests sent to the dedicated ONNX worker thread.
+const INFERENCE_QUEUE_CAPACITY: usize = 64;
 
 /// An embedding model backed by ONNX Runtime.
 ///
@@ -64,7 +70,7 @@ use tokenizers::Tokenizer;
 /// ```
 pub struct OrtEmbedding {
     inference_tx: Sender<InferenceRequest>,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     dimension: usize,
     pooling: PoolingStrategy,
     normalize: bool,
@@ -137,29 +143,47 @@ impl OrtEmbedding {
     }
 }
 
+struct EncodedTokens {
+    input_ids: Vec<i64>,
+    onnx_mask: Vec<i64>,
+    pooling_mask: Vec<u32>,
+}
+
 impl EmbeddingModel for OrtEmbedding {
     fn dim(&self) -> usize {
         self.dimension
     }
 
     async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
-        // Tokenize
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| OrtError::Tokenization(e.to_string()))?;
+        let tokenizer = Arc::clone(&self.tokenizer);
+        let owned_text = text.to_owned();
+        let encoded = blocking::unblock(move || -> Result<EncodedTokens, OrtError> {
+            let encoding = tokenizer
+                .encode(owned_text.as_str(), true)
+                .map_err(|e| OrtError::Tokenization(e.to_string()))?;
+            let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
+            let pooling_mask: Vec<u32> = encoding.get_attention_mask().to_vec();
+            let onnx_mask: Vec<i64> = pooling_mask.iter().map(|&m| i64::from(m)).collect();
+            Ok(EncodedTokens {
+                input_ids,
+                onnx_mask,
+                pooling_mask,
+            })
+        })
+        .await?;
 
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
-        let attention_mask: Vec<i64> = encoding
-            .get_attention_mask()
-            .iter()
-            .map(|&m| i64::from(m))
-            .collect();
+        if encoded.input_ids.is_empty() {
+            return Err(OrtError::Tokenization(
+                "tokenizer produced empty token sequence".to_string(),
+            )
+            .into());
+        }
+
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.inference_tx
             .send(InferenceRequest {
-                input_ids,
-                attention_mask,
+                input_ids: encoded.input_ids,
+                attention_mask: encoded.onnx_mask,
                 response_tx,
             })
             .await
@@ -169,40 +193,75 @@ impl EmbeddingModel for OrtEmbedding {
             .await
             .map_err(|_| OrtError::Worker("inference worker dropped response".to_string()))??;
 
-        let rank = hidden_states_owned.shape().len();
-        let hidden_states_3d = match rank {
-            3 => hidden_states_owned
-                .into_dimensionality::<Ix3>()
-                .map_err(|e| OrtError::Shape(e.to_string()))?,
-            2 => hidden_states_owned
-                .into_dimensionality::<Ix2>()
-                .map_err(|e| OrtError::Shape(e.to_string()))?
-                .insert_axis(Axis(0)),
-            _ => return Err(OrtError::InvalidOutputShape(rank).into()),
-        };
-
-        // Apply pooling
-        let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().to_vec();
-        let mut embedding = self
-            .pooling
-            .apply(&hidden_states_3d.view(), &attention_mask_u32);
-
-        // Normalize if enabled
-        if self.normalize {
-            l2_normalize(&mut embedding);
-        }
-
+        let embedding = extract_embedding(
+            hidden_states_owned,
+            &encoded.pooling_mask,
+            self.pooling,
+            self.normalize,
+        )?;
         Ok(embedding)
     }
 }
 
+fn extract_embedding(
+    hidden_states_owned: ArrayD<f32>,
+    attention_mask: &[u32],
+    pooling: PoolingStrategy,
+    normalize: bool,
+) -> Result<Vec<f32>, OrtError> {
+    let rank = hidden_states_owned.shape().len();
+    let mut embedding = match rank {
+        // Rank-2 `[batch, hidden_dim]` outputs are already sentence-pooled by the ONNX graph.
+        2 => {
+            let pooled = hidden_states_owned
+                .into_dimensionality::<Ix2>()
+                .map_err(|e| OrtError::Shape(e.to_string()))?;
+            if pooled.shape()[0] == 0 {
+                return Err(OrtError::Shape(
+                    "empty batch dimension in rank-2 output".to_string(),
+                ));
+            }
+            pooled.row(0).to_vec()
+        }
+        3 => {
+            let hidden_states_3d = hidden_states_owned
+                .into_dimensionality::<Ix3>()
+                .map_err(|e| OrtError::Shape(e.to_string()))?;
+            if hidden_states_3d.shape()[0] == 0 || hidden_states_3d.shape()[1] == 0 {
+                return Err(OrtError::Shape(
+                    "empty batch or sequence dimension in rank-3 output".to_string(),
+                ));
+            }
+            pooling.apply(&hidden_states_3d.view(), attention_mask)
+        }
+        _ => return Err(OrtError::InvalidOutputShape(rank)),
+    };
+
+    if normalize {
+        l2_normalize(&mut embedding);
+    }
+
+    Ok(embedding)
+}
+
 /// Builder for [`OrtEmbedding`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OrtEmbeddingBuilder {
     model_path: Option<PathBuf>,
     tokenizer_path: Option<PathBuf>,
     pooling: PoolingStrategy,
     normalize: bool,
+}
+
+impl Default for OrtEmbeddingBuilder {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            tokenizer_path: None,
+            pooling: PoolingStrategy::default(),
+            normalize: true,
+        }
+    }
 }
 
 impl OrtEmbeddingBuilder {
@@ -274,19 +333,11 @@ impl OrtEmbeddingBuilder {
 
         Ok(OrtEmbedding {
             inference_tx,
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
             dimension,
             pooling: self.pooling,
             normalize: self.normalize,
         })
-    }
-}
-
-impl Default for OrtEmbedding {
-    fn default() -> Self {
-        panic!(
-            "OrtEmbedding requires a model path; use OrtEmbedding::from_directory() or OrtEmbedding::builder()"
-        )
     }
 }
 
@@ -386,7 +437,7 @@ fn num_cpus() -> usize {
 }
 
 fn spawn_inference_worker(session: Session) -> Result<Sender<InferenceRequest>, OrtError> {
-    let (tx, rx) = async_channel::unbounded::<InferenceRequest>();
+    let (tx, rx) = async_channel::bounded::<InferenceRequest>(INFERENCE_QUEUE_CAPACITY);
     std::thread::Builder::new()
         .name("ort-embedding-worker".to_string())
         .spawn(move || run_inference_worker(session, &rx))
@@ -425,6 +476,7 @@ fn run_inference(
     let hidden_states = outputs
         .get("last_hidden_state")
         .or_else(|| outputs.get("hidden_states"))
+        .or_else(|| outputs.get("sentence_embedding"))
         .or_else(|| outputs.get("output"))
         .ok_or(OrtError::InvalidOutputShape(0))?;
 
@@ -466,5 +518,46 @@ mod tests {
         let mut vec = vec![0.0, 0.0];
         l2_normalize(&mut vec);
         assert_eq!(vec, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn builder_defaults_normalize_to_true() {
+        let builder = OrtEmbedding::builder();
+        assert!(builder.normalize);
+        let unnormalized = builder.normalize(false);
+        assert!(!unnormalized.normalize);
+    }
+
+    #[test]
+    fn rank_two_outputs_bypass_pooling_with_multi_token_masks() {
+        let rank2 = ndarray::Array2::from_shape_vec((1, 2), vec![3.0_f32, 4.0_f32])
+            .unwrap()
+            .into_dyn();
+        // Six-token attention mask would panic if rank-2 were reshaped to [1, 1, 2] and pooled.
+        let mask = [1, 1, 1, 1, 1, 1];
+        let normalized =
+            extract_embedding(rank2.clone(), &mask, PoolingStrategy::LastToken, true).unwrap();
+        assert!((normalized[0] - 0.6).abs() < 1e-6);
+        assert!((normalized[1] - 0.8).abs() < 1e-6);
+
+        let raw = extract_embedding(rank2, &mask, PoolingStrategy::Mean, false).unwrap();
+        assert_eq!(raw, vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn extract_embedding_rejects_empty_and_invalid_ranks() {
+        let rank1 = ndarray::Array1::from_vec(vec![1.0_f32, 2.0]).into_dyn();
+        assert!(matches!(
+            extract_embedding(rank1, &[1], PoolingStrategy::Cls, true),
+            Err(OrtError::InvalidOutputShape(1))
+        ));
+
+        let empty_rank2 = ndarray::Array2::<f32>::from_shape_vec((0, 4), Vec::new())
+            .unwrap()
+            .into_dyn();
+        assert!(matches!(
+            extract_embedding(empty_rank2, &[1], PoolingStrategy::Cls, true),
+            Err(OrtError::Shape(_))
+        ));
     }
 }
