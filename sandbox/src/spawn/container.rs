@@ -103,7 +103,7 @@ impl Sandbox {
     fn exec_script(
         &self,
         launch: &ContainerLaunch,
-        script: String,
+        script: &str,
         space_env: Vec<(String, String)>,
         env: Vec<(String, String)>,
         info: &LaunchInfo,
@@ -111,11 +111,11 @@ impl Sandbox {
         let failed = |error: &dyn std::fmt::Display| SpawnError::Setup(error.to_string());
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
         let space_env: Arc<dyn EnvSource> = Arc::new(space_env);
+        let script = launch.wrap_script(script).map_err(|e| failed(&e))?;
         let script = inject_env_exports(script, Some(&spec_env), info).map_err(|e| failed(&e))?;
         let script = inject_env_exports(script, Some(&space_env), info).map_err(|e| failed(&e))?;
         let script = inject_env_exports(script, self.inner.env_source.as_ref(), info)
             .map_err(|e| failed(&e))?;
-        let script = launch.wrap_script(&script).map_err(|e| failed(&e))?;
         launch.shell_command(&script).map_err(|e| failed(&e))
     }
 
@@ -270,7 +270,7 @@ impl Sandbox {
         };
         let script = script_reading(stdin, script)?;
         let space_env = self.container_space_environment(runtime)?;
-        let script = self.exec_script(launch, script, space_env, env, info)?;
+        let script = self.exec_script(launch, &script, space_env, env, info)?;
         // A confined process runs in a sandbox rooted at the sandbox's own
         // directory; the directory it was asked to start in is entered inside.
         let script = match (&confinement, cwd.is_some()) {

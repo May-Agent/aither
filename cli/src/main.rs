@@ -40,7 +40,7 @@ use aither_core::LanguageModel;
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::enable_raw_mode;
 use executor_core::tokio::TokioGlobal;
 use tracing_subscriber::EnvFilter;
@@ -52,6 +52,7 @@ use crate::provider::Provider;
 use aither_cloud::CloudProvider;
 
 /// Interactive CLI for testing aither agents.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(name = "aither", version, about)]
 struct Args {
@@ -86,6 +87,10 @@ struct Args {
     /// Quiet mode. Only output the response (useful with --prompt for scripting).
     #[arg(short, long)]
     quiet: bool,
+
+    /// Automatically approve commands, mutating filesystem operations, and MCP tools.
+    #[arg(long)]
+    approve: bool,
 
     /// Run as ACP server (for integration with Zed and other editors).
     #[arg(long)]
@@ -192,7 +197,7 @@ fn acp_session_agent(
 async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudProvider, CliHooks>> {
     let cwd = std::env::current_dir().context("failed to read the working directory")?;
     let mut builder = Agent::builder(cloud)
-        .hooks(CliHooks)
+        .hooks(CliHooks::new(args.approve))
         .approver(TerminalApprover)
         .tool(aither_agent::filesystem::FileSystemTool::new(&cwd))
         .tool(aither_agent::command::CommandTool::new(&cwd))
@@ -218,7 +223,7 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
 
     // Add MCP connections from config file
     if let Some(ref mcp_path) = args.mcp {
-        let config_str = tokio::fs::read_to_string(mcp_path)
+        let config_str = async_fs::read_to_string(mcp_path)
             .await
             .with_context(|| format!("failed to read MCP config from {}", mcp_path.display()))?;
         let config: McpServersConfig =
@@ -299,7 +304,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
 
     // REPL loop
     loop {
-        let Some(input) = read_line("You> ")? else {
+        let Some(input) = blocking::unblock(|| read_line("You> ")).await? else {
             break;
         };
 
@@ -387,8 +392,42 @@ where
 
 fn truncate(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
-        Some((byte_index, _)) => format!("{}...", &s[..byte_index]),
+        Some((byte_index, _)) => format!("{}...", s.get(..byte_index).unwrap_or_default()),
         None => s.to_string(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LineKeyAction {
+    Echo(char),
+    Backspace,
+    Submit,
+    Cancel { interrupted: bool },
+    Ignore,
+}
+
+fn classify_line_key(key: KeyEvent, buffer_empty: bool) -> LineKeyAction {
+    if key.kind != KeyEventKind::Press {
+        return LineKeyAction::Ignore;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c' | 'C') => LineKeyAction::Cancel { interrupted: true },
+            KeyCode::Char('d' | 'D') if buffer_empty => {
+                LineKeyAction::Cancel { interrupted: false }
+            }
+            _ => LineKeyAction::Ignore,
+        };
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return LineKeyAction::Ignore;
+    }
+    match key.code {
+        KeyCode::Esc => LineKeyAction::Cancel { interrupted: false },
+        KeyCode::Enter => LineKeyAction::Submit,
+        KeyCode::Backspace => LineKeyAction::Backspace,
+        KeyCode::Char(c) => LineKeyAction::Echo(c),
+        _ => LineKeyAction::Ignore,
     }
 }
 
@@ -400,34 +439,86 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
 
     let mut buffer = String::new();
     loop {
-        if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Esc => {
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            match classify_line_key(key, buffer.is_empty()) {
+                LineKeyAction::Cancel { interrupted } => {
+                    if interrupted {
+                        print!("^C\r\n");
+                    } else {
                         print!("\r\n");
-                        io::stdout().flush().ok();
-                        return Ok(None);
                     }
-                    KeyCode::Enter => {
-                        print!("\r\n");
-                        io::stdout().flush().ok();
-                        return Ok(Some(buffer));
-                    }
-                    KeyCode::Backspace => {
-                        if buffer.pop().is_some() {
-                            print!("\u{8} \u{8}");
-                            io::stdout().flush().ok();
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        buffer.push(c);
-                        print!("{c}");
+                    io::stdout().flush().ok();
+                    return Ok(None);
+                }
+                LineKeyAction::Submit => {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    return Ok(Some(buffer));
+                }
+                LineKeyAction::Backspace => {
+                    if buffer.pop().is_some() {
+                        print!("\u{8} \u{8}");
                         io::stdout().flush().ok();
                     }
-                    _ => {}
-                },
-                _ => {}
+                }
+                LineKeyAction::Echo(c) => {
+                    buffer.push(c);
+                    print!("{c}");
+                    io::stdout().flush().ok();
+                }
+                LineKeyAction::Ignore => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_c_and_ctrl_d_cancel_without_echoing_characters() {
+        assert_eq!(
+            classify_line_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                true
+            ),
+            LineKeyAction::Cancel { interrupted: true }
+        );
+        assert_eq!(
+            classify_line_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                false
+            ),
+            LineKeyAction::Cancel { interrupted: true }
+        );
+        assert_eq!(
+            classify_line_key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                true
+            ),
+            LineKeyAction::Cancel { interrupted: false }
+        );
+        assert_eq!(
+            classify_line_key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                false
+            ),
+            LineKeyAction::Ignore
+        );
+        assert_eq!(
+            classify_line_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), true),
+            LineKeyAction::Echo('c')
+        );
+    }
+
+    #[test]
+    fn args_parse_approve_flag() {
+        let args = Args::parse_from(["aither", "--approve", "--prompt", "hello"]);
+        assert!(args.approve);
+        let default_args = Args::parse_from(["aither", "--prompt", "hello"]);
+        assert!(!default_args.approve);
     }
 }

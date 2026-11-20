@@ -18,8 +18,6 @@
 )]
 
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use super::sandboxed::within;
@@ -130,100 +128,95 @@ impl TestGit {
     }
 }
 
-impl SandboxedGitImpl for TestGit {
-    fn run<'a>(
-        &'a self,
-        run: SandboxedRun<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<SandboxedExit, ExportError>> + Send + 'a>> {
-        Box::pin(async move {
-            let args: Vec<String> = run.args.iter().map(ToString::to_string).collect();
-            self.ran.lock().unwrap().push(args.clone());
-            let command = args[0].as_str();
-            for (hooked, hook) in self.hooks.lock().unwrap().iter() {
-                if hooked == command {
-                    hook();
-                }
+impl SandboxedGit for TestGit {
+    async fn run<'a>(&'a self, run: SandboxedRun<'a>) -> Result<SandboxedExit, ExportError> {
+        let args: Vec<String> = run.args.iter().map(ToString::to_string).collect();
+        self.ran.lock().unwrap().push(args.clone());
+        let command = args[0].as_str();
+        for (hooked, hook) in self.hooks.lock().unwrap().iter() {
+            if hooked == command {
+                hook();
             }
-            let reply = {
-                let replies = self.replies.lock().unwrap();
-                replies
-                    .iter()
-                    .find(|(replied, _)| replied == command)
-                    .map(|(_, reply)| match reply {
-                        Reply::Print { code, stdout } => Reply::Print {
-                            code: *code,
-                            stdout: stdout.clone(),
-                        },
-                        Reply::Hang => Reply::Hang,
-                    })
-            };
-            match reply {
-                Some(Reply::Print { code, stdout }) => {
-                    for chunk in stdout.chunks(4096) {
-                        run.stdout
-                            .send(chunk.to_vec())
-                            .await
-                            .map_err(|_| ExportError::OutputClosed)?;
-                    }
-                    return Ok(SandboxedExit {
-                        code: Some(code),
-                        stderr: String::new(),
-                    });
-                }
-                Some(Reply::Hang) => {
-                    let mut child = async_process::Command::new("sleep")
-                        .arg("60")
-                        .kill_on_drop(true)
-                        .spawn()?;
-                    self.hung.lock().unwrap().push(child.id());
-                    let status = child.status().await?;
-                    return Ok(SandboxedExit {
-                        code: status.code(),
-                        stderr: String::new(),
-                    });
-                }
-                None => {}
-            }
-
-            let mut command = async_process::Command::new("git");
-            command
-                .envs(crate::test_git::ISOLATION)
-                .arg("--git-dir")
-                .arg(run.repository)
-                .args(&args)
-                .stdin(async_process::Stdio::piped())
-                .stdout(async_process::Stdio::piped())
-                .stderr(async_process::Stdio::piped())
-                .kill_on_drop(true);
-            let mut child = command.spawn()?;
-            let mut stdin = child.stdin.take().expect("piped");
-            let mut stdout = child.stdout.take().expect("piped");
-            let stdin_bytes = run.stdin;
-            let feed = async move {
-                use futures_lite::io::AsyncWriteExt as _;
-                let _ = stdin.write_all(&stdin_bytes).await;
-            };
-            let forward = async {
-                use futures_lite::io::AsyncReadExt as _;
-                let mut buffer = vec![0_u8; 8192];
-                loop {
-                    let read = stdout.read(&mut buffer).await?;
-                    if read == 0 {
-                        return Ok::<_, ExportError>(());
-                    }
+        }
+        let reply = {
+            let replies = self.replies.lock().unwrap();
+            replies
+                .iter()
+                .find(|(replied, _)| replied == command)
+                .map(|(_, reply)| match reply {
+                    Reply::Print { code, stdout } => Reply::Print {
+                        code: *code,
+                        stdout: stdout.clone(),
+                    },
+                    Reply::Hang => Reply::Hang,
+                })
+        };
+        match reply {
+            Some(Reply::Print { code, stdout }) => {
+                for chunk in stdout.chunks(4096) {
                     run.stdout
-                        .send(buffer[..read].to_vec())
+                        .send(chunk.to_vec())
                         .await
                         .map_err(|_| ExportError::OutputClosed)?;
                 }
-            };
-            let (forwarded, ()) = futures::join!(forward, feed);
-            forwarded?;
-            let output = child.output().await?;
-            Ok(SandboxedExit {
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            })
+                return Ok(SandboxedExit {
+                    code: Some(code),
+                    stderr: String::new(),
+                });
+            }
+            Some(Reply::Hang) => {
+                let mut child = async_process::Command::new("sleep")
+                    .arg("60")
+                    .kill_on_drop(true)
+                    .spawn()?;
+                self.hung.lock().unwrap().push(child.id());
+                let status = child.status().await?;
+                return Ok(SandboxedExit {
+                    code: status.code(),
+                    stderr: String::new(),
+                });
+            }
+            None => {}
+        }
+
+        let mut command = async_process::Command::new("git");
+        command
+            .envs(crate::test_git::ISOLATION)
+            .arg("--git-dir")
+            .arg(run.repository)
+            .args(&args)
+            .stdin(async_process::Stdio::piped())
+            .stdout(async_process::Stdio::piped())
+            .stderr(async_process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let mut stdin = child.stdin.take().expect("piped");
+        let mut stdout = child.stdout.take().expect("piped");
+        let stdin_bytes = run.stdin;
+        let feed = async move {
+            use futures_lite::io::AsyncWriteExt as _;
+            let _ = stdin.write_all(&stdin_bytes).await;
+        };
+        let forward = async {
+            use futures_lite::io::AsyncReadExt as _;
+            let mut buffer = vec![0_u8; 8192];
+            loop {
+                let read = stdout.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok::<_, ExportError>(());
+                }
+                run.stdout
+                    .send(buffer[..read].to_vec())
+                    .await
+                    .map_err(|_| ExportError::OutputClosed)?;
+            }
+        };
+        let (forwarded, ()) = futures::join!(forward, feed);
+        forwarded?;
+        let output = child.output().await?;
+        Ok(SandboxedExit {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         })
     }
 }

@@ -14,6 +14,10 @@ categories = ["web-programming"]
 [dependencies]
 aither-core.workspace = true
 anyhow = "1.0"
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+async-io = { version = "2", default-features = false }
+blocking = { version = "1.7", default-features = false }
+futures-lite = { version = "2.6", default-features = false, features = ["std"] }
 htmd = "0.5"
 dom_smoothie = "0.18"
 # Already in the lockfile through dom_smoothie; used to read a page's main landmark.
@@ -37,7 +41,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # `fetcher` (and its TLS/zip features) is deliberately off: we drive a browser
 # that is already installed rather than downloading one.
 chromiumoxide = { version = "0.9", optional = true, default-features = false, features = ["bytes"] }
-futures-lite = { version = "2.6", optional = true }
 tokio = { version = "1.53", optional = true, features = ["rt", "time", "net", "io-util", "sync", "macros"] }
 # The forward proxy that is the headless browser's only network path.
 hyper = { version = "1.12", optional = true, default-features = false, features = ["server", "client", "http1"] }
@@ -55,7 +58,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 default = []
 headless = [
     "dep:chromiumoxide",
-    "dep:futures-lite",
     "dep:tokio",
     "dep:tempfile",
     "dep:hyper",

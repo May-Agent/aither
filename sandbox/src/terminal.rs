@@ -10,7 +10,7 @@
 //! executions share this directory, but each execution gets a fresh sandbox
 //! (new TTY/process). The ids the model addresses — task ids, stored output
 //! names, subagent spaces — are leased from the terminal's
-//! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
+//! [`AnyIdAllocator`].
 
 use crate::foreground_wait::ForegroundWait;
 use crate::memory::{
@@ -27,7 +27,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -35,7 +35,8 @@ use std::{
 
 use crate::spawn::container_ipc::ExecSetup;
 use aither_core::llm::tool::{
-    AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
+    AgentIdentity, AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
+    SubagentIdentity, ToolCallId,
 };
 use aither_core::llm::{AgentPath, CallIdentity, ToolContext};
 use aither_core::llm::{
@@ -171,31 +172,62 @@ fn looks_like_env_assignment(token: &str) -> bool {
 fn is_shell_builtin(program: &str) -> bool {
     matches!(
         program,
-        "alias"
+        "." | ":"
+            | "["
+            | "alias"
             | "bg"
             | "break"
+            | "builtin"
+            | "caller"
             | "cd"
             | "command"
             | "continue"
+            | "declare"
+            | "dirs"
+            | "disown"
+            | "echo"
+            | "enable"
             | "eval"
             | "exec"
             | "exit"
             | "export"
+            | "false"
+            | "fc"
             | "fg"
+            | "getopts"
+            | "hash"
+            | "help"
+            | "history"
             | "jobs"
+            | "kill"
+            | "let"
+            | "local"
+            | "logout"
+            | "mapfile"
+            | "popd"
+            | "printf"
+            | "pushd"
+            | "pwd"
             | "read"
+            | "readarray"
             | "readonly"
             | "return"
             | "set"
             | "shift"
+            | "shopt"
             | "source"
+            | "suspend"
+            | "test"
             | "times"
             | "trap"
+            | "true"
             | "type"
+            | "typeset"
             | "ulimit"
             | "umask"
             | "unalias"
             | "unset"
+            | "wait"
     )
 }
 
@@ -273,7 +305,7 @@ fn runs_in_shell(script: &str) -> bool {
 /// A command killed because its `timeout` bound passed, with the UTC times it
 /// started and was killed at.
 ///
-/// [`ShellWording::command_killed`](crate::ShellWording::command_killed)
+/// [`ShellWording::command_killed`]
 /// renders the sentence the model reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutKill {
@@ -787,6 +819,8 @@ struct ContainerCarry {
     start: ContainerPath,
 }
 
+type SubagentApproverFactory = Arc<dyn Fn(&AgentPath) -> Option<AnyApprover> + Send + Sync>;
+
 /// The terminal tool for executing scripts in a sandbox.
 ///
 /// Creates a shared working directory that persists across all executions,
@@ -800,8 +834,10 @@ pub struct Shell<E> {
     /// The SSH servers scripts may name as their `location`.
     sessions: ShellSessionRegistry,
     /// Approves what no call's context can: a script run with no tool call
-    /// to ask through. Shared with the subagents' terminals.
+    /// to ask through. Shared with or scoped for the subagents' terminals.
     approver: Option<AnyApprover>,
+    /// Optional factory deriving a subagent-scoped approver from its path.
+    subagent_approver: Option<SubagentApproverFactory>,
     executor: E,
     /// Leases the words naming what the model addresses: task ids, stored
     /// outputs and subagent spaces. Shared with the output store and every
@@ -862,6 +898,8 @@ pub struct Shell<E> {
     /// The shell scripts run under when the sandbox runs on the host; `None`
     /// on a container, whose launch names it.
     host_launch: Option<crate::HostLaunch>,
+    /// Cached host `git` binary `(path, parent_dir)` shared across subagents.
+    host_git: Arc<OnceLock<Option<(PathBuf, PathBuf)>>>,
 }
 
 impl<E: Clone> Clone for Shell<E> {
@@ -870,6 +908,7 @@ impl<E: Clone> Clone for Shell<E> {
             working_dir: self.working_dir.clone(),
             sessions: self.sessions.clone(),
             approver: self.approver.clone(),
+            subagent_approver: self.subagent_approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
@@ -893,6 +932,7 @@ impl<E: Clone> Clone for Shell<E> {
             committed: self.committed.clone(),
             launches: self.launches.clone(),
             host_launch: self.host_launch.clone(),
+            host_git: self.host_git.clone(),
         }
     }
 }
@@ -905,6 +945,18 @@ impl<E: Executor + Clone + 'static> Shell<E> {
     #[must_use]
     pub fn with_approver(mut self, approver: impl Approver) -> Self {
         self.approver = Some(AnyApprover::new(approver));
+        self
+    }
+
+    /// Configures a factory that derives the [`Approver`] handed to subagent
+    /// shells launched from this terminal (and nested subagents beneath them).
+    /// Returning `None` leaves the subagent without an approver.
+    #[must_use]
+    pub fn with_subagent_approver(
+        mut self,
+        factory: impl Fn(&AgentPath) -> Option<AnyApprover> + Send + Sync + 'static,
+    ) -> Self {
+        self.subagent_approver = Some(Arc::new(factory));
         self
     }
 
@@ -997,6 +1049,8 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         // Start job registry service
         let (job_registry, job_registry_service) =
             job_registry_channel(output_store.policy().clone());
+        let job_registry_service =
+            job_registry_service.with_wording(output_store.wording().clone());
         executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1012,6 +1066,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             working_dir: working_dir_path,
             sessions: ShellSessionRegistry::default(),
             approver: None,
+            subagent_approver: None,
             executor,
             ids,
             output_store,
@@ -1035,6 +1090,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
             host_launch: parts.host_shell,
+            host_git: Arc::new(OnceLock::new()),
         })
     }
 
@@ -1514,11 +1570,24 @@ where
         // The subagent's jobs raise their facts on the parent's handle, as
         // the agent named beneath this shell's.
         let agent = self.events_tx.agent().child(name);
+        let derived_approver = self.subagent_approver.as_ref().map_or_else(
+            || {
+                self.approver.as_ref().map(|parent| {
+                    AnyApprover::new(SubagentIdentityApprover {
+                        inner: parent.clone(),
+                        agent: agent.clone(),
+                    })
+                })
+            },
+            |factory| factory(&agent),
+        );
         let events_rx = self.events_rx.clone();
         let events_tx = events_rx.sender(agent);
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (job_registry, job_registry_service) =
             job_registry_channel(self.output_store.policy().clone());
+        let job_registry_service =
+            job_registry_service.with_wording(self.output_store.wording().clone());
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1565,12 +1634,14 @@ where
                     .host_heel()
                     .expect("a subagent outside a container runs on the host")
                     .clone(),
+                host_git: self.host_git.clone(),
             })),
         };
         Ok(Self {
             working_dir: space,
             sessions: self.sessions.clone(),
-            approver: self.approver.clone(),
+            approver: derived_approver,
+            subagent_approver: self.subagent_approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
@@ -1600,6 +1671,7 @@ where
             committed: self.committed.clone(),
             launches: Arc::default(),
             host_launch: self.host_launch.clone(),
+            host_git: self.host_git.clone(),
         })
     }
 
@@ -2000,6 +2072,11 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 &**self.wording(),
                 CallRefusal::TimeoutOutOfRange { cap },
             ));
+        }
+        if let Some(call) = self.effective_call_identity(cx.identity(), "terminal")
+            && cx.identity() != Some(&call)
+        {
+            cx = cx.with_identity(call);
         }
         let prepared = self.prepare_execution(&arguments, &mut cx).await?;
         // A detached job cannot report a directory carry: its final
@@ -2567,12 +2644,13 @@ where
     /// it ends; one admission fails is reported here, unrun.
     async fn admit_command(
         &self,
-        admission: Admission<'_>,
+        mut admission: Admission<'_>,
         cx: Option<&mut ToolContext>,
     ) -> Result<ExecutionPreparation, ShellRunError> {
         // Leased for as long as the command can be addressed: the registry
         // keeps a clone once the job is registered.
         let task_id = self.ids.lease()?;
+        admission.call = self.effective_call_identity(admission.call.as_ref(), &task_id);
         let environment = self.resolve_location(admission.location)?;
         // Decided once, here: the policies see the directory the command
         // then starts in, and so does its launch.
@@ -2721,6 +2799,30 @@ where
         self.approve(request, admission.call(), cx).await
     }
 
+    /// Ensures a subagent shell's [`AgentPath`] is reflected on `call` even
+    /// when a caller attached no identity or attached [`AgentIdentity::Main`]
+    /// from an inner agent loop.
+    fn effective_call_identity(
+        &self,
+        call: Option<&CallIdentity>,
+        fallback_call_id: &str,
+    ) -> Option<CallIdentity> {
+        let path = self.events_tx.agent();
+        if path.is_main() {
+            return call.cloned();
+        }
+        if let Some(existing) = call
+            && AgentPath::of(existing.agent()) == *path
+        {
+            return Some(existing.clone());
+        }
+        let call_id = call.map_or_else(
+            || ToolCallId::new(fallback_call_id),
+            |existing| existing.call().clone(),
+        );
+        Some(CallIdentity::new(call_id, agent_identity_from_path(path)))
+    }
+
     /// Puts `request` to the approver of the call that carries the script, or
     /// to the terminal's own when the script has no call to ask through:
     /// a run, a background script started directly, or a call whose
@@ -2731,6 +2833,10 @@ where
         call: Option<&CallIdentity>,
         cx: Option<&mut ToolContext>,
     ) -> Result<(), TerminalError> {
+        let request = match call {
+            Some(call) => request.with_call(call.clone()),
+            None => request,
+        };
         let kind = request.kind().clone();
         let answer = match cx {
             Some(cx) => match cx.approve(request.clone()).await {
@@ -2744,10 +2850,6 @@ where
         } else {
             let Some(approver) = &self.approver else {
                 return Err(TerminalError::NoApprover(kind));
-            };
-            let request = match call {
-                Some(call) => request.with_call(call.clone()),
-                None => request,
             };
             approver
                 .approve(request)
@@ -3804,12 +3906,67 @@ struct CompletedStdoutFormat<'a> {
     stdout: StdoutTreatment,
 }
 
+fn agent_identity_from_path(path: &AgentPath) -> AgentIdentity {
+    let mut current = AgentIdentity::Main;
+    for segment in path.segments() {
+        let started_by = match current {
+            AgentIdentity::Main => None,
+            AgentIdentity::Subagent(_) => {
+                Some(CallIdentity::new(ToolCallId::new("subagent"), current))
+            }
+        };
+        current = AgentIdentity::Subagent(SubagentIdentity::new(segment.clone(), started_by));
+    }
+    current
+}
+
+#[derive(Clone)]
+struct SubagentIdentityApprover {
+    inner: AnyApprover,
+    agent: AgentPath,
+}
+
+impl Approver for SubagentIdentityApprover {
+    fn approve(
+        &self,
+        request: ApprovalRequest,
+    ) -> impl std::future::Future<Output = Result<Approval, aither_core::llm::tool::ApproverFailure>>
+    + Send {
+        let request = match request.call() {
+            Some(existing) if AgentPath::of(existing.agent()) == self.agent => request,
+            Some(existing) => {
+                let call_id = existing.call().clone();
+                request.with_call(CallIdentity::new(
+                    call_id,
+                    agent_identity_from_path(&self.agent),
+                ))
+            }
+            None => request.with_call(CallIdentity::new(
+                ToolCallId::new("subagent"),
+                agent_identity_from_path(&self.agent),
+            )),
+        };
+        let inner = self.inner.clone();
+        async move { inner.approve(request).await }
+    }
+}
+
 async fn save_completed_stdout(
     job_registry: &JobRegistry,
     task_id: &IdLease,
     stdout: &[u8],
     format: CompletedStdoutFormat<'_>,
 ) -> Result<CommandStream, TerminalError> {
+    if let Some(redirect_path) = job_registry.flush_output_redirect(task_id).await {
+        return match format.outputs.stream_of_file(&redirect_path).await {
+            Ok(entry) => Ok(entry),
+            Err(err) => {
+                job_registry.fail(task_id, &err.to_string(), None).await;
+                Err(TerminalError::Io(err))
+            }
+        };
+    }
+
     let byte_limit = Some(format.outputs.policy().get().inline_bytes);
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
@@ -4314,6 +4471,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
             job_registry.clone(),
             task_id.downgrade(),
             chunk_rx,
+            None,
         ))
         .detach();
 
@@ -4752,6 +4910,35 @@ struct SpawnedJob<'a, E> {
     lifetime: JobLifetime,
 }
 
+async fn attach_backend_killer<E: Executor + Clone + 'static>(
+    job: &SpawnedJob<'_, E>,
+    child: &Arc<crate::SandboxedChild>,
+    drained_rx: Receiver<()>,
+) {
+    let (kill_tx, kill_rx) = async_channel::bounded::<Sender<bool>>(1);
+    job.job_registry
+        .attach_backend_killer(job.task_id, kill_tx)
+        .await;
+    let killed = Arc::clone(child);
+    job.executor
+        .spawn(async move {
+            if let Ok(done_tx) = kill_rx.recv().await {
+                let ok = match killed.kill().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "ending the job failed");
+                        false
+                    }
+                };
+                if ok {
+                    let _ = drained_rx.recv().await;
+                }
+                let _ = done_tx.send(ok).await;
+            }
+        })
+        .detach();
+}
+
 /// Registers a spawned child as a job, streams its output into the registry
 /// and answers what it produced when it ended.
 async fn run_spawned_job<E: Executor + Clone + 'static>(
@@ -4788,23 +4975,7 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
     if let (Some(signals), Some(alerts)) = (stdin_blocked, job.lifetime.stdin_alerts()) {
         job.executor.spawn(alerts.clone().relay(signals)).detach();
     }
-    // A kill of the job ends the whole process tree, wherever it runs.
-    let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-    job.job_registry
-        .attach_kill_switch(job.task_id, kill_tx)
-        .await;
-    let killed = Arc::clone(&child);
-    job.executor
-        .spawn(async move {
-            if kill_rx.recv().await.is_ok()
-                && let Err(error) = killed.kill().await
-            {
-                warn!(%error, "ending the job failed");
-            }
-        })
-        .detach();
-    job.background_startup.report_ready().await;
-
+    let (drained_tx, drained_rx) = async_channel::bounded::<()>(1);
     let (chunk_tx, chunk_rx) = async_channel::unbounded();
     for (stream, is_stderr) in [(stdout, false), (stderr, true)] {
         job.executor
@@ -4817,8 +4988,14 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
             job.job_registry.clone(),
             job.task_id.downgrade(),
             chunk_rx,
+            Some(drained_tx),
         ))
         .detach();
+
+    // A kill of the job ends the whole process tree, wherever it runs, and
+    // settles only after the backend kill and stream drain complete.
+    attach_backend_killer(&job, &child, drained_rx).await;
+    job.background_startup.report_ready().await;
 
     let status = match child.wait().await {
         crate::ChildExit::Exited(status) => status,
@@ -5147,6 +5324,7 @@ async fn drain_terminal_chunks(
     job_registry: JobRegistry,
     task_id: WeakIdLease,
     rx: async_channel::Receiver<TerminalChunk>,
+    _drained: Option<Sender<()>>,
 ) {
     while let Ok(chunk) = rx.recv().await {
         // The flow holds the lease until both streams closed: one gone means
@@ -5469,10 +5647,10 @@ mod tests {
         ] {
             assert_eq!(direct_command(script).unwrap(), None, "{script}");
         }
-        for (script, arg) in [("echo '$HOME'", "$HOME"), ("echo \"\\$HOME\"", "$HOME")] {
+        for (script, arg) in [("env '$HOME'", "$HOME"), ("env \"\\$HOME\"", "$HOME")] {
             assert_eq!(
                 direct_command(script).unwrap(),
-                Some(("echo".to_string(), vec![arg.to_string()])),
+                Some(("env".to_string(), vec![arg.to_string()])),
                 "{script}"
             );
         }
@@ -5747,7 +5925,7 @@ mod tests {
         .expect("wrap script");
         assert!(wrapped.contains("tcp://host.containers.internal:43123"));
         assert!(wrapped.contains(
-            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"stdin_arg":null,"raw_args":false},"session":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"raw_args":false,"stdin_arg":null},"session":{"positional_args":[],"raw_args":false,"stdin_arg":null}}'"#
         ));
     }
 
@@ -5767,7 +5945,7 @@ mod tests {
         )
         .expect("wrap script");
         assert!(wrapped.contains(
-            r#"--commands '{"issue":{"positional_args":["number"],"stdin_arg":"body","raw_args":false}}'"#
+            r#"--commands '{"issue":{"positional_args":["number"],"raw_args":false,"stdin_arg":"body"}}'"#
         ));
         assert!(!wrapped.contains("printf"));
     }
@@ -5963,6 +6141,64 @@ mod tests {
             .await
             .expect_err("nobody can approve the script");
         assert!(error.to_string().contains("no approver"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subagent_shell_stamps_subagent_identity_and_scopes_approver() {
+        use aither_core::llm::tool::{AgentIdentity, ToolCallId};
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let parent_approvals = Approvals::default();
+        let subagent_approvals = Approvals::default();
+        let scoped = subagent_approvals.clone();
+        let parent = approval_tool(dir.path(), [], Some(parent_approvals.clone()))
+            .await
+            .with_subagent_approver(move |_path| Some(AnyApprover::new(scoped.clone())));
+
+        let child = parent
+            .subagent(SubagentGrant::new(), None, "worker")
+            .await
+            .expect("subagent shell launches");
+
+        // Even when ToolContext carries AgentIdentity::Main (as a nested Agent loop does),
+        // Shell::execute stamps the subagent's own identity onto ApprovalRequest::call().
+        let call_approvals = Approvals::default();
+        let main_call = CallIdentity::new(ToolCallId::new("sub-call-1"), AgentIdentity::Main);
+        child
+            .call(
+                unsandboxed_args("true"),
+                ToolContext::new()
+                    .with_identity(main_call)
+                    .with_approver(AnyApprover::new(call_approvals.clone())),
+            )
+            .await
+            .expect("call approver allows");
+        let asked_call = call_approvals.asked();
+        assert_eq!(asked_call.len(), 1);
+        assert!(
+            matches!(
+                asked_call[0].call().map(CallIdentity::agent),
+                Some(AgentIdentity::Subagent(sub)) if sub.name() == "worker"
+            ),
+            "subagent approval request must carry AgentIdentity::Subagent: {:?}",
+            asked_call[0].call()
+        );
+
+        // Without a call approver, child uses the derived subagent_approver rather than parent's.
+        child
+            .run_background(ShellArgs {
+                background: true,
+                ..unsandboxed_args("true")
+            })
+            .await
+            .expect("scoped subagent approver allows");
+        assert_eq!(parent_approvals.asked().len(), 0);
+        let scoped_asked = subagent_approvals.asked();
+        assert_eq!(scoped_asked.len(), 1);
+        assert!(matches!(
+            scoped_asked[0].call().map(CallIdentity::agent),
+            Some(AgentIdentity::Subagent(_))
+        ));
     }
 
     #[test]
@@ -9340,13 +9576,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn container_ipc_bridge_round_trips_a_command_over_tcp() {
         use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        let workspace_dir = tempfile::tempdir().expect("temp workspace");
+        let canonical_workspace =
+            dunce::canonicalize(workspace_dir.path()).expect("canonical workspace");
         let router = heel::IpcRouter::new().register(ProbeEchoCommand);
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         let runtime = crate::ContainerShellRuntime::new(
             "aither-test-ipc",
             crate::HostRoute::new("host.docker.internal", loopback).expect("loopback is routable"),
             crate::AnyContainerExec::new(Arc::new(UnreachableContainerExec)),
-        );
+        )
+        .with_workspace_mount(crate::MountRoot::new(
+            canonical_workspace,
+            ContainerPath::new("/workspace").expect("valid container root"),
+        ));
         let executor = Arc::new(executor_core::AnyExecutor::new(
             executor_core::tokio::TokioGlobal,
         ));
@@ -9361,8 +9604,10 @@ mod tests {
 
         let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "pong" }))
             .expect("params should encode");
-        let request = heel::ipc::IpcRequest::encode("probe_echo", Path::new("/workspace"), &params)
-            .expect("request should encode");
+        let authed_method = format!("{}:probe_echo", bridge.token());
+        let request =
+            heel::ipc::IpcRequest::encode(&authed_method, Path::new("/workspace"), &params)
+                .expect("request should encode");
         stream
             .write_all(&request)
             .await
@@ -9392,6 +9637,94 @@ mod tests {
 
         drop(stream);
         bridge.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_ipc_rejects_bad_token_and_unmapped_working_dir() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        let workspace_dir = tempfile::tempdir().expect("temp workspace");
+        let canonical_workspace =
+            dunce::canonicalize(workspace_dir.path()).expect("canonical workspace");
+        let router = heel::IpcRouter::new().register(ProbeEchoCommand);
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        let runtime = crate::ContainerShellRuntime::new(
+            "aither-test-ipc-auth",
+            crate::HostRoute::new("host.docker.internal", loopback).expect("loopback is routable"),
+            crate::AnyContainerExec::new(Arc::new(UnreachableContainerExec)),
+        )
+        .with_workspace_mount(crate::MountRoot::new(
+            canonical_workspace,
+            ContainerPath::new("/workspace").expect("valid container root"),
+        ));
+        let executor = Arc::new(executor_core::AnyExecutor::new(
+            executor_core::tokio::TokioGlobal,
+        ));
+        let bridge = crate::spawn::container_ipc::ContainerIpc::serve(&executor, router, &runtime)
+            .expect("bridge should start on loopback");
+        let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "spoof" })).unwrap();
+
+        let send_frame = |method: String, cwd: &'static str| {
+            let port = bridge.port();
+            let payload = params.clone();
+            async move {
+                let mut stream = async_io::Async::<std::net::TcpStream>::connect(
+                    std::net::SocketAddr::new(loopback, port),
+                )
+                .await
+                .unwrap();
+                let req = heel::ipc::IpcRequest::encode(&method, Path::new(cwd), &payload).unwrap();
+                stream.write_all(&req).await.unwrap();
+                let mut len = [0_u8; 4];
+                stream.read_exact(&mut len).await.unwrap();
+                let mut resp = vec![0_u8; u32::from_be_bytes(len) as usize];
+                stream.read_exact(&mut resp).await.unwrap();
+                resp
+            }
+        };
+
+        // Missing or wrong token is rejected.
+        let unauthed = send_frame("probe_echo".to_string(), "/workspace").await;
+        assert_eq!(unauthed.first().copied(), Some(0));
+        let wrong_token = send_frame(format!("{}:probe_echo", "0".repeat(64)), "/workspace").await;
+        assert_eq!(wrong_token.first().copied(), Some(0));
+
+        // Valid token with unmapped or escaping working_dir is rejected before handler runs.
+        let escaped = send_frame(format!("{}:probe_echo", bridge.token()), "/etc").await;
+        assert_eq!(escaped.first().copied(), Some(0));
+        let parent_escape = send_frame(
+            format!("{}:probe_echo", bridge.token()),
+            "/workspace/../etc",
+        )
+        .await;
+        assert_eq!(parent_escape.first().copied(), Some(0));
+
+        bridge.stop().await;
+    }
+
+    #[test]
+    fn builtins_and_wrapped_path_ordering_keep_managed_bin_dir_ahead_of_exports() {
+        for builtin in [
+            ".", ":", "[", "echo", "printf", "pwd", "test", "true", "wait",
+        ] {
+            assert!(
+                is_shell_builtin(builtin),
+                "{builtin} must be treated as a builtin"
+            );
+        }
+        assert!(!is_shell_builtin("ripgrep"));
+
+        let launch = crate::RemoteLaunch::new("/opt/aither/bin", "/opt/aither/bin/bash");
+        let wrapped = launch
+            .wrap_script_with_exports("export PATH='/usr/bin:/bin'", "which rg")
+            .expect("wrap_script_with_exports renders");
+        let export_pos = wrapped.find("export PATH=").expect("env export present");
+        let prepend_pos = wrapped
+            .find("PATH=/opt/aither/bin")
+            .expect("bin_dir prepend present");
+        assert!(
+            prepend_pos > export_pos,
+            "managed bin_dir must be prepended after user/env PATH exports:\n{wrapped}"
+        );
     }
 
     // ---- subagent authority -------------------------------------------------
@@ -12582,6 +12915,63 @@ mod tests {
         assert!(
             !shell_target.exists(),
             "the shell launched before the grant is still sandboxed without it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_flushes_unterminated_eof_line_and_refuses_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("outside.log");
+        std::fs::write(&secret, "secret\n").unwrap();
+
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let escape_link = tool.working_dir().join("escape.log");
+        std::os::unix::fs::symlink(&secret, &escape_link).unwrap();
+
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
+        let refused = monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::File {
+                        file: "escape.log".to_string(),
+                    },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "symlink escaping working_dir without a readable grant must be refused"
+        );
+
+        monitor
+            .call(
+                monitor_command("printf 'first\\ntrailing-no-newline'", 30),
+                ToolContext::new(),
+            )
+            .await
+            .expect("monitor starts");
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        let lines: Vec<&String> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                ShellEvent::MonitorIncrement(increment) => Some(&increment.lines),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            lines.iter().any(|line| *line == "trailing-no-newline"),
+            "unterminated EOF line must be delivered: {lines:?}"
         );
     }
 }

@@ -1,12 +1,18 @@
 //! Command execution tool for LLM agents.
 
-use std::{borrow::Cow, fmt, path::PathBuf, process::ExitStatus};
+use std::{
+    borrow::Cow,
+    fmt,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+};
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
 use anyhow::{Context, Result, bail};
 use askama::Template;
 use async_process::Command;
+use futures_lite::io::AsyncReadExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -166,16 +172,19 @@ impl Tool for CommandTool {
     async fn call(
         &self,
         arguments: Self::Arguments,
-        _cx: ToolContext,
+        cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
         self.ensure_allowed(&arguments.program)?;
 
         let working_dir = arguments.cwd.unwrap_or_else(|| self.default_cwd.clone());
-        let output = Command::new(&arguments.program)
+        let mut child = Command::new(&arguments.program)
             .args(&arguments.args)
             .current_dir(&working_dir)
-            .output()
-            .await
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
             .with_context(|| {
                 format!(
                     "failed to execute '{}' in {}",
@@ -184,14 +193,71 @@ impl Tool for CommandTool {
                 )
             })?;
 
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let byte_cap = self.max_output.saturating_add(8);
+
+        let collect = async {
+            let (stdout_res, stderr_res) = futures_lite::future::zip(
+                read_bounded_stream(stdout_pipe, byte_cap),
+                read_bounded_stream(stderr_pipe, byte_cap),
+            )
+            .await;
+            let stdout = stdout_res?;
+            let stderr = stderr_res?;
+            let status = child.status().await?;
+            Ok::<_, std::io::Error>((status, stdout, stderr))
+        };
+
+        let cancellation = cx.cancellation().clone();
+        let (status, stdout, stderr) = futures_lite::future::or(collect, async {
+            cancellation.cancelled().await;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "command cancelled",
+            ))
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed while running '{}' in {}",
+                arguments.program,
+                working_dir.display()
+            )
+        })?;
+
         let response = CommandOutput {
             program: arguments.program,
-            termination: Termination::of(output.status)?,
-            stdout: self.truncate(String::from_utf8_lossy(&output.stdout).to_string()),
-            stderr: self.truncate(String::from_utf8_lossy(&output.stderr).to_string()),
+            termination: Termination::of(status)?,
+            stdout: self.truncate(String::from_utf8_lossy(&stdout).into_owned()),
+            stderr: self.truncate(String::from_utf8_lossy(&stderr).into_owned()),
         };
 
         Ok(ToolResult::text(response.render()?))
+    }
+}
+
+async fn read_bounded_stream<R>(reader: Option<R>, cap: usize) -> std::io::Result<Vec<u8>>
+where
+    R: futures_lite::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok(Vec::new());
+    };
+    let mut retained = Vec::new();
+    let mut scratch = vec![0_u8; 8192];
+    loop {
+        match reader.read(&mut scratch).await {
+            Ok(0) => return Ok(retained),
+            Ok(n) => {
+                if retained.len() < cap {
+                    let take = (cap - retained.len()).min(n);
+                    retained.extend_from_slice(&scratch[..take]);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -290,5 +356,74 @@ mod tests {
             output.render().unwrap(),
             "true exited with status 0.\n(no output)\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn large_stream_is_bounded_and_truncated() {
+        let tool = CommandTool::new(".").max_output(32);
+        let text = run(&tool, "sh", &["-c", "yes x | head -c 262144"]).await;
+        assert!(text.contains("\n...output truncated..."), "{text}");
+        assert!(
+            text.len() < 256,
+            "retained output must stay bounded: {}",
+            text.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_aborts_and_kills_spawned_child() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let tool = CommandTool::new(dir.path());
+        let token = aither_core::llm::tool::Canceller::new();
+        let cx = ToolContext::new().with_cancellation(token.signal());
+
+        let pid_path = pid_file.clone();
+        let stopper = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Ok(raw) = std::fs::read_to_string(&pid_path)
+                    && raw.trim().parse::<i32>().is_ok()
+                {
+                    token.cancel();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            token.cancel();
+        });
+
+        let result = tool
+            .call(
+                CommandArgs {
+                    program: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        format!("echo $$ > '{}'; exec sleep 60", pid_file.display()),
+                    ],
+                    cwd: None,
+                },
+                cx,
+            )
+            .await;
+        stopper.await.unwrap();
+        assert!(result.is_err(), "cancelled command must return an error");
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut exited = false;
+        for _ in 0..50 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(exited, "kill_on_drop must terminate child pid {pid}");
     }
 }

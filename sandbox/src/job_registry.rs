@@ -3,13 +3,13 @@
 //! Uses an internal command channel to avoid shared locks.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use aither_core::{IdLease, WeakIdLease};
 use async_channel::{Receiver, Sender, WeakSender};
-use futures_lite::io::AsyncWriteExt;
+use futures_lite::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::interpreter::Interpreter;
 use crate::memory::MemoryDomain;
@@ -19,6 +19,15 @@ use crate::policy::SandboxMode;
 use crate::process_tree::KillTreeError;
 use crate::process_tree::{JobTree, ProcessScanner};
 use crate::terminal::TimeoutKill;
+use crate::wording::{AnyShellWording, RunningJob, render_default_running_jobs};
+
+/// Maximum bytes retained per stream buffer in memory once a job redirects its
+/// output to disk.
+const REDIRECTED_BUFFER_CAP: usize = 256 * 1024;
+
+/// Maximum bytes of complete lines retained in memory once a job redirects its
+/// output to disk.
+const REDIRECTED_LINE_BUFFER_CAP: usize = 512 * 1024;
 
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
@@ -206,7 +215,7 @@ pub enum Delivery {
 /// lives; dropping it is the agent taking the completion, which marks the
 /// job [`Delivery::Taken`] and lets the registry forget it, so its task id
 /// goes back to the allocator. The registry hands out one per job, through
-/// [`JobRegistry::owe_completion`].
+/// `JobRegistry::owe_completion`.
 #[must_use = "dropping it marks the completion taken"]
 pub struct PendingCompletion {
     tx: Sender<JobCommand>,
@@ -286,7 +295,7 @@ impl Drop for JobWatch {
     }
 }
 
-/// What [`JobRegistry::owe_completion`] settled for a job.
+/// What `JobRegistry::owe_completion` settled for a job.
 #[derive(Debug)]
 pub struct OwedCompletion {
     /// The job as it ended. A job whose completion a waiter took is
@@ -294,7 +303,7 @@ pub struct OwedCompletion {
     /// read of it its flow is sure of.
     pub info: JobInfo,
     /// Keeps the completion pending until the agent takes it; `None` when a
-    /// waiter ([`JobRegistry::wait_taking`]) already took it, so nothing is
+    /// waiter (`JobRegistry::wait_taking`) already took it, so nothing is
     /// owed.
     pub pending: Option<PendingCompletion>,
 }
@@ -360,15 +369,28 @@ pub enum TerminalStream {
 }
 
 #[derive(Debug)]
+enum KillSwitch {
+    /// One-way kill switch used by test fixtures with no child process.
+    Fire(Sender<()>),
+    /// Two-phase backend kill that completes once the backend process is
+    /// killed and its output chunks have drained.
+    Backend(Sender<Sender<bool>>),
+}
+
+#[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct JobState {
     info: JobInfo,
     /// Keeps the job's task id leased while the registry keeps the job.
     task_id: IdLease,
     terminal_buffer: Vec<u8>,
+    /// Bytes evicted from the front of `terminal_buffer` once redirected to disk.
+    terminal_evicted: usize,
     /// Complete lines only, each from one stream, in the order they
     /// completed: what the `monitor` pump reads.
     line_buffer: Vec<u8>,
+    /// Bytes evicted from the front of `line_buffer` once redirected to disk.
+    line_evicted: usize,
     stdout_partial: Vec<u8>,
     stderr_partial: Vec<u8>,
     stdout_buffer: Vec<u8>,
@@ -376,7 +398,11 @@ struct JobState {
     stdout_closed: bool,
     stderr_closed: bool,
     input_tx: Option<TerminalInputSender>,
-    kill_switch: Option<Sender<()>>,
+    kill_switch: Option<KillSwitch>,
+    /// True while a `KillSwitch` kill is running outside the registry.
+    switch_kill_in_flight: bool,
+    /// Concurrent callers waiting on the active `KillSwitch` kill.
+    switch_kill_waiters: Vec<Sender<bool>>,
     process_tree: Option<JobTree>,
     /// Why the kill in flight was asked for: the first of overlapping kills.
     kill_cause: Option<KillCause>,
@@ -389,6 +415,8 @@ struct JobState {
     /// Callers parked until the job ends.
     ended_waiters: Vec<Sender<Option<JobInfo>>>,
     output_redirect: Option<async_fs::File>,
+    /// True once initial output has been written to `info.output_path`.
+    redirected_disk: bool,
     finished_at: Option<Instant>,
     /// Whether the job's [`PendingCompletion`] was handed out.
     completion_owed: bool,
@@ -445,7 +473,7 @@ enum StateCommand {
     },
     AttachKillSwitch {
         task_id: IdLease,
-        kill_tx: Sender<()>,
+        kill_switch: KillSwitch,
     },
     AppendTerminalOutput {
         task_id: IdLease,
@@ -533,6 +561,10 @@ enum JobRequest {
         output_path: PathBuf,
         reply: Sender<Result<Vec<u8>, String>>,
     },
+    FlushOutputRedirect {
+        task_id: String,
+        reply: Sender<Option<PathBuf>>,
+    },
     TerminalOutput {
         task_id: String,
         reply: Sender<Option<(Vec<u8>, Vec<u8>)>>,
@@ -580,6 +612,10 @@ enum JobRequest {
 enum KillPlan {
     /// The registry decided at once.
     Done(bool),
+    /// Run a backend or test kill switch outside the registry.
+    Switch(KillSwitch),
+    /// Wait on a `KillSwitch` kill already in flight.
+    AwaitSwitch(Receiver<bool>),
     /// Kill the job's whole process tree.
     Tree(JobTree),
     /// Kill the process group led by this pid.
@@ -638,6 +674,8 @@ pub struct JobRegistryService {
     tx: WeakSender<JobCommand>,
     /// How much of a script a job listing shows.
     policy: OutputPolicy,
+    /// Embedder wording for running job summaries.
+    wording: Option<AnyShellWording>,
 }
 
 /// Creates a registry handle and its background service; job listings are
@@ -655,8 +693,18 @@ pub fn job_registry_channel(policy: OutputPolicy) -> (JobRegistry, JobRegistrySe
             rx,
             tx: weak,
             policy,
+            wording: None,
         },
     )
+}
+
+impl JobRegistryService {
+    /// Formats running job summaries through `wording`.
+    #[must_use]
+    pub fn with_wording(mut self, wording: AnyShellWording) -> Self {
+        self.wording = Some(wording);
+        self
+    }
 }
 
 impl JobRegistry {
@@ -789,7 +837,21 @@ impl JobRegistry {
     pub async fn attach_kill_switch(&self, task_id: &IdLease, kill_tx: Sender<()>) {
         self.send_command(StateCommand::AttachKillSwitch {
             task_id: task_id.clone(),
-            kill_tx,
+            kill_switch: KillSwitch::Fire(kill_tx),
+        })
+        .await;
+    }
+
+    /// Attaches a two-phase backend killer that replies once the backend kill
+    /// and its output drain have completed.
+    pub(crate) async fn attach_backend_killer(
+        &self,
+        task_id: &IdLease,
+        kill_tx: Sender<Sender<bool>>,
+    ) {
+        self.send_command(StateCommand::AttachKillSwitch {
+            task_id: task_id.clone(),
+            kill_switch: KillSwitch::Backend(kill_tx),
         })
         .await;
     }
@@ -930,6 +992,18 @@ impl JobRegistry {
         self.send_command(JobRequest::StartOutputRedirect {
             task_id: task_id.to_string(),
             output_path,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Flushes any active output redirect file for `task_id` and returns its
+    /// disk path when redirected.
+    pub(crate) async fn flush_output_redirect(&self, task_id: &str) -> Option<PathBuf> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::FlushOutputRedirect {
+            task_id: task_id.to_string(),
             reply: reply_tx,
         })
         .await;
@@ -1201,6 +1275,24 @@ impl JobRegistry {
     async fn finish_kill(&self, task_id: &str, plan: KillPlan) -> bool {
         let killed = match plan {
             KillPlan::Done(killed) => return killed,
+            KillPlan::Switch(KillSwitch::Fire(kill_tx)) => {
+                if kill_tx.send(()).await.is_err() {
+                    tracing::warn!(task_id, "failed to signal runtime kill switch");
+                    false
+                } else {
+                    true
+                }
+            }
+            KillPlan::Switch(KillSwitch::Backend(kill_tx)) => {
+                let (done_tx, done_rx) = async_channel::bounded(1);
+                if kill_tx.send(done_tx).await.is_err() {
+                    tracing::warn!(task_id, "failed to signal backend kill switch");
+                    false
+                } else {
+                    done_rx.recv().await.unwrap_or(false)
+                }
+            }
+            KillPlan::AwaitSwitch(wait_rx) => wait_rx.recv().await.unwrap_or(false),
             KillPlan::Tree(tree) => match tree.kill().await {
                 Ok(()) => true,
                 #[cfg(unix)]
@@ -1436,6 +1528,7 @@ impl JobRegistryService {
                         &mut parked,
                         &self.tx,
                         preview,
+                        self.wording.as_deref(),
                         request,
                     )
                     .await;
@@ -1505,9 +1598,12 @@ async fn handle_state_command(
                 job.input_tx = Some(input_tx);
             }
         }
-        StateCommand::AttachKillSwitch { task_id, kill_tx } => {
+        StateCommand::AttachKillSwitch {
+            task_id,
+            kill_switch,
+        } => {
             if let Some(job) = jobs.get_mut(task_id.as_str()) {
-                job.kill_switch = Some(kill_tx);
+                job.kill_switch = Some(kill_switch);
             }
         }
         StateCommand::AppendTerminalOutput {
@@ -1574,6 +1670,7 @@ async fn handle_job_request(
     parked: &mut ParkedOutput,
     tx: &WeakSender<JobCommand>,
     script_preview_bytes: usize,
+    wording: Option<&dyn crate::wording::ShellWording>,
     request: JobRequest,
 ) {
     match request {
@@ -1624,7 +1721,7 @@ async fn handle_job_request(
             cause,
             reply,
         } => {
-            let plan = begin_kill(jobs, &task_id, cause).await;
+            let plan = begin_kill(jobs, &task_id, cause);
             let _ = reply.send(plan).await;
         }
         JobRequest::BeginKillByExecutionKey {
@@ -1632,7 +1729,7 @@ async fn handle_job_request(
             cause,
             reply,
         } => {
-            let plans = begin_kill_by_execution_key(jobs, &execution_key, cause).await;
+            let plans = begin_kill_by_execution_key(jobs, &execution_key, cause);
             let _ = reply.send(plans).await;
         }
         JobRequest::EndKill {
@@ -1660,6 +1757,19 @@ async fn handle_job_request(
             let result = redirect_task_output(jobs, &task_id, output_path).await;
             let _ = reply.send(result).await;
         }
+        JobRequest::FlushOutputRedirect { task_id, reply } => {
+            let path = if let Some(job) = jobs.get_mut(&task_id) {
+                if let Some(file) = job.output_redirect.as_mut() {
+                    let _ = file.flush().await;
+                }
+                job.redirected_disk
+                    .then(|| job.info.output_path.clone())
+                    .flatten()
+            } else {
+                None
+            };
+            let _ = reply.send(path).await;
+        }
         JobRequest::TerminalOutput { task_id, reply } => {
             send_terminal_output(jobs, &task_id, reply).await;
         }
@@ -1671,6 +1781,7 @@ async fn handle_job_request(
             reply,
         } => {
             let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
+                .await
                 .map(|delta| tracked_delta(reads, &task_id, delta, tracked));
             let _ = reply.send(result).await;
         }
@@ -1689,7 +1800,7 @@ async fn handle_job_request(
         }
         JobRequest::FormatRunning { reply } => {
             let _ = reply
-                .send(format_running_jobs(jobs, script_preview_bytes))
+                .send(format_running_jobs(jobs, script_preview_bytes, wording))
                 .await;
         }
         JobRequest::HasRunning { reply } => {
@@ -1771,7 +1882,9 @@ impl JobState {
             info,
             task_id,
             terminal_buffer: Vec::new(),
+            terminal_evicted: 0,
             line_buffer: Vec::new(),
+            line_evicted: 0,
             stdout_partial: Vec::new(),
             stderr_partial: Vec::new(),
             stdout_buffer: Vec::new(),
@@ -1780,6 +1893,8 @@ impl JobState {
             stderr_closed: false,
             input_tx: None,
             kill_switch: None,
+            switch_kill_in_flight: false,
+            switch_kill_waiters: Vec::new(),
             process_tree: None,
             kill_cause: None,
             kills_in_flight: 0,
@@ -1787,10 +1902,63 @@ impl JobState {
             settled_waiters: Vec::new(),
             ended_waiters: Vec::new(),
             output_redirect: None,
+            redirected_disk: false,
             finished_at: None,
             completion_owed: false,
             claimed: false,
             watchers: 0,
+        }
+    }
+}
+
+fn flush_stream_partial(job: &mut JobState, stream: TerminalStream) {
+    let partial = match stream {
+        TerminalStream::Stdout => &mut job.stdout_partial,
+        TerminalStream::Stderr => &mut job.stderr_partial,
+    };
+    if !partial.is_empty() {
+        job.line_buffer.append(partial);
+        job.line_buffer.push(b'\n');
+        trim_redirected_buffers(job);
+    }
+}
+
+fn trim_redirected_buffers(job: &mut JobState) {
+    if !job.redirected_disk {
+        return;
+    }
+    if job.terminal_buffer.len() > REDIRECTED_BUFFER_CAP {
+        let drop_len = job.terminal_buffer.len() - REDIRECTED_BUFFER_CAP;
+        job.terminal_buffer.drain(..drop_len);
+        job.terminal_evicted += drop_len;
+        if job.terminal_buffer.capacity() > REDIRECTED_BUFFER_CAP * 4 {
+            job.terminal_buffer.shrink_to(REDIRECTED_BUFFER_CAP * 2);
+        }
+    }
+    if job.stdout_buffer.len() > REDIRECTED_BUFFER_CAP {
+        let drop_len = job.stdout_buffer.len() - REDIRECTED_BUFFER_CAP;
+        job.stdout_buffer.drain(..drop_len);
+        if job.stdout_buffer.capacity() > REDIRECTED_BUFFER_CAP * 4 {
+            job.stdout_buffer.shrink_to(REDIRECTED_BUFFER_CAP * 2);
+        }
+    }
+    if job.stderr_buffer.len() > REDIRECTED_BUFFER_CAP {
+        let drop_len = job.stderr_buffer.len() - REDIRECTED_BUFFER_CAP;
+        job.stderr_buffer.drain(..drop_len);
+        if job.stderr_buffer.capacity() > REDIRECTED_BUFFER_CAP * 4 {
+            job.stderr_buffer.shrink_to(REDIRECTED_BUFFER_CAP * 2);
+        }
+    }
+    if job.line_buffer.len() > REDIRECTED_LINE_BUFFER_CAP {
+        let min_drop = job.line_buffer.len() - REDIRECTED_LINE_BUFFER_CAP;
+        let drop_len = job.line_buffer[min_drop..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(min_drop, |pos| min_drop + pos + 1);
+        job.line_buffer.drain(..drop_len);
+        job.line_evicted += drop_len;
+        if job.line_buffer.capacity() > REDIRECTED_LINE_BUFFER_CAP * 4 {
+            job.line_buffer.shrink_to(REDIRECTED_LINE_BUFFER_CAP * 2);
         }
     }
 }
@@ -1814,6 +1982,8 @@ fn finish(job: &mut JobState, end: JobEnd) {
         job.info.task_id,
         job.info.status
     );
+    flush_stream_partial(job, TerminalStream::Stdout);
+    flush_stream_partial(job, TerminalStream::Stderr);
     let delivery = if job.claimed {
         Delivery::Taken
     } else {
@@ -1986,11 +2156,13 @@ async fn append_terminal_output(
         if let Some(last_newline) = partial.iter().rposition(|byte| *byte == b'\n') {
             job.line_buffer.extend(partial.drain(..=last_newline));
         }
+        trim_redirected_buffers(job);
     }
 }
 
 fn close_terminal_stream(jobs: &mut Jobs, task_id: &str, stream: TerminalStream) {
     if let Some(job) = jobs.get_mut(task_id) {
+        flush_stream_partial(job, stream);
         match stream {
             TerminalStream::Stdout => job.stdout_closed = true,
             TerminalStream::Stderr => job.stderr_closed = true,
@@ -2064,7 +2236,7 @@ async fn fail_job(jobs: &mut Jobs, task_id: &str, error: String, output_path: Op
     }
 }
 
-async fn begin_kill_by_execution_key(
+fn begin_kill_by_execution_key(
     jobs: &mut Jobs,
     execution_key: &str,
     cause: KillCause,
@@ -2080,7 +2252,7 @@ async fn begin_kill_by_execution_key(
 
     let mut plans = Vec::with_capacity(task_ids.len());
     for task_id in task_ids {
-        let plan = begin_kill(jobs, &task_id, cause).await;
+        let plan = begin_kill(jobs, &task_id, cause);
         plans.push((task_id, plan));
     }
     plans
@@ -2168,17 +2340,17 @@ async fn wait_for_end(jobs: &mut Jobs, task_id: &str, claim: bool, reply: Sender
     }
 }
 
-fn read_terminal_delta(
-    jobs: &Jobs,
+async fn read_terminal_delta(
+    jobs: &mut Jobs,
     task_id: &str,
     cursor: usize,
     max_bytes: usize,
     lines: bool,
 ) -> Result<JobDelta, String> {
-    jobs.get(task_id).map_or_else(
-        || Err(format!("unknown task_id: {task_id}")),
-        |job| terminal_read(job, cursor, max_bytes, lines),
-    )
+    let Some(job) = jobs.get_mut(task_id) else {
+        return Err(format!("unknown task_id: {task_id}"));
+    };
+    terminal_read(job, cursor, max_bytes, lines).await
 }
 
 async fn start_output_redirect(
@@ -2224,9 +2396,12 @@ async fn start_output_redirect(
         )
     })?;
 
+    let snapshot = job.terminal_buffer.clone();
     job.info.output_path = Some(output_path);
     job.output_redirect = Some(file);
-    Ok(job.terminal_buffer.clone())
+    job.redirected_disk = true;
+    trim_redirected_buffers(job);
+    Ok(snapshot)
 }
 
 fn mark_job_failed(job: &mut JobState, error: String) {
@@ -2247,7 +2422,7 @@ async fn finalize_output_redirect(job: &mut JobState) -> Result<(), String> {
 
 /// Starts killing a job: decides at once what needs no process signal, and
 /// otherwise hands back what the caller must kill outside the registry.
-async fn begin_kill(jobs: &mut Jobs, task_id: &str, cause: KillCause) -> KillPlan {
+fn begin_kill(jobs: &mut Jobs, task_id: &str, cause: KillCause) -> KillPlan {
     let Some(job) = jobs.get_mut(task_id) else {
         return KillPlan::Done(false);
     };
@@ -2256,28 +2431,21 @@ async fn begin_kill(jobs: &mut Jobs, task_id: &str, cause: KillCause) -> KillPla
         return KillPlan::Done(false);
     }
 
-    if let Some(kill_switch) = job.kill_switch.take() {
-        if kill_switch.send(()).await.is_err() {
-            tracing::warn!(task_id, "failed to signal runtime kill switch");
-            return KillPlan::Done(false);
-        }
-        if let Err(error) = finalize_output_redirect(job).await {
-            tracing::warn!(
-                task_id,
-                error = %error,
-                "failed to flush redirected output after kill switch signal"
-            );
-        }
-        finish(job, JobEnd::Killed(cause));
-        job.stdout_closed = true;
-        job.stderr_closed = true;
-        tracing::info!(task_id, "killed job via runtime kill switch");
-        return KillPlan::Done(true);
-    }
-
     if job.kills_in_flight == 0 {
         job.kill_cause = Some(cause);
     }
+    if let Some(kill_switch) = job.kill_switch.take() {
+        job.kills_in_flight += 1;
+        job.switch_kill_in_flight = true;
+        return KillPlan::Switch(kill_switch);
+    }
+    if job.switch_kill_in_flight {
+        job.kills_in_flight += 1;
+        let (tx, rx) = async_channel::bounded(1);
+        job.switch_kill_waiters.push(tx);
+        return KillPlan::AwaitSwitch(rx);
+    }
+
     job.kills_in_flight += 1;
     let group = job.info.pid;
     job.process_tree
@@ -2291,6 +2459,12 @@ async fn end_kill(jobs: &mut Jobs, task_id: &str, killed: bool) -> bool {
     let Some(job) = jobs.get_mut(task_id) else {
         return false;
     };
+    if job.switch_kill_in_flight {
+        job.switch_kill_in_flight = false;
+        for waiter in std::mem::take(&mut job.switch_kill_waiters) {
+            let _ = waiter.try_send(killed);
+        }
+    }
     job.kills_in_flight = job.kills_in_flight.saturating_sub(1);
     if killed {
         job.deferred_end = None;
@@ -2378,14 +2552,15 @@ fn script_preview(script: &str, limit: usize) -> String {
     if script.len() <= limit {
         return script.to_string();
     }
-    let end = (0..=limit)
-        .rev()
-        .find(|index| script.is_char_boundary(*index))
-        .unwrap_or(0);
-    format!("{}...", &script[..end])
+    let end = script.floor_char_boundary(limit);
+    format!("{}...", script.get(..end).unwrap_or_default())
 }
 
-fn format_running_jobs(jobs: &Jobs, script_preview_bytes: usize) -> String {
+fn format_running_jobs(
+    jobs: &Jobs,
+    script_preview_bytes: usize,
+    wording: Option<&dyn crate::wording::ShellWording>,
+) -> String {
     let running: Vec<_> = jobs
         .values()
         .filter(|job| matches!(job.info.status, JobStatus::Running))
@@ -2395,38 +2570,62 @@ fn format_running_jobs(jobs: &Jobs, script_preview_bytes: usize) -> String {
         return String::new();
     }
 
-    let mut output = String::new();
-    for job in running {
-        let script_preview = script_preview(&job.info.script, script_preview_bytes);
-
-        let output_path = job
-            .info
-            .output_path
-            .as_ref()
-            .map_or_else(|| "(no output)".to_string(), |p| p.display().to_string());
-
-        let _ = writeln!(
-            output,
-            "  - task {} (pid {}): `{}` -> {}",
-            job.info.task_id, job.info.pid, script_preview, output_path
-        );
-    }
-
-    output
+    let prepared: Vec<(String, Option<String>)> = running
+        .iter()
+        .map(|job| {
+            let preview = script_preview(&job.info.script, script_preview_bytes);
+            let path = job
+                .info
+                .output_path
+                .as_ref()
+                .map(|p| p.display().to_string());
+            (preview, path)
+        })
+        .collect();
+    let entries: Vec<RunningJob<'_>> = running
+        .iter()
+        .zip(&prepared)
+        .map(|(job, (preview, path))| RunningJob {
+            task_id: &job.info.task_id,
+            pid: job.info.pid,
+            script_preview: preview,
+            output_path: path.as_deref(),
+        })
+        .collect();
+    wording.map_or_else(
+        || render_default_running_jobs(&entries),
+        |wording| wording.running_jobs(&entries),
+    )
 }
 
-fn terminal_read(
-    job: &JobState,
+async fn terminal_read(
+    job: &mut JobState,
     cursor: usize,
     max_bytes: usize,
     lines: bool,
 ) -> Result<JobDelta, String> {
-    let buffer = if lines {
-        &job.line_buffer
-    } else {
-        &job.terminal_buffer
-    };
-    let total_bytes = buffer.len();
+    if lines {
+        let total_bytes = job.line_evicted + job.line_buffer.len();
+        if cursor > total_bytes {
+            return Err(format!(
+                "cursor {cursor} exceeds terminal buffer size {total_bytes} for task {}",
+                job.info.task_id
+            ));
+        }
+        let effective_cursor = cursor.max(job.line_evicted);
+        let end = total_bytes.min(effective_cursor.saturating_add(max_bytes));
+        let start_idx = effective_cursor - job.line_evicted;
+        let end_idx = end - job.line_evicted;
+        return Ok(JobDelta {
+            task_id: job.info.task_id.clone(),
+            cursor: end,
+            total_bytes,
+            bytes: job.line_buffer[start_idx..end_idx].to_vec(),
+            status: job.info.status.clone(),
+        });
+    }
+
+    let total_bytes = job.terminal_evicted + job.terminal_buffer.len();
     if cursor > total_bytes {
         return Err(format!(
             "cursor {cursor} exceeds terminal buffer size {total_bytes} for task {}",
@@ -2434,11 +2633,54 @@ fn terminal_read(
         ));
     }
     let end = total_bytes.min(cursor.saturating_add(max_bytes));
+    let bytes = if cursor >= job.terminal_evicted {
+        let start_idx = cursor - job.terminal_evicted;
+        let end_idx = end - job.terminal_evicted;
+        job.terminal_buffer[start_idx..end_idx].to_vec()
+    } else if let Some(path) = job.info.output_path.clone() {
+        if let Some(file) = job.output_redirect.as_mut() {
+            let _ = file.flush().await;
+        }
+        let wanted = end - cursor;
+        let mut out = Vec::with_capacity(wanted.min(REDIRECTED_BUFFER_CAP));
+        let mut reader = async_fs::File::open(&path).await.map_err(|error| {
+            format!(
+                "failed to open redirected output {} for task {}: {error}",
+                path.display(),
+                job.info.task_id
+            )
+        })?;
+        reader
+            .seek(SeekFrom::Start(cursor as u64))
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to seek redirected output {} for task {}: {error}",
+                    path.display(),
+                    job.info.task_id
+                )
+            })?;
+        reader
+            .take(wanted as u64)
+            .read_to_end(&mut out)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to read redirected output {} for task {}: {error}",
+                    path.display(),
+                    job.info.task_id
+                )
+            })?;
+        out
+    } else {
+        Vec::new()
+    };
+
     Ok(JobDelta {
         task_id: job.info.task_id.clone(),
         cursor: end,
         total_bytes,
-        bytes: buffer[cursor..end].to_vec(),
+        bytes,
         status: job.info.status.clone(),
     })
 }
@@ -3282,11 +3524,11 @@ mod tests {
         let mut jobs = running_job(7);
         let user = KillCause::User;
         assert!(matches!(
-            begin_kill(&mut jobs, "task", user).await,
+            begin_kill(&mut jobs, "task", user),
             KillPlan::Group(7)
         ));
         assert!(matches!(
-            begin_kill(&mut jobs, "task", user).await,
+            begin_kill(&mut jobs, "task", user),
             KillPlan::Group(7)
         ));
         complete_job(&mut jobs, "task", 0, None).await;
@@ -3318,7 +3560,7 @@ mod tests {
     async fn a_successful_kill_wins_over_a_deferred_ending() {
         let mut jobs = running_job(8);
         assert!(matches!(
-            begin_kill(&mut jobs, "task", KillCause::User).await,
+            begin_kill(&mut jobs, "task", KillCause::User),
             KillPlan::Group(8)
         ));
         complete_job(&mut jobs, "task", 0, None).await;
@@ -3562,5 +3804,115 @@ mod tests {
         );
         let _first = owe_completion(&mut jobs, "twice", Ok(0), &weak).await;
         let _second = owe_completion(&mut jobs, "twice", Ok(0), &weak).await;
+    }
+
+    #[tokio::test]
+    async fn two_phase_backend_kill_waits_for_drain_and_preserves_unterminated_eof_line() {
+        let registry = spawn_registry();
+        let id = lease("containerjob");
+        registry
+            .register(0, &id, "exec", "echo partial", SandboxMode::Sandboxed, None)
+            .await;
+
+        let (kill_tx, kill_rx) = async_channel::bounded::<Sender<bool>>(1);
+        let (kill_entered_tx, kill_entered_rx) = async_channel::bounded(1);
+        let (release_kill_tx, release_kill_rx) = async_channel::bounded::<()>(1);
+        registry.attach_backend_killer(&id, kill_tx).await;
+
+        let reg_for_killer = registry.clone();
+        let id_for_killer = id.clone();
+        let killer_task = tokio::spawn(async move {
+            let done_tx = kill_rx.recv().await.unwrap();
+            let _ = kill_entered_tx.send(()).await;
+            let _ = release_kill_rx.recv().await;
+            reg_for_killer
+                .append_stdout(&id_for_killer, b"final-unterminated".to_vec())
+                .await;
+            reg_for_killer.close_stdout(&id_for_killer).await;
+            let _ = done_tx.send(true).await;
+        });
+
+        let reg_kill = registry.clone();
+        let kill_task = tokio::spawn(async move { reg_kill.kill_by_task_id("containerjob").await });
+
+        kill_entered_rx.recv().await.unwrap();
+        assert_eq!(
+            registry
+                .get_by_task_id("containerjob")
+                .await
+                .unwrap()
+                .status,
+            JobStatus::Running,
+            "job stays Running while backend killer and stream drain are in flight"
+        );
+
+        release_kill_tx.send(()).await.unwrap();
+        assert!(kill_task.await.unwrap());
+        killer_task.await.unwrap();
+
+        let settled = registry.get_by_task_id("containerjob").await.unwrap();
+        assert!(matches!(settled.status, JobStatus::Killed { .. }));
+
+        let (stdout, _stderr) = registry
+            .terminal_output("containerjob")
+            .await
+            .expect("terminal output preserved");
+        assert_eq!(stdout, b"final-unterminated");
+
+        let delta = registry
+            .monitor_read("containerjob", 0, 1024)
+            .await
+            .expect("monitor read succeeds");
+        assert_eq!(
+            delta.bytes, b"final-unterminated\n",
+            "unterminated EOF line must remain readable after kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirected_job_bounds_in_memory_buffers_and_serves_evicted_bytes_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let redirect_path = dir.path().join("redirected.log");
+        let registry = spawn_registry();
+        let id = lease("bigjob");
+        registry
+            .register(0, &id, "exec", "yes line", SandboxMode::Sandboxed, None)
+            .await;
+
+        registry
+            .start_output_redirect("bigjob", redirect_path.clone())
+            .await
+            .unwrap();
+
+        let chunk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc\n".repeat(256);
+        let mut total = 0_usize;
+        for _ in 0..64 {
+            registry.append_stdout(&id, chunk.as_bytes().to_vec()).await;
+            total += chunk.len();
+        }
+        assert!(total > REDIRECTED_BUFFER_CAP * 3);
+
+        let (stdout_in_mem, _) = registry.terminal_output("bigjob").await.unwrap();
+        assert!(
+            stdout_in_mem.len() <= REDIRECTED_BUFFER_CAP,
+            "stdout_buffer must stay bounded after redirect: {}",
+            stdout_in_mem.len()
+        );
+
+        let first_slice = registry
+            .terminal_read("bigjob", 0, 64)
+            .await
+            .unwrap()
+            .into_delta()
+            .expect("first slice is a delta");
+        assert_eq!(first_slice.bytes.len(), 64);
+        assert_eq!(&first_slice.bytes, &chunk.as_bytes()[..64]);
+        assert_eq!(first_slice.total_bytes, total);
+
+        registry.complete(&id, 0, Some(redirect_path.clone())).await;
+        assert_eq!(
+            usize::try_from(std::fs::metadata(&redirect_path).unwrap().len()).unwrap(),
+            total
+        );
     }
 }

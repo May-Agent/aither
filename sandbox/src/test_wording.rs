@@ -11,8 +11,8 @@ use crate::monitor::MonitorRefusal;
 use crate::terminal::{TerminalError, TimeoutKill};
 use crate::wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
-    JsonAsTsv, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, RunFailure, ShellWording,
-    StoredBinaryPart,
+    JsonAsTsv, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, RunFailure, RunningJob,
+    ShellWording, StoredBinaryPart,
 };
 use aither_core::llm::CommandStream;
 
@@ -169,6 +169,12 @@ struct RepeatedLinesText {
     first: usize,
     last: usize,
     count: usize,
+}
+
+#[derive(Template)]
+#[template(path = "test_wording/running_jobs.txt", escape = "none")]
+struct RunningJobsText<'a> {
+    jobs: &'a [RunningJob<'a>],
 }
 
 fn rendered(template: &impl Template) -> String {
@@ -374,6 +380,10 @@ impl ShellWording for TestWording {
             last: repeated.range.last,
             count: repeated.count,
         })
+    }
+
+    fn running_jobs(&self, jobs: &[RunningJob<'_>]) -> String {
+        rendered(&RunningJobsText { jobs })
     }
 }
 

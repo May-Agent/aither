@@ -8,27 +8,126 @@
 #[cfg(not(feature = "code-folding"))]
 use crate::wording::ShellWording;
 
-/// Folds `text` when it is recognisable source code and folding makes it
-/// smaller.
-///
-/// Without the `code-folding` feature there is no content detector, so output
-/// is passed through rather than folded against a guessed grammar.
+/// Reusable pool of content-identification sessions for source-code folding.
 #[cfg(not(feature = "code-folding"))]
-pub fn fold_source_code(_text: &str, _wording: &dyn ShellWording) -> Option<String> {
-    None
+#[derive(Debug, Default)]
+pub struct CodeFolder;
+
+#[cfg(not(feature = "code-folding"))]
+impl CodeFolder {
+    /// Creates an empty code folder.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Without the `code-folding` feature there is no content detector, so
+    /// output is passed through rather than folded against a guessed grammar.
+    #[allow(clippy::unused_self)]
+    pub fn fold_source_code(&self, _text: &str, _wording: &dyn ShellWording) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(feature = "code-folding")]
-pub use enabled::fold_source_code;
+pub use enabled::CodeFolder;
 
 #[cfg(feature = "code-folding")]
 mod enabled {
+    use std::fmt;
+    use std::num::NonZero;
+    use std::sync::Mutex;
+    #[cfg(test)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use tracing::debug;
 
     use crate::wording::{FoldedLines, LineRange, ShellWording};
 
     /// Minimum number of lines a foldable block must span to be worth folding.
     const MIN_FOLD_LINES: usize = 4;
+
+    /// Reusable pool of `magika::Session` instances owned by an `OutputStore`,
+    /// bounded to the host's available parallelism.
+    pub struct CodeFolder {
+        sessions: Mutex<Vec<magika::Session>>,
+        capacity: usize,
+        #[cfg(test)]
+        created: AtomicUsize,
+    }
+
+    impl Default for CodeFolder {
+        fn default() -> Self {
+            let capacity = std::thread::available_parallelism().map_or(1, NonZero::get);
+            Self {
+                sessions: Mutex::new(Vec::new()),
+                capacity,
+                #[cfg(test)]
+                created: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl fmt::Debug for CodeFolder {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let pooled = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            f.debug_struct("CodeFolder")
+                .field("pooled", &pooled)
+                .field("capacity", &self.capacity)
+                .finish_non_exhaustive()
+        }
+    }
+
+    struct PooledSession<'a> {
+        pool: &'a CodeFolder,
+        session: Option<magika::Session>,
+    }
+
+    impl<'a> PooledSession<'a> {
+        fn acquire(pool: &'a CodeFolder) -> Option<Self> {
+            let cached = pool
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop();
+            let session = if let Some(session) = cached {
+                session
+            } else {
+                let session = magika::Session::new().ok()?;
+                #[cfg(test)]
+                pool.created.fetch_add(1, Ordering::Relaxed);
+                session
+            };
+            Some(Self {
+                pool,
+                session: Some(session),
+            })
+        }
+
+        fn identify_label(&mut self, bytes: &[u8]) -> Option<&'static str> {
+            let result = self.session.as_mut()?.identify_content_sync(bytes).ok()?;
+            Some(result.info().label)
+        }
+    }
+
+    impl Drop for PooledSession<'_> {
+        fn drop(&mut self) {
+            if let Some(session) = self.session.take() {
+                let mut pool = self
+                    .pool
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if pool.len() < self.pool.capacity {
+                    pool.push(session);
+                }
+            }
+        }
+    }
 
     /// Maps a magika content-type label to a tree-sitter grammar.
     fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
@@ -89,78 +188,86 @@ mod enabled {
         )
     }
 
-    /// Folds `text` when it is recognisable source code and folding makes it
-    /// smaller.
-    ///
-    /// Every emitted line carries its 1-based number in `text`, and each fold
-    /// marker names the range it replaced, so the result lines up with the
-    /// unfolded copy the orchestrator stores.
-    pub fn fold_source_code(text: &str, wording: &dyn ShellWording) -> Option<String> {
-        let mut session = magika::Session::new().ok()?;
-        let result = session.identify_content_sync(text.as_bytes()).ok()?;
-        let label = result.info().label;
-
-        let ts_lang = magika_label_to_ts_language(label)?;
-
-        debug!(label = %label, "detected source code via magika, applying tree-sitter folding");
-
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&ts_lang).ok()?;
-        let tree = parser.parse(text, None)?;
-
-        let mut fold_ranges: Vec<(usize, usize)> = Vec::new();
-        collect_foldable_ranges(tree.root_node(), &mut fold_ranges);
-        if fold_ranges.is_empty() {
-            return None;
+    impl CodeFolder {
+        /// Creates a session pool sized to the host's available parallelism.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
         }
-        fold_ranges.sort_by_key(|range| range.0);
-        let merged = merge_ranges(&fold_ranges);
 
-        let lines: Vec<&str> = text.lines().collect();
-        let total_lines = lines.len();
-        let width = digit_count(total_lines);
-        let indent = " ".repeat(width);
+        /// Folds `text` when it is recognisable source code and folding makes
+        /// it smaller.
+        ///
+        /// Every emitted line carries its 1-based number in `text`, and each
+        /// fold marker names the range it replaced, so the result lines up
+        /// with the unfolded copy the orchestrator stores.
+        pub fn fold_source_code(&self, text: &str, wording: &dyn ShellWording) -> Option<String> {
+            let mut session = PooledSession::acquire(self)?;
+            let label = session.identify_label(text.as_bytes())?;
+            drop(session);
 
-        let mut output = String::new();
-        let mut cursor = 0;
+            let ts_lang = magika_label_to_ts_language(label)?;
 
-        for &(fold_start, fold_end) in &merged {
-            let fold_end = fold_end.min(total_lines.saturating_sub(1));
+            debug!(label = %label, "detected source code via magika, applying tree-sitter folding");
 
-            while cursor < fold_start && cursor < total_lines {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&ts_lang).ok()?;
+            let tree = parser.parse(text, None)?;
+
+            let mut fold_ranges: Vec<(usize, usize)> = Vec::new();
+            collect_foldable_ranges(tree.root_node(), &mut fold_ranges);
+            if fold_ranges.is_empty() {
+                return None;
+            }
+            fold_ranges.sort_by_key(|range| range.0);
+            let merged = merge_ranges(&fold_ranges);
+
+            let lines: Vec<&str> = text.lines().collect();
+            let total_lines = lines.len();
+            let width = digit_count(total_lines);
+            let indent = " ".repeat(width);
+
+            let mut output = String::new();
+            let mut cursor = 0;
+
+            for &(fold_start, fold_end) in &merged {
+                let fold_end = fold_end.min(total_lines.saturating_sub(1));
+
+                while cursor < fold_start && cursor < total_lines {
+                    append_numbered_line(&mut output, cursor + 1, lines[cursor], width);
+                    cursor += 1;
+                }
+
+                // The first line of the region is the signature or declaration.
+                if cursor < total_lines {
+                    append_numbered_line(&mut output, cursor + 1, lines[cursor], width);
+                    cursor += 1;
+                }
+
+                let inner_end = fold_end + 1;
+                let folded_count = inner_end.saturating_sub(cursor);
+                if folded_count > 0 {
+                    let marker = wording.folded_lines(&FoldedLines {
+                        indent: &indent,
+                        count: folded_count,
+                        range: LineRange {
+                            first: cursor + 1,
+                            last: inner_end,
+                        },
+                    });
+                    output.push_str(&marker);
+                    output.push('\n');
+                    cursor = inner_end;
+                }
+            }
+
+            while cursor < total_lines {
                 append_numbered_line(&mut output, cursor + 1, lines[cursor], width);
                 cursor += 1;
             }
 
-            // The first line of the region is the signature or declaration.
-            if cursor < total_lines {
-                append_numbered_line(&mut output, cursor + 1, lines[cursor], width);
-                cursor += 1;
-            }
-
-            let inner_end = fold_end + 1;
-            let folded_count = inner_end.saturating_sub(cursor);
-            if folded_count > 0 {
-                let marker = wording.folded_lines(&FoldedLines {
-                    indent: &indent,
-                    count: folded_count,
-                    range: LineRange {
-                        first: cursor + 1,
-                        last: inner_end,
-                    },
-                });
-                output.push_str(&marker);
-                output.push('\n');
-                cursor = inner_end;
-            }
+            (output.len() < text.len()).then_some(output)
         }
-
-        while cursor < total_lines {
-            append_numbered_line(&mut output, cursor + 1, lines[cursor], width);
-            cursor += 1;
-        }
-
-        (output.len() < text.len()).then_some(output)
     }
 
     /// Recursively collects foldable line ranges from the tree-sitter AST.
@@ -217,7 +324,28 @@ mod enabled {
         use crate::test_wording::TestWording;
 
         fn fold_source_code(text: &str) -> Option<String> {
-            super::fold_source_code(text, &TestWording)
+            CodeFolder::default().fold_source_code(text, &TestWording)
+        }
+
+        #[test]
+        fn reuses_pooled_magika_session_across_sequential_folds() {
+            let folder = CodeFolder::default();
+            let code = "fn compute_sum(values: &[i64]) -> i64 {\n    let mut total = 0;\n    for &value in values {\n        total += value;\n    }\n    total\n}\n";
+            for _ in 0..4 {
+                let _ = folder.fold_source_code(code, &TestWording);
+            }
+            let created = folder.created.load(Ordering::Relaxed);
+            if created > 0 {
+                assert_eq!(
+                    created, 1,
+                    "sequential folds should reuse one pooled session"
+                );
+                assert_eq!(
+                    folder.sessions.lock().unwrap().len(),
+                    1,
+                    "session should be returned to the pool"
+                );
+            }
         }
 
         #[test]

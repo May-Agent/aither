@@ -70,10 +70,13 @@ pub trait FileSystem: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an [`io::Error`] if the pattern is invalid or scanning fails.
-    fn glob(&self, pattern: &str) -> io::Result<Vec<String>> {
+    fn glob<'a>(
+        &'a self,
+        pattern: &'a str,
+    ) -> impl Future<Output = io::Result<Vec<String>>> + Send + 'a {
         // Default implementation returns empty - override for real filesystems
         let _ = pattern;
-        Ok(Vec::new())
+        std::future::ready(Ok(Vec::new()))
     }
 }
 
@@ -293,7 +296,11 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                 ))
             }
             FsOperation::Glob { pattern } => {
-                let matches = self.filesystem.glob(&pattern)?;
+                let matches = self
+                    .filesystem
+                    .glob(&pattern)
+                    .await
+                    .map_err(anyhow::Error::new)?;
                 Ok(ToolResult::text(
                     MatchesTemplate { matches: &matches }.render()?,
                 ))
@@ -447,9 +454,16 @@ impl FileSystem for LocalFileSystem {
         let mut entries = Vec::new();
         while let Some(entry) = reader.next().await {
             if let Ok(entry) = entry {
+                let is_dir = match entry.file_type().await {
+                    Ok(ft) if ft.is_dir() => true,
+                    Ok(ft) if ft.is_symlink() => async_fs::metadata(entry.path())
+                        .await
+                        .is_ok_and(|meta| meta.is_dir()),
+                    _ => false,
+                };
                 entries.push(DirEntry {
                     name: entry.file_name().to_string_lossy().into_owned(),
-                    is_dir: entry.path().is_dir(),
+                    is_dir,
                 });
             }
         }
@@ -468,35 +482,40 @@ impl FileSystem for LocalFileSystem {
         remove_dir(&target).await
     }
 
-    fn glob(&self, pattern: &str) -> io::Result<Vec<String>> {
+    async fn glob<'a>(&'a self, pattern: &'a str) -> io::Result<Vec<String>> {
         if Path::new(pattern)
             .components()
             .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
         {
             return Err(self.escape_error(Path::new(pattern)));
         }
-        let full_pattern = self.root.join(pattern);
-        let pattern_str = full_pattern.to_string_lossy();
+        let root = self.root.clone();
+        let canonical_root = self.canonical_root.clone();
+        let full_pattern = root.join(pattern);
+        let pattern_str = full_pattern.to_string_lossy().into_owned();
 
-        let entries = glob::glob(&pattern_str)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.msg))?;
+        blocking::unblock(move || {
+            let entries = glob::glob(&pattern_str)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.msg))?;
 
-        let mut results = Vec::new();
-        for entry in entries.flatten() {
-            // Symlinks may lead out of the root: only matches that resolve
-            // inside it are reported.
-            let Ok(canonical) = fs::canonicalize(&entry) else {
-                continue;
-            };
-            if !canonical.starts_with(&self.canonical_root) {
-                continue;
+            let mut results = Vec::new();
+            for entry in entries.flatten() {
+                // Symlinks may lead out of the root: only matches that resolve
+                // inside it are reported.
+                let Ok(canonical) = fs::canonicalize(&entry) else {
+                    continue;
+                };
+                if !canonical.starts_with(&canonical_root) {
+                    continue;
+                }
+                if let Ok(relative) = entry.strip_prefix(&root) {
+                    results.push(relative.to_string_lossy().into_owned());
+                }
             }
-            if let Ok(relative) = entry.strip_prefix(&self.root) {
-                results.push(relative.to_string_lossy().into_owned());
-            }
-        }
-        results.sort();
-        Ok(results)
+            results.sort();
+            Ok(results)
+        })
+        .await
     }
 }
 
@@ -530,12 +549,23 @@ impl InMemoryFileSystem {
 
     fn mutate_entries(
         &self,
-        update: impl FnOnce(&mut BTreeMap<PathBuf, MemoryEntry>) -> io::Result<()>,
+        mut update: impl FnMut(&mut BTreeMap<PathBuf, MemoryEntry>) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut entries = self.state.load().entries.clone();
-        update(&mut entries)?;
-        self.state.store(Arc::new(MemoryState { entries }));
-        Ok(())
+        let mut outcome = Ok(());
+        self.state.rcu(|current| {
+            let mut entries = current.entries.clone();
+            match update(&mut entries) {
+                Ok(()) => {
+                    outcome = Ok(());
+                    Arc::new(MemoryState { entries })
+                }
+                Err(error) => {
+                    outcome = Err(error);
+                    Arc::clone(current)
+                }
+            }
+        });
+        outcome
     }
 
     fn normalize(path: &Path) -> io::Result<PathBuf> {
@@ -556,8 +586,13 @@ impl InMemoryFileSystem {
     }
 
     fn ensure_dir_present(entries: &mut BTreeMap<PathBuf, MemoryEntry>, dir: &Path) {
-        if !entries.contains_key(dir) {
-            entries.insert(dir.to_path_buf(), MemoryEntry::Directory);
+        for ancestor in dir.ancestors() {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            entries
+                .entry(ancestor.to_path_buf())
+                .or_insert(MemoryEntry::Directory);
         }
     }
 
@@ -616,7 +651,7 @@ impl FileSystem for InMemoryFileSystem {
                 if let Some(parent) = path.parent() {
                     Self::ensure_dir_present(entries, parent);
                 }
-                entries.insert(path, MemoryEntry::File(contents));
+                entries.insert(path.clone(), MemoryEntry::File(contents.clone()));
                 Ok(())
             })
         });
@@ -644,7 +679,7 @@ impl FileSystem for InMemoryFileSystem {
                     if let Some(parent) = path.parent() {
                         Self::ensure_dir_present(entries, parent);
                     }
-                    entries.insert(path, MemoryEntry::File(contents));
+                    entries.insert(path.clone(), MemoryEntry::File(contents.clone()));
                 }
                 Ok(())
             })
@@ -692,7 +727,7 @@ impl FileSystem for InMemoryFileSystem {
                 if let Some(parent) = dir.parent() {
                     Self::ensure_dir_present(entries, parent);
                 }
-                entries.insert(dir, MemoryEntry::Directory);
+                entries.insert(dir.clone(), MemoryEntry::Directory);
                 Ok(())
             })
         });
@@ -777,13 +812,16 @@ where
     /// Mounts a filesystem at the given path prefix.
     #[must_use]
     pub fn mount(self, prefix: impl Into<PathBuf>, fs: FS) -> Self {
-        let mut mounts = self.mounts.load().as_ref().clone();
-        let prefix = prefix.into();
-        mounts.push(MountPoint {
-            prefix: normalize_mount(&prefix),
-            fs: Arc::new(fs),
+        let prefix = normalize_mount(&prefix.into());
+        let fs = Arc::new(fs);
+        self.mounts.rcu(|current| {
+            let mut mounts = current.as_ref().clone();
+            mounts.push(MountPoint {
+                prefix: prefix.clone(),
+                fs: Arc::clone(&fs),
+            });
+            Arc::new(mounts)
         });
-        self.mounts.store(Arc::new(mounts));
         self
     }
 
@@ -1192,5 +1230,35 @@ mod template_tests {
             MatchesTemplate { matches: &[] }.render().unwrap(),
             "No files match."
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_memory_fs_preserves_concurrent_writes_and_ancestor_dirs() {
+        let fs = InMemoryFileSystem::new();
+        let mut tasks = Vec::new();
+        for index in 0..32_usize {
+            let fs_clone = fs.clone();
+            tasks.push(tokio::spawn(async move {
+                let path = PathBuf::from(format!("nested/group_{}/item_{index}.txt", index % 4));
+                fs_clone
+                    .write_file(&path, format!("payload-{index}"))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        for index in 0..32_usize {
+            let path = PathBuf::from(format!("nested/group_{}/item_{index}.txt", index % 4));
+            assert_eq!(
+                fs.read_file(&path).await.unwrap(),
+                format!("payload-{index}")
+            );
+        }
+        let root_entries = fs.list_dir(Path::new("")).await.unwrap();
+        assert!(root_entries.iter().any(|e| e.name == "nested" && e.is_dir));
+        let nested_entries = fs.list_dir(Path::new("nested")).await.unwrap();
+        assert_eq!(nested_entries.len(), 4);
     }
 }

@@ -54,20 +54,21 @@ mod navigation;
 pub mod proxy;
 
 use std::borrow::Cow;
-use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Cursor;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
 use anyhow::{Result, anyhow};
+use askama::Template;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "headless")]
 use tracing::debug;
-use zenwave::{Client, ResponseExt, client, header};
+use zenwave::header;
 
 fn ensure_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -178,6 +179,8 @@ impl FetchRequest {
 pub struct FetchContext {
     started_at: Instant,
     budget: Duration,
+    #[cfg(test)]
+    frozen_elapsed: Option<Duration>,
     /// Per-stage traces in execution order.
     pub trace: Vec<StageTrace>,
 }
@@ -189,13 +192,26 @@ impl FetchContext {
         Self {
             started_at: Instant::now(),
             budget,
+            #[cfg(test)]
+            frozen_elapsed: None,
             trace: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn with_frozen_elapsed(mut self, elapsed: Duration) -> Self {
+        self.frozen_elapsed = Some(elapsed);
+        self
     }
 
     /// Returns the elapsed time since the context was created.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(elapsed) = self.frozen_elapsed {
+            return elapsed;
+        }
         self.started_at.elapsed()
     }
 
@@ -383,7 +399,7 @@ where
     ) -> std::result::Result<FetchResult, ProviderError> {
         match run_stage(&self.first, req, ctx).await {
             Ok(result) => Ok(result),
-            Err(first_err) if first_err.is_http_failure() => {
+            Err(first_err) if first_err.is_http_failure() && !ctx.remaining().is_zero() => {
                 run_stage(&self.second, req, ctx).await
             }
             Err(first_err) => Err(first_err),
@@ -428,10 +444,12 @@ where
     ) -> std::result::Result<FetchResult, ProviderError> {
         match run_stage(&self.first, req, ctx).await {
             Ok(result) => Ok(result),
-            Err(first_err) if first_err.is_http_failure() => {
+            Err(first_err) if first_err.is_http_failure() && !ctx.remaining().is_zero() => {
                 match run_stage(&self.second, req, ctx).await {
                     Ok(result) => Ok(result),
-                    Err(second_err) if second_err.is_http_failure() => {
+                    Err(second_err)
+                        if second_err.is_http_failure() && !ctx.remaining().is_zero() =>
+                    {
                         run_stage(&self.third, req, ctx).await
                     }
                     Err(second_err) => Err(second_err),
@@ -552,7 +570,13 @@ pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
 #[cfg(feature = "headless")]
 pub async fn fetch_html_raw(url: &str) -> Result<String> {
     guard::guard_url(url).await?;
-    fetch_html_headless(url, guard::SystemResolver, guard::PublicOnly).await
+    fetch_html_headless(
+        url,
+        guard::SystemResolver,
+        guard::PublicOnly,
+        DEFAULT_TOTAL_BUDGET,
+    )
+    .await
 }
 
 /// Smart fetch with strict fallback order:
@@ -583,7 +607,7 @@ pub async fn fetch_smart(url: &str) -> Result<FetchResult> {
 pub async fn fetch_image(url: &str) -> Result<(Vec<u8>, String)> {
     ensure_rustls_provider();
     let bytes = fetch_bytes(url).await?;
-    convert_to_jpeg(&bytes)
+    blocking::unblock(move || convert_to_jpeg(&bytes)).await
 }
 
 /// Fetches an image and returns an `ImageResult`.
@@ -622,17 +646,21 @@ fn convert_to_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, String)> {
 
 /// Extract og:description from HTML for sites where readability fails.
 fn extract_og_description(html: &str) -> Option<String> {
-    let og_re =
-        Regex::new(r#"<meta[^>]+(?:property|name)="og:description"[^>]+content="([^"]+)""#).ok()?;
-    if let Some(cap) = og_re.captures(html) {
+    static OG_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<meta[^>]+(?:property|name)="og:description"[^>]+content="([^"]+)""#)
+            .expect("valid og:description regex")
+    });
+    static OG_RE_REVERSED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<meta[^>]+content="([^"]+)"[^>]+(?:property|name)="og:description""#)
+            .expect("valid reversed og:description regex")
+    });
+
+    if let Some(cap) = OG_RE.captures(html) {
         return cap
             .get(1)
             .map(|m| html_escape::decode_html_entities(m.as_str()).to_string());
     }
-    // Try reversed attribute order
-    let og_re2 =
-        Regex::new(r#"<meta[^>]+content="([^"]+)"[^>]+(?:property|name)="og:description""#).ok()?;
-    og_re2.captures(html).and_then(|cap| {
+    OG_RE_REVERSED.captures(html).and_then(|cap| {
         cap.get(1)
             .map(|m| html_escape::decode_html_entities(m.as_str()).to_string())
     })
@@ -696,25 +724,29 @@ fn main_landmark_html(html: &str) -> Option<String> {
 
 /// Extract body content from HTML, stripping scripts and styles.
 fn extract_body_content(html: &str) -> String {
+    static SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("valid script regex")
+    });
+    static STYLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("valid style regex"));
+    static NOSCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<noscript[^>]*>.*?</noscript>").expect("valid noscript regex")
+    });
+
     // Find body content
     let body_start = html
         .find("<body")
-        .and_then(|i| html[i..].find('>').map(|j| i + j + 1));
+        .and_then(|i| html.get(i..)?.find('>').map(|j| i + j + 1));
     let body_end = html.rfind("</body>");
 
     let body = match (body_start, body_end) {
-        (Some(start), Some(end)) if start < end => &html[start..end],
+        (Some(start), Some(end)) if start < end => html.get(start..end).unwrap_or(html),
         _ => html,
     };
 
-    // Remove script and style tags
-    let script_re = Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap();
-    let style_re = Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap();
-    let noscript_re = Regex::new(r"(?is)<noscript[^>]*>.*?</noscript>").unwrap();
-
-    let cleaned = script_re.replace_all(body, "");
-    let cleaned = style_re.replace_all(&cleaned, "");
-    let cleaned = noscript_re.replace_all(&cleaned, "");
+    let cleaned = SCRIPT_RE.replace_all(body, "");
+    let cleaned = STYLE_RE.replace_all(&cleaned, "");
+    let cleaned = NOSCRIPT_RE.replace_all(&cleaned, "");
 
     cleaned.to_string()
 }
@@ -738,29 +770,35 @@ fn get_user_agent(url: &str) -> &'static str {
 
 /// Fetches raw bytes from a URL with browser-like headers.
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    guard::guard_url(url).await?;
-    let user_agent = get_user_agent(url);
-
-    let mut backend = client();
-    let bytes = backend
-        .get(url)?
-        .header(header::USER_AGENT.as_str(), user_agent)?
-        .header(header::ACCEPT.as_str(), "*/*")?
-        .header(header::ACCEPT_LANGUAGE.as_str(), "en-US,en;q=0.9")?
-        .header(
+    ensure_rustls_provider();
+    let user_agent = get_user_agent(url).to_string();
+    let headers = [
+        (header::USER_AGENT.as_str(), user_agent),
+        (header::ACCEPT.as_str(), "*/*".to_string()),
+        (
+            header::ACCEPT_LANGUAGE.as_str(),
+            "en-US,en;q=0.9".to_string(),
+        ),
+        (
             "Sec-CH-UA",
-            "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"",
-        )?
-        .header("Sec-CH-UA-Mobile", "?0")?
-        .header("Sec-CH-UA-Platform", "\"macOS\"")?
-        .header("Sec-Fetch-Dest", "image")?
-        .header("Sec-Fetch-Mode", "no-cors")?
-        .header("Sec-Fetch-Site", "cross-site")?
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
-
-    Ok(bytes.to_vec())
+            "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"".to_string(),
+        ),
+        ("Sec-CH-UA-Mobile", "?0".to_string()),
+        ("Sec-CH-UA-Platform", "\"macOS\"".to_string()),
+        ("Sec-Fetch-Dest", "image".to_string()),
+        ("Sec-Fetch-Mode", "no-cors".to_string()),
+        ("Sec-Fetch-Site", "cross-site".to_string()),
+    ];
+    let response = guard::guarded_get(
+        url,
+        &headers,
+        DEFAULT_TOTAL_BUDGET,
+        guard::SystemResolver,
+        guard::PublicOnly,
+    )
+    .await
+    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+    Ok(response.body)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,50 +849,71 @@ async fn fetch_document_static(
     accept: &str,
     timeout: Duration,
 ) -> std::result::Result<StaticFetchResponse, FetchHttpError> {
-    let user_agent = get_user_agent(url);
+    fetch_document_static_with(
+        url,
+        accept,
+        timeout,
+        guard::SystemResolver,
+        guard::PublicOnly,
+    )
+    .await
+}
 
-    let mut backend = client().timeout(clamp_timeout(timeout));
-    let response = backend
-        .get(url)?
-        .header(header::USER_AGENT.as_str(), user_agent)?
-        .header(header::ACCEPT.as_str(), accept)?
-        .header(header::ACCEPT_LANGUAGE.as_str(), "en-US,en;q=0.9")?
-        .header(
+async fn fetch_document_static_with<R, P>(
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+    resolver: R,
+    policy: P,
+) -> std::result::Result<StaticFetchResponse, FetchHttpError>
+where
+    R: guard::Resolver,
+    P: guard::AddressPolicy,
+{
+    ensure_rustls_provider();
+    let user_agent = get_user_agent(url).to_string();
+    let headers = [
+        (header::USER_AGENT.as_str(), user_agent),
+        (header::ACCEPT.as_str(), accept.to_string()),
+        (
+            header::ACCEPT_LANGUAGE.as_str(),
+            "en-US,en;q=0.9".to_string(),
+        ),
+        (
             "Sec-CH-UA",
-            "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"",
-        )?
-        .header("Sec-CH-UA-Mobile", "?0")?
-        .header("Sec-CH-UA-Platform", "\"macOS\"")?
-        .header("Sec-Fetch-Dest", "document")?
-        .header("Sec-Fetch-Mode", "navigate")?
-        .header("Sec-Fetch-Site", "none")?
-        .header("Sec-Fetch-User", "?1")?
-        .header("Upgrade-Insecure-Requests", "1")?
-        .header("Cache-Control", "max-age=0")?
+            "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"".to_string(),
+        ),
+        ("Sec-CH-UA-Mobile", "?0".to_string()),
+        ("Sec-CH-UA-Platform", "\"macOS\"".to_string()),
+        ("Sec-Fetch-Dest", "document".to_string()),
+        ("Sec-Fetch-Mode", "navigate".to_string()),
+        ("Sec-Fetch-Site", "none".to_string()),
+        ("Sec-Fetch-User", "?1".to_string()),
+        ("Upgrade-Insecure-Requests", "1".to_string()),
+        ("Cache-Control", "max-age=0".to_string()),
+    ];
+    let response = guard::guarded_get(url, &headers, clamp_timeout(timeout), resolver, policy)
         .await
-        .map_err(|e| FetchHttpError::http(anyhow!("{e}")))?;
+        .map_err(classify_guarded_error)?;
 
     let content_type = response
-        .headers()
+        .headers
         .get(header::CONTENT_TYPE.as_str())
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let markdown_tokens = response
-        .headers()
+        .headers
         .get("x-markdown-tokens")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
     let content_signal = response
-        .headers()
+        .headers
         .get("content-signal")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let body = response
-        .into_string()
-        .await
-        .map_err(|e| FetchHttpError::decode(anyhow!("{e}")))?
-        .to_string();
+    let body =
+        String::from_utf8(response.body).map_err(|e| FetchHttpError::decode(anyhow!("{e}")))?;
 
     Ok(StaticFetchResponse {
         body,
@@ -862,6 +921,14 @@ async fn fetch_document_static(
         markdown_tokens,
         content_signal,
     })
+}
+
+fn classify_guarded_error(err: anyhow::Error) -> FetchHttpError {
+    if err.downcast_ref::<guard::DecodeFailure>().is_some() {
+        FetchHttpError::decode(err)
+    } else {
+        FetchHttpError::http(err)
+    }
 }
 
 async fn fetch_markdown_static(
@@ -888,49 +955,53 @@ async fn fetch_document_jina(
     api_key: Option<&str>,
     timeout: Duration,
 ) -> std::result::Result<StaticFetchResponse, FetchHttpError> {
+    ensure_rustls_provider();
     let jina_url = build_jina_url(url).map_err(FetchHttpError::decode)?;
-    let mut backend = client().timeout(clamp_timeout(timeout));
-    let mut builder = backend
-        .get(&jina_url)?
-        .header(header::ACCEPT.as_str(), "text/markdown")?
-        .header(header::USER_AGENT.as_str(), "aither-webfetch/0.1")?;
-
+    let mut headers = vec![
+        (header::ACCEPT.as_str(), "text/markdown".to_string()),
+        (
+            header::USER_AGENT.as_str(),
+            "aither-webfetch/0.1".to_string(),
+        ),
+    ];
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        builder = builder
-            .header(header::AUTHORIZATION.as_str(), format!("Bearer {key}"))?
-            .header("X-API-Key", key.to_string())?;
+        headers.push((header::AUTHORIZATION.as_str(), format!("Bearer {key}")));
+        headers.push(("X-API-Key", key.to_string()));
     }
 
-    let response = builder
-        .await
-        .map_err(|e| FetchHttpError::http(anyhow!("{e}")))?;
+    let response = guard::guarded_get(
+        &jina_url,
+        &headers,
+        clamp_timeout(timeout),
+        guard::SystemResolver,
+        guard::PublicOnly,
+    )
+    .await
+    .map_err(classify_guarded_error)?;
     let content_type = response
-        .headers()
+        .headers
         .get(header::CONTENT_TYPE.as_str())
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let markdown_tokens = response
-        .headers()
+        .headers
         .get("x-markdown-tokens")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
         .or_else(|| {
             response
-                .headers()
+                .headers
                 .get("x-token-count")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<usize>().ok())
         });
     let content_signal = response
-        .headers()
+        .headers
         .get("content-signal")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body = response
-        .into_string()
-        .await
-        .map_err(|e| FetchHttpError::decode(anyhow!("{e}")))?
-        .to_string();
+    let body =
+        String::from_utf8(response.body).map_err(|e| FetchHttpError::decode(anyhow!("{e}")))?;
 
     Ok(StaticFetchResponse {
         body,
@@ -1048,7 +1119,7 @@ fn extract_front_matter(markdown: &str) -> Option<&str> {
 
     for marker in ["\n---\n", "\n---\r\n", "\r\n---\r\n"] {
         if let Some(idx) = rest.find(marker) {
-            return Some(&rest[..idx]);
+            return rest.get(..idx);
         }
     }
 
@@ -1087,6 +1158,9 @@ impl WebFetcher for JinaFetcher {
         req: &FetchRequest,
         ctx: &mut FetchContext,
     ) -> std::result::Result<FetchResult, ProviderError> {
+        guard::guard_url(&req.url)
+            .await
+            .map_err(|err| ProviderError::http(self.name(), err))?;
         let jina_budget = ctx.stage_budget(JINA_STAGE_BUDGET);
         if jina_budget.is_zero() {
             return Err(ProviderError::http(
@@ -1126,6 +1200,9 @@ impl WebFetcher for StaticFetcher {
         req: &FetchRequest,
         ctx: &mut FetchContext,
     ) -> std::result::Result<FetchResult, ProviderError> {
+        guard::guard_url(&req.url)
+            .await
+            .map_err(|err| ProviderError::http(self.name(), err))?;
         let static_budget = ctx.stage_budget(STATIC_STAGE_BUDGET);
         if static_budget.is_zero() {
             return Err(ProviderError::http(
@@ -1203,22 +1280,126 @@ impl WebFetcher for HeadlessFetcher {
         req: &FetchRequest,
         ctx: &mut FetchContext,
     ) -> std::result::Result<FetchResult, ProviderError> {
-        if ctx.stage_budget(HEADLESS_STAGE_BUDGET).is_zero() {
+        guard::guard_url(&req.url)
+            .await
+            .map_err(|err| ProviderError::http(self.name(), err))?;
+        let headless_budget = ctx.stage_budget(HEADLESS_STAGE_BUDGET);
+        if headless_budget.is_zero() {
             return Err(ProviderError::http(
                 self.name(),
                 anyhow!("headless stage deadline exhausted"),
             ));
         }
 
-        let html = fetch_html_headless(&req.url, guard::SystemResolver, guard::PublicOnly)
-            .await
-            .map_err(|err| ProviderError::http(self.name(), err))?;
+        let html = fetch_html_headless(
+            &req.url,
+            guard::SystemResolver,
+            guard::PublicOnly,
+            headless_budget,
+        )
+        .await
+        .map_err(|err| ProviderError::http(self.name(), err))?;
         let mut result = html_to_result_with_metadata(&req.url, &html, None, None)
             .map_err(|err| ProviderError::extraction(self.name(), err))?;
         result.extractor = Some(self.name().to_string());
         result.quality_score = Some(0.8);
         Ok(result)
     }
+}
+
+#[cfg(feature = "headless")]
+struct HeadlessSessionGuard {
+    browser: Option<chromiumoxide::browser::Browser>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "headless")]
+impl HeadlessSessionGuard {
+    async fn shutdown(mut self) {
+        if let Some(mut browser) = self.browser.take() {
+            let _ = browser.close().await;
+            let _ = browser.kill().await;
+            let _ = browser.wait().await;
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+#[cfg(feature = "headless")]
+impl Drop for HeadlessSessionGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        if let Some(mut browser) = self.browser.take() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = browser.kill().await;
+                    let _ = browser.wait().await;
+                });
+            } else {
+                let _ = browser.try_wait();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "headless")]
+fn build_headless_config(
+    proxy_addr: std::net::SocketAddr,
+    profile_dir: &std::path::Path,
+) -> Result<chromiumoxide::browser::BrowserConfig> {
+    use chromiumoxide::browser::BrowserConfig;
+    use chromiumoxide::handler::viewport::Viewport;
+
+    let proxy_server = format!("http://{proxy_addr}");
+    let resolver_rules = format!("MAP * ~NOTFOUND , EXCLUDE {}", proxy_addr.ip());
+
+    // chromiumoxide adds the leading `--` itself and keys switches by name,
+    // so each is given as its bare name, or as a name and its value.
+    let switches = [
+        "disable-infobars",
+        "disable-dev-shm-usage",
+        "disable-gpu",
+        "start-maximized",
+        "disable-extensions",
+        "disable-background-networking",
+        "disable-sync",
+        "disable-translate",
+        "metrics-recording-only",
+        "no-first-run",
+        "safebrowsing-disable-auto-update",
+        "disable-quic",
+    ];
+    let valued = [
+        ("disable-blink-features", "AutomationControlled"),
+        ("window-size", "1920,1080"),
+        (
+            "user-agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ),
+        ("proxy-server", proxy_server.as_str()),
+        ("proxy-bypass-list", "<-loopback>"),
+        ("host-resolver-rules", resolver_rules.as_str()),
+        ("force-webrtc-ip-handling-policy", "disable_non_proxied_udp"),
+    ];
+
+    BrowserConfig::builder()
+        .launch_timeout(BROWSER_LAUNCH_TIMEOUT)
+        .user_data_dir(profile_dir)
+        .viewport(Some(Viewport {
+            width: 1920,
+            height: 1080,
+            device_scale_factor: Some(1.0),
+            ..Default::default()
+        }))
+        .args(switches)
+        .args(valued)
+        .build()
+        .map_err(|e| anyhow!("Browser config error: {e}"))
 }
 
 /// Fetches raw HTML using a headless Chrome browser with anti-detection measures.
@@ -1232,12 +1413,11 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
     url: &str,
     resolver: R,
     policy: P,
+    budget: Duration,
 ) -> Result<String> {
-    use chromiumoxide::browser::{Browser, BrowserConfig};
+    use chromiumoxide::browser::Browser;
     use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
-    use chromiumoxide::handler::viewport::Viewport;
     use futures_lite::StreamExt;
-    use std::time::Duration;
 
     debug!("Launching headless browser for {}", url);
 
@@ -1251,129 +1431,82 @@ async fn fetch_html_headless<R: guard::Resolver, P: guard::AddressPolicy>(
     let mut proxy = proxy::Proxy::start(resolver, policy)
         .await
         .map_err(|e| anyhow!("Failed to start the browser's proxy: {e}"))?;
-    // Every destination goes through the proxy, and nothing else gives the
-    // browser a network path:
-    // - Chrome sends loopback hosts direct even with a proxy; `<-loopback>`
-    //   removes that implicit bypass, and the list has no other entry.
-    // - Every host lookup Chrome would make itself resolves to nothing, so
-    //   DNS prefetch and anything else that resolves outside the proxied
-    //   request path finds no address; only the proxy's own literal address
-    //   is left alone. Proxied requests are resolved by the proxy, not here.
-    // - QUIC is off, so nothing tries HTTP/3 directly over UDP.
-    // - WebRTC may not send UDP outside the proxy, which it cannot do at all.
-    let proxy_server = format!("http://{}", proxy.addr());
-    let resolver_rules = format!("MAP * ~NOTFOUND , EXCLUDE {}", proxy.addr().ip());
-
-    // chromiumoxide adds the leading `--` itself and keys switches by name,
-    // so each is given as its bare name, or as a name and its value.
-    let switches = [
-        "disable-infobars",
-        "disable-dev-shm-usage",
-        "disable-gpu",
-        "no-sandbox",
-        "start-maximized",
-        "disable-extensions",
-        "disable-background-networking",
-        "disable-sync",
-        "disable-translate",
-        "metrics-recording-only",
-        "no-first-run",
-        "safebrowsing-disable-auto-update",
-        "disable-quic",
-    ];
-    let valued = [
-        // Anti-detection.
-        ("disable-blink-features", "AutomationControlled"),
-        ("window-size", "1920,1080"),
-        (
-            "user-agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ),
-        // The network path described above.
-        ("proxy-server", proxy_server.as_str()),
-        ("proxy-bypass-list", "<-loopback>"),
-        ("host-resolver-rules", resolver_rules.as_str()),
-        ("force-webrtc-ip-handling-policy", "disable_non_proxied_udp"),
-    ];
 
     // A profile of its own: Chrome holds a singleton lock on its profile, so
-    // fetches sharing one cannot run at the same time. It outlives `browser`,
+    // fetches sharing one cannot run at the same time. It outlives `session`,
     // which is declared after it and so dropped first.
     let profile = tempfile::Builder::new()
         .prefix("aither-webfetch-")
         .tempdir()
         .map_err(|e| anyhow!("Failed to create the browser profile: {e}"))?;
 
-    let config = BrowserConfig::builder()
-        .launch_timeout(BROWSER_LAUNCH_TIMEOUT)
-        .user_data_dir(profile.path())
-        .viewport(Some(Viewport {
-            width: 1920,
-            height: 1080,
-            device_scale_factor: Some(1.0),
-            ..Default::default()
-        }))
-        .args(switches)
-        .args(valued)
-        .build()
-        .map_err(|e| anyhow!("Browser config error: {e}"))?;
-
+    let config = build_headless_config(proxy.addr(), profile.path())?;
     let (browser, mut handler) = Browser::launch(config)
         .await
         .map_err(|e| anyhow!("Failed to launch browser: {e}"))?;
 
-    // Spawn handler task
     let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let session = HeadlessSessionGuard {
+        browser: Some(browser),
+        handle: Some(handle),
+    };
+    let browser_ref = session.browser.as_ref().expect("browser initialized");
 
-    // Create blank page first
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .map_err(|e| anyhow!("Failed to create page: {e}"))?;
+    let stage_deadline = Instant::now() + clamp_timeout(budget);
+    let run_navigation = async {
+        let page = browser_ref
+            .new_page("about:blank")
+            .await
+            .map_err(|e| anyhow!("Failed to create page: {e}"))?;
 
-    // Inject stealth script BEFORE navigation
-    let stealth_js = r"
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        window.chrome = { runtime: {} };
-    ";
+        let stealth_js = r"
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = { runtime: {} };
+        ";
 
-    // Use Page.addScriptToEvaluateOnNewDocument to inject before any page script runs
-    page.execute(AddScriptToEvaluateOnNewDocumentParams::new(stealth_js))
-        .await
-        .ok();
+        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(stealth_js))
+            .await
+            .ok();
 
-    let mut navigation = navigation::Navigation::watch(&page).await?;
+        let mut navigation = navigation::Navigation::watch(&page).await?;
+        let navigated = page.goto(url).await;
+        let requested = navigation.requested().await;
+        if let Some(refusal) = proxy
+            .refusals()
+            .into_iter()
+            .find(|refusal| requested.contains(&refusal.authority))
+        {
+            return Err(anyhow!("Navigation refused: {}", refusal.reason));
+        }
+        navigated.map_err(|e| anyhow!("Failed to navigate: {e}"))?;
 
-    // Now navigate to the actual URL
-    let navigated = page.goto(url).await;
-    let requested = navigation.requested().await;
-    if let Some(refusal) = proxy
-        .refusals()
-        .into_iter()
-        .find(|refusal| requested.contains(&refusal.authority))
-    {
-        handle.abort();
-        return Err(anyhow!("Navigation refused: {}", refusal.reason));
-    }
-    navigated.map_err(|e| anyhow!("Failed to navigate: {e}"))?;
+        let remaining = stage_deadline.saturating_duration_since(Instant::now());
+        let initial_settle = (remaining / 3).min(Duration::from_millis(500));
+        if !initial_settle.is_zero() {
+            async_io::Timer::after(initial_settle).await;
+        }
 
-    // Wait for page to load
-    tokio::time::sleep(Duration::from_millis(5000)).await;
+        page.evaluate("window.scrollTo(0, 500)").await.ok();
+        let remaining = stage_deadline.saturating_duration_since(Instant::now());
+        let scroll_settle = (remaining / 3).min(Duration::from_millis(250));
+        if !scroll_settle.is_zero() {
+            async_io::Timer::after(scroll_settle).await;
+        }
 
-    // Scroll to trigger lazy loading
-    page.evaluate("window.scrollTo(0, 500)").await.ok();
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+        page.content()
+            .await
+            .map_err(|e| anyhow!("Failed to get page content: {e}"))
+    };
 
-    let html = page
-        .content()
-        .await
-        .map_err(|e| anyhow!("Failed to get page content: {e}"))?;
-
-    handle.abort();
-
-    Ok(html)
+    let result = futures_lite::future::or(run_navigation, async {
+        async_io::Timer::at(stage_deadline).await;
+        Err(anyhow!("headless stage deadline exhausted"))
+    })
+    .await;
+    session.shutdown().await;
+    result
 }
 
 /// Check if a URL looks like an image based on extension or known image hosts.
@@ -1504,6 +1637,21 @@ impl WebFetchTool {
     }
 }
 
+#[derive(Template)]
+#[template(path = "result.txt", escape = "none")]
+struct WebFetchOutputTemplate<'a> {
+    title: Option<&'a str>,
+    url: &'a str,
+    content_type: Option<&'a str>,
+    markdown_tokens: Option<usize>,
+    content_signal: Option<&'a str>,
+    extractor: Option<&'a str>,
+    quality_score: Option<String>,
+    warnings_joined: Option<String>,
+    has_metadata: bool,
+    content: &'a str,
+}
+
 impl Tool for WebFetchTool {
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
@@ -1543,40 +1691,28 @@ impl Tool for WebFetchTool {
         }
 
         let result = fetch_with_request(request).await?;
-
-        let mut output = String::new();
-        if let Some(title) = &result.title {
-            let _ = writeln!(output, "# {title}\n");
-        }
-        let _ = writeln!(output, "Source: {}\n", result.url);
-        if let Some(content_type) = &result.content_type {
-            let _ = writeln!(output, "Content-Type: {content_type}");
-        }
-        if let Some(markdown_tokens) = result.markdown_tokens {
-            let _ = writeln!(output, "X-Markdown-Tokens: {markdown_tokens}");
-        }
-        if let Some(content_signal) = &result.content_signal {
-            let _ = writeln!(output, "Content-Signal: {content_signal}");
-        }
-        if let Some(extractor) = &result.extractor {
-            let _ = writeln!(output, "Extractor: {extractor}");
-        }
-        if let Some(quality_score) = result.quality_score {
-            let _ = writeln!(output, "Quality-Score: {quality_score:.2}");
-        }
-        if !result.warnings.is_empty() {
-            let _ = writeln!(output, "Warnings: {}", result.warnings.join(" | "));
-        }
-        if result.content_type.is_some()
+        let quality_score = result.quality_score.map(|score| format!("{score:.2}"));
+        let warnings_joined = (!result.warnings.is_empty()).then(|| result.warnings.join(" | "));
+        let has_metadata = result.content_type.is_some()
             || result.markdown_tokens.is_some()
             || result.content_signal.is_some()
             || result.extractor.is_some()
-            || result.quality_score.is_some()
-            || !result.warnings.is_empty()
-        {
-            output.push('\n');
+            || quality_score.is_some()
+            || warnings_joined.is_some();
+
+        let output = WebFetchOutputTemplate {
+            title: result.title.as_deref(),
+            url: &result.url,
+            content_type: result.content_type.as_deref(),
+            markdown_tokens: result.markdown_tokens,
+            content_signal: result.content_signal.as_deref(),
+            extractor: result.extractor.as_deref(),
+            quality_score,
+            warnings_joined,
+            has_metadata,
+            content: &result.content,
         }
-        output.push_str(&result.content);
+        .render()?;
 
         Ok(ToolResult::text(output))
     }
@@ -1778,12 +1914,16 @@ description: Example
         }
     }
 
+    fn frozen_ctx(budget: Duration, elapsed: Duration) -> FetchContext {
+        FetchContext::new(budget).with_frozen_elapsed(elapsed)
+    }
+
     #[tokio::test]
     async fn fallback2_falls_back_only_on_http_failure() {
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
         let request = FetchRequest::new("https://example.com");
-        let mut ctx = FetchContext::new(Duration::from_secs(1));
+        let mut ctx = frozen_ctx(Duration::from_secs(1), Duration::ZERO);
 
         let first = MockFetcher {
             name: "first",
@@ -1816,7 +1956,7 @@ description: Example
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
         let request = FetchRequest::new("https://example.com");
-        let mut ctx = FetchContext::new(Duration::from_secs(1));
+        let mut ctx = frozen_ctx(Duration::from_secs(1), Duration::ZERO);
 
         let first = MockFetcher {
             name: "first",
@@ -1844,6 +1984,44 @@ description: Example
         assert_eq!(ctx.trace.len(), 1);
     }
 
+    #[tokio::test]
+    async fn fallback_stops_when_pipeline_deadline_is_exhausted() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let request = FetchRequest::new("https://example.com");
+        let mut ctx = frozen_ctx(Duration::from_secs(1), Duration::from_secs(1));
+
+        let first = MockFetcher {
+            name: "first",
+            calls: Arc::clone(&first_calls),
+            result: Err(ProviderErrorKind::HttpFailure),
+        };
+        let second = MockFetcher {
+            name: "second",
+            calls: Arc::clone(&second_calls),
+            result: Ok(markdown_to_result(
+                "https://example.com",
+                "# second".to_string(),
+                Some("text/markdown".to_string()),
+                None,
+                None,
+            )),
+        };
+
+        let chain = Fallback2::new(first, second);
+        let err = chain.fetch(&request, &mut ctx).await.unwrap_err();
+
+        assert!(err.is_http_failure());
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.trace.len(), 1);
+        assert_eq!(ctx.trace[0].outcome, StageOutcome::HttpFailure);
+        assert_eq!(
+            ctx.trace[0].message.as_deref(),
+            Some("pipeline deadline exhausted")
+        );
+    }
+
     #[test]
     fn jina_url_builder_requires_http_scheme() {
         let ok = build_jina_url("https://example.com").unwrap();
@@ -1851,6 +2029,91 @@ description: Example
 
         let err = build_jina_url("file:///tmp/a.md");
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn static_fetcher_pins_approved_addr_and_blocks_redirect_to_private_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let private_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let private_port = private_listener.local_addr().unwrap().port();
+        let private_hits = Arc::new(AtomicUsize::new(0));
+        let private_hits_task = Arc::clone(&private_hits);
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = private_listener.accept().await {
+                private_hits_task.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecret")
+                    .await;
+            }
+        });
+
+        let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_addr = public_listener.local_addr().unwrap();
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let public_hits_task = Arc::clone(&public_hits);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = public_listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                public_hits_task.fetch_add(1, Ordering::SeqCst);
+                let reply = if head.contains("GET /redirect ") {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{private_port}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: 14\r\nConnection: close\r\n\r\n# Pinned Hello".to_string()
+                };
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+
+        // Direct StaticFetcher call refuses loopback under PublicOnly.
+        let mut ctx = FetchContext::new(Duration::from_secs(5));
+        let direct_err = StaticFetcher
+            .fetch(
+                &FetchRequest::new(format!("http://127.0.0.1:{private_port}/secret")),
+                &mut ctx,
+            )
+            .await
+            .expect_err("StaticFetcher must refuse private addresses");
+        assert!(direct_err.is_http_failure());
+        assert_eq!(private_hits.load(Ordering::SeqCst), 0);
+
+        // Pinned resolver connects to approved SocketAddr for an unresolvable synthetic host.
+        let resolver = guard::testing::Table::new(&[("pinned.test", public_addr)]);
+        let ok = fetch_document_static_with(
+            &format!("http://pinned.test:{}/ok", public_addr.port()),
+            "text/markdown",
+            Duration::from_secs(5),
+            resolver.clone(),
+            guard::testing::Only(public_addr),
+        )
+        .await
+        .expect("pinned host resolves and connects via approved SocketAddr");
+        assert!(ok.body.contains("Pinned Hello"));
+        assert_eq!(resolver.lookups("pinned.test"), 1);
+
+        // HTTP 302 redirect to unapproved loopback target is blocked before connecting.
+        let redirected = fetch_document_static_with(
+            &format!("http://pinned.test:{}/redirect", public_addr.port()),
+            "text/markdown",
+            Duration::from_secs(5),
+            resolver,
+            guard::testing::Only(public_addr),
+        )
+        .await;
+        assert!(
+            redirected.is_err(),
+            "redirect to unapproved target must fail"
+        );
+        assert_eq!(
+            private_hits.load(Ordering::SeqCst),
+            0,
+            "refused redirect target must receive zero connections"
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 2);
     }
 }
 
@@ -1934,9 +2197,14 @@ mod headless_tests {
             format!("http://127.0.0.1:{port}/"),
             format!("http://allowed.test:{port}/"),
         ] {
-            let html = fetch_html_headless(&url, resolver.clone(), Only(loopback(port)))
-                .await
-                .unwrap_or_else(|e| panic!("{url} loads: {e}"));
+            let html = fetch_html_headless(
+                &url,
+                resolver.clone(),
+                Only(loopback(port)),
+                DEFAULT_TOTAL_BUDGET,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{url} loads: {e}"));
             assert!(html.contains("hello there"), "{url}: {html}");
         }
         assert!(requests.load(Ordering::SeqCst) >= 2);
@@ -1961,9 +2229,14 @@ mod headless_tests {
             format!("http://rebind.test:{port}/"),
             format!("https://rebind.test:{port}/"),
         ] {
-            let error = fetch_html_headless(&url, resolver.clone(), guard::PublicOnly)
-                .await
-                .expect_err("the private address is refused");
+            let error = fetch_html_headless(
+                &url,
+                resolver.clone(),
+                guard::PublicOnly,
+                DEFAULT_TOTAL_BUDGET,
+            )
+            .await
+            .expect_err("the private address is refused");
             assert!(
                 error.to_string().contains("Navigation refused"),
                 "{url}: {error}"
@@ -1995,8 +2268,13 @@ mod headless_tests {
             format!("http://private.test:{private_port}/"),
             format!("http://127.0.0.1:{allowed_port}/"),
         ] {
-            let fetched =
-                fetch_html_headless(&url, resolver.clone(), Only(loopback(allowed_port))).await;
+            let fetched = fetch_html_headless(
+                &url,
+                resolver.clone(),
+                Only(loopback(allowed_port)),
+                DEFAULT_TOTAL_BUDGET,
+            )
+            .await;
             assert!(fetched.is_err(), "{url} must not load: {fetched:?}");
         }
         assert_eq!(private_requests.load(Ordering::SeqCst), 0);
@@ -2016,6 +2294,7 @@ mod headless_tests {
             &format!("http://127.0.0.1:{public_port}/"),
             Table::default(),
             Only(loopback(public_port)),
+            DEFAULT_TOTAL_BUDGET,
         )
         .await;
 

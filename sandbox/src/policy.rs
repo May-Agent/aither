@@ -4,7 +4,7 @@
 //! script should run at all — a toolchain preference, a ban on killing by
 //! name, a rule against polling, an approval for a server — is the
 //! embedder's. Every [`ScriptPolicy`] given to the
-//! [`ShellBuilder`](crate::ShellBuilder) sees each script before it runs, parsed when it
+//! [`ShellBuilder`] sees each script before it runs, parsed when it
 //! is shell, with the directory it starts in, the call it came from and the
 //! policy's own state for the agent that runs it, and decides [`Pass`],
 //! [`Allow`], [`Ask`] or [`Refuse`]. With no policy the sandbox refuses
@@ -266,7 +266,7 @@ impl ScriptDecision {
 /// is put to every policy of its shell ahead of the approval it needs. The
 /// policies of one shell decide concurrently and the strictest decision wins.
 ///
-/// A policy keeps what it remembers in its [`State`](Self::State): every
+/// A policy keeps what it remembers in its [`Self::State`]: every
 /// agent's terminal, each subagent's included, starts with a fresh one and
 /// shares it with nobody else. Calls run in parallel, so the state is shared
 /// by reference and the policy chooses how to synchronise it.

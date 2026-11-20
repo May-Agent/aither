@@ -141,25 +141,25 @@ async fn nested_new_paths_inside_root_are_created() {
     assert!(sb.root.join("d/e").is_dir());
 }
 
-#[test]
-fn glob_cannot_leave_the_root() {
+#[tokio::test]
+async fn glob_cannot_leave_the_root() {
     let sb = Sandbox::new("glob");
     fs::write(sb.outside.join("secret.txt"), "secret").unwrap();
     fs::write(sb.root.join("mine.txt"), "mine").unwrap();
     let fs = sb.fs();
-    assert_eq!(fs.glob("*.txt").unwrap(), ["mine.txt"]);
+    assert_eq!(fs.glob("*.txt").await.unwrap(), ["mine.txt"]);
     assert_eq!(
-        fs.glob("../outside/*").unwrap_err().kind(),
+        fs.glob("../outside/*").await.unwrap_err().kind(),
         io::ErrorKind::PermissionDenied
     );
     let absolute = format!("{}/*", sb.outside.display());
     assert_eq!(
-        fs.glob(&absolute).unwrap_err().kind(),
+        fs.glob(&absolute).await.unwrap_err().kind(),
         io::ErrorKind::PermissionDenied
     );
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&sb.outside, sb.root.join("link")).unwrap();
-        assert_eq!(fs.glob("link/*").unwrap(), Vec::<String>::new());
+        assert_eq!(fs.glob("link/*").await.unwrap(), Vec::<String>::new());
     }
 }

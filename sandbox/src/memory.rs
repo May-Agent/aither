@@ -652,7 +652,7 @@ pub trait ContainerMemory: Send + Sync + 'static {
 
 /// Object-safe twin of [`ContainerMemory`], used only through
 /// [`AnyContainerMemory`].
-pub trait ContainerMemoryImpl: Send + Sync {
+trait ContainerMemoryImpl: Send + Sync {
     /// [`ContainerMemory::cgroup`] through a boxed future.
     fn cgroup_boxed(
         &self,
