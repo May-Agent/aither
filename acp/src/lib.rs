@@ -55,23 +55,29 @@
 //!
 //! # async fn run() {
 //! let server = Server::new(EchoHost, Implementation::new("echo-agent", "0.1.0"));
-//! let (peer, serve) = server.serve_stdio();
+//! let (_client_end, agent_end) = aither_acp::rpc::Memory::pair();
+//! let (peer, serve) = server.serve(agent_end); // or serve_stdio() with `stdio`
 //! // Drive `serve` on an executor: it dispatches requests and runs turns.
 //! # let _ = (peer, serve);
 //! # }
 //! ```
 //!
-//! # Driving an agent process
+//! # Driving an agent
+//!
+//! [`ClientBuilder::spawn`] (`process` feature) launches an agent child,
+//! [`ClientBuilder::connect`] attaches any [`Transport`], and
+//! [`ClientBuilder::in_process`] attaches a [`SessionHost`] with zero
+//! serialization:
 //!
 //! ```rust,no_run
-//! use std::path::Path;
-//!
 //! use aither_acp::domain::PermissionOptionId;
+//! use aither_acp::rpc;
 //! use aither_acp::{
 //!     Client, Implementation, PermissionOutcome, PermissionRequest, domain::SelectedOutcome,
 //! };
 //!
 //! # async fn run() {
+//! let (client_end, _agent_end) = rpc::Memory::pair();
 //! let (client, conn) = Client::builder(Implementation::new("my-editor", "1.0.0"))
 //!     .permissions(|_req: PermissionRequest| async move {
 //!         PermissionOutcome::Selected(SelectedOutcome {
@@ -79,7 +85,7 @@
 //!             meta: None,
 //!         })
 //!     })
-//!     .spawn("my-agent", &[], &[], Path::new("/"))
+//!     .connect(client_end)
 //!     .await
 //!     .expect("connect");
 //! tokio::spawn(conn); // drive the connection
