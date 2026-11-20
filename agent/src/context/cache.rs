@@ -430,4 +430,152 @@ mod tests {
         };
         assert!(breakpoints.second.is_none());
     }
+
+    #[test]
+    fn systemless_requests_omit_last_system_breakpoint() {
+        let cache = PromptCache::new("session-1");
+        let messages = vec![Message::user("hello")];
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::Message {
+                message_index: 0,
+                block_index: 0,
+            }
+        );
+        assert!(breakpoints.second.is_none());
+
+        let empty = cache.apply(Parameters::default(), &[], false, true, false);
+        assert!(empty.cache.claude.is_none());
+    }
+
+    #[test]
+    fn thinking_led_assistant_turns_target_last_cacheable_block() {
+        let cache = PromptCache::new("session-1");
+        let thinking = ReasoningState::new(
+            "claude",
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "step one",
+                "signature": "sig-1"
+            })
+            .to_string(),
+        );
+        let redacted = ReasoningState::new(
+            "claude",
+            serde_json::json!({
+                "type": "redacted_thinking",
+                "data": "cipher"
+            })
+            .to_string(),
+        );
+        let call = aither_core::llm::ToolCall::new("c1", "terminal", serde_json::json!({}));
+        let messages = vec![
+            Message::user("run"),
+            Message::assistant_with_reasoning(
+                "doing it",
+                vec![call],
+                vec![thinking.clone(), redacted],
+            ),
+        ];
+        // Blocks: [Thinking(0), RedactedThinking(1), Text(2), ToolUse(3)] -> last cacheable is 3.
+        let parameters = cache.apply(Parameters::default(), &messages, false, true, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::Message {
+                message_index: 1,
+                block_index: 3,
+            }
+        );
+
+        // A thinking-only assistant turn has no cacheable block, so the
+        // breakpoint walks back to the preceding user message.
+        let thinking_only = vec![
+            Message::user("run"),
+            Message::assistant_with_reasoning("", Vec::new(), vec![thinking]),
+        ];
+        let parameters = cache.apply(Parameters::default(), &thinking_only, false, true, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::Message {
+                message_index: 0,
+                block_index: 0,
+            }
+        );
+    }
+
+    /// A folding model puts the live tail inside `system`, so the
+    /// `LastSystem` breakpoint would cache a span that dies on every
+    /// request. `LastTool` still names a stable span.
+    #[test]
+    fn folding_models_skip_the_last_system_breakpoint() {
+        let cache = PromptCache::new("session-1");
+        let messages = vec![
+            Message::system("prefix"),
+            Message::user("hello"),
+            Message::system("live tail"),
+        ];
+        let parameters = cache.apply(Parameters::default(), &messages, true, false, true);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::LastTool
+        );
+        assert_ne!(
+            breakpoints.second.map(|point| point.target),
+            Some(ClaudeCacheBreakpointTarget::LastSystem)
+        );
+
+        // Without a tail every system block is stable, so the breakpoint
+        // is worth writing even on a folding model.
+        let parameters = cache.apply(Parameters::default(), &messages, true, false, false);
+        let ClaudePromptCacheStrategy::Explicit(breakpoints) = claude_strategy(&parameters) else {
+            panic!("expected explicit claude breakpoints");
+        };
+        assert_eq!(
+            breakpoints.second.map(|point| point.target),
+            Some(ClaudeCacheBreakpointTarget::LastSystem)
+        );
+    }
+
+    /// Host-set cache options the agent does not own (a Gemini
+    /// cached-content resource, custom routing) survive `apply`.
+    #[test]
+    fn apply_preserves_cache_options_it_does_not_own() {
+        use aither_core::llm::model::{GeminiPromptCache, OpenAIPromptCache};
+
+        let cache = PromptCache::new("session-1");
+        let mut parameters = Parameters::default();
+        parameters.cache.gemini = Some(GeminiPromptCache::new("cached-content-1"));
+        parameters.cache.openai = Some(OpenAIPromptCache {
+            key: Some("host-key".into()),
+            retention: None,
+        });
+        let messages = vec![Message::user("hello")];
+        let parameters = cache.apply(parameters, &messages, false, true, false);
+        assert!(
+            parameters.cache.gemini.is_some(),
+            "a host-set Gemini cache resource must survive apply"
+        );
+        assert_eq!(
+            parameters
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|openai| openai.key.as_deref()),
+            Some("session-1:0"),
+            "the agent still writes the key it owns"
+        );
+    }
 }

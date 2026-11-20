@@ -1754,6 +1754,40 @@ where
         Ok(Some(refreshed))
     }
 
+    /// Whether refreshing the cache entry pays for itself, given the chance
+    /// that a real request arrives before it expires.
+    ///
+    /// The refresh costs a cached-prefix read plus one output token; losing
+    /// the entry costs the next request a full-prefix write (or read when
+    /// the model publishes no write price). `continuation_probability` is
+    /// the caller's estimate that another request lands in time — a running
+    /// background job is a near-certainty, an idle session much less.
+    /// `None` when the model publishes no pricing or no request has run.
+    #[must_use]
+    pub fn keep_warm_economics(&self, continuation_probability: f64) -> Option<KeepWarmEconomics> {
+        let pricing = self.profile.as_ref()?.pricing.as_ref()?;
+        let prompt_tokens = self.cache_stats.last_prompt_tokens();
+        if prompt_tokens == 0 {
+            return None;
+        }
+        #[expect(clippy::cast_precision_loss)]
+        let tokens = prompt_tokens as f64;
+        let warm_cost = pricing.input_cache_read.mul_add(tokens, pricing.completion);
+        let write_price = if pricing.input_cache_write > 0.0 {
+            pricing.input_cache_write
+        } else {
+            pricing.prompt
+        };
+        let miss_cost = (write_price - pricing.input_cache_read).max(0.0) * tokens;
+        let expected_savings = continuation_probability.mul_add(miss_cost, -warm_cost);
+        Some(KeepWarmEconomics {
+            warm_cost,
+            miss_cost,
+            expected_savings,
+            warm: expected_savings >= MINIMUM_EXPECTED_WARM_SAVINGS,
+        })
+    }
+
     /// A shared handle on whether the provider's prompt-cache entry for this
     /// agent's context is warm and how long until it goes cold. It keeps
     /// tracking this agent's later requests and keep-alives.
