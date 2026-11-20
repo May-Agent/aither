@@ -556,36 +556,45 @@ impl V1Codec {
 
     /// v1 `session/new`-style result → domain setup result (modes become
     /// a synthesized mode-category option prepended to `config_options`).
+    /// An agent that already advertises a mode-category option keeps it —
+    /// the synthesized entry would only duplicate it.
     pub fn setup_result_from_v1(&mut self, r: &v1::SessionNewResult) -> domain::SetupResult {
-        let mut config_options = Vec::new();
-        if let Some(modes) = &r.modes {
+        let mut config_options: Vec<domain::ConfigOption> = r
+            .config_options
+            .iter()
+            .flatten()
+            .map(|o| self.config_option_to_domain(o))
+            .collect();
+        if let Some(modes) = &r.modes
+            && !config_options.iter().any(domain::ConfigOption::is_mode)
+        {
             self.mode_option_id = Some(DEFAULT_MODE_OPTION_ID.to_string());
-            config_options.push(domain::ConfigOption {
-                config_id: DEFAULT_MODE_OPTION_ID.into(),
-                name: "Mode".to_string(),
-                description: None,
-                category: Some(Open::Known(domain::ConfigCategory::Mode)),
-                kind: domain::ConfigKind::Select(domain::SelectConfig {
-                    current_value: modes.current_mode_id.clone().into(),
-                    options: domain::SelectOptions::Ungrouped(
-                        modes
-                            .available_modes
-                            .iter()
-                            .map(|m| domain::SelectOption {
-                                value: m.id.clone().into(),
-                                name: m.name.clone(),
-                                description: m.description.clone(),
-                                meta: m.meta.clone(),
-                            })
-                            .collect(),
-                    ),
-                }),
-                meta: modes.meta.clone(),
-                extra: BTreeMap::new(),
-            });
-        }
-        if let Some(options) = &r.config_options {
-            config_options.extend(options.iter().map(|o| self.config_option_to_domain(o)));
+            config_options.insert(
+                0,
+                domain::ConfigOption {
+                    config_id: DEFAULT_MODE_OPTION_ID.into(),
+                    name: "Mode".to_string(),
+                    description: None,
+                    category: Some(Open::Known(domain::ConfigCategory::Mode)),
+                    kind: domain::ConfigKind::Select(domain::SelectConfig {
+                        current_value: modes.current_mode_id.clone().into(),
+                        options: domain::SelectOptions::Ungrouped(
+                            modes
+                                .available_modes
+                                .iter()
+                                .map(|m| domain::SelectOption {
+                                    value: m.id.clone().into(),
+                                    name: m.name.clone(),
+                                    description: m.description.clone(),
+                                    meta: m.meta.clone(),
+                                })
+                                .collect(),
+                        ),
+                    }),
+                    meta: modes.meta.clone(),
+                    extra: BTreeMap::new(),
+                },
+            );
         }
         self.cache_options(&config_options);
         domain::SetupResult {
