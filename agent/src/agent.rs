@@ -1827,9 +1827,9 @@ where
 
     /// Re-sends the last request to refresh the cache entry of an idle agent.
     ///
-    /// Re-sends the last request with no output (`max_tokens: 0`,
-    /// non-streaming, the same thinking and effort settings), so the
-    /// provider restarts the entry's lifetime. The history is untouched, the
+    /// Re-sends the last request with a one-token output cap
+    /// (`max_tokens: 1`, non-streaming, the same thinking and effort
+    /// settings), so the provider restarts the entry's lifetime. The history is untouched, the
     /// request's usage is recorded in [`cache_stats`](Self::cache_stats) and
     /// the entry's [`cache_warmth`](Self::cache_warmth) restarts. The caller
     /// decides when to call it, shortly before the entry goes cold.
@@ -1852,7 +1852,7 @@ where
         let (messages, parameters, tool_definitions) = last_request.into_parts();
         let request = LLMRequest::new(messages)
             .with_tool_definitions(tool_definitions)
-            .with_parameters(parameters.max_tokens(0).stream(false));
+            .with_parameters(parameters.max_tokens(1).stream(false));
         let stream = Self::respond_stream(&self.model, &self.connectivity, request);
         futures_lite::pin!(stream);
         let mut refreshed = aither_core::llm::Usage::default();
@@ -2200,9 +2200,11 @@ where
         self.model = Arc::new(model);
         // Forget what belonged to the replaced model: its profile, fetched
         // again before the next request, and the last request, which a
-        // keep-alive would otherwise send it.
+        // keep-alive would otherwise send it. Its cache entry is its own:
+        // the warmth handle reports Cold from here.
         self.profile = None;
         self.last_request = None;
+        self.warmth.reset();
     }
 
     /// Whether the agent's own model takes reasoning effort changes inside

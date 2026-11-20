@@ -74,6 +74,15 @@ impl CacheWarmth {
         **self.inner.lifetime.load()
     }
 
+    /// Forgets the entry: every clone reads [`CacheState::Cold`] from here,
+    /// as though no request had ever run. A model swap calls it — the new
+    /// model's cache is its own.
+    pub(crate) fn reset(&self) {
+        self.inner
+            .entry_started_nanos
+            .store(NOT_STARTED, Ordering::Relaxed);
+    }
+
     /// Records that a request or keep-alive started the entry at `at`.
     pub(crate) fn start_entry(&self, at: Instant) {
         self.inner
