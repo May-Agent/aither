@@ -674,18 +674,19 @@ pub enum ShellRunError {
 impl ShellRunError {
     /// The error a tool call answers with: a refusal stays typed so the agent
     /// loop recognises it, every other failure is worded by `wording`.
-    pub(crate) fn into_tool_error(self, wording: &dyn ShellWording) -> anyhow::Error {
+    pub(crate) fn into_tool_error(self, wording: &dyn ShellWording) -> ShellCallError {
         let failure = match self {
-            Self::Refused(refusal) => return anyhow::Error::from(refusal),
+            Self::Refused(refusal) => return ShellCallError::ScriptRefused(refusal),
             Self::Timeout { cap } => {
-                return crate::Refused::call(wording, CallRefusal::TimeoutOutOfRange { cap });
+                return crate::Refused::call(wording, CallRefusal::TimeoutOutOfRange { cap })
+                    .into();
             }
             Self::NoWorkspaceMount => RunFailure::NoWorkspaceMount,
             Self::OutsideWorkspace(ref error) => RunFailure::OutsideWorkspace(error),
             Self::Terminal(ref error) => RunFailure::Terminal(error),
             Self::Ids(_) => RunFailure::IdsExhausted,
         };
-        anyhow::Error::msg(wording.run_failure(&failure))
+        ShellCallError::RunFailed(wording.run_failure(&failure))
     }
 }
 
@@ -1958,6 +1959,8 @@ pub struct ShellTool<E> {
 }
 
 impl<E: Executor + Clone + 'static> Tool for ShellTool<E> {
+    type Error = ShellCallError;
+
     fn name(&self) -> Cow<'static, str> {
         self.identity.name.clone()
     }
@@ -1995,7 +1998,7 @@ impl<E: Executor + Clone + 'static> Tool for ShellTool<E> {
         &self,
         arguments: Self::Arguments,
         cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         self.shell.call(arguments, cx).await
     }
 }
@@ -2043,10 +2046,10 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         &self,
         arguments: ShellArgs,
         cx: ToolContext,
-    ) -> aither_core::Result<ToolResult> {
+    ) -> Result<ToolResult, ShellCallError> {
         match self.execute(arguments, cx).await? {
-            Execution::Finished(result) => result.into_tool_result(),
-            Execution::Detached(detached) => detached.into_command_result().into_tool_result(),
+            Execution::Finished(result) => Ok(result.into_tool_result()),
+            Execution::Detached(detached) => Ok(detached.into_command_result().into_tool_result()),
         }
     }
 
@@ -2056,14 +2059,15 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         &self,
         arguments: ShellArgs,
         mut cx: ToolContext,
-    ) -> aither_core::Result<Execution> {
+    ) -> Result<Execution, ShellCallError> {
         if !self.interpreters.contains(&arguments.interpreter) {
             return Err(crate::Refused::call(
                 &**self.wording(),
                 CallRefusal::InterpreterNotConfigured {
                     interpreter: arguments.interpreter,
                 },
-            ));
+            )
+            .into());
         }
         let cap = self.limits.timeout_cap.get();
         let timeout = Duration::from_secs(arguments.timeout);
@@ -2071,7 +2075,8 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             return Err(crate::Refused::call(
                 &**self.wording(),
                 CallRefusal::TimeoutOutOfRange { cap },
-            ));
+            )
+            .into());
         }
         if let Some(call) = self.effective_call_identity(cx.identity(), "terminal")
             && cx.identity() != Some(&call)
@@ -2493,7 +2498,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
     ///
     /// Fails the way a `terminal` call does: an invalid `timeout`, a
     /// refused permission, a blocked command or a spawn failure.
-    pub async fn run_background(&self, arguments: ShellArgs) -> aither_core::Result<crate::Job> {
+    pub async fn run_background(&self, arguments: ShellArgs) -> Result<crate::Job, ShellCallError> {
         let execution = self
             .execute(
                 ShellArgs {
@@ -2525,7 +2530,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
     /// Fails the way a `terminal` call does apart from a `timeout`, which
     /// `ServiceArgs` does not take: a refused permission, a blocked command
     /// or a spawn failure.
-    pub async fn run_service(&self, arguments: ServiceArgs) -> aither_core::Result<crate::Job> {
+    pub async fn run_service(&self, arguments: ServiceArgs) -> Result<crate::Job, ShellCallError> {
         let arguments = ShellArgs::from(arguments);
         if !self.interpreters.contains(&arguments.interpreter) {
             return Err(crate::Refused::call(
@@ -2533,7 +2538,8 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 CallRefusal::InterpreterNotConfigured {
                     interpreter: arguments.interpreter,
                 },
-            ));
+            )
+            .into());
         }
         let prepared = self
             .prepare_execution(&arguments, &mut ToolContext::new())
@@ -2605,12 +2611,11 @@ where
         &self,
         arguments: &ShellArgs,
         cx: &mut ToolContext,
-    ) -> anyhow::Result<ExecutionPreparation> {
+    ) -> Result<ExecutionPreparation, ShellCallError> {
         if arguments.description.trim().is_empty() {
-            return Err(crate::Refused::call(
-                &**self.wording(),
-                CallRefusal::EmptyDescription,
-            ));
+            return Err(
+                crate::Refused::call(&**self.wording(), CallRefusal::EmptyDescription).into(),
+            );
         }
         let origin = if arguments.background {
             ScriptOrigin::Background
@@ -3122,19 +3127,56 @@ fn run_start(target: &ExecutionTarget, dir: PathBuf) -> Result<CwdCarry, ShellRu
 async fn wait_for_background_startup(
     startup_rx: &Receiver<Result<(), String>>,
     wording: &dyn ShellWording,
-) -> anyhow::Result<()> {
+) -> Result<(), ShellCallError> {
     match startup_rx.recv().await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(detail)) => Err(failed_run(wording, &detail)),
-        Err(_) => Err(anyhow::Error::msg(
+        Err(_) => Err(ShellCallError::RunFailed(
             wording.run_failure(&RunFailure::Terminal(&TerminalError::TaskLost)),
         )),
     }
 }
 
+/// Why a `terminal`-family call failed.
+///
+/// Refusals of the call itself stay typed in `source` (`Refused<CallRefusal>`
+/// and the other `Refused<R>` shapes), and worded run failures keep the text
+/// [`ShellWording::run_failure`] renders for the model.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ShellCallError {
+    /// The call or a part of the run was refused, worded for the model.
+    #[error("{0}")]
+    Refused(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The script itself was refused by policy.
+    #[error("{0}")]
+    ScriptRefused(#[from] crate::ScriptRefusal),
+    /// A failure of the run, worded for the model.
+    #[error("{0}")]
+    RunFailed(String),
+    /// The terminal backend failed.
+    #[error("{0}")]
+    Terminal(#[from] TerminalError),
+    /// The job's output could not be read or redirected.
+    #[error("{0}")]
+    Read(String),
+    /// Writing to the job's stdin failed.
+    #[error("{0}")]
+    JobInput(#[from] crate::job_registry::JobInputError),
+    /// An IO step failed.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl<R: std::fmt::Debug + Send + Sync + 'static> From<crate::Refused<R>> for ShellCallError {
+    fn from(refusal: crate::Refused<R>) -> Self {
+        Self::Refused(Box::new(refusal))
+    }
+}
+
 /// The error of a run whose execution failed with `detail`, worded.
-fn failed_run(wording: &dyn ShellWording, detail: &str) -> anyhow::Error {
-    anyhow::Error::msg(wording.run_failure(&RunFailure::Failed { detail }))
+fn failed_run(wording: &dyn ShellWording, detail: &str) -> ShellCallError {
+    ShellCallError::RunFailed(wording.run_failure(&RunFailure::Failed { detail }))
 }
 
 /// Races the result channel against the foreground limit.
@@ -3160,7 +3202,7 @@ async fn detach_job(
     task_id: &str,
     max_lines: usize,
     started_tx: &EventSender,
-) -> aither_core::Result<Detached> {
+) -> Result<Detached, ShellCallError> {
     // The call still owns the job's completion, so the job is registered; the
     // hold keeps it past a consumer that takes the completion at once.
     let watch = job_registry
@@ -3197,7 +3239,7 @@ async fn start_background_output_redirect(
     outputs: &OutputStore,
     task_id: &str,
     max_lines: usize,
-) -> Result<BackgroundRedirect, anyhow::Error> {
+) -> Result<BackgroundRedirect, ShellCallError> {
     let (url, output_path) = outputs.save_raw(&[]).await?;
     let file = StoredFile {
         url,
@@ -3206,7 +3248,7 @@ async fn start_background_output_redirect(
     let snapshot = job_registry
         .start_output_redirect(task_id, output_path)
         .await
-        .map_err(anyhow::Error::msg)?;
+        .map_err(ShellCallError::Read)?;
     let (preview, truncated) = preview_first_lines(&snapshot, max_lines);
     Ok(BackgroundRedirect {
         file,
@@ -5587,11 +5629,11 @@ mod tests {
 
     /// A detached call answered as the model reads it.
     trait CallDetached {
-        async fn call_detached(&self, arguments: ShellArgs) -> aither_core::Result<ToolResult>;
+        async fn call_detached(&self, arguments: ShellArgs) -> Result<ToolResult, ShellCallError>;
     }
 
     impl<E: Executor + Clone + 'static> CallDetached for Shell<E> {
-        async fn call_detached(&self, arguments: ShellArgs) -> aither_core::Result<ToolResult> {
+        async fn call_detached(&self, arguments: ShellArgs) -> Result<ToolResult, ShellCallError> {
             self.call(
                 ShellArgs {
                     background: true,
@@ -5753,9 +5795,7 @@ mod tests {
 
     #[test]
     fn completed_command_exit_zero_is_the_bare_output() {
-        let result = completed(inline("done"), None, 0)
-            .into_tool_result()
-            .unwrap();
+        let result = completed(inline("done"), None, 0).into_tool_result();
         assert_eq!(result.render_for_model(), "done\n");
         assert_eq!(
             result.command().map(|command| &command.outcome),
@@ -7300,8 +7340,8 @@ mod tests {
             )
             .await
             .expect_err("a repeat read is refused");
-        let refusal = refusal
-            .downcast_ref::<crate::Refused<crate::UnchangedRead>>()
+        let refusal = std::error::Error::source(&refusal)
+            .and_then(|source| source.downcast_ref::<crate::Refused<crate::UnchangedRead>>())
             .expect("the refusal is typed");
         assert_eq!(refusal.reason().task_id, sleeping.task_id());
         assert!(
@@ -7865,8 +7905,8 @@ mod tests {
             )
             .await
             .expect_err("a promoted foreground job takes no input");
-        let refusal = refusal
-            .downcast_ref::<crate::Refused<CallRefusal>>()
+        let refusal = std::error::Error::source(&refusal)
+            .and_then(|source| source.downcast_ref::<crate::Refused<CallRefusal>>())
             .expect("the refusal is typed");
         assert_eq!(
             refusal.reason(),
@@ -12100,8 +12140,8 @@ mod tests {
             .await
             .expect_err("the policy refuses the script");
         assert_eq!(error.to_string(), text);
-        let refusal = error
-            .downcast_ref::<ScriptRefusal>()
+        let refusal = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ScriptRefusal>())
             .expect("the refusal stays typed for the agent loop");
         assert_eq!(refusal.text(), text);
         let error = tool
@@ -12364,7 +12404,11 @@ mod tests {
             .call(terminal_args("again", "echo once"), ToolContext::new())
             .await
             .expect_err("a repeat of a successful script is refused");
-        assert!(error.downcast_ref::<ScriptRefusal>().is_some(), "{error}");
+        assert!(
+            std::error::Error::source(&error)
+                .is_some_and(|source| source.downcast_ref::<ScriptRefusal>().is_some()),
+            "{error}"
+        );
         assert_eq!(exit_code_of(&tool, "echo twice").await, 0);
     }
 

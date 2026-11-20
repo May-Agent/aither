@@ -48,19 +48,20 @@
 //!
 //!     type Arguments = MathArgs;
 //!     type Res = ToolResult;
+//!     type Error = core::convert::Infallible;
 //!
 //!     async fn call(
 //!         &self,
 //!         args: Self::Arguments,
 //!         _cx: ToolContext,
-//!     ) -> aither_core::Result<Self::Res> {
+//!     ) -> Result<Self::Res, Self::Error> {
 //!         let result = match args.operation.as_str() {
 //!             "add" => args.a + args.b,
 //!             "subtract" => args.a - args.b,
 //!             "multiply" => args.a * args.b,
 //!             "divide" if args.b != 0.0 => args.a / args.b,
-//!             "divide" => return Err(anyhow::Error::msg("Division by zero")),
-//!             _ => return Err(anyhow::Error::msg("Unknown operation")),
+//!             "divide" => return Ok(ToolResult::error("Division by zero")),
+//!             _ => return Ok(ToolResult::error("Unknown operation")),
 //!         };
 //!         Ok(ToolResult::text(result.to_string()))
 //!     }
@@ -97,12 +98,13 @@
 //!
 //!     type Arguments = CopyArgs;
 //!     type Res = ToolResult;
+//!     type Error = aither_core::llm::tool::ProgressError;
 //!
 //!     async fn call(
 //!         &self,
 //!         args: Self::Arguments,
 //!         mut cx: ToolContext,
-//!     ) -> aither_core::Result<Self::Res> {
+//!     ) -> Result<Self::Res, Self::Error> {
 //!         let total = args.files.len() as f64;
 //!         for (done, file) in args.files.iter().enumerate() {
 //!             // ... copy `file` ...
@@ -210,7 +212,6 @@ pub use aither_derive::tool;
 pub use alloc::borrow::Cow;
 use serde_json::Value;
 
-use crate::Result;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
@@ -601,46 +602,42 @@ fn join_part_renders(parts: &[ToolResultPart], wording: &dyn CommandWording) -> 
 /// rendered to text by the tool itself, never by a serializer.
 pub trait IntoToolResult {
     /// Converts the value into a final [`ToolResult`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the conversion cannot be completed.
-    fn into_tool_result(self) -> Result<ToolResult>;
+    fn into_tool_result(self) -> ToolResult;
 }
 
 impl IntoToolResult for ToolResult {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(self)
+    fn into_tool_result(self) -> ToolResult {
+        self
     }
 }
 
 impl IntoToolResult for CommandResult {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(ToolResult::Command(Box::new(self)))
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult::Command(Box::new(self))
     }
 }
 
 impl IntoToolResult for () {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(ToolResult::Done)
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult::Done
     }
 }
 
 impl IntoToolResult for String {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(ToolResult::text(self))
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult::text(self)
     }
 }
 
 impl IntoToolResult for &str {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(ToolResult::text(self))
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult::text(self)
     }
 }
 
 impl IntoToolResult for Cow<'_, str> {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(ToolResult::text(self.into_owned()))
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult::text(self.into_owned())
     }
 }
 
@@ -648,14 +645,14 @@ impl<T> IntoToolResult for Option<T>
 where
     T: IntoToolResult,
 {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        self.map_or_else(|| Ok(ToolResult::Done), IntoToolResult::into_tool_result)
+    fn into_tool_result(self) -> ToolResult {
+        self.map_or_else(|| ToolResult::Done, IntoToolResult::into_tool_result)
     }
 }
 
 impl IntoToolResult for Vec<ToolResultPart> {
-    fn into_tool_result(self) -> Result<ToolResult> {
-        Ok(ToolResult::parts(self))
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult::parts(self)
     }
 }
 
@@ -664,10 +661,10 @@ where
     T: IntoToolResult,
     E: Display,
 {
-    fn into_tool_result(self) -> Result<ToolResult> {
+    fn into_tool_result(self) -> ToolResult {
         match self {
             Ok(value) => value.into_tool_result(),
-            Err(error) => Ok(ToolResult::error(error.to_string())),
+            Err(error) => ToolResult::error(error.to_string()),
         }
     }
 }
@@ -702,7 +699,9 @@ fn parse_media_type_or_octet_stream(media_type: &str) -> String {
 ///     type Arguments = CalculatorArgs;
 ///     type Res = ToolResult;
 ///
-///     async fn call(&self, args: Self::Arguments, _cx: ToolContext) -> aither::Result<Self::Res> {
+///     type Error = core::convert::Infallible;
+///
+///     async fn call(&self, args: Self::Arguments, _cx: ToolContext) -> Result<Self::Res, Self::Error> {
 ///         match args.operation.as_str() {
 ///             "add" => Ok(ToolResult::text((args.a + args.b).to_string())),
 ///             "subtract" => Ok(ToolResult::text((args.a - args.b).to_string())),
@@ -711,10 +710,10 @@ fn parse_media_type_or_octet_stream(media_type: &str) -> String {
 ///                 if args.b != 0.0 {
 ///                     Ok(ToolResult::text((args.a / args.b).to_string()))
 ///                 } else {
-///                     Err(anyhow::Error::msg("Division by zero"))
+///                     Ok(ToolResult::error("Division by zero"))
 ///                 }
 ///             }
-///             _ => Err(anyhow::Error::msg("Unknown operation")),
+///             _ => Ok(ToolResult::error("Unknown operation")),
 ///         }
 ///     }
 /// }
@@ -757,6 +756,12 @@ pub trait Tool: Send + Sync {
     /// Raw return type from the tool implementation.
     type Res: IntoToolResult + Send;
 
+    /// Error type the tool's execution can fail with.
+    ///
+    /// [`Tools`] erases it into [`ToolDispatchError::Execution`]; infallible
+    /// tools use [`core::convert::Infallible`].
+    type Error: core::error::Error + Send + Sync + 'static;
+
     /// Executes the tool with the provided arguments.
     ///
     /// `cx` is this call's own context: report progress through
@@ -771,7 +776,7 @@ pub trait Tool: Send + Sync {
         &self,
         arguments: Self::Arguments,
         cx: ToolContext,
-    ) -> impl Future<Output = Result<Self::Res>> + Send;
+    ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send;
 }
 
 trait ToolImpl: Send + Sync + Any {
@@ -779,7 +784,7 @@ trait ToolImpl: Send + Sync + Any {
         &self,
         args: &str,
         cx: ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolDispatchError>> + Send + '_>>;
 
     /// The cached definition. Borrowed, so registering a tool does not have to
     /// clone its argument schema.
@@ -804,13 +809,13 @@ struct DynToolImpl<F> {
 impl<F, Fut> ToolImpl for DynToolImpl<F>
 where
     F: Fn(&str, ToolContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<ToolResult>> + Send + 'static,
+    Fut: Future<Output = Result<ToolResult, ToolDispatchError>> + Send + 'static,
 {
     fn call(
         &self,
         args: &str,
         cx: ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolDispatchError>> + Send + '_>> {
         Box::pin((self.handler)(args, cx))
     }
 
@@ -948,42 +953,36 @@ impl<T: Tool> RegisteredTool<T> {
     }
 }
 
-/// Error the model reads when it sends arguments that do not parse.
-#[derive(askama::Template)]
-#[template(path = "invalid_arguments.txt", escape = "none")]
-struct InvalidArguments<'a> {
-    tool: &'a str,
-    error: &'a serde_json::Error,
-}
-
 impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
     fn call(
         &self,
         args: &str,
         cx: ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult, ToolDispatchError>> + Send + '_>> {
         let result = if self.args_are_object {
             serde_json::from_str::<T::Arguments>(args)
         } else {
             serde_json::from_str::<ToolArgument<T::Arguments>>(args).map(|wrapper| wrapper.value)
         };
 
+        let name = self.definition.name().to_string();
         let arguments = match result {
             Ok(arguments) => arguments,
-            Err(error) => {
-                let message = InvalidArguments {
-                    tool: self.definition.name(),
-                    error: &error,
-                }
-                .to_string();
-                return Box::pin(async move { Err(anyhow::Error::msg(message)) });
+            Err(source) => {
+                return Box::pin(async move {
+                    Err(ToolDispatchError::InvalidArguments { tool: name, source })
+                });
             }
         };
 
         Box::pin(async move {
             Tool::call(&self.tool, arguments, cx)
-                .await?
-                .into_tool_result()
+                .await
+                .map(IntoToolResult::into_tool_result)
+                .map_err(|source| ToolDispatchError::Execution {
+                    tool: name,
+                    source: Box::new(source),
+                })
         })
     }
 
@@ -1061,6 +1060,45 @@ impl Display for RegisterError {
 }
 
 impl core::error::Error for RegisterError {}
+
+/// Why a [`Tools::call`] did not produce a [`ToolResult`].
+///
+/// The variants split the failure at the three places it can happen —
+/// lookup, argument parsing, and the tool's own execution — so callers can
+/// match on the kind without downcasting or parsing messages.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolDispatchError {
+    /// No tool is registered under the requested name.
+    #[error("Tool '{0}' not found")]
+    NotFound(String),
+
+    /// The arguments the model sent could not be deserialized into the
+    /// tool's `Arguments` type.
+    #[error("Invalid arguments for tool '{tool}': {source}")]
+    InvalidArguments {
+        /// Name of the tool that rejected the arguments.
+        tool: String,
+        /// The deserialization failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// The tool's own execution failed.
+    ///
+    /// The concrete [`Tool::Error`] is erased here so a registry can hold
+    /// tools with different error types; [`core::error::Error::source`]
+    /// recovers it for downcasting. The `Display` is the tool's own message:
+    /// `tool` names the failing call for matching, it is not repeated in the
+    /// text the model reads.
+    #[error("{source}")]
+    Execution {
+        /// Name of the tool that failed.
+        tool: String,
+        /// The error the tool returned.
+        #[source]
+        source: Box<dyn core::error::Error + Send + Sync>,
+    },
+}
 
 /// Tool registry for managing and calling tools by name.
 ///
@@ -1683,7 +1721,7 @@ impl Tools {
     ) -> core::result::Result<(), RegisterError>
     where
         F: Fn(&str, ToolContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolResult>> + Send + 'static,
+        Fut: Future<Output = Result<ToolResult, ToolDispatchError>> + Send + 'static,
     {
         self.insert(Box::new(DynToolImpl {
             definition,
@@ -1713,19 +1751,20 @@ impl Tools {
     ///
     /// # Errors
     ///
-    /// Returns an error if the tool is not found, arguments cannot be parsed,
-    /// or tool execution fails.
-    pub async fn call(&self, name: &str, args: &str, cx: ToolContext) -> Result<ToolResult> {
-        #[derive(askama::Template)]
-        #[template(path = "tool_not_found.txt", escape = "none")]
-        struct ToolNotFound<'a> {
-            name: &'a str,
-        }
-
+    /// Returns [`ToolDispatchError::NotFound`] if no tool is registered under
+    /// `name`, [`ToolDispatchError::InvalidArguments`] if the arguments do not
+    /// parse, or [`ToolDispatchError::Execution`] when the tool's own call
+    /// fails.
+    pub async fn call(
+        &self,
+        name: &str,
+        args: &str,
+        cx: ToolContext,
+    ) -> Result<ToolResult, ToolDispatchError> {
         if let Some(tool) = self.tools.get(name) {
             tool.call(args, cx).await
         } else {
-            Err(anyhow::Error::msg(ToolNotFound { name }.to_string()))
+            Err(ToolDispatchError::NotFound(name.to_string()))
         }
     }
 }
@@ -1753,27 +1792,25 @@ mod tests {
         }
         type Arguments = CalculatorArgs;
         type Res = ToolResult;
+        type Error = ToolFailure;
 
         fn call(
             &self,
             args: Self::Arguments,
             _cx: ToolContext,
-        ) -> impl Future<Output = Result<Self::Res>> + Send {
+        ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
             core::future::ready(match args.operation.as_str() {
                 "add" => Ok(ToolResult::text((args.a + args.b).to_string())),
                 "subtract" => Ok(ToolResult::text((args.a - args.b).to_string())),
                 "multiply" => Ok(ToolResult::text((args.a * args.b).to_string())),
                 "divide" => {
                     if args.b == 0.0 {
-                        Err(anyhow::Error::msg("Division by zero"))
+                        Err(ToolFailure("Division by zero"))
                     } else {
                         Ok(ToolResult::text((args.a / args.b).to_string()))
                     }
                 }
-                _ => Err(anyhow::Error::msg(format!(
-                    "Unknown operation: {}",
-                    args.operation
-                ))),
+                _ => Err(ToolFailure("Unknown operation")),
             })
         }
     }
@@ -1792,12 +1829,13 @@ mod tests {
         }
         type Arguments = GreetArgs;
         type Res = ToolResult;
+        type Error = core::convert::Infallible;
 
         fn call(
             &self,
             args: Self::Arguments,
             _cx: ToolContext,
-        ) -> impl Future<Output = Result<Self::Res>> + Send {
+        ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
             core::future::ready(Ok(ToolResult::text(format!("Hello, {}!", args.name))))
         }
     }
@@ -2095,44 +2133,39 @@ mod tests {
     #[test]
     fn into_tool_result_string_is_plain_text() {
         assert_eq!(
-            String::from("hello").into_tool_result().unwrap(),
+            String::from("hello").into_tool_result(),
             ToolResult::text("hello")
         );
     }
 
     #[test]
     fn into_tool_result_str_is_plain_text() {
-        assert_eq!(
-            "hello".into_tool_result().unwrap(),
-            ToolResult::text("hello")
-        );
+        assert_eq!("hello".into_tool_result(), ToolResult::text("hello"));
     }
 
     #[test]
     fn into_tool_result_option_none_is_done() {
-        let result = Option::<String>::None.into_tool_result().unwrap();
+        let result = Option::<String>::None.into_tool_result();
         assert_eq!(result, ToolResult::Done);
     }
 
     #[test]
     fn into_tool_result_option_some_delegates() {
-        let result = Some("hello").into_tool_result().unwrap();
+        let result = Some("hello").into_tool_result();
         assert_eq!(result, ToolResult::text("hello"));
     }
 
     #[test]
     fn into_tool_result_result_ok_string_is_text() {
         let result = core::result::Result::<String, ToolFailure>::Ok(String::from("hello"))
-            .into_tool_result()
-            .unwrap();
+            .into_tool_result();
         assert_eq!(result, ToolResult::text("hello"));
     }
 
     #[test]
     fn into_tool_result_result_err_is_typed_error() {
         let result = core::result::Result::<String, ToolFailure>::Err(ToolFailure("boom"))
-            .into_tool_result()
-            .unwrap();
+            .into_tool_result();
         assert_eq!(result, ToolResult::error("boom"));
         assert!(result.is_error());
         assert_eq!(result.error_message(), Some("boom"));
@@ -2237,12 +2270,13 @@ mod tests {
         }
         type Arguments = PickArgs;
         type Res = ToolResult;
+        type Error = core::convert::Infallible;
 
         fn call(
             &self,
             _args: Self::Arguments,
             _cx: ToolContext,
-        ) -> impl Future<Output = Result<Self::Res>> + Send {
+        ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
             core::future::ready(Ok(ToolResult::text("ok")))
         }
     }
@@ -2315,12 +2349,13 @@ mod tests {
             }
             type Arguments = Args;
             type Res = ToolResult;
+            type Error = core::convert::Infallible;
 
             fn call(
                 &self,
                 _args: Self::Arguments,
                 _cx: ToolContext,
-            ) -> impl Future<Output = Result<Self::Res>> + Send {
+            ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
                 core::future::ready(Ok(ToolResult::text("ok")))
             }
         }
@@ -2515,12 +2550,13 @@ mod tests {
             }
             type Arguments = Vec<Entry>;
             type Res = String;
+            type Error = core::convert::Infallible;
 
             fn call(
                 &self,
                 args: Self::Arguments,
                 _cx: ToolContext,
-            ) -> impl Future<Output = Result<Self::Res>> + Send {
+            ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
                 core::future::ready(Ok(args.len().to_string()))
             }
         }
@@ -2542,12 +2578,13 @@ mod tests {
             }
             type Arguments = DocMode;
             type Res = &'static str;
+            type Error = core::convert::Infallible;
 
             fn call(
                 &self,
                 args: Self::Arguments,
                 _cx: ToolContext,
-            ) -> impl Future<Output = Result<Self::Res>> + Send {
+            ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
                 core::future::ready(Ok(match args {
                     DocMode::Fast => "fast",
                     DocMode::Thorough => "thorough",
@@ -2610,12 +2647,13 @@ mod tests {
             }
             type Arguments = FilterTree;
             type Res = ToolResult;
+            type Error = core::convert::Infallible;
 
             fn call(
                 &self,
                 _args: Self::Arguments,
                 _cx: ToolContext,
-            ) -> impl Future<Output = Result<Self::Res>> + Send {
+            ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
                 core::future::ready(Ok(ToolResult::Done))
             }
         }
@@ -2703,12 +2741,13 @@ mod tests {
             }
             type Arguments = Value;
             type Res = String;
+            type Error = core::convert::Infallible;
 
             fn call(
                 &self,
                 args: Self::Arguments,
                 _cx: ToolContext,
-            ) -> impl Future<Output = Result<Self::Res>> + Send {
+            ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
                 core::future::ready(Ok(args["query"].as_str().unwrap_or_default().to_string()))
             }
         }

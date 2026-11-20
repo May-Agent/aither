@@ -360,6 +360,7 @@ pub struct McpTool {
 impl Tool for McpTool {
     type Arguments = serde_json::Value;
     type Res = ToolResult;
+    type Error = McpError;
 
     fn name(&self) -> Cow<'static, str> {
         Cow::Owned(self.name.clone())
@@ -377,12 +378,12 @@ impl Tool for McpTool {
         &self,
         arguments: Self::Arguments,
         cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let result = self
             .connection
             .call_with_cancel(&self.name, arguments, cx.cancellation())
             .await?;
-        Ok(call_result_to_tool_result(result)?)
+        call_result_to_tool_result(result)
     }
 }
 

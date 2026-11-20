@@ -5,7 +5,7 @@ use std::time::Duration;
 use aither_webfetch::{FetchRequest, fetch_with_request};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().collect();
     let url = args
         .iter()

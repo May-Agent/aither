@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::job_registry::{JobInputError, JobRead, UnchangedRead};
 use crate::jobs::Jobs;
+use crate::terminal::ShellCallError;
 use crate::wording::{AnyShellWording, CallRefusal, JobInputSent, JobKillAsked, Refused};
 
 /// What an embedder calls one of its tools and how it describes it to the
@@ -87,7 +88,10 @@ pub struct ShellToolSettings {
     pub kill: ToolIdentity,
 }
 
-fn task_id<'a>(argument: &'a str, wording: &AnyShellWording) -> aither_core::Result<&'a str> {
+fn task_id<'a>(
+    argument: &'a str,
+    wording: &AnyShellWording,
+) -> Result<&'a str, Refused<CallRefusal>> {
     let task_id = argument.trim();
     if task_id.is_empty() {
         return Err(Refused::call(&**wording, CallRefusal::EmptyTaskId));
@@ -95,7 +99,7 @@ fn task_id<'a>(argument: &'a str, wording: &AnyShellWording) -> aither_core::Res
     Ok(task_id)
 }
 
-fn unknown_task(task_id: &str, wording: &AnyShellWording) -> anyhow::Error {
+fn unknown_task(task_id: &str, wording: &AnyShellWording) -> Refused<CallRefusal> {
     Refused::call(
         &**wording,
         CallRefusal::UnknownTask {
@@ -148,12 +152,13 @@ impl Tool for JobKillTool {
 
     type Arguments = JobKillArgs;
     type Res = ToolResult;
+    type Error = ShellCallError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let task_id = task_id(&args.task_id, &self.wording)?;
         let killed = self.jobs.kill(task_id).await;
         Ok(ToolResult::text(
@@ -215,12 +220,13 @@ impl Tool for JobInputTool {
 
     type Arguments = JobInputArgs;
     type Res = ToolResult;
+    type Error = ShellCallError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let task_id = task_id(&args.task_id, &self.wording)?;
         let job = self
             .jobs
@@ -235,10 +241,7 @@ impl Tool for JobInputTool {
         match job.input(bytes).await {
             Ok(()) => {}
             Err(JobInputError::NoStdin { task_id }) => {
-                return Err(Refused::call(
-                    &*self.wording,
-                    CallRefusal::NoStdin { task_id },
-                ));
+                return Err(Refused::call(&*self.wording, CallRefusal::NoStdin { task_id }).into());
             }
             Err(error) => return Err(error.into()),
         }
@@ -307,18 +310,19 @@ impl Tool for JobReadTool {
 
     type Arguments = JobReadArgs;
     type Res = ToolResult;
+    type Error = ShellCallError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let task_id = task_id(&args.task_id, &self.wording)?;
         let max_bytes = args
             .max_bytes
             .unwrap_or_else(|| self.output.get().read_bytes);
         if max_bytes == 0 {
-            return Err(Refused::call(&*self.wording, CallRefusal::ZeroMaxBytes));
+            return Err(Refused::call(&*self.wording, CallRefusal::ZeroMaxBytes).into());
         }
         let job = self
             .jobs
@@ -328,7 +332,7 @@ impl Tool for JobReadTool {
         let read = job
             .read(args.cursor, max_bytes)
             .await
-            .map_err(anyhow::Error::msg)?;
+            .map_err(ShellCallError::Read)?;
         match read {
             JobRead::Delta(_) => Ok(ToolResult::text(self.wording.job_read(&read))),
             // A poll is a refusal the loop can tell from a read, worded as

@@ -12,14 +12,17 @@
 use aither_core::llm::Message;
 use aither_gemini::Gemini;
 use aither_mem0::{Config, Mem0, store::InMemoryStore};
-use anyhow::{Context, Result};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const TEXT_MODEL: &str = "gemini-flash-latest";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api_key =
-        std::env::var("GEMINI_API_KEY").context("set GEMINI_API_KEY in your environment")?;
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("set GEMINI_API_KEY in your environment: {e}").into()
+        },
+    )?;
 
     let gemini = Gemini::new(api_key).with_text_model(TEXT_MODEL);
 

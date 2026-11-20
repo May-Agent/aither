@@ -21,11 +21,12 @@ impl Tool for Calc {
     }
     type Arguments = AddArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
     fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
+    ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
         ready(Ok(ToolResult::text((args.a + args.b).to_string())))
     }
 }
@@ -44,11 +45,12 @@ impl Tool for NoDoc {
     }
     type Arguments = NoDocArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
     fn call(
         &self,
         _args: Self::Arguments,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
+    ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
         ready(Ok(ToolResult::Done))
     }
 }
@@ -64,11 +66,12 @@ impl Tool for Described {
     }
     type Arguments = NoDocArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
     fn call(
         &self,
         _args: Self::Arguments,
         _cx: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
+    ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
         ready(Ok(ToolResult::Done))
     }
 }

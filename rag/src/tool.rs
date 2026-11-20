@@ -11,6 +11,7 @@ use std::borrow::Cow;
 
 use crate::chunking::Chunker;
 use crate::cleaning::Cleaner;
+use crate::error::RagError;
 use crate::persistence::Persistence;
 use crate::rag::Rag;
 use crate::types::Metadata;
@@ -61,12 +62,13 @@ where
 
     type Arguments = RagToolArgs;
     type Res = ToolResult;
+    type Error = RagError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let results = self
             .store()
             .search_with_k(&arguments.query, arguments.top_k)
@@ -115,6 +117,8 @@ mod tests {
     }
 
     impl EmbeddingModel for MockEmbedder {
+        type Error = core::convert::Infallible;
+
         fn dim(&self) -> usize {
             self.dimension
         }
@@ -122,7 +126,7 @@ mod tests {
         fn embed(
             &self,
             text: &str,
-        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+        ) -> impl std::future::Future<Output = Result<Vec<f32>, Self::Error>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {

@@ -9,7 +9,7 @@
 //! ```no_run
 //! use aither_websearch::{Tavily, SearchProvider};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let provider = Tavily::new("YOUR_API_KEY");
 //! let results = provider.search("latest AI developments", 5).await?;
 //! for result in results {
@@ -19,8 +19,7 @@
 //! # }
 //! ```
 
-use crate::{SearchProvider, SearchResult};
-use anyhow::{Result, anyhow};
+use crate::{SearchError, SearchProvider, SearchResult};
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
 
@@ -77,7 +76,7 @@ impl Tavily {
 }
 
 impl SearchProvider for Tavily {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, SearchError> {
         let request = TavilyRequest {
             api_key: &self.api_key,
             query,
@@ -89,18 +88,18 @@ impl SearchProvider for Tavily {
         let mut backend = client();
         let response: TavilyResponse = backend
             .post(TAVILY_API_URL)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::CONTENT_TYPE.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::ACCEPT.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json_body(&request)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json()
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(SearchError::from)?;
 
         Ok(response
             .results

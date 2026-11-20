@@ -352,14 +352,14 @@ impl From<Result<BrowserResult, BrowserToolError>> for BrowserToolOutput {
 }
 
 impl IntoToolResult for BrowserToolOutput {
-    fn into_tool_result(self) -> aither_core::Result<ToolResult> {
+    fn into_tool_result(self) -> ToolResult {
         match self.0 {
-            Ok(result) => Ok(ToolResult::text(
+            Ok(result) => ToolResult::text(
                 BrowserResultTemplate { result: &result }
                     .render()
                     .expect("browser result template must render"),
-            )),
-            Err(error) => Ok(ToolResult::error(error.to_string())),
+            ),
+            Err(error) => ToolResult::error(error.to_string()),
         }
     }
 }
@@ -447,12 +447,13 @@ impl Tool for BrowserTool {
 
     type Arguments = BrowserArgs;
     type Res = BrowserToolOutput;
+    type Error = crate::tool_request::ToolRequestError;
 
     async fn call(
         &self,
         args: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let Some(broker) = self.broker.as_ref() else {
             return Ok(BrowserToolOutput::from(Err(
                 BrowserToolError::UnavailableInRuntime,

@@ -22,6 +22,17 @@ impl<Args, Response> ToolRequest<Args, Response> {
     }
 }
 
+/// Why a [`ToolRequestBroker::request`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ToolRequestError {
+    /// The host stopped listening for requests.
+    #[error("tool request channel is unavailable")]
+    Unavailable,
+    /// The host dropped the request without answering.
+    #[error("tool request was cancelled")]
+    Cancelled,
+}
+
 /// Sends requests to the host and awaits its responses.
 #[derive(Debug, Clone)]
 pub struct ToolRequestBroker<Args, Response> {
@@ -36,17 +47,17 @@ impl<Args, Response> ToolRequestBroker<Args, Response> {
     /// Returns an error if the queue has been dropped, which means no host is
     /// listening for requests any more, or if the host dropped the request
     /// without responding.
-    pub async fn request(&self, args: Args) -> aither_core::Result<Response> {
+    pub async fn request(&self, args: Args) -> Result<Response, ToolRequestError> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.tx
             .send(ToolRequest { args, response_tx })
             .await
-            .map_err(|_| aither_core::Error::msg("Tool request channel is unavailable."))?;
+            .map_err(|_| ToolRequestError::Unavailable)?;
 
         response_rx
             .recv()
             .await
-            .map_err(|_| aither_core::Error::msg("Tool request was cancelled."))
+            .map_err(|_| ToolRequestError::Cancelled)
     }
 }
 

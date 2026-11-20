@@ -23,7 +23,7 @@ async fn search_docs(
     /// Maximum results to return.
     #[serde(default = "default_limit", rename = "maxResults")]
     mut limit: usize,
-) -> aither_core::Result<String> {
+) -> Result<String, core::convert::Infallible> {
     let _ = &mut cx;
     query = query.trim().to_owned();
     limit = limit.max(1);
@@ -36,7 +36,7 @@ async fn normalize_tag(
     /// Tag identifier to normalize.
     #[serde(rename = "tagName")]
     mut tag: String,
-) -> aither_core::Result<String> {
+) -> Result<String, core::convert::Infallible> {
     tag.make_ascii_lowercase();
     Ok(tag)
 }
@@ -48,7 +48,7 @@ struct MutStructArgs {
 }
 
 #[tool]
-async fn bump_struct(mut args: MutStructArgs) -> aither_core::Result<String> {
+async fn bump_struct(mut args: MutStructArgs) -> Result<String, core::convert::Infallible> {
     args.count += 1;
     Ok(args.count.to_string())
 }

@@ -2,17 +2,22 @@ use crate::{
     client::{Config, OpenAI},
     error::OpenAIError,
 };
-use aither_core::{EmbeddingModel, Result as CoreResult};
+use aither_core::EmbeddingModel;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zenwave::{Client, client, header};
 
 impl EmbeddingModel for OpenAI {
+    type Error = OpenAIError;
+
     fn dim(&self) -> usize {
         self.config().embedding_dimensions
     }
 
-    fn embed(&self, text: &str) -> impl core::future::Future<Output = CoreResult<Vec<f32>>> + Send {
+    fn embed(
+        &self,
+        text: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<f32>, Self::Error>> + Send {
         let cfg = self.config();
         let input = text.to_owned();
         async move {

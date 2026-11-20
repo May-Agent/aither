@@ -12,7 +12,6 @@ use std::{
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
-use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use askama::Template;
 use async_fs::{
@@ -20,6 +19,20 @@ use async_fs::{
     symlink_metadata, write,
 };
 use futures_lite::{AsyncWriteExt, StreamExt};
+
+/// Why a [`FileSystemTool`] call failed.
+#[derive(Debug, thiserror::Error)]
+pub enum FsToolError {
+    /// The tool was built read-only but the operation writes.
+    #[error("filesystem tool is read-only")]
+    ReadOnly,
+    /// A filesystem operation failed.
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    /// Rendering the tool's output failed.
+    #[error("{0}")]
+    Render(#[from] askama::Error),
+}
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -230,11 +243,11 @@ impl<FS: FileSystem> FileSystemTool<FS> {
         self
     }
 
-    fn ensure_writable(&self) -> Result<()> {
+    const fn ensure_writable(&self) -> Result<(), FsToolError> {
         if self.allow_writes {
             Ok(())
         } else {
-            Err(anyhow!("Filesystem tool is read-only"))
+            Err(FsToolError::ReadOnly)
         }
     }
 }
@@ -246,61 +259,48 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
 
     type Arguments = FsOperation;
     type Res = ToolResult;
+    type Error = FsToolError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         match arguments {
             FsOperation::Read { path } => {
-                let content = self
-                    .filesystem
-                    .read_file(Path::new(&path))
-                    .await
-                    .map_err(anyhow::Error::new)?;
+                let content = self.filesystem.read_file(Path::new(&path)).await?;
                 Ok(ToolResult::text(content))
             }
             FsOperation::Write { path, content } => {
                 self.ensure_writable()?;
                 self.filesystem
                     .write_file(Path::new(&path), content)
-                    .await
-                    .map_err(anyhow::Error::new)?;
+                    .await?;
                 Ok(ToolResult::Done)
             }
             FsOperation::Append { path, content } => {
                 self.ensure_writable()?;
                 self.filesystem
                     .append_file(Path::new(&path), content)
-                    .await
-                    .map_err(anyhow::Error::new)?;
+                    .await?;
                 Ok(ToolResult::Done)
             }
             FsOperation::Delete { path } => {
                 self.ensure_writable()?;
-                self.filesystem
-                    .remove_file(Path::new(&path))
-                    .await
-                    .map_err(anyhow::Error::new)?;
+                self.filesystem.remove_file(Path::new(&path)).await?;
                 Ok(ToolResult::Done)
             }
             FsOperation::List { path } => {
                 let listing = self
                     .filesystem
                     .list_dir(path.as_deref().map_or_else(|| Path::new(""), Path::new))
-                    .await
-                    .map_err(anyhow::Error::new)?;
+                    .await?;
                 Ok(ToolResult::text(
                     ListingTemplate { entries: &listing }.render()?,
                 ))
             }
             FsOperation::Glob { pattern } => {
-                let matches = self
-                    .filesystem
-                    .glob(&pattern)
-                    .await
-                    .map_err(anyhow::Error::new)?;
+                let matches = self.filesystem.glob(&pattern).await?;
                 Ok(ToolResult::text(
                     MatchesTemplate { matches: &matches }.render()?,
                 ))

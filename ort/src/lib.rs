@@ -150,11 +150,13 @@ struct EncodedTokens {
 }
 
 impl EmbeddingModel for OrtEmbedding {
+    type Error = OrtError;
+
     fn dim(&self) -> usize {
         self.dimension
     }
 
-    async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, Self::Error> {
         let tokenizer = Arc::clone(&self.tokenizer);
         let owned_text = text.to_owned();
         let encoded = blocking::unblock(move || -> Result<EncodedTokens, OrtError> {
@@ -175,8 +177,7 @@ impl EmbeddingModel for OrtEmbedding {
         if encoded.input_ids.is_empty() {
             return Err(OrtError::Tokenization(
                 "tokenizer produced empty token sequence".to_string(),
-            )
-            .into());
+            ));
         }
 
         let (response_tx, response_rx) = async_channel::bounded(1);

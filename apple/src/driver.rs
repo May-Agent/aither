@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use aither_core::llm::tool::{ToolContext, ToolResult, Tools};
+use aither_core::llm::tool::{ToolContext, ToolDispatchError, ToolResult, Tools};
 use aither_core::llm::{Event, Usage};
 use async_channel::Receiver;
 use futures_lite::Stream;
@@ -184,7 +184,7 @@ struct Active {
 }
 
 type ToolTask<'a> =
-    Pin<Box<dyn Future<Output = (u64, String, aither_core::Result<ToolResult>)> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = (u64, String, Result<ToolResult, ToolDispatchError>)> + Send + 'a>>;
 
 type Starting = Pin<Box<dyn Future<Output = Result<Active, AppleError>> + Send>>;
 

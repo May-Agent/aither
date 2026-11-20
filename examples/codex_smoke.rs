@@ -7,7 +7,8 @@
 use aither_codex::auth::CodexCredentials;
 use aither_codex::{CodexProvider, LanguageModel, LanguageModelProvider};
 use aither_core::llm::{Event, LLMRequest, Message};
-use anyhow::{Context, Result};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 use futures_lite::StreamExt;
 use serde::Deserialize;
 
@@ -29,9 +30,9 @@ struct CodexCliTokens {
 
 fn load_credentials() -> Result<CodexCredentials> {
     let path = std::env::home_dir()
-        .context("no home dir")?
+        .ok_or("no home dir")?
         .join(".codex/auth.json");
-    let raw = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let auth: CodexCliAuth = serde_json::from_str(&raw)?;
     let mut credentials =
         CodexCredentials::new(auth.tokens.access_token, auth.tokens.refresh_token);
@@ -64,7 +65,7 @@ async fn main() -> Result<()> {
     let slug = std::env::args()
         .nth(1)
         .or_else(|| models.first().map(|m| m.slug.clone()))
-        .context("no model available")?;
+        .ok_or("no model available")?;
     println!("\n=== respond() on {slug} ===");
 
     let model = provider.get_model(&slug).await?;

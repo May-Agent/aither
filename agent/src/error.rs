@@ -128,8 +128,8 @@ impl AgentError {
     }
 }
 
-impl From<anyhow::Error> for AgentError {
-    fn from(error: anyhow::Error) -> Self {
+impl From<Box<dyn std::error::Error + Send + Sync>> for AgentError {
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Self::llm_local(error.to_string())
     }
 }

@@ -40,6 +40,7 @@ use crate::{
     request_parameters::WithParameters,
     tools::AgentTools,
 };
+use aither_core::llm::tool::ToolDispatchError;
 use aither_core::{
     LanguageModel,
     llm::{
@@ -540,7 +541,10 @@ impl<H: Hooks> ToolRun<'_, H> {
             .unwrap_or_else(|payload| {
                 let panic = ToolPanic::caught(&call.name, payload.as_ref());
                 tracing::error!(tool = %panic.name, message = %panic.message, "tool panicked");
-                Err(panic.into())
+                Err(ToolDispatchError::Execution {
+                    tool: call.name.clone(),
+                    source: Box::new(panic),
+                })
             });
             (result, self.clock.since(start))
         };

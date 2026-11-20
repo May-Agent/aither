@@ -7,11 +7,11 @@ use thiserror::Error;
 pub enum Mem0Error {
     /// The language model call used to extract or reconcile facts failed.
     #[error("LLM error: {0}")]
-    Llm(anyhow::Error),
+    Llm(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Embedding the text to store or search for failed.
     #[error("Embedding error: {0}")]
-    Embedding(anyhow::Error),
+    Embedding(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// The backing store rejected a read or write.
     #[error("Store error: {0}")]

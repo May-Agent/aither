@@ -367,11 +367,13 @@ async fn dropping_call_tool_or_cancelling_mcp_tool_notifies_server_and_cleans_up
         type Arguments = HangArgs;
         type Res = ToolResult;
 
+        type Error = core::convert::Infallible;
+
         async fn call(
             &self,
             args: Self::Arguments,
             cx: ToolContext,
-        ) -> aither_core::Result<Self::Res> {
+        ) -> Result<Self::Res, Self::Error> {
             let cancelled_tx = self.cancelled_tx.clone();
             let signal = cx.cancellation().clone();
             let tag = args.tag;

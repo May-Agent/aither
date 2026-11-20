@@ -13,7 +13,6 @@ categories = ["web-programming"]
 
 [dependencies]
 aither-core.workspace = true
-anyhow = "1.0"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 async-io = { version = "2", default-features = false }
 blocking = { version = "1.7", default-features = false }

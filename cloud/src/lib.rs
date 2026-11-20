@@ -67,6 +67,12 @@ pub enum CloudEmbedderError {
     /// The provider does not implement embeddings.
     #[error("provider does not support embeddings: {0}")]
     UnsupportedProvider(&'static str),
+    /// The `OpenAI` provider's embed call failed.
+    #[error("{0}")]
+    OpenAI(#[from] aither_openai::OpenAIError),
+    /// The `Gemini` provider's embed call failed.
+    #[error("{0}")]
+    Gemini(#[from] aither_gemini::GeminiError),
 }
 
 impl TryFrom<CloudProvider> for CloudEmbedder {
@@ -84,6 +90,8 @@ impl TryFrom<CloudProvider> for CloudEmbedder {
 }
 
 impl EmbeddingModel for CloudEmbedder {
+    type Error = CloudEmbedderError;
+
     fn dim(&self) -> usize {
         match self {
             Self::OpenAI(client) => client.dim(),
@@ -94,13 +102,19 @@ impl EmbeddingModel for CloudEmbedder {
     fn embed(
         &self,
         text: &str,
-    ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+    ) -> impl std::future::Future<Output = Result<Vec<f32>, Self::Error>> + Send {
         let embedder = self.clone();
         let text = text.to_string();
         async move {
             match embedder {
-                Self::OpenAI(client) => client.embed(text.as_str()).await,
-                Self::Gemini(client) => client.embed(text.as_str()).await,
+                Self::OpenAI(client) => client
+                    .embed(text.as_str())
+                    .await
+                    .map_err(CloudEmbedderError::from),
+                Self::Gemini(client) => client
+                    .embed(text.as_str())
+                    .await
+                    .map_err(CloudEmbedderError::from),
             }
         }
     }

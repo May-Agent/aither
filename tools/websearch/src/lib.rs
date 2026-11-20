@@ -43,10 +43,27 @@ use std::borrow::Cow;
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
-use anyhow::Result;
 use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Why a [`SearchProvider::search`] or a [`WebSearchTool`] call failed.
+#[derive(Debug, thiserror::Error)]
+pub enum SearchError {
+    /// The HTTP request to the provider failed.
+    #[error("search request failed: {0}")]
+    Http(#[from] zenwave::Error),
+    /// The provider answered with a CAPTCHA challenge; retrying the same
+    /// query cannot help.
+    #[error("{0}")]
+    Captcha(String),
+    /// The provider rejected the query or returned an unusable answer.
+    #[error("{0}")]
+    Provider(String),
+    /// Rendering the results failed.
+    #[error("{0}")]
+    Render(#[from] askama::Error),
+}
 
 /// Search the web and return relevant results.
 ///
@@ -90,7 +107,7 @@ struct ResultsTemplate<'a> {
     results: &'a [SearchResult],
 }
 
-fn render_results(results: &[SearchResult]) -> Result<String> {
+fn render_results(results: &[SearchResult]) -> Result<String, SearchError> {
     Ok(ResultsTemplate { results }.render()?)
 }
 
@@ -101,7 +118,7 @@ pub trait SearchProvider: Send + Sync {
         &self,
         query: &str,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<SearchResult>>> + Send;
+    ) -> impl Future<Output = Result<Vec<SearchResult>, SearchError>> + Send;
 }
 
 /// A tool that integrates web search capabilities into LLM agents.
@@ -141,9 +158,9 @@ const MAX_RETRIES: u32 = 3;
 /// Delay between retry attempts in milliseconds.
 const RETRY_DELAY_MS: u64 = 500;
 
-/// Check if an error is non-retryable (e.g., CAPTCHA).
-fn is_non_retryable(e: &anyhow::Error) -> bool {
-    e.to_string().contains("CAPTCHA")
+/// Check if an error is non-retryable (a CAPTCHA challenge).
+const fn is_non_retryable(e: &SearchError) -> bool {
+    matches!(e, SearchError::Captcha(_))
 }
 
 impl<P> Tool for WebSearchTool<P>
@@ -156,12 +173,13 @@ where
 
     type Arguments = WebSearchArgs;
     type Res = ToolResult;
+    type Error = SearchError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let limit = arguments.limit.clamp(1, 10);
 
         // Retry on empty results (search engines may temporarily fail)

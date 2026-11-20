@@ -38,7 +38,8 @@ use std::time::Duration;
 use aither_agent::{Agent, AgentEvent, CompactionOutcome, Hooks, RunOutcome};
 use aither_core::LanguageModel;
 use aither_mcp::{McpConnection, McpServersConfig};
-use anyhow::{Context, Result};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::enable_raw_mode;
@@ -195,7 +196,9 @@ fn acp_session_agent(
 }
 
 async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudProvider, CliHooks>> {
-    let cwd = std::env::current_dir().context("failed to read the working directory")?;
+    let cwd = std::env::current_dir().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("failed to read the working directory: {e}").into()
+    })?;
     let mut builder = Agent::builder(cloud)
         .hooks(CliHooks::new(args.approve))
         .approver(TerminalApprover)
@@ -223,11 +226,16 @@ async fn build_agent(cloud: CloudProvider, args: &Args) -> Result<Agent<CloudPro
 
     // Add MCP connections from config file
     if let Some(ref mcp_path) = args.mcp {
-        let config_str = async_fs::read_to_string(mcp_path)
-            .await
-            .with_context(|| format!("failed to read MCP config from {}", mcp_path.display()))?;
-        let config: McpServersConfig =
-            serde_json::from_str(&config_str).with_context(|| "failed to parse MCP config")?;
+        let config_str = async_fs::read_to_string(mcp_path).await.map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to read MCP config from {}: {e}", mcp_path.display()).into()
+            },
+        )?;
+        let config: McpServersConfig = serde_json::from_str(&config_str).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to parse MCP config: {e}").into()
+            },
+        )?;
 
         let connections = McpConnection::from_configs(&TokioGlobal, &config).await?;
         for (name, conn) in connections {
@@ -274,7 +282,7 @@ where
     match flow {
         ControlFlow::Continue(Some(reply)) => Ok(reply),
         ControlFlow::Continue(None) | ControlFlow::Break(()) => {
-            anyhow::bail!("the run ended without a reply")
+            Err("the run ended without a reply".into())
         }
     }
 }

@@ -8,7 +8,7 @@
 //! ```no_run
 //! use aither_websearch::{Exa, SearchProvider};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let provider = Exa::new("YOUR_API_KEY");
 //! let results = provider.search("latest rust async patterns", 5).await?;
 //! for result in results {
@@ -18,8 +18,7 @@
 //! # }
 //! ```
 
-use crate::{SearchProvider, SearchResult};
-use anyhow::{Result, anyhow};
+use crate::{SearchError, SearchProvider, SearchResult};
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
 
@@ -46,26 +45,26 @@ impl Exa {
 }
 
 impl SearchProvider for Exa {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, SearchError> {
         let request = build_request(query, limit.min(100));
 
         let mut backend = client();
         let response: ExaResponse = backend
             .post(EXA_SEARCH_API_URL)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header("x-api-key", &self.api_key)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::CONTENT_TYPE.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::ACCEPT.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json_body(&request)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json()
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(SearchError::from)?;
 
         Ok(response.results.into_iter().map(map_result).collect())
     }

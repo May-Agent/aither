@@ -527,6 +527,8 @@ mod tests {
     }
 
     impl EmbeddingModel for MockEmbedder {
+        type Error = core::convert::Infallible;
+
         fn dim(&self) -> usize {
             self.dimension
         }
@@ -534,7 +536,8 @@ mod tests {
         fn embed(
             &self,
             text: &str,
-        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+        ) -> impl std::future::Future<Output = std::result::Result<Vec<f32>, Self::Error>> + Send
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {

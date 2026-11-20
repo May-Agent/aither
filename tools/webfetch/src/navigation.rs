@@ -7,7 +7,7 @@
 //! does not. It only observes: nothing here decides what the browser may
 //! reach.
 
-use anyhow::{Result, anyhow};
+use crate::HeadlessError;
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::network::{EventRequestWillBeSent, ResourceType};
 use chromiumoxide::cdp::browser_protocol::page::FrameId;
@@ -32,16 +32,9 @@ impl Navigation {
     ///
     /// Returns an error if the page has no main frame or its requests cannot
     /// be listened to.
-    pub async fn watch(page: &Page) -> Result<Self> {
-        let requests = page
-            .event_listener::<EventRequestWillBeSent>()
-            .await
-            .map_err(|e| anyhow!("Failed to listen for requests: {e}"))?;
-        let main_frame = page
-            .mainframe()
-            .await
-            .map_err(|e| anyhow!("Failed to find the main frame: {e}"))?
-            .ok_or_else(|| anyhow!("The page has no main frame"))?;
+    pub async fn watch(page: &Page) -> Result<Self, HeadlessError> {
+        let requests = page.event_listener::<EventRequestWillBeSent>().await?;
+        let main_frame = page.mainframe().await?.ok_or(HeadlessError::NoMainFrame)?;
         Ok(Self {
             requests,
             main_frame,
