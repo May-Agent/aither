@@ -68,7 +68,7 @@ pub use aither_webfetch as webfetch;
 pub use aither_websearch as websearch;
 
 // Public API
-pub use agent::{Agent, CancelHandle, CompactResult, Run};
+pub use agent::{Agent, CancelHandle, CompactResult, KeepWarmEconomics, Run};
 pub use builder::AgentBuilder;
 pub use cache_stats::CacheStats;
 pub use checkpoint::{AgentCheckpoint, Checkpoints};

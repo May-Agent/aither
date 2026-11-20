@@ -1380,7 +1380,7 @@ mod tests {
             Parameters::default(),
             &messages,
             false,
-            false,
+            true,
             true,
         );
         let main = LLMRequest::new(messages).with_parameters(parameters);
