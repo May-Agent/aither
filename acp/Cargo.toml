@@ -12,31 +12,39 @@ keywords = ["ai", "agent", "acp", "editor-integration"]
 categories = ["api-bindings"]
 
 [features]
-default = ["agent"]
-agent = ["dep:aither-agent", "dep:aither-core", "dep:uuid"]
+default = []
+stdio = ["dep:blocking"]
+process = ["stdio", "dep:async-process"]
+mcp = ["dep:aither-mcp", "dep:executor-core", "dep:async-process"]
+agent = ["mcp", "dep:aither-agent", "dep:aither-core"]
 
 [dependencies]
 aither-core = { workspace = true, optional = true }
 aither-agent = { workspace = true, optional = true, default-features = false, features = ["mcp"] }
-aither-mcp.workspace = true
-executor-core = { version = "0.7", default-features = false }
+aither-mcp = { workspace = true, optional = true, default-features = false, features = ["client", "http"] }
+executor-core = { version = "0.7", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-lite = "2"
 futures-util = "0.3"
 async-channel = "2"
-async-process = "2"
+blocking = { version = "1", optional = true }
+async-process = { version = "2", optional = true }
 thiserror = "2"
 tracing = "0.1"
-uuid = { version = "1", optional = true, features = ["v4"] }
+uuid = { version = "1", features = ["v4"] }
 
 [[test]]
 name = "child_agent"
-required-features = ["agent"]
+required-features = ["agent", "process"]
 
 [[test]]
 name = "session_mcp"
 required-features = ["agent"]
+
+[[example]]
+name = "devin_smoke"
+required-features = ["process"]
 
 [dev-dependencies]
 executor-core = { version = "0.7", features = ["tokio"] }

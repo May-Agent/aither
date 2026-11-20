@@ -6,18 +6,17 @@
 //!   prefix ([`capability`]);
 //! - `initialize` result `_meta.mcpConfigPath` ([`mcp_config_path`]);
 //! - `_cognition.ai/*` agent→client notifications ([`notification`]);
-//! - the `devin-browser` [`authenticate`](crate::AcpClient::authenticate)
-//!   method ID.
+//! - the `devin-browser` auth-login method ID.
 
 use std::collections::BTreeMap;
 
-use aither_mcp::protocol::JsonRpcNotification;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::{AgentCapabilities, InitializeResult};
+use crate::domain::{AgentCapabilities, SessionId};
+use crate::rpc::Notification;
 
-/// Devin's browser sign-in `authenticate` method ID.
+/// Devin's browser sign-in `auth/login` method ID.
 pub const BROWSER_AUTH_METHOD: &str = "devin-browser";
 
 /// `initialize` result `_meta` key carrying the path of the MCP config
@@ -71,14 +70,15 @@ pub fn supports(caps: &AgentCapabilities, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The MCP config file path devin reports on `initialize`, if any.
+/// The MCP config file path devin reports on `initialize`
+/// (`meta.mcpConfigPath` on the `initialize` result), if any.
 #[must_use]
-pub fn mcp_config_path(result: &InitializeResult) -> Option<&str> {
-    result.meta.as_ref()?.get(MCP_CONFIG_PATH)?.as_str()
+pub fn mcp_config_path(meta: &Option<Value>) -> Option<&str> {
+    meta.as_ref()?.get(MCP_CONFIG_PATH)?.as_str()
 }
 
-/// `_cognition.ai/output` — devin pushes log lines (MCP startup, internal
-/// progress) outside the session transcript.
+/// `_cognition.ai/output` — devin pushes log lines (MCP startup,
+/// internal progress) outside the session transcript.
 pub const OUTPUT_NOTIFICATION: &str = "_cognition.ai/output";
 
 /// `_cognition.ai/mcp/serversChanged` — the MCP server set changed at
@@ -96,9 +96,9 @@ pub struct OutputNotification {
     /// Severity (`info`, `warning`, `error`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
-    /// Session the message belongs to; empty when connection-scoped.
-    #[serde(default)]
-    pub session_id: String,
+    /// Session the message belongs to; unset when connection-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     /// Fields this crate does not model, preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -125,7 +125,7 @@ pub enum DevinNotification {
 /// Returns `None` for notifications outside the `_cognition.ai/`
 /// namespace.
 #[must_use]
-pub fn notification(notification: &JsonRpcNotification) -> Option<DevinNotification> {
+pub fn notification(notification: &Notification) -> Option<DevinNotification> {
     match notification.method.as_str() {
         OUTPUT_NOTIFICATION => serde_json::from_value(notification.params.clone()?)
             .ok()
@@ -152,12 +152,14 @@ pub mod revert {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
-    /// `_cognition.ai/revert/listSteps` — list the session's history steps
-    /// with their revert/fork anchor node ids.
+    use crate::domain::{MessageId, SessionId, ToolCallId};
+
+    /// `_cognition.ai/revert/listSteps` — list the session's history
+    /// steps with their revert/fork anchor node ids.
     pub const LIST_STEPS_METHOD: &str = "_cognition.ai/revert/listSteps";
 
-    /// `_cognition.ai/revert/forkFromStep` — clone the session into a new
-    /// session at a step's [`StepInfo::fork_target_node_id`].
+    /// `_cognition.ai/revert/forkFromStep` — clone the session into a
+    /// new session at a step's [`StepInfo::fork_target_node_id`].
     pub const FORK_FROM_STEP_METHOD: &str = "_cognition.ai/revert/forkFromStep";
 
     /// Params of [`LIST_STEPS_METHOD`].
@@ -165,7 +167,7 @@ pub mod revert {
     #[serde(rename_all = "camelCase")]
     pub struct ListStepsParams {
         /// Session to inspect.
-        pub session_id: String,
+        pub session_id: SessionId,
     }
 
     /// Result of [`LIST_STEPS_METHOD`].
@@ -194,10 +196,10 @@ pub mod revert {
         pub summary: Option<String>,
         /// Message id for `prompt` steps.
         #[serde(default)]
-        pub user_message_id: Option<String>,
+        pub user_message_id: Option<MessageId>,
         /// Tool call id for tool steps.
         #[serde(default)]
-        pub tool_call_id: Option<String>,
+        pub tool_call_id: Option<ToolCallId>,
         /// Anchor node for question steps.
         #[serde(default)]
         pub question_node_id: Option<u64>,
@@ -217,7 +219,7 @@ pub mod revert {
     #[serde(rename_all = "camelCase")]
     pub struct ForkFromStepParams {
         /// Session to fork.
-        pub session_id: String,
+        pub session_id: SessionId,
         /// The target step's [`StepInfo::fork_target_node_id`].
         pub target_node_id: u64,
     }
@@ -226,9 +228,9 @@ pub mod revert {
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct ForkFromStepResult {
-        /// The new session's id; load it with `session/load` (or resume it)
-        /// on any connection.
-        pub forked_session_id: String,
+        /// The new session's id; load it with `session/load` (or resume
+        /// it) on any connection.
+        pub forked_session_id: SessionId,
         /// Fields this crate does not model, preserved verbatim.
         #[serde(flatten)]
         pub extra: BTreeMap<String, Value>,
@@ -263,22 +265,17 @@ mod tests {
     /// `mcpConfigPath` reads off the initialize result's `_meta`.
     #[test]
     fn mcp_config_path_extraction() {
-        let result: InitializeResult = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "_meta": {"mcpConfigPath": "/home/me/.devin/mcp.json"},
-        }))
-        .expect("deserializes");
-        assert_eq!(mcp_config_path(&result), Some("/home/me/.devin/mcp.json"));
+        let meta = Some(json!({"mcpConfigPath": "/home/me/.devin/mcp.json"}));
+        assert_eq!(mcp_config_path(&meta), Some("/home/me/.devin/mcp.json"));
 
-        let result: InitializeResult =
-            serde_json::from_value(json!({"protocolVersion": 1})).expect("deserializes");
-        assert_eq!(mcp_config_path(&result), None);
+        assert_eq!(mcp_config_path(&None), None);
+        assert_eq!(mcp_config_path(&Some(json!({}))), None);
     }
 
     /// `_cognition.ai/*` notifications decode; others return `None`.
     #[test]
     fn notification_parsing() {
-        let output = JsonRpcNotification::with_params(
+        let output = Notification::with_params(
             OUTPUT_NOTIFICATION,
             json!({
                 "channel": "MCP: fs",
@@ -291,22 +288,21 @@ mod tests {
             panic!("expected output");
         };
         assert_eq!(output.channel, "MCP: fs");
-        assert_eq!(output.session_id, "s1");
+        assert_eq!(output.session_id, Some(SessionId::from("s1")));
 
-        let changed =
-            JsonRpcNotification::with_params(MCP_SERVERS_CHANGED_NOTIFICATION, json!({"n": 2}));
+        let changed = Notification::with_params(MCP_SERVERS_CHANGED_NOTIFICATION, json!({"n": 2}));
         let Some(DevinNotification::McpServersChanged(params)) = notification(&changed) else {
             panic!("expected servers-changed");
         };
         assert_eq!(params, Some(json!({"n": 2})));
 
-        let other = JsonRpcNotification::new("_cognition.ai/futureThing");
+        let other = Notification::new("_cognition.ai/futureThing");
         let Some(DevinNotification::Other { method, .. }) = notification(&other) else {
             panic!("expected other");
         };
         assert_eq!(method, "_cognition.ai/futureThing");
 
-        let foreign = JsonRpcNotification::new("_acme/ping");
+        let foreign = Notification::new("_acme/ping");
         assert!(notification(&foreign).is_none());
     }
 
@@ -314,7 +310,7 @@ mod tests {
     #[test]
     fn revert_types() {
         let params = serde_json::to_value(revert::ListStepsParams {
-            session_id: "s1".to_string(),
+            session_id: "s1".into(),
         })
         .expect("serializes");
         assert_eq!(params, json!({"sessionId": "s1"}));
@@ -349,7 +345,7 @@ mod tests {
         assert_eq!(result.steps[1].fork_target_node_id, None);
 
         let params = serde_json::to_value(revert::ForkFromStepParams {
-            session_id: "s1".to_string(),
+            session_id: "s1".into(),
             target_node_id: 27,
         })
         .expect("serializes");
@@ -357,7 +353,7 @@ mod tests {
 
         let result: revert::ForkFromStepResult =
             serde_json::from_value(json!({"forkedSessionId": "s2"})).expect("deserializes");
-        assert_eq!(result.forked_session_id, "s2");
+        assert_eq!(result.forked_session_id.as_str(), "s2");
 
         // A missing required field fails rather than defaulting.
         assert!(

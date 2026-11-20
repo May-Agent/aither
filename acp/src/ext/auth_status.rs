@@ -1,18 +1,18 @@
 //! `_auth/status_update` — agent-pushed connection auth identity.
 //!
-//! A provider-neutral convention: an agent that pushes auth status updates
-//! advertises an (empty) `authStatus` object under `agentCapabilities._meta`.
-//! Whenever the auth identity changes it sends an
-//! `_auth/status_update` notification.
+//! A provider-neutral convention: an agent that pushes auth status
+//! updates advertises an (empty) `authStatus` object under
+//! `agentCapabilities._meta`. Whenever the auth identity changes it
+//! sends an `_auth/status_update` notification.
 
 use std::collections::BTreeMap;
 
-use aither_mcp::protocol::JsonRpcNotification;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::macros::string_enum;
-use crate::protocol::{AgentCapabilities, ExtMethod};
+use crate::domain::open::string_enum;
+use crate::domain::{AgentCapabilities, ExtMethod};
+use crate::rpc::Notification;
 
 /// The auth-status extension notification.
 pub const METHOD: ExtMethod = ExtMethod::new("_auth/status_update");
@@ -88,12 +88,12 @@ pub struct AuthStatus {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// Parse the [`AuthStatus`] out of an [`ExtMethod`] notification.
+/// Parse the [`AuthStatus`] out of an agent→client notification.
 ///
 /// Returns `None` for notifications that are not [`METHOD`] or carry no
 /// `authStatus` object.
 #[must_use]
-pub fn notification(notification: &JsonRpcNotification) -> Option<AuthStatus> {
+pub fn notification(notification: &Notification) -> Option<AuthStatus> {
     if notification.method != METHOD.as_str() {
         return None;
     }
@@ -125,7 +125,7 @@ mod tests {
     /// A matching notification decodes the `authStatus` object.
     #[test]
     fn notification_parsing() {
-        let notification = JsonRpcNotification::with_params(
+        let notification = Notification::with_params(
             METHOD.as_str(),
             json!({
                 "authStatus": {
@@ -143,10 +143,9 @@ mod tests {
         assert_eq!(status.extra["vendorField"], 1);
 
         // Other methods and malformed payloads return None.
-        let other = JsonRpcNotification::new("_acme/ping");
+        let other = Notification::new("_acme/ping");
         assert!(super::notification(&other).is_none());
-        let malformed =
-            JsonRpcNotification::with_params(METHOD.as_str(), json!({"authStatus": "oops"}));
+        let malformed = Notification::with_params(METHOD.as_str(), json!({"authStatus": "oops"}));
         assert!(super::notification(&malformed).is_none());
     }
 
