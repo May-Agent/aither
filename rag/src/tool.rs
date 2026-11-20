@@ -9,6 +9,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
 
+use crate::chunking::Chunker;
+use crate::cleaning::Cleaner;
+use crate::persistence::Persistence;
 use crate::rag::Rag;
 use crate::types::Metadata;
 
@@ -45,9 +48,12 @@ pub struct RagToolResponse {
     pub score: f32,
 }
 
-impl<M> Tool for Rag<M>
+impl<M, C, L, P> Tool for Rag<M, C, L, P>
 where
     M: EmbeddingModel + Send + Sync + 'static,
+    C: Chunker + 'static,
+    L: Cleaner + 'static,
+    P: Persistence + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
         "rag_search".into()
@@ -84,7 +90,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "redb-persistence"))]
 mod tests {
     use super::*;
     use crate::types::Document;
@@ -137,12 +143,10 @@ mod tests {
             .build()
             .unwrap();
 
-        // Insert some data
         rag.insert(Document::new("doc1", "Rust programming language"))
             .await
             .unwrap();
 
-        // Use tool interface
         let args = RagToolArgs {
             query: "rust".to_string(),
             top_k: 5,

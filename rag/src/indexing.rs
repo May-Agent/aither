@@ -1,5 +1,6 @@
 //! Directory indexing with progress tracking.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -58,17 +59,37 @@ pub enum IndexStage {
     },
 }
 
-/// Collects all files from a directory tree.
+/// Collects all files from a directory tree while breaking symlink cycles.
 pub(crate) fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let root_meta = fs::metadata(root)?;
+    if !root_meta.is_dir() {
+        return Ok(if root_meta.is_file() {
+            vec![root.to_path_buf()]
+        } else {
+            Vec::new()
+        });
+    }
+
     let mut stack = vec![root.to_path_buf()];
+    let mut visited_dirs = HashSet::new();
     let mut files = Vec::new();
 
     while let Some(path) = stack.pop() {
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
+        let metadata = match fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
         };
 
         if metadata.is_dir() {
+            let canonical = match fs::canonicalize(&path) {
+                Ok(canon) => canon,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            if !visited_dirs.insert(canonical) {
+                continue;
+            }
             let entries = fs::read_dir(&path)?;
             for entry in entries {
                 let entry = entry?;
@@ -107,6 +128,26 @@ mod tests {
         let dir = tempdir().unwrap();
         let files = collect_files(dir.path()).unwrap();
         assert_eq!(files, [] as [std::path::PathBuf; 0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_breaks_directory_symlink_cycles() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("root.txt"), "root").unwrap();
+
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("nested.txt"), "nested").unwrap();
+
+        // Cycle back to parent and self, plus a dangling symlink
+        std::os::unix::fs::symlink(dir.path(), sub.join("loop_parent")).unwrap();
+        std::os::unix::fs::symlink(&sub, sub.join("loop_self")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing_target.txt"), sub.join("dangling"))
+            .unwrap();
+
+        let files = collect_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 2);
     }
 
     #[test]

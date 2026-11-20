@@ -34,20 +34,25 @@ impl ParagraphChunker {
         let mut start = 0usize;
 
         while start < paragraph.len() {
-            let mut end = (start + self.max_chunk_size).min(paragraph.len());
+            let capped = start
+                .saturating_add(self.max_chunk_size)
+                .min(paragraph.len());
+            let mut end = paragraph.floor_char_boundary(capped);
 
-            if end < paragraph.len() {
-                // Prefer a whitespace split inside the window for cleaner boundaries.
-                if let Some(rel) = paragraph[start..end].rfind(char::is_whitespace) {
-                    let candidate = start + rel;
-                    if candidate > start {
-                        end = candidate;
-                    }
+            if end == start {
+                let ch_len = paragraph[start..]
+                    .chars()
+                    .next()
+                    .expect("start < paragraph.len()")
+                    .len_utf8();
+                end = start + ch_len;
+            } else if end < paragraph.len()
+                && let Some(rel) = paragraph[start..end].rfind(char::is_whitespace)
+            {
+                let candidate = start + rel;
+                if candidate > start {
+                    end = candidate;
                 }
-            }
-
-            if end <= start {
-                break;
             }
 
             let piece = paragraph[start..end].trim();
@@ -55,6 +60,12 @@ impl ParagraphChunker {
                 pieces.push(piece);
             }
             start = end;
+            let skip: usize = paragraph[start..]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            start += skip;
         }
 
         pieces
@@ -166,5 +177,18 @@ mod tests {
 
         assert!(chunks.len() >= 2);
         assert!(chunks.iter().all(|c| !c.text.is_empty()));
+    }
+
+    #[test]
+    fn multibyte_cjk_and_emoji_split_without_panicking_or_dropping_text() {
+        // CJK (Chinese, Japanese, Korean) plus 4-byte emoji without whitespace
+        let text = "中文段落测试日本語のテキスト한국어문단테스트🦀🚀✨".repeat(6);
+        for limit in [0, 1, 2, 3, 5, 7, 13, 25] {
+            let chunker = ParagraphChunker::new(limit);
+            let chunks = chunker.chunk(&Document::new("cjk", &text)).unwrap();
+            assert!(!chunks.is_empty(), "limit {limit} produced no chunks");
+            let reassembled: String = chunks.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(reassembled, text, "limit {limit} lost or corrupted text");
+        }
     }
 }

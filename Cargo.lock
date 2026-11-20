@@ -75,8 +75,10 @@ dependencies = [
  "aither-agent",
  "aither-core",
  "aither-mcp",
+ "askama 0.16.1",
  "async-channel",
  "async-process",
+ "base64 0.23.1",
  "blocking",
  "executor-core",
  "futures-lite",
@@ -459,8 +461,9 @@ dependencies = [
  "aither-gemini",
  "aither-openai",
  "anyhow",
- "async-channel",
- "async-global-executor",
+ "askama 0.16.1",
+ "async-lock",
+ "futures-lite",
  "schemars 1.2.3",
  "serde",
  "thiserror 2.0.21",
@@ -534,7 +537,11 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "askama 0.16.1",
- "futures",
+ "async-fs",
+ "async-lock",
+ "blocking",
+ "futures-lite",
+ "futures-util",
  "instant-distance",
  "lancedb",
  "ordered-float 5.5.0",
@@ -1232,20 +1239,6 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8034a681df4aed8b8edbd7fbe472401ecf009251c8b40556b304567052e294c5"
 dependencies = [
- "async-lock",
- "blocking",
- "futures-lite",
-]
-
-[[package]]
-name = "async-global-executor"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13f937e26114b93193065fd44f507aa2e9169ad0cdabbb996920b1fe1ddea7ba"
-dependencies = [
- "async-channel",
- "async-executor",
- "async-io",
  "async-lock",
  "blocking",
  "futures-lite",

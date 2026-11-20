@@ -1,21 +1,25 @@
 //! High-level RAG orchestrator.
 
-use std::fs;
 use std::path::Path;
 
 use aither_core::embedding::EmbeddingModel;
 
-use crate::chunking::{Chunker, CodeChunker, FixedSizeChunker, ParagraphChunker, SentenceChunker};
+#[cfg(feature = "code-chunking")]
+use crate::chunking::CodeChunker;
+use crate::chunking::{Chunker, FixedSizeChunker, ParagraphChunker, SentenceChunker};
 use crate::cleaning::{BasicCleaner, Cleaner};
 use crate::config::{RagConfig, RagConfigBuilder};
 use crate::error::Result;
 use crate::index::VectorIndex;
 use crate::indexing::{IndexProgress, IndexStage};
-use crate::persistence::{Persistence, RedbPersistence};
+use crate::persistence::Persistence;
+#[cfg(feature = "redb-persistence")]
+use crate::persistence::RedbPersistence;
 use crate::store::RagStore;
 use crate::types::{Document, Metadata, SearchResult};
 
 /// High-level RAG orchestrator that provides a simple API for common RAG workflows.
+#[cfg(feature = "redb-persistence")]
 pub struct Rag<
     M: EmbeddingModel,
     C: Chunker = FixedSizeChunker,
@@ -25,6 +29,51 @@ pub struct Rag<
     store: RagStore<M, C, L>,
     persistence: P,
     config: RagConfig,
+}
+
+/// High-level RAG orchestrator that provides a simple API for common RAG workflows.
+#[cfg(not(feature = "redb-persistence"))]
+pub struct Rag<
+    M: EmbeddingModel,
+    C: Chunker = FixedSizeChunker,
+    L: Cleaner = BasicCleaner,
+    P: Persistence = NoPersistence,
+> {
+    store: RagStore<M, C, L>,
+    persistence: P,
+    config: RagConfig,
+}
+
+/// In-memory no-op persistence fallback used only as the type default when
+/// `redb-persistence` is disabled.
+#[cfg(not(feature = "redb-persistence"))]
+#[derive(Debug, Default)]
+pub struct NoPersistence {
+    path: std::path::PathBuf,
+}
+
+#[cfg(not(feature = "redb-persistence"))]
+impl Persistence for NoPersistence {
+    fn save<'a>(
+        &'a self,
+        _entries: &'a [crate::types::IndexEntry],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        std::future::ready(Ok(()))
+    }
+
+    fn load(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<crate::types::IndexEntry>>> + Send + '_ {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    fn extension(&self) -> &'static str {
+        "none"
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl<M: EmbeddingModel, C: Chunker, L: Cleaner, P: Persistence> std::fmt::Debug
@@ -39,6 +88,7 @@ impl<M: EmbeddingModel, C: Chunker, L: Cleaner, P: Persistence> std::fmt::Debug
     }
 }
 
+#[cfg(feature = "redb-persistence")]
 impl<M> Rag<M, FixedSizeChunker, BasicCleaner, RedbPersistence>
 where
     M: EmbeddingModel + Send + Sync + 'static,
@@ -60,6 +110,17 @@ where
         }
     }
 
+    /// Creates a builder for custom configuration.
+    pub fn builder(embedder: M) -> RagBuilder<M> {
+        RagBuilder::new(embedder)
+    }
+}
+
+#[cfg(not(feature = "redb-persistence"))]
+impl<M> Rag<M, FixedSizeChunker, BasicCleaner, NoPersistence>
+where
+    M: EmbeddingModel + Send + Sync + 'static,
+{
     /// Creates a builder for custom configuration.
     pub fn builder(embedder: M) -> RagBuilder<M> {
         RagBuilder::new(embedder)
@@ -122,9 +183,11 @@ where
 
         on_progress(IndexProgress::new(0, 0, None, IndexStage::Scanning));
 
-        let files = collect_files(&dir_path)?;
+        let scan_root = dir_path.clone();
+        let files = blocking::unblock(move || collect_files(&scan_root)).await?;
         let total = files.len();
         let mut indexed = 0usize;
+        let mut batch = Vec::with_capacity(64.min(total));
 
         for (idx, path) in files.into_iter().enumerate() {
             let relative_id = path
@@ -133,7 +196,7 @@ where
                 .to_string_lossy()
                 .to_string();
 
-            let content = match fs::read_to_string(&path) {
+            let content = match async_fs::read_to_string(&path).await {
                 Ok(text) => text,
                 Err(err) => {
                     on_progress(IndexProgress::new(
@@ -152,23 +215,25 @@ where
             metadata.insert("path".into(), path.display().to_string());
 
             let doc = Document::with_metadata(relative_id, content, metadata);
-
             on_progress(IndexProgress::new(
                 idx,
                 total,
                 Some(path.clone()),
-                IndexStage::Embedding,
+                IndexStage::Chunking,
             ));
+            batch.push((idx, path, doc));
 
-            self.store.insert(doc).await?;
-            indexed += 1;
+            if batch.len() >= 64 {
+                indexed += self
+                    .flush_directory_batch(std::mem::take(&mut batch), total, &mut on_progress)
+                    .await?;
+            }
+        }
 
-            on_progress(IndexProgress::new(
-                idx + 1,
-                total,
-                Some(path),
-                IndexStage::Indexing,
-            ));
+        if !batch.is_empty() {
+            indexed += self
+                .flush_directory_batch(batch, total, &mut on_progress)
+                .await?;
         }
 
         if self.config.auto_save {
@@ -181,12 +246,49 @@ where
         Ok(indexed)
     }
 
+    async fn flush_directory_batch<F>(
+        &self,
+        batch: Vec<(usize, std::path::PathBuf, Document)>,
+        total: usize,
+        on_progress: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(IndexProgress),
+    {
+        let last_path = batch.last().map(|(_, p, _)| p.clone());
+        let last_idx = batch.last().map_or(0, |(i, _, _)| *i);
+        let batch_len = batch.len();
+        on_progress(IndexProgress::new(
+            last_idx,
+            total,
+            last_path.clone(),
+            IndexStage::Embedding,
+        ));
+        let docs: Vec<Document> = batch.into_iter().map(|(_, _, d)| d).collect();
+        self.store.insert_batch(docs).await?;
+        on_progress(IndexProgress::new(
+            last_idx + 1,
+            total,
+            last_path,
+            IndexStage::Indexing,
+        ));
+        Ok(batch_len)
+    }
+
     /// Inserts a single document.
     /// # Errors
     ///
     /// Returns an error if the document cannot be embedded or stored.
     pub async fn insert(&self, document: Document) -> Result<usize> {
         self.store.insert(document).await
+    }
+
+    /// Inserts multiple documents in a single batched embedding and index update.
+    /// # Errors
+    ///
+    /// Returns an error if any document cannot be embedded or stored.
+    pub async fn insert_batch(&self, documents: Vec<Document>) -> Result<usize> {
+        self.store.insert_batch(documents).await
     }
 
     /// Deletes a document and all its chunks.
@@ -262,7 +364,9 @@ impl<M> RagBuilder<M, FixedSizeChunker, BasicCleaner>
 where
     M: EmbeddingModel + Send + Sync + 'static,
 {
-    fn new(embedder: M) -> Self {
+    /// Creates a new [`RagBuilder`] with default settings.
+    #[must_use]
+    pub fn new(embedder: M) -> Self {
         Self {
             embedder,
             config_builder: RagConfigBuilder::new(),
@@ -358,6 +462,7 @@ where
     }
 
     /// Uses tree-sitter semantic code chunking.
+    #[cfg(feature = "code-chunking")]
     #[must_use]
     pub fn code_chunking(self, max_chunk_size: usize) -> RagBuilder<M, CodeChunker, L> {
         self.chunker(CodeChunker::new(max_chunk_size))
@@ -367,6 +472,7 @@ where
     ///
     /// # Errors
     /// Returns an error when the configured redb persistence store cannot be created.
+    #[cfg(feature = "redb-persistence")]
     pub fn build(self) -> Result<Rag<M, C, L, RedbPersistence>> {
         let config = self.config_builder.build();
         let persistence = RedbPersistence::new(&config.index_path)?;
@@ -397,10 +503,11 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "redb-persistence"))]
 mod tests {
     use super::*;
     use aither_core::EmbeddingModel;
+    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;

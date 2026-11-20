@@ -25,6 +25,9 @@ use aither_core::LanguageModel;
 use aither_core::llm::tool::CancelSignal;
 use aither_core::llm::{AgentIdentity, ToolResult};
 use aither_mcp::McpConnection;
+use aither_mcp::protocol::McpToolDefinition;
+use askama::Template;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use executor_core::{AnyExecutor, Executor};
 use futures_lite::StreamExt;
 use futures_lite::future::or;
@@ -145,6 +148,10 @@ where
                     ServerError::Rpc(RpcError::internal_error(error.to_string()))
                 }
             })?;
+        let mcp_definitions: Vec<McpToolDefinition> = mcp
+            .iter()
+            .flat_map(|connection| connection.mcp_definitions().as_ref().clone())
+            .collect();
         let setup = SessionSetup {
             cwd: params.cwd.clone(),
             mcp,
@@ -152,7 +159,7 @@ where
         let agent = (self.make_agent)(setup)
             .await
             .map_err(|error| ServerError::host(format!("could not start a session: {error}")))?;
-        Ok(AitherSession::new(params.cwd, agent))
+        Ok(AitherSession::new(params.cwd, agent).with_tool_definitions(&mcp_definitions))
     }
 }
 
@@ -205,6 +212,23 @@ impl<LLM: LanguageModel + 'static> AitherSession<LLM> {
     pub const fn cwd(&self) -> &PathBuf {
         &self.cwd
     }
+
+    /// Attaches ACP display metadata extracted from `definitions`' extension
+    /// keys (`x-acp-kind`, `x-acp-title`, `x-acp-title-field`).
+    #[must_use]
+    pub fn with_tool_definitions<'a>(
+        self,
+        definitions: impl IntoIterator<Item = &'a McpToolDefinition>,
+    ) -> Self {
+        let TurnDrive { agent, mapper } = self.inner.into_inner();
+        Self {
+            cwd: self.cwd,
+            inner: futures_util::lock::Mutex::new(TurnDrive {
+                agent,
+                mapper: mapper.with_definitions(definitions),
+            }),
+        }
+    }
 }
 
 impl<LLM: LanguageModel + 'static> Session for AitherSession<LLM> {
@@ -213,7 +237,13 @@ impl<LLM: LanguageModel + 'static> Session for AitherSession<LLM> {
         pending: PendingPrompt,
         cx: &SessionContext,
     ) -> Result<StopReason, PromptError> {
-        let text = prompt_text(pending.content());
+        let text = match prompt_text(pending.content()) {
+            Ok(text) => text,
+            Err(error) => {
+                pending.reject(error.clone()).await;
+                return Err(PromptError::Failed(error));
+            }
+        };
         let turn = pending
             .accept()
             .await
@@ -255,13 +285,114 @@ impl<LLM: LanguageModel + 'static> Session for AitherSession<LLM> {
     }
 }
 
-/// The concatenated text of a prompt's text blocks.
-fn prompt_text(prompt: &[ContentBlock]) -> String {
-    prompt
-        .iter()
-        .filter_map(ContentBlock::as_text)
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Text resource contents rendered for the model.
+#[derive(Template)]
+#[template(path = "embedded_resource_text.txt", escape = "none")]
+struct EmbeddedResourceTextTemplate<'a> {
+    uri: &'a str,
+    mime_type: Option<&'a str>,
+    text: &'a str,
+}
+
+/// A binary resource reported without its payload.
+#[derive(Template)]
+#[template(path = "embedded_resource_binary.txt", escape = "none")]
+struct EmbeddedResourceBinaryTemplate<'a> {
+    uri: &'a str,
+    mime_type: Option<&'a str>,
+    byte_len: usize,
+}
+
+/// A resource link rendered for the model.
+#[derive(Template)]
+#[template(path = "resource_link.txt", escape = "none")]
+struct ResourceLinkTemplate<'a> {
+    uri: &'a str,
+    name: &'a str,
+    title: Option<&'a str>,
+    description: Option<&'a str>,
+    mime_type: Option<&'a str>,
+    size: Option<u64>,
+}
+
+/// Render an embedded [`ContentBlock::Resource`] for the model.
+fn format_embedded_resource(
+    resource: &crate::domain::EmbeddedResource,
+) -> Result<String, RpcError> {
+    match &resource.resource {
+        crate::domain::ResourceContents::Text(text) => Ok(EmbeddedResourceTextTemplate {
+            uri: &text.uri,
+            mime_type: text.mime_type.as_deref(),
+            text: &text.text,
+        }
+        .render()
+        .expect("embedded text resource template must render")),
+        crate::domain::ResourceContents::Blob(blob) => {
+            let bytes = BASE64.decode(&blob.blob).map_err(|error| {
+                RpcError::invalid_params(format!(
+                    "invalid base64 in embedded resource '{}': {error}",
+                    blob.uri
+                ))
+            })?;
+            Ok(std::str::from_utf8(&bytes).map_or_else(
+                |_| {
+                    EmbeddedResourceBinaryTemplate {
+                        uri: &blob.uri,
+                        mime_type: blob.mime_type.as_deref(),
+                        byte_len: bytes.len(),
+                    }
+                    .render()
+                    .expect("embedded binary resource template must render")
+                },
+                |text| {
+                    EmbeddedResourceTextTemplate {
+                        uri: &blob.uri,
+                        mime_type: blob.mime_type.as_deref(),
+                        text,
+                    }
+                    .render()
+                    .expect("embedded text resource template must render")
+                },
+            ))
+        }
+    }
+}
+
+/// Render a [`ContentBlock::ResourceLink`] for the model.
+fn format_resource_link(link: &crate::domain::ResourceLink) -> String {
+    ResourceLinkTemplate {
+        uri: &link.uri,
+        name: &link.name,
+        title: link.title.as_deref(),
+        description: link.description.as_deref(),
+        mime_type: link.mime_type.as_deref(),
+        size: link.size,
+    }
+    .render()
+    .expect("resource link template must render")
+}
+
+/// Render a prompt's text blocks, embedded resources, and resource links
+/// for the model — the `embeddedContext` capability this host advertises
+/// means the client may send all three.
+///
+/// # Errors
+///
+/// `invalid params` when an embedded blob resource is not valid base64.
+fn prompt_text(prompt: &[ContentBlock]) -> Result<String, RpcError> {
+    let mut rendered = Vec::with_capacity(prompt.len());
+    for block in prompt {
+        match block {
+            ContentBlock::Text(text) => rendered.push(text.text.clone()),
+            ContentBlock::Resource(resource) => {
+                rendered.push(format_embedded_resource(resource)?);
+            }
+            ContentBlock::ResourceLink(link) => rendered.push(format_resource_link(link)),
+            // Image, audio, and extension blocks have no text rendering.
+            _ => {}
+        }
+    }
+    Ok(rendered.join("\n"))
 }
 
 /// An external ACP session run as a subagent.
@@ -644,6 +775,106 @@ fn result_text(content: &[ToolCallContent], raw_output: Option<&Value>) -> Optio
 /// `AgentEvent::ToolCallDelta` carries incremental argument fragments; the
 /// mapper accumulates them per call so each emitted `ToolCallUpdate` reports
 /// the arguments received so far.
+/// Optional display metadata describing how a tool's calls map onto ACP
+/// [`ToolCallUpdate`]s.
+///
+/// Extracted from a tool's raw argument-schema extension keys
+/// (`x-acp-kind`/`x-tool-kind`, `x-acp-title`/`x-tool-title`, and
+/// `x-acp-title-field`/`x-title-field`) or configured directly on
+/// [`SessionUpdateMapper`]. When unset, the mapper falls back to
+/// [`ToolKind::Other`] and `"Running <name>"` — no product-specific tool
+/// names or argument fields are assumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolMetadata {
+    kind: Option<ToolKind>,
+    title: Option<String>,
+    title_field: Option<String>,
+}
+
+impl ToolMetadata {
+    /// Empty metadata (uses generic fallbacks).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            kind: None,
+            title: None,
+            title_field: None,
+        }
+    }
+
+    /// Sets the ACP [`ToolKind`] reported for calls to this tool.
+    #[must_use]
+    pub const fn with_kind(mut self, kind: ToolKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    /// Sets a static human-readable title fallback for calls to this tool.
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        let title = title.into();
+        if !title.is_empty() {
+            self.title = Some(title);
+        }
+        self
+    }
+
+    /// Names the JSON object argument property whose non-empty string
+    /// value titles a call to this tool.
+    #[must_use]
+    pub fn with_title_field(mut self, field: impl Into<String>) -> Self {
+        let field = field.into();
+        if !field.is_empty() {
+            self.title_field = Some(field);
+        }
+        self
+    }
+
+    /// Reads optional ACP display metadata from a tool's raw JSON
+    /// argument schema (`x-acp-kind`/`x-tool-kind`, `x-acp-title`/
+    /// `x-tool-title`, and `x-acp-title-field`/`x-title-field`).
+    #[must_use]
+    pub fn from_schema(schema: &Value) -> Self {
+        let Some(schema) = schema.as_object() else {
+            return Self::new();
+        };
+
+        let kind = schema
+            .get("x-acp-kind")
+            .or_else(|| schema.get("x-tool-kind"))
+            .and_then(|val| serde_json::from_value::<ToolKind>(val.clone()).ok());
+
+        let title = schema
+            .get("x-acp-title")
+            .or_else(|| schema.get("x-tool-title"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        let title_field = schema
+            .get("x-acp-title-field")
+            .or_else(|| schema.get("x-title-field"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        Self {
+            kind,
+            title,
+            title_field,
+        }
+    }
+
+    /// Reads the same keys from an [`McpToolDefinition`]'s raw input
+    /// schema — the form extension keys survive in, since provider-facing
+    /// schemas are cleaned of `x-*` keys.
+    #[must_use]
+    pub fn from_mcp_definition(definition: &McpToolDefinition) -> Self {
+        Self::from_schema(&definition.input_schema)
+    }
+}
+
+/// Converts a stream of [`TimedEvent`]s into ACP [`SessionUpdate`]s.
 #[derive(Debug, Default)]
 pub struct SessionUpdateMapper {
     /// Arguments accumulated per tool call, keyed by the agent and call id.
@@ -651,9 +882,61 @@ pub struct SessionUpdateMapper {
     /// Message ids allocated per response block, keyed by the request and
     /// block ids, so one block's chunks append to one message.
     messages: HashMap<(u64, u32), MessageId>,
+    /// Optional per-tool display metadata keyed by tool name.
+    tool_metadata: HashMap<String, ToolMetadata>,
 }
 
 impl SessionUpdateMapper {
+    /// A mapper pre-populated with display metadata extracted from
+    /// `definitions`.
+    #[must_use]
+    pub fn from_definitions<'a>(
+        definitions: impl IntoIterator<Item = &'a McpToolDefinition>,
+    ) -> Self {
+        Self::default().with_definitions(definitions)
+    }
+
+    /// Registers display metadata extracted from each
+    /// [`McpToolDefinition`] in `definitions`.
+    #[must_use]
+    pub fn with_definitions<'a>(
+        mut self,
+        definitions: impl IntoIterator<Item = &'a McpToolDefinition>,
+    ) -> Self {
+        for def in definitions {
+            let meta = ToolMetadata::from_mcp_definition(def);
+            if meta != ToolMetadata::default() {
+                self.tool_metadata.insert(def.name.clone(), meta);
+            }
+        }
+        self
+    }
+
+    /// Attaches explicit [`ToolMetadata`] for `name`.
+    #[must_use]
+    pub fn with_tool_metadata(mut self, name: impl Into<String>, metadata: ToolMetadata) -> Self {
+        self.register_tool_metadata(name, metadata);
+        self
+    }
+
+    /// Inserts or replaces [`ToolMetadata`] for `name`.
+    pub fn register_tool_metadata(&mut self, name: impl Into<String>, metadata: ToolMetadata) {
+        self.tool_metadata.insert(name.into(), metadata);
+    }
+
+    /// The [`ToolKind`] reported for calls to `name`.
+    fn kind_for(&self, name: &str) -> ToolKind {
+        self.tool_metadata
+            .get(name)
+            .and_then(|meta| meta.kind)
+            .unwrap_or(ToolKind::Other)
+    }
+
+    /// The title reported for a call to `name` with `arguments`.
+    fn title_for(&self, agent: &AgentPath, name: &str, arguments: &str) -> String {
+        format_tool_title(agent, name, arguments, self.tool_metadata.get(name))
+    }
+
     /// Convert a `TimedEvent` to an ACP `SessionUpdate`.
     ///
     /// Returns `None` for events that have no ACP mapping; see the type's
@@ -782,8 +1065,8 @@ impl SessionUpdateMapper {
         let mut update = update(call_id(agent, call.as_str()));
         update.status = Patch::Set(Open::Known(ToolCallStatus::Pending));
         update.name = Patch::Set(name.to_string());
-        update.title = Patch::Set(format_tool_title(agent, name, &title_arguments));
-        update.kind = Patch::Set(Open::Known(infer_tool_kind(name)));
+        update.title = Patch::Set(self.title_for(agent, name, &title_arguments));
+        update.kind = Patch::Set(Open::Known(self.kind_for(name)));
         if let Some(raw_input) = raw_input {
             update.raw_input = Patch::Set(raw_input);
         }
@@ -798,18 +1081,20 @@ impl SessionUpdateMapper {
         name: &str,
         arguments_fragment: &str,
     ) -> SessionUpdate {
-        let arguments = self
-            .tool_arguments
-            .entry((agent.clone(), call.as_str().to_string()))
-            .or_default();
-        arguments.push_str(arguments_fragment);
-        let arguments = arguments.as_str();
+        let arguments = {
+            let entry = self
+                .tool_arguments
+                .entry((agent.clone(), call.as_str().to_string()))
+                .or_default();
+            entry.push_str(arguments_fragment);
+            entry.clone()
+        };
         let mut update = update(call_id(agent, call.as_str()));
         update.status = Patch::Set(Open::Known(ToolCallStatus::Pending));
         update.name = Patch::Set(name.to_string());
-        update.title = Patch::Set(format_tool_title(agent, name, arguments));
-        update.kind = Patch::Set(Open::Known(infer_tool_kind(name)));
-        update.raw_input = Patch::Set(Value::String(arguments.to_string()));
+        update.title = Patch::Set(self.title_for(agent, name, &arguments));
+        update.kind = Patch::Set(Open::Known(self.kind_for(name)));
+        update.raw_input = Patch::Set(Value::String(arguments));
         SessionUpdate::ToolCallUpdate(update)
     }
 
@@ -915,34 +1200,32 @@ fn truncate_title(text: &str) -> String {
     }
 }
 
-/// Format a human-readable title for a tool call.
-///
-/// A call whose arguments carry a non-empty `description` is titled by it:
-/// that is the UI-facing explanation a model writes for what it runs.
-/// Every other call gets the generic title. A child's calls are prefixed
-/// with the child's path.
-fn format_tool_title(agent: &AgentPath, name: &str, arguments: &str) -> String {
-    let title = match serde_json::from_str(arguments) {
-        Ok(Value::Object(arguments)) => arguments
-            .get("description")
-            .and_then(Value::as_str)
-            .filter(|description| !description.is_empty())
-            .map_or_else(|| format!("Running {name}"), truncate_title),
-        _ => format!("Running {name}"),
-    };
+/// Format a human-readable title for a tool call from optional
+/// [`ToolMetadata`], falling back to `"Running <name>"` when no metadata
+/// is configured. A child's calls are prefixed with the child's path.
+fn format_tool_title(
+    agent: &AgentPath,
+    name: &str,
+    arguments: &str,
+    metadata: Option<&ToolMetadata>,
+) -> String {
+    let dynamic_title = metadata
+        .and_then(|meta| meta.title_field.as_deref())
+        .and_then(|field| match serde_json::from_str(arguments) {
+            Ok(Value::Object(map)) => map
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|val| !val.is_empty())
+                .map(truncate_title),
+            _ => None,
+        });
+    let title = dynamic_title
+        .or_else(|| metadata.and_then(|meta| meta.title.clone()))
+        .unwrap_or_else(|| format!("Running {name}"));
     if agent.is_main() {
         title
     } else {
         format!("[{agent}] {title}")
-    }
-}
-
-/// Infer the tool kind from the tool name.
-fn infer_tool_kind(name: &str) -> ToolKind {
-    match name {
-        "terminal" | "terminal_kill" | "terminal_input" => ToolKind::Execute,
-        "terminal_read" => ToolKind::Read,
-        _ => ToolKind::Other,
     }
 }
 

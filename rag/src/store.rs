@@ -1,8 +1,10 @@
 //! Core RAG store implementation.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aither_core::embedding::EmbeddingModel;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 use crate::chunking::{Chunker, FixedSizeChunker};
 use crate::cleaning::{BasicCleaner, Cleaner};
@@ -10,6 +12,29 @@ use crate::config::RagConfig;
 use crate::error::{RagError, Result};
 use crate::index::{HnswIndex, VectorIndex};
 use crate::types::{Chunk, Document, SearchResult};
+
+/// Maximum number of chunk embedding requests kept in flight concurrently
+/// during batch document ingestion, bounding provider/model saturation.
+const MAX_CONCURRENT_EMBEDDINGS: usize = 16;
+
+/// Embeds a batch of texts concurrently in input order using bounded concurrency.
+///
+/// # Errors
+///
+/// Returns the first embedding error encountered.
+pub async fn embed_batch<M: EmbeddingModel>(
+    embedder: &M,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>> {
+    // `embed` ties its returned future to the shared lifetime of `&self` and
+    // `&str`, so texts are owned — an `&str` parameter would leak its region
+    // into this future's opaque type and break higher-ranked callers.
+    stream::iter(texts)
+        .map(|text| async move { embedder.embed(&text).await.map_err(RagError::Embedding) })
+        .buffered(MAX_CONCURRENT_EMBEDDINGS)
+        .try_collect()
+        .await
+}
 
 /// The core RAG store that manages documents, cleaning, chunking, and indexing.
 ///
@@ -110,9 +135,11 @@ where
         }
     }
 
-    /// Inserts a document into the store.
+    /// Inserts a document into the store, replacing any prior chunks stored for
+    /// the same document ID.
     ///
-    /// The document is cleaned, chunked, deduplicated (if enabled), embedded, and indexed.
+    /// The document is cleaned, chunked, deduplicated (if enabled), embedded as
+    /// a batch, and indexed in a single state update.
     ///
     /// # Returns
     /// The number of chunks actually inserted (may be less than total chunks
@@ -121,29 +148,11 @@ where
     ///
     /// Returns an error if the document cannot be embedded or stored.
     pub async fn insert(&self, document: Document) -> Result<usize> {
-        let cleaned = self.cleaner.clean(&document);
-        let chunks = self.chunker.chunk(&cleaned)?;
-        let mut inserted = 0;
-
-        for chunk in chunks {
-            if self.config.deduplication && self.index.contains_hash(chunk.content_hash) {
-                continue;
-            }
-
-            let embedding = self
-                .embedder
-                .embed(&chunk.text)
-                .await
-                .map_err(RagError::Embedding)?;
-
-            self.index.insert(chunk, embedding)?;
-            inserted += 1;
-        }
-
-        Ok(inserted)
+        self.insert_batch(vec![document]).await
     }
 
-    /// Inserts multiple documents into the store.
+    /// Inserts multiple documents into the store, clearing prior chunks of any
+    /// re-inserted document IDs and batching chunk embeddings and index updates.
     ///
     /// # Returns
     /// The total number of chunks inserted across all documents.
@@ -151,11 +160,39 @@ where
     ///
     /// Returns an error if any document cannot be embedded or stored.
     pub async fn insert_batch(&self, documents: Vec<Document>) -> Result<usize> {
-        let mut total_inserted = 0;
-        for doc in documents {
-            total_inserted += self.insert(doc).await?;
+        if documents.is_empty() {
+            return Ok(0);
         }
-        Ok(total_inserted)
+
+        let replaced_sources: HashSet<String> = documents.iter().map(|d| d.id.clone()).collect();
+        let mut seen_batch_hashes = HashSet::new();
+        let mut to_embed = Vec::new();
+
+        for document in &documents {
+            let cleaned = self.cleaner.clean(document);
+            let chunks = self.chunker.chunk(&cleaned)?;
+            for chunk in chunks {
+                if self.config.deduplication
+                    && (!seen_batch_hashes.insert(chunk.content_hash)
+                        || self
+                            .index
+                            .contains_hash_outside_sources(chunk.content_hash, &replaced_sources))
+                {
+                    continue;
+                }
+                to_embed.push(chunk);
+            }
+        }
+
+        let texts: Vec<String> = to_embed.iter().map(|c| c.text.clone()).collect();
+        let embeddings = embed_batch(&self.embedder, texts).await?;
+        let inserted = to_embed.len();
+
+        let entries: Vec<(Chunk, Vec<f32>)> = to_embed.into_iter().zip(embeddings).collect();
+        self.index
+            .replace_sources_and_insert(&replaced_sources, &entries)?;
+
+        Ok(inserted)
     }
 
     /// Inserts a pre-chunked chunk with a precomputed embedding.
@@ -173,8 +210,6 @@ where
     /// # Returns
     /// `true` if any chunks were removed.
     pub fn delete(&self, doc_id: &str) -> bool {
-        // An entry stored under the document's own id, then every chunk the
-        // index holds for it as its source, which dedup may have thinned.
         let removed = self.index.remove(doc_id);
         self.index.remove_source(doc_id) > 0 || removed
     }
@@ -201,7 +236,8 @@ where
             .map_err(RagError::Embedding)?;
 
         self.index
-            .search(&embedding, top_k, self.config.similarity_threshold)
+            .search_async(&embedding, top_k, self.config.similarity_threshold)
+            .await
     }
 
     /// Returns the number of indexed chunks.
@@ -358,6 +394,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reinserting_shorter_document_removes_trailing_chunks_even_with_dedup() {
+        let config = RagConfig::builder().deduplication(true).build();
+        let store = RagStore::with_config(MockEmbedder::new(4), config).with_chunker(BarChunker);
+
+        assert_eq!(
+            store
+                .insert(Document::new("doc1", "alpha|beta|gamma|delta"))
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(store.len(), 4);
+
+        // Re-insert shorter version keeping `alpha` and replacing `beta..delta` with `omega`.
+        assert_eq!(
+            store
+                .insert(Document::new("doc1", "alpha|omega"))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.len(), 2);
+
+        let mut texts: Vec<String> = store
+            .index()
+            .entries()
+            .into_iter()
+            .map(|e| e.chunk.text)
+            .collect();
+        texts.sort();
+        assert_eq!(texts, ["alpha", "omega"]);
+    }
+
+    #[tokio::test]
     async fn deleting_a_document_removes_chunks_after_one_dedup_skipped() {
         let config = RagConfig::builder().deduplication(true).build();
         let store = RagStore::with_config(MockEmbedder::new(4), config).with_chunker(BarChunker);
@@ -366,8 +436,6 @@ mod tests {
             .insert(Document::new("a", "shared|first"))
             .await
             .unwrap();
-        // The first chunk of "b" duplicates one of "a", so only its second
-        // chunk is stored, under `b#chunk_1`.
         assert_eq!(
             store
                 .insert(Document::new("b", "shared|second"))

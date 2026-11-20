@@ -12,8 +12,8 @@ use tracing::{debug, warn};
 
 use super::handler::{McpHandler, ServerNotification};
 use crate::protocol::{
-    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    ListToolsResult, McpError, McpToolDefinition, RequestId,
+    CancelledParams, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, ListToolsResult, McpError, McpToolDefinition, RequestId,
 };
 use crate::transport::BidirectionalTransport;
 
@@ -30,6 +30,12 @@ pub(super) enum Command {
         notification: JsonRpcNotification,
         reply: Sender<Result<(), McpError>>,
     },
+    /// Withdraw a pending request when its caller drops or cancels it.
+    Cancel {
+        id: RequestId,
+        notify: bool,
+        reason: Option<String>,
+    },
 }
 
 impl Command {
@@ -41,15 +47,20 @@ impl Command {
             Self::Notification { reply, .. } => {
                 let _ = reply.try_send(Err(ending.error()));
             }
+            Self::Cancel { .. } => {}
         }
     }
+}
+
+const fn is_fatal_transport_error(error: &McpError) -> bool {
+    matches!(error, McpError::ConnectionClosed | McpError::Io(_))
 }
 
 /// Why the loop stopped.
 enum Ending {
     /// The peer hung up, or the client closed the connection.
     Closed(Option<String>),
-    /// Reading or writing the transport failed.
+    /// Reading or writing the transport failed fatally.
     Failed(String),
 }
 
@@ -111,8 +122,6 @@ async fn list_tools(
 ) -> Result<Vec<McpToolDefinition>, McpError> {
     let (reply, response) = async_channel::bounded(1);
     let request = JsonRpcRequest::new(next_id.fetch_add(1, Ordering::SeqCst), "tools/list");
-    // Hold the strong sender only while queuing, so an awaiting refresh never
-    // keeps a dropped client's connection open.
     commands
         .upgrade()
         .ok_or(McpError::ConnectionClosed)?
@@ -129,17 +138,6 @@ async fn list_tools(
 }
 
 /// Run the connection until the transport ends or the client closes it.
-///
-/// Routes each response to the request awaiting it, answers `ping`, answers
-/// every other server request with method-not-found (the client advertises no
-/// capability that would let a server send one), and hands notifications to
-/// `handler`. On `notifications/tools/list_changed` it also re-lists the tools
-/// and replaces `cache.tools` with the complete new list; a change arriving
-/// while a listing is in flight schedules one more listing after it, so the
-/// cache always ends at the server's latest list. On exit the transport is
-/// closed and every request still pending, queued or sent later fails with an
-/// error naming why. `alive` is dropped last, which is how the client learns
-/// the loop has finished.
 pub(super) async fn run<T, H>(
     mut transport: T,
     commands: Receiver<Command>,
@@ -157,11 +155,8 @@ pub(super) async fn run<T, H>(
     let mut listing_again = false;
 
     let ending = loop {
-        // Handlers are polled first so they keep progressing while the
-        // server's traffic is a steady stream.
         let event = or(
             async {
-                // An empty set resolves to `None` at once; park instead.
                 match handling.next().await {
                     Some(done) => Event::Handled(done),
                     None => std::future::pending().await,
@@ -174,20 +169,8 @@ pub(super) async fn run<T, H>(
         .await;
 
         match event {
-            Event::Command(Ok(Command::Request { request, reply })) => {
-                pending.insert(request.id.clone(), reply);
-                if let Err(error) = transport.send_request(request).await {
-                    break Ending::Failed(error.to_string());
-                }
-            }
-            Event::Command(Ok(Command::Notification {
-                notification,
-                reply,
-            })) => {
-                let sent = transport.notify(notification).await;
-                let failed = sent.as_ref().err().map(ToString::to_string);
-                let _ = reply.try_send(sent);
-                if let Some(message) = failed {
+            Event::Command(Ok(command)) => {
+                if let Err(message) = handle_command(&mut transport, &mut pending, command).await {
                     break Ending::Failed(message);
                 }
             }
@@ -202,7 +185,10 @@ pub(super) async fn run<T, H>(
             }
             Event::Incoming(Ok(Some(JsonRpcMessage::Request(request)))) => {
                 if let Err(error) = transport.respond(answer(request)).await {
-                    break Ending::Failed(error.to_string());
+                    if is_fatal_transport_error(&error) {
+                        break Ending::Failed(error.to_string());
+                    }
+                    warn!(%error, "failed to send server request response");
                 }
             }
             Event::Incoming(Ok(Some(JsonRpcMessage::Notification(notification)))) => {
@@ -257,7 +243,60 @@ pub(super) async fn run<T, H>(
     drop(alive);
 }
 
-/// The response to a request the server sent.
+async fn handle_command<T: BidirectionalTransport>(
+    transport: &mut T,
+    pending: &mut HashMap<RequestId, Sender<Result<JsonRpcResponse, McpError>>>,
+    command: Command,
+) -> std::result::Result<(), String> {
+    match command {
+        Command::Request { request, reply } => {
+            let id = request.id.clone();
+            pending.insert(id.clone(), reply);
+            if let Err(error) = transport.send_request(request).await {
+                if is_fatal_transport_error(&error) {
+                    return Err(error.to_string());
+                }
+                if let Some(reply) = pending.remove(&id) {
+                    let _ = reply.try_send(Err(error));
+                }
+            }
+        }
+        Command::Notification {
+            notification,
+            reply,
+        } => {
+            let sent = transport.notify(notification).await;
+            let fatal = sent
+                .as_ref()
+                .err()
+                .filter(|err| is_fatal_transport_error(err))
+                .map(ToString::to_string);
+            let _ = reply.try_send(sent);
+            if let Some(message) = fatal {
+                return Err(message);
+            }
+        }
+        Command::Cancel { id, notify, reason } => {
+            if pending.remove(&id).is_some() && notify {
+                let notification = JsonRpcNotification::with_params(
+                    "notifications/cancelled",
+                    CancelledParams {
+                        request_id: id,
+                        reason,
+                    },
+                );
+                if let Err(error) = transport.notify(notification).await {
+                    if is_fatal_transport_error(&error) {
+                        return Err(error.to_string());
+                    }
+                    warn!(%error, "failed to send notifications/cancelled");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn answer(request: JsonRpcRequest) -> JsonRpcResponse {
     if request.method == "ping" {
         JsonRpcResponse::success(request.id, serde_json::json!({}))

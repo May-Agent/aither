@@ -19,7 +19,10 @@ fn assert_well_formed(chunker: &FixedSizeChunker, text: &str, size: usize) {
             text.contains(&chunk.text),
             "chunk is not a slice of the text"
         );
-        assert!(chunk.text.chars().count() <= size, "chunk exceeds the size");
+        assert!(
+            chunk.text.char_indices().nth(size).is_none(),
+            "chunk exceeds the size"
+        );
 
         let start: usize = chunk.metadata["chunk_start"].parse().unwrap_or(0);
         let end: usize = chunk.metadata["chunk_end"].parse().unwrap_or(text.len());
