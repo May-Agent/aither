@@ -8481,6 +8481,65 @@ mod tests {
         (task_id, child)
     }
 
+    /// A service's args for a test, on `terminal_args`' script shape.
+    fn service_args(description: &str, script: &str) -> ServiceArgs {
+        ServiceArgs {
+            description: description.to_string(),
+            script: script.to_string(),
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
+            location: None,
+            resolution: MediaResolution::Auto,
+            max_lines: Some(50),
+            raw: false,
+        }
+    }
+
+    /// A service carries no bound: it outlives a cap that would kill a
+    /// bounded job, and `terminal_kill` still stops it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_service_runs_unbounded_until_it_is_killed() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let job = tool
+            .run_service(service_args("a service", "sleep 60"))
+            .await
+            .expect("the service starts");
+        let task_id = job.task_id().to_owned();
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the service is registered");
+        assert!(info.timeout.is_none(), "a service is unbounded: {info:?}");
+
+        // Past the timeout cap a bounded job would already be dead.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the service stays in the registry");
+        assert!(
+            matches!(info.status, JobStatus::Running),
+            "the service outlives the timeout cap: {:?}",
+            info.status
+        );
+
+        assert!(
+            tool.job_registry().kill_by_task_id(&task_id).await,
+            "a service is killable like any job"
+        );
+    }
+
     #[cfg(unix)]
     async fn background_job_stays_running_until_its_descendant_exits(descendant: Descendant) {
         let dir = tempfile::tempdir().expect("temp dir should be created");
