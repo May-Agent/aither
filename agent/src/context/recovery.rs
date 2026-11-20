@@ -96,6 +96,47 @@ pub async fn clean_for_recovery(
     })
 }
 
+/// Spills non-kept tool outputs at or above `since_seq` exceeding
+/// `limits.threshold` into `spill_dir`, returning `(seq, replacement)` pairs
+/// without mutating `context` so callers can commit atomically after awaits.
+pub async fn prepare_post_fork_spills(
+    context: &Context,
+    since_seq: u64,
+    spill_dir: Option<&Path>,
+    first_root: Option<&Path>,
+    limits: SpillLimits,
+) -> std::io::Result<Vec<(u64, String)>> {
+    let Some(dir) = spill_dir else {
+        return Ok(Vec::new());
+    };
+    let outputs = context.long_tool_outputs_since(since_seq, limits.threshold);
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    async_fs::create_dir_all(dir).await?;
+    let mut replacements = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let name = format!(
+            "compaction-{}-{}.txt",
+            output.seq,
+            file_stem(&output.tool_call_id)
+        );
+        let absolute = dir.join(&name);
+        async_fs::write(&absolute, output.content.as_bytes()).await?;
+        let relative = display_spill_path(&absolute, dir, first_root, &name);
+        let replacement = SpilledToolOutput {
+            head: &truncate_on_char_boundary(&output.content, limits.head),
+            bytes: output.content.len(),
+            path: &relative,
+            absolute_path: &absolute.to_string_lossy(),
+        }
+        .render()
+        .expect("spilled tool output template must render");
+        replacements.push((output.seq, replacement));
+    }
+    Ok(replacements)
+}
+
 fn display_spill_path(
     absolute: &Path,
     spill_dir: &Path,

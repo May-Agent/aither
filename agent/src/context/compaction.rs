@@ -207,11 +207,16 @@ pub struct SkillCatalogEntry {
 
 /// A catalog attachment's place in the window.
 ///
+/// Synthetic sequence number identifying attachments already carried on the
+/// active [`Handoff`] when building a subsequent compaction's catalog.
+pub const HANDOFF_ATTACHMENT_SEQ: u64 = u64::MAX;
+
 /// The sequence number identifies the user message carrying it; the index
 /// its position in that message's attachments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AttachmentRef {
-    /// Sequence number of the user message carrying the attachment.
+    /// Sequence number of the user message carrying the attachment, or
+    /// [`HANDOFF_ATTACHMENT_SEQ`] when carried on the active [`Handoff`].
     pub seq: u64,
     /// Index of the attachment within that message.
     pub index: usize,
@@ -345,16 +350,57 @@ pub enum CompactionError {
 /// Joins an index entry's path to its description.
 const INDEX_SEPARATOR: &str = " — ";
 
-/// The handoff a [`Context`](crate::context::Context) carries between
-/// compactions: the text the conversation reads in place of what it
-/// replaced, and the file index the next compaction extends.
+/// The handoff a [`Context`](crate::context::Context) carries between compactions.
+///
+/// Holds the text the conversation reads in place of what it replaced, folded
+/// user messages and in-flight post-fork activity, and the file index the next
+/// compaction extends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
-    /// The rendered handoff, as the conversation reads it.
+    /// The rendered handoff summary, as produced by the compaction schema.
     text: String,
     /// The mechanical index of on-disk materials, carried into the next
     /// compaction so a file indexed once stays indexed.
     file_index: Vec<String>,
+    /// Verbatim user messages from before the fork, kept in chronological
+    /// order inside `<handoff>` up to `user_message_budget`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    user_messages: Vec<String>,
+    /// User messages that arrived at or after the fork during compaction,
+    /// rendered in-place in `post_fork` on this handoff and carried into the
+    /// next compaction's `user_messages` pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    post_fork_user_messages: Vec<String>,
+    /// Chronological transcript of conversation activity (`>= fork_point`)
+    /// that ran while this handoff was being generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_fork: Option<String>,
+    /// Whether this handoff was committed by [`Context::apply_handoff`](crate::context::Context::apply_handoff),
+    /// in which case it emits a post-compaction resume notice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    applied: bool,
+    /// Rendered `<restored_context>` body to accompany the resume notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restored_context: Option<String>,
+    /// Attachments retained across compaction (named pre-fork attachments
+    /// plus attachments on folded post-fork messages).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<aither_core::llm::Attachment>,
+}
+
+#[derive(Template)]
+#[template(path = "handoff_folded.md", escape = "none")]
+struct HandoffFoldedTemplate<'a> {
+    summary: &'a str,
+    user_messages: &'a [String],
+    post_fork: Option<&'a str>,
+}
+
+#[derive(Template)]
+#[template(path = "compaction_resume.md", escape = "none")]
+struct CompactionResumeTemplate<'a> {
+    had_post_fork: bool,
+    restored_context: Option<&'a str>,
 }
 
 impl Handoff {
@@ -364,25 +410,129 @@ impl Handoff {
         Self {
             text: text.into(),
             file_index: Vec::new(),
+            user_messages: Vec::new(),
+            post_fork_user_messages: Vec::new(),
+            post_fork: None,
+            applied: false,
+            restored_context: None,
+            attachments: Vec::new(),
         }
     }
 
     /// A handoff of `text` that carries `file_index`.
     #[must_use]
     pub const fn with_file_index(text: String, file_index: Vec<String>) -> Self {
-        Self { text, file_index }
+        Self {
+            text,
+            file_index,
+            user_messages: Vec::new(),
+            post_fork_user_messages: Vec::new(),
+            post_fork: None,
+            applied: false,
+            restored_context: None,
+            attachments: Vec::new(),
+        }
     }
 
-    /// The handoff text, as the conversation reads it.
+    /// The handoff summary text, before folded user messages and post-fork
+    /// activity are appended.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The full body rendered inside `<handoff>`, including folded verbatim
+    /// user messages and post-fork activity when present.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bundled folded handoff template cannot be rendered.
+    #[must_use]
+    pub fn body(&self) -> String {
+        if self.user_messages.is_empty() && self.post_fork.is_none() {
+            return self.text.clone();
+        }
+        HandoffFoldedTemplate {
+            summary: &self.text,
+            user_messages: &self.user_messages,
+            post_fork: self.post_fork.as_deref(),
+        }
+        .render()
+        .expect("handoff folded template must render")
+    }
+
+    /// Renders the post-compaction resume notice (and `<restored_context>`,
+    /// when present) for an applied handoff.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bundled compaction resume template cannot be rendered.
+    #[must_use]
+    pub fn render_resume(&self) -> Option<String> {
+        if !self.applied && self.restored_context.is_none() {
+            return None;
+        }
+        Some(
+            CompactionResumeTemplate {
+                had_post_fork: self.post_fork.is_some(),
+                restored_context: self.restored_context.as_deref(),
+            }
+            .render()
+            .expect("compaction resume template must render"),
+        )
     }
 
     /// The file index entries this handoff carries.
     #[must_use]
     pub fn file_index(&self) -> &[String] {
         &self.file_index
+    }
+
+    /// Verbatim user messages folded into this handoff from before the fork.
+    #[must_use]
+    pub fn user_messages(&self) -> &[String] {
+        &self.user_messages
+    }
+
+    /// Chronological transcript of post-fork activity folded into this handoff.
+    #[must_use]
+    pub fn post_fork(&self) -> Option<&str> {
+        self.post_fork.as_deref()
+    }
+
+    /// Attachments retained across the compaction on the opening user turn.
+    #[must_use]
+    pub fn attachments(&self) -> &[aither_core::llm::Attachment] {
+        &self.attachments
+    }
+
+    pub(crate) fn set_file_index(&mut self, file_index: Vec<String>) {
+        self.file_index = file_index;
+    }
+
+    pub(crate) fn set_restored_context(&mut self, restored_context: Option<String>) {
+        self.restored_context = restored_context;
+    }
+
+    pub(crate) fn carried_user_messages(&self) -> impl Iterator<Item = &str> {
+        self.user_messages
+            .iter()
+            .chain(self.post_fork_user_messages.iter())
+            .map(String::as_str)
+    }
+
+    pub(crate) fn apply_folded(
+        &mut self,
+        user_messages: Vec<String>,
+        post_fork_user_messages: Vec<String>,
+        post_fork: Option<String>,
+        attachments: Vec<aither_core::llm::Attachment>,
+    ) {
+        self.applied = true;
+        self.user_messages = user_messages;
+        self.post_fork_user_messages = post_fork_user_messages;
+        self.post_fork = post_fork;
+        self.attachments = attachments;
     }
 }
 

@@ -1183,11 +1183,16 @@ impl LanguageModel for YieldingClaudeScripted {
 }
 
 #[tokio::test]
-async fn generic_async_compaction_strips_claude_bound_thinking_from_post_fork_turns_and_rotates_epoch()
- {
+async fn generic_async_compaction_folds_post_fork_turns_into_handoff_and_rotates_epoch() {
     use aither_core::llm::ReasoningState;
 
-    let handoff_json = r#"{"current_task":"post-fork","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["finish"],"recovery_hints":[],"skills":[]}"#;
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let spill_dir = workdir.path().join("outputs");
+    async_fs::write(workdir.path().join("spec.md"), "spec-invariant-42")
+        .await
+        .expect("write spec");
+
+    let handoff_json = r#"{"current_task":"post-fork","key_decisions":[],"context_files":[{"path":"spec.md","why":"core spec"}],"errors_fixes":[],"pending_work":["finish"],"recovery_hints":[],"skills":[]}"#;
     let claude_thinking = ReasoningState::new(
         "claude",
         serde_json::json!({
@@ -1197,8 +1202,6 @@ async fn generic_async_compaction_strips_claude_bound_thinking_from_post_fork_tu
         })
         .to_string(),
     );
-    let openai_reasoning = ReasoningState::new("openai", "enc-item-1");
-    let gemini_reasoning = ReasoningState::new("gemini", "thought-sig-1");
 
     let compactor = ClaudeScripted::new(128_000, [say(handoff_json), say(handoff_json)]);
     let main_llm = YieldingClaudeScripted {
@@ -1207,10 +1210,8 @@ async fn generic_async_compaction_strips_claude_bound_thinking_from_post_fork_tu
             [
                 vec![
                     Event::ReasoningState(claude_thinking),
-                    Event::ReasoningState(openai_reasoning.clone()),
-                    Event::ReasoningState(gemini_reasoning.clone()),
                     Event::Text("post-fork tool step".to_string()),
-                    Event::ToolCall(ToolCall::new("c_post", "probe", serde_json::json!({}))),
+                    Event::ToolCall(ToolCall::new("c_post", "big_tool", serde_json::json!({}))),
                 ],
                 say("finished"),
             ],
@@ -1222,7 +1223,9 @@ async fn generic_async_compaction_strips_claude_bound_thinking_from_post_fork_tu
         // High `start_distance` forks `WindowFilling` compaction on Turn 1 without hitting `should_pause`.
         start_distance: 9_900,
         warn_distance: 9_950,
-        user_message_budget: 0,
+        spill_threshold: 50,
+        spill_head: 10,
+        user_message_budget: 2_000,
         ..crate::ContextPolicy::default()
     };
     let mut agent = AgentBuilder::new(main_llm.clone())
@@ -1230,9 +1233,14 @@ async fn generic_async_compaction_strips_claude_bound_thinking_from_post_fork_tu
             context_policy: policy,
             ..crate::AgentConfig::default()
         })
+        .restore_roots([workdir.path().to_path_buf()])
+        .spill_dir(spill_dir.clone())
         .prompt_cache(crate::PromptCache::new("sess-196"))
         .compaction_model(compactor, aither_core::llm::model::Parameters::default())
-        .tool(Probe::default())
+        .tool(NamedTool {
+            name: "big_tool",
+            reply: "post-fork-result-line\n".repeat(40),
+        })
         .build();
 
     let (result, events) = run_to_end(&mut agent, &"seed ".repeat(300)).await;
@@ -1273,35 +1281,52 @@ async fn generic_async_compaction_strips_claude_bound_thinking_from_post_fork_tu
         "PromptCache epoch must advance when compaction rewrites the prefix"
     );
 
-    assert_post_fork_assistant_stripped(
-        requests[1].messages(),
-        &[openai_reasoning, gemini_reasoning],
-    );
+    assert_folded_async_handoff_request(requests[1].messages());
 }
 
-fn assert_post_fork_assistant_stripped(
-    messages: &[aither_core::llm::Message],
-    expected_non_claude: &[aither_core::llm::ReasoningState],
-) {
-    let post_fork_assistant = messages
-        .iter()
-        .find(|msg| msg.role() == aither_core::llm::Role::Assistant)
-        .expect("post-fork assistant turn kept across async compaction");
-    assert_eq!(post_fork_assistant.content(), "post-fork tool step");
-    assert_eq!(post_fork_assistant.tool_calls().len(), 1);
-    assert_eq!(post_fork_assistant.tool_calls()[0].id, "c_post");
+fn assert_folded_async_handoff_request(post_messages: &[aither_core::llm::Message]) {
+    assert_valid_claude_system_turns(post_messages);
     assert!(
-        post_fork_assistant
-            .reasoning()
+        post_messages
             .iter()
-            .all(|state| state.provider() != "claude"),
-        "Claude prefix-bound thinking must be stripped from post-fork turns"
+            .all(|msg| msg.role() != aither_core::llm::Role::Assistant
+                && msg.role() != aither_core::llm::Role::Tool),
+        "post-fork assistant/tool chain must be folded into <handoff> rather than left trailing: {post_messages:?}"
     );
-    assert_eq!(post_fork_assistant.reasoning(), expected_non_claude);
+    let handoff_msg = post_messages
+        .iter()
+        .find(|msg| {
+            msg.role() == aither_core::llm::Role::System && msg.content().contains("<handoff>")
+        })
+        .expect("system handoff message");
+    assert!(handoff_msg.content().contains("## User Messages"));
     assert!(
-        messages
-            .iter()
-            .any(|msg| msg.tool_call_id() == Some("c_post"))
+        handoff_msg
+            .content()
+            .contains("## Activity During Compaction")
+    );
+    assert!(handoff_msg.content().contains("post-fork tool step"));
+    assert!(handoff_msg.content().contains("big_tool"));
+    assert!(handoff_msg.content().contains("c_post"));
+    assert!(
+        handoff_msg.content().contains("outputs/compaction-"),
+        "oversized post-fork tool output must spill to outputs/: {}",
+        handoff_msg.content()
+    );
+
+    let resume_user = post_messages
+        .iter()
+        .find(|msg| msg.role() == aither_core::llm::Role::User)
+        .expect("opening user resume turn");
+    assert!(
+        resume_user
+            .content()
+            .contains("while compaction was in flight")
+    );
+    assert!(
+        resume_user.content().contains("spec-invariant-42"),
+        "restored context file must be inlined in the post-compaction resume turn: {}",
+        resume_user.content()
     );
 }
 
