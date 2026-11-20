@@ -42,6 +42,10 @@ required-features = ["agent", "process"]
 name = "session_mcp"
 required-features = ["agent"]
 
+[[example]]
+name = "devin_smoke"
+required-features = ["process"]
+
 [dev-dependencies]
 executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
