@@ -57,7 +57,7 @@
 {% if !handoff.attachments.is_empty() %}
 
 ## Attachments
-These stay in the user messages they came with.
+Retained across compaction on the opening user message:
 {% for item in handoff.attachments %}
 - {{ item.why }}
 {% endfor %}

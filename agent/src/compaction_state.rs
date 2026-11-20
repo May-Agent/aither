@@ -18,7 +18,7 @@ pub enum CompactionState {
     /// A compaction forked alongside the run is still in flight.
     Running(PendingCompaction),
     /// A compaction finished and waits for the next request boundary.
-    Landed(CompletedCompaction),
+    Landed(Box<CompletedCompaction>),
 }
 
 impl CompactionState {
@@ -58,11 +58,11 @@ impl CompactionState {
 
     /// Records that a compaction finished.
     pub fn land(&mut self, completed: CompletedCompaction) {
-        *self = Self::Landed(completed);
+        *self = Self::Landed(Box::new(completed));
     }
 
     /// The finished compaction, if one waits, left in place.
-    pub const fn landed(&self) -> Option<&CompletedCompaction> {
+    pub fn landed(&self) -> Option<&CompletedCompaction> {
         match self {
             Self::Landed(completed) => Some(completed),
             _ => None,
@@ -72,7 +72,7 @@ impl CompactionState {
     /// Takes the finished compaction, if one waits.
     pub fn take_landed(&mut self) -> Option<CompletedCompaction> {
         match std::mem::take(self) {
-            Self::Landed(completed) => Some(completed),
+            Self::Landed(completed) => Some(*completed),
             other => {
                 *self = other;
                 None

@@ -22,8 +22,8 @@ use crate::{
         AnyContextSource, AnyFileReferences, AnyLiveSource, AttachmentRef, Block, CacheLifetime,
         CompactionFork, CompletedCompaction, Context, ContextBlock, ContextBudget, HandoffDocument,
         Moment, PendingCompaction, Placement, PrefixChain, PrefixRewrites, PromptCache,
-        PromptPrefix, SourceId,
-        recovery::{SpillLimits, clean_for_recovery},
+        PromptPrefix, SourceId, build_file_index,
+        recovery::{SpillLimits, clean_for_recovery, prepare_post_fork_spills},
         restore_context,
     },
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
@@ -1905,6 +1905,16 @@ where
         self.prompt_cache.set_ttl(ttl);
     }
 
+    /// Updates the readable roots that post-compaction restoration may inline
+    /// files from, taking effect on the next compaction apply.
+    pub fn set_restore_roots<I, P>(&mut self, roots: I)
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.restore_roots = roots.into_iter().map(Into::into).collect();
+    }
+
     /// Performs a one-shot query and returns the final response.
     ///
     /// This is the simplest way to use the agent. The agent handles tool
@@ -2547,12 +2557,47 @@ where
         // a caller that drops this future during the read leaves it pending
         // for the next boundary, with nothing half applied.
         let completed = self.compaction.landed()?;
-        let handoff = completed.handoff.clone();
+        let fork_point = completed.fork_point;
+        let mut handoff = completed.handoff.clone();
         let restoration = completed.restoration.clone();
         let attachment_catalog = completed.attachment_catalog.clone();
-        let tokens = self
-            .budget
-            .fraction_tokens(self.config.context_policy.restore_budget);
+
+        let policy = self.config.context_policy;
+        let spill_limits = SpillLimits {
+            threshold: self.budget.chars_for_tokens(policy.spill_threshold),
+            head: self.budget.chars_for_tokens(policy.spill_head),
+        };
+        let spilled_post_fork = match prepare_post_fork_spills(
+            &self.context,
+            fork_point,
+            self.spill_dir.as_deref(),
+            self.restore_roots.first().map(PathBuf::as_path),
+            spill_limits,
+        )
+        .await
+        {
+            Ok(replacements) => replacements,
+            Err(error) => {
+                tracing::warn!(%error, "could not spill post-fork tool output during compaction apply");
+                Vec::new()
+            }
+        };
+
+        // Extend the mechanical file index across any post-fork activity (with
+        // spilled replacements visible) before running restoration.
+        let post_fork_messages = self
+            .context
+            .items_since_with_replacements(fork_point, &spilled_post_fork);
+        if !post_fork_messages.is_empty() {
+            let extended = build_file_index(
+                handoff.file_index(),
+                &post_fork_messages,
+                self.file_references.as_ref(),
+            );
+            handoff.set_file_index(extended);
+        }
+
+        let tokens = self.budget.fraction_tokens(policy.restore_budget);
         let budget_chars = self.budget.chars_for_tokens(tokens);
         #[cfg(feature = "skills")]
         let skills = self.skill_catalog();
@@ -2571,14 +2616,15 @@ where
         // From here there is no await: the handoff, the cleanup and the
         // restored block commit together.
         let CompletedCompaction { fork_point, .. } = self.compaction.take_landed()?;
-        let messages_compacted = self.context.len_below(fork_point);
-        let summary = handoff.text().to_string();
+        for (seq, replacement) in spilled_post_fork {
+            self.context.replace_tool_output_text(seq, replacement);
+        }
+        let total_before = self.context.len_recent();
+        handoff.set_restored_context(restored.map(|block| block.content().to_owned()));
         // Compaction rewrites the cacheable prefix anyway, so this is where
         // staged system-block updates and superseded tool results fold in.
         self.context.reassemble_below(fork_point);
-        let user_message_chars = self
-            .budget
-            .chars_for_tokens(self.config.context_policy.user_message_budget);
+        let user_message_chars = self.budget.chars_for_tokens(policy.user_message_budget);
         let kept_attachments: HashSet<AttachmentRef> = restoration
             .attachments
             .iter()
@@ -2589,22 +2635,22 @@ where
                     .map(|entry| entry.reference)
             })
             .collect();
+        let summary = handoff.text().to_string();
         self.context
             .apply_handoff(handoff, fork_point, user_message_chars, &kept_attachments);
-        if let Some(block) = restored {
-            self.context.push_block_alert(&block);
-        }
+        let messages_remaining = self.context.len_recent();
+        let messages_compacted = total_before.saturating_sub(messages_remaining);
         self.reassembled = true;
         self.prefix_rewrites.compacted = true;
         self.compaction_failure = None;
         tracing::info!(
             fork_point,
-            kept = self.context.len_recent(),
+            kept = messages_remaining,
             "applied handoff from forked compaction"
         );
         let result = CompactResult {
             messages_compacted,
-            messages_remaining: self.context.len_recent(),
+            messages_remaining,
             summary,
         };
         self.finish_compaction(events, CompactionOutcome::Applied(result.clone()));

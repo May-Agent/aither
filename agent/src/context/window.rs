@@ -35,6 +35,7 @@
 //! lets its result be applied to a window that has moved on: everything newer
 //! than the fork point is kept verbatim.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
@@ -43,10 +44,11 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use aither_core::llm::model::ReasoningEffort;
-use aither_core::llm::{Message, Role, ToolCall};
+use aither_core::llm::{Attachment, Message, Role, ToolCall};
 
-use super::compaction::{AttachmentCatalogEntry, AttachmentRef, Handoff};
+use super::compaction::{AttachmentCatalogEntry, AttachmentRef, HANDOFF_ATTACHMENT_SEQ, Handoff};
 use super::live::{LiveContent, LiveUpdate};
+use super::reassembly::truncate_on_char_boundary;
 use super::source::{Block, LiveChange};
 use super::system::{
     External, Instruction, Sourced, SourcedSlot, SystemLayout, SystemRegion, TaggedBlockTemplate,
@@ -56,6 +58,14 @@ use super::system::{
 /// Tombstone text left in place of a superseded tool result.
 const SUPERSEDED_TOOL_RESULT: &str =
     "(superseded: an identical later call in this conversation holds the current result)";
+
+/// Fallback inline cap (~4,000 tokens, matching [`ContextPolicy::default().spill_threshold`])
+/// for a single post-fork tool output when no spill directory is configured.
+const MAX_INLINE_POST_FORK_TOOL_CHARS: usize = 16_000;
+
+/// Leading bytes kept inline when a post-fork tool output exceeds
+/// [`MAX_INLINE_POST_FORK_TOOL_CHARS`] without a spill directory.
+const POST_FORK_TOOL_HEAD_CHARS: usize = 2_000;
 
 /// A conversation message together with its position in the window.
 ///
@@ -393,7 +403,11 @@ impl Context {
         for (_, block) in self.sourced.iter() {
             block.hash(&mut hasher);
         }
-        self.handoff.as_ref().map(Handoff::text).hash(&mut hasher);
+        if let Some(handoff) = &self.handoff {
+            handoff.body().hash(&mut hasher);
+            handoff.render_resume().hash(&mut hasher);
+            handoff.attachments().len().hash(&mut hasher);
+        }
         self.rewrite_generation.hash(&mut hasher);
         hasher.finish()
     }
@@ -552,6 +566,19 @@ impl Context {
     #[must_use]
     pub fn attachment_catalog(&self, fork_point: u64) -> Vec<AttachmentCatalogEntry> {
         let mut catalog = Vec::new();
+        if let Some(handoff) = &self.handoff {
+            for (index, attachment) in handoff.attachments().iter().enumerate() {
+                catalog.push(AttachmentCatalogEntry {
+                    id: format!("attachment-{}", catalog.len() + 1),
+                    media_type: attachment.media_type().essence_str().to_string(),
+                    excerpt: String::new(),
+                    reference: AttachmentRef {
+                        seq: HANDOFF_ATTACHMENT_SEQ,
+                        index,
+                    },
+                });
+            }
+        }
         for item in self.items.iter().filter(|item| item.seq < fork_point) {
             let Message::User {
                 content,
@@ -578,10 +605,28 @@ impl Context {
     /// Returns the items added at or after `seq`.
     #[must_use]
     pub fn items_since(&self, seq: u64) -> Vec<Message> {
+        self.items_since_with_replacements(seq, &[])
+    }
+
+    /// Returns the items added at or after `seq`, substituting `(seq, text)`
+    /// replacements for matching tool outputs without mutating `self`.
+    pub(crate) fn items_since_with_replacements(
+        &self,
+        seq: u64,
+        replacements: &[(u64, String)],
+    ) -> Vec<Message> {
         self.items
             .iter()
             .filter(|item| item.seq >= seq)
-            .map(|item| item.message.clone())
+            .map(|item| {
+                let mut msg = item.message.clone();
+                if let Some((_, text)) = replacements.iter().find(|(s, _)| *s == item.seq)
+                    && let Message::Tool { content, .. } = &mut msg
+                {
+                    content.clone_from(text);
+                }
+                msg
+            })
             .collect()
     }
 
@@ -676,7 +721,7 @@ impl Context {
     /// or a system turn directly before a user turn.
     #[must_use]
     pub fn build_request(&self, tail: &[Block]) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(self.items.len() + self.sourced.len() + 3);
+        let mut messages = Vec::with_capacity(self.items.len() + self.sourced.len() + 4);
 
         if let Some(prefix) = self.system_prefix() {
             messages.push(Message::system(prefix));
@@ -688,14 +733,35 @@ impl Context {
                 .map(|(_, block)| Message::system(block.as_str())),
         );
 
+        let handoff_resume = self.handoff.as_ref().and_then(Handoff::render_resume);
+        let handoff_attachments = self.handoff.as_ref().map_or(&[][..], Handoff::attachments);
         if let Some(handoff) = &self.handoff {
             messages.push(Message::system(handoff.render()));
         }
+
+        let first_turn_is_user = self
+            .items
+            .iter()
+            .find(|item| !matches!(item.message.role(), Role::System | Role::Configuration))
+            .is_some_and(|item| item.message.role() == Role::User);
 
         let mut seen_turn = false;
         let mut last_turn_is_user = false;
         let mut pending_system: Vec<&str> = Vec::new();
         let mut pending_configs: Vec<Message> = Vec::new();
+        let mut resume_for_first_user = first_turn_is_user
+            .then_some(handoff_resume.as_deref())
+            .flatten();
+        let mut attachments_for_first_user =
+            (!handoff_attachments.is_empty() && first_turn_is_user).then_some(handoff_attachments);
+
+        if !first_turn_is_user && (handoff_resume.is_some() || !handoff_attachments.is_empty()) {
+            let text = handoff_resume.as_deref().unwrap_or_default();
+            messages
+                .push(Message::user(text).with_attachments(handoff_attachments.iter().cloned()));
+            seen_turn = true;
+            last_turn_is_user = true;
+        }
 
         for item in &self.items {
             let message = &item.message;
@@ -720,21 +786,26 @@ impl Context {
                 }
                 Role::User | Role::Tool => {
                     messages.append(&mut pending_configs);
-                    messages.push(message.clone());
+                    if message.role() == Role::User
+                        && let Some(extra) = attachments_for_first_user.take()
+                    {
+                        let mut combined = extra.to_vec();
+                        combined.extend(message.attachments().iter().cloned());
+                        messages.push(Message::user(message.content()).with_attachments(combined));
+                    } else {
+                        messages.push(message.clone());
+                    }
+                    if message.role() == Role::User
+                        && let Some(resume) = resume_for_first_user.take()
+                    {
+                        pending_system.push(resume);
+                    }
                     seen_turn = true;
                     last_turn_is_user = true;
                 }
                 Role::Assistant => {
                     messages.append(&mut pending_configs);
-                    if !pending_system.is_empty() {
-                        let joined = pending_system.join("\n");
-                        pending_system.clear();
-                        if last_turn_is_user {
-                            messages.push(Message::system(joined));
-                        } else {
-                            messages.push(Message::user(joined));
-                        }
-                    }
+                    flush_pending_system(&mut messages, &mut pending_system, last_turn_is_user);
                     messages.push(message.clone());
                     seen_turn = true;
                     last_turn_is_user = false;
@@ -742,31 +813,14 @@ impl Context {
             }
         }
 
-        let tail_text = render_tail_text(tail);
-        if !seen_turn {
-            if let Some(tail_text) = tail_text {
-                messages.push(Message::system(tail_text));
-            }
-            messages.append(&mut pending_configs);
-        } else if last_turn_is_user {
-            messages.append(&mut pending_configs);
-            if let Some(ref tail_text) = tail_text {
-                pending_system.push(tail_text);
-            }
-            if !pending_system.is_empty() {
-                messages.push(Message::system(pending_system.join("\n")));
-            }
-        } else {
-            messages.append(&mut pending_configs);
-            if !pending_system.is_empty() {
-                messages.push(Message::user(pending_system.join("\n")));
-                if let Some(tail_text) = tail_text {
-                    messages.push(Message::system(tail_text));
-                }
-            } else if let Some(tail_text) = tail_text {
-                messages.push(Message::user(tail_text));
-            }
-        }
+        append_request_tail(
+            &mut messages,
+            tail,
+            seen_turn,
+            last_turn_is_user,
+            &pending_system,
+            &mut pending_configs,
+        );
 
         messages
     }
@@ -794,10 +848,9 @@ impl Context {
     pub fn stable_chars(&self) -> usize {
         let blocks = self.system_prefix().map_or(0, |prefix| prefix.len());
         let sourced: usize = self.sourced.iter().map(|(_, block)| block.len()).sum();
-        let handoff = self
-            .handoff
-            .as_ref()
-            .map_or(0, |handoff| handoff.render().len());
+        let handoff = self.handoff.as_ref().map_or(0, |handoff| {
+            handoff.render().len() + handoff.render_resume().map_or(0, |resume| resume.len())
+        });
         blocks + sourced + handoff
     }
 
@@ -873,72 +926,226 @@ impl Context {
 
     /// Replaces the conversation with a compaction result.
     ///
-    /// `handoff` becomes the new anchor and only the items numbered at or
-    /// above `fork_point` are kept: they arrived while the handoff was being
-    /// written and are not described by it.
+    /// `handoff` becomes the new anchor. Pre-fork user messages within
+    /// `user_message_chars` and all non-kept post-fork (`>= fork_point`)
+    /// conversation activity (`User`, `Assistant` text and tool calls, and
+    /// `Tool` outputs) are folded in chronological order into `handoff`, so
+    /// the post-compaction window starts cleanly at the handoff boundary
+    /// instead of trailing mid-stride in a tool chain or placing pre-fork user
+    /// turns after the summary that already covers them.
     ///
-    /// Kept post-fork items lose reasoning bound to the old prefix (Claude
-    /// thinking blocks): a provider whose thinking verifies the conversation
-    /// around it rejects a block replayed under a rewritten prefix. Text, tool
-    /// calls, and prefix-independent reasoning (`OpenAI` encrypted items,
-    /// Gemini signatures) stay intact.
+    /// Items kept in the conversation list across the whole window:
+    /// - completed tool exchanges marked `kept`, whatever their size,
+    /// - undelivered system alerts, and
+    /// - the newest configuration update, so the active effort stays in force.
     ///
-    /// An alert below the fork that no request has carried yet stays too:
-    /// the model has not seen it, whatever the handoff says of it.
-    ///
-    /// Retained items below the fork survive beside the handoff, verbatim and
-    /// in chronological order: every completed tool exchange marked `kept`,
-    /// whatever its size, and the newest user messages that fit
-    /// `user_message_chars` characters.
-    ///
-    /// The last configuration update below the fork is kept too, in its
-    /// place, so the effort it set stays in force: the handoff restates it.
-    ///
-    /// A kept user message carries only the attachments `kept_attachments`
-    /// names, resolved from the catalog the compaction's instruction
-    /// rendered; a message whose attachment is named is kept even when it
-    /// falls outside `user_message_chars`, and every unnamed attachment is
-    /// gone with the conversation the handoff replaced.
+    /// Pre-fork attachments named by `kept_attachments` and attachments on
+    /// folded post-fork messages are carried on `handoff` and attached to the
+    /// opening post-compaction user turn.
     pub fn apply_handoff(
         &mut self,
-        handoff: Handoff,
+        mut handoff: Handoff,
         fork_point: u64,
         user_message_chars: usize,
         kept_attachments: &HashSet<AttachmentRef>,
     ) {
-        let mut kept = self.verbatim_below(fork_point, user_message_chars, kept_attachments);
-        self.items.retain(|item| item.seq >= fork_point);
-        for item in &mut self.items {
-            strip_prefix_bound_reasoning(&mut item.message);
-        }
-        kept.append(&mut self.items);
+        let user_messages =
+            self.collect_verbatim_user_messages(fork_point, user_message_chars, kept_attachments);
+        let mut retained_attachments =
+            self.collect_named_pre_fork_attachments(fork_point, kept_attachments);
+        let (post_fork, post_fork_user_messages, post_fork_attachments) =
+            self.fold_post_fork_activity(fork_point);
+        retained_attachments.extend(post_fork_attachments);
+
+        let kept = self.surviving_items();
+        handoff.apply_folded(
+            user_messages,
+            post_fork_user_messages,
+            post_fork,
+            retained_attachments,
+        );
         self.items = kept;
         self.set_handoff(handoff);
         self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
     }
 
-    /// The items below `fork_point` that survive a handoff: completed `kept`
-    /// tool exchanges, and the newest user messages within
-    /// `user_message_chars`, each carrying only the attachments
-    /// `kept_attachments` names, oldest first.
-    fn verbatim_below(
+    fn collect_verbatim_user_messages(
         &self,
         fork_point: u64,
         user_message_chars: usize,
         kept_attachments: &HashSet<AttachmentRef>,
-    ) -> Vec<ContextItem> {
-        let below = || self.items.iter().filter(|item| item.seq < fork_point);
-
-        let kept_calls: HashSet<&str> = below()
-            .filter(|item| item.kept)
-            .filter_map(|item| item.message.tool_call_id())
+    ) -> Vec<String> {
+        let candidates: Vec<(&str, bool)> = self
+            .handoff
+            .iter()
+            .flat_map(|handoff| handoff.carried_user_messages().map(|text| (text, false)))
+            .chain(
+                self.items
+                    .iter()
+                    .filter(|item| item.seq < fork_point)
+                    .filter_map(|item| match &item.message {
+                        Message::User {
+                            content,
+                            attachments,
+                        } if !content.is_empty() => {
+                            let has_named = (0..attachments.len()).any(|index| {
+                                kept_attachments.contains(&AttachmentRef {
+                                    seq: item.seq,
+                                    index,
+                                })
+                            });
+                            Some((content.as_str(), has_named))
+                        }
+                        _ => None,
+                    }),
+            )
             .collect();
-        let mut kept: Vec<ContextItem> = Vec::new();
-        for item in below() {
+
+        let mut remaining = user_message_chars;
+        let mut budget_spent = user_message_chars == 0;
+        let mut selected: Vec<String> = Vec::new();
+        for (text, has_named) in candidates.into_iter().rev() {
+            if has_named {
+                selected.push(text.to_owned());
+                continue;
+            }
+            if budget_spent {
+                continue;
+            }
+            let Some(left) = remaining.checked_sub(text.len()) else {
+                budget_spent = true;
+                continue;
+            };
+            remaining = left;
+            selected.push(text.to_owned());
+        }
+        selected.reverse();
+        selected
+    }
+
+    fn collect_named_pre_fork_attachments(
+        &self,
+        fork_point: u64,
+        kept_attachments: &HashSet<AttachmentRef>,
+    ) -> Vec<Attachment> {
+        let mut retained = Vec::new();
+        if let Some(handoff) = &self.handoff {
+            for (index, attachment) in handoff.attachments().iter().enumerate() {
+                if kept_attachments.contains(&AttachmentRef {
+                    seq: HANDOFF_ATTACHMENT_SEQ,
+                    index,
+                }) {
+                    retained.push(attachment.clone());
+                }
+            }
+        }
+        for item in self.items.iter().filter(|item| item.seq < fork_point) {
+            let Message::User { attachments, .. } = &item.message else {
+                continue;
+            };
+            for (index, attachment) in attachments.iter().enumerate() {
+                if kept_attachments.contains(&AttachmentRef {
+                    seq: item.seq,
+                    index,
+                }) {
+                    retained.push(attachment.clone());
+                }
+            }
+        }
+        retained
+    }
+
+    fn fold_post_fork_activity(
+        &self,
+        fork_point: u64,
+    ) -> (Option<String>, Vec<String>, Vec<Attachment>) {
+        let kept_calls = self.kept_call_ids();
+        let mut entries: Vec<PostForkEntry<'_>> = Vec::new();
+        let mut post_fork_users: Vec<String> = Vec::new();
+        let mut attachments: Vec<Attachment> = Vec::new();
+
+        for item in self.items.iter().filter(|item| item.seq >= fork_point) {
             match &item.message {
-                // The call keeps only its kept calls: the turn's other
-                // calls and reasoning are compacted, and a result must not
-                // outlive the call it answers.
+                Message::User {
+                    content,
+                    attachments: msg_attachments,
+                } => {
+                    if !content.is_empty() {
+                        post_fork_users.push(content.clone());
+                    }
+                    attachments.extend(msg_attachments.iter().cloned());
+                    if !content.is_empty() || !msg_attachments.is_empty() {
+                        entries.push(PostForkEntry::User {
+                            content,
+                            attachment_count: msg_attachments.len(),
+                        });
+                    }
+                }
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => {
+                    let calls: Vec<PostForkCall<'_>> = tool_calls
+                        .iter()
+                        .filter(|call| !kept_calls.contains(call.id.as_str()))
+                        .map(|call| PostForkCall {
+                            id: &call.id,
+                            name: &call.name,
+                            arguments: call.arguments.to_string(),
+                        })
+                        .collect();
+                    if !content.is_empty() || !calls.is_empty() {
+                        entries.push(PostForkEntry::Assistant { content, calls });
+                    }
+                }
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                    attachments: msg_attachments,
+                } if !item.kept && !kept_calls.contains(tool_call_id.as_str()) => {
+                    attachments.extend(msg_attachments.iter().cloned());
+                    let rendered = if content.len() <= MAX_INLINE_POST_FORK_TOOL_CHARS {
+                        Cow::Borrowed(content.as_str())
+                    } else {
+                        let head = truncate_on_char_boundary(content, POST_FORK_TOOL_HEAD_CHARS);
+                        let omitted_bytes = content.len().saturating_sub(head.len());
+                        Cow::Owned(
+                            TruncatedPostForkOutput {
+                                head: &head,
+                                omitted_bytes,
+                            }
+                            .render()
+                            .expect("truncated post-fork output template must render"),
+                        )
+                    };
+                    entries.push(PostForkEntry::Tool {
+                        call_id: tool_call_id,
+                        content: rendered,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let rendered = (!entries.is_empty()).then(|| {
+            HandoffPostForkTemplate { entries: &entries }
+                .render()
+                .expect("handoff post-fork template must render")
+                .trim()
+                .to_owned()
+        });
+        (rendered, post_fork_users, attachments)
+    }
+
+    /// Items that stay in `self.items` across a compaction: completed `kept`
+    /// exchanges, undelivered system alerts, and the newest configuration
+    /// update.
+    fn surviving_items(&self) -> Vec<ContextItem> {
+        let kept_calls = self.kept_call_ids();
+        let mut kept: Vec<ContextItem> = Vec::new();
+        for item in &self.items {
+            match &item.message {
                 Message::Assistant { tool_calls, .. } => {
                     let calls: Vec<ToolCall> = tool_calls
                         .iter()
@@ -953,65 +1160,18 @@ impl Context {
                     }
                 }
                 Message::Tool { .. } if item.kept => kept.push(item.clone()),
-                // An alert no request carried yet, an event recorded while
-                // the agent waited, still owes the model its delivery.
                 message if message.role() == Role::System && item.undelivered => {
                     kept.push(item.clone());
                 }
                 _ => {}
             }
         }
-        if let Some(update) = below().rfind(|item| item.message.role() == Role::Configuration) {
+        if let Some(update) = self
+            .items
+            .iter()
+            .rfind(|item| item.message.role() == Role::Configuration)
+        {
             kept.push(update.clone());
-        }
-
-        let mut remaining = user_message_chars;
-        let mut text_budget_spent = false;
-        for item in below().rev() {
-            let Message::User {
-                content,
-                attachments,
-            } = &item.message
-            else {
-                continue;
-            };
-            let named: Vec<usize> = (0..attachments.len())
-                .filter(|index| {
-                    kept_attachments.contains(&AttachmentRef {
-                        seq: item.seq,
-                        index: *index,
-                    })
-                })
-                .collect();
-            // A message whose attachment the handoff named is kept
-            // whatever the budget says; an unnamed one pays for its text.
-            // Once the budget is spent the scan still runs on — an older
-            // message can still be kept on a named attachment.
-            if named.is_empty() {
-                if text_budget_spent {
-                    continue;
-                }
-                let Some(left) = remaining.checked_sub(content.len()) else {
-                    text_budget_spent = true;
-                    continue;
-                };
-                remaining = left;
-            }
-            let message = if named.len() == attachments.len() {
-                item.message.clone()
-            } else {
-                Message::User {
-                    content: content.clone(),
-                    attachments: named
-                        .iter()
-                        .map(|index| attachments[*index].clone())
-                        .collect(),
-                }
-            };
-            kept.push(ContextItem {
-                message,
-                ..item.clone()
-            });
         }
         kept.sort_by_key(|item| item.seq);
         kept
@@ -1125,9 +1285,20 @@ impl Context {
 
     /// The tool results holding more than `min_bytes` bytes.
     pub(crate) fn long_tool_outputs(&self, min_bytes: usize) -> Vec<LongToolOutput> {
+        self.long_tool_outputs_since(0, min_bytes)
+    }
+
+    /// Non-kept tool results at or above `since_seq` holding more than
+    /// `min_bytes` bytes.
+    pub(crate) fn long_tool_outputs_since(
+        &self,
+        since_seq: u64,
+        min_bytes: usize,
+    ) -> Vec<LongToolOutput> {
         let kept_calls = self.kept_call_ids();
         self.items
             .iter()
+            .filter(|item| item.seq >= since_seq && !item.kept)
             .filter_map(|item| match &item.message {
                 Message::Tool {
                     content,
@@ -1143,6 +1314,17 @@ impl Context {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Replaces the text of the tool result numbered `seq` without dropping its
+    /// attachments.
+    pub(crate) fn replace_tool_output_text(&mut self, seq: u64, replacement: String) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.seq == seq)
+            && let Message::Tool { content, .. } = &mut item.message
+        {
+            *content = replacement;
+            self.rewrite_generation = self.rewrite_generation.wrapping_add(1);
+        }
     }
 
     /// Replaces the content of the tool result numbered `seq`.
@@ -1337,13 +1519,48 @@ impl ContextCheckpoint {
     }
 }
 
+struct PostForkCall<'a> {
+    id: &'a str,
+    name: &'a str,
+    arguments: String,
+}
+
+enum PostForkEntry<'a> {
+    User {
+        content: &'a str,
+        attachment_count: usize,
+    },
+    Assistant {
+        content: &'a str,
+        calls: Vec<PostForkCall<'a>>,
+    },
+    Tool {
+        call_id: &'a str,
+        content: Cow<'a, str>,
+    },
+}
+
+#[derive(Template)]
+#[template(path = "handoff_post_fork.md", escape = "none")]
+struct HandoffPostForkTemplate<'a> {
+    entries: &'a [PostForkEntry<'a>],
+}
+
+#[derive(Template)]
+#[template(path = "truncated_post_fork_output.txt", escape = "none")]
+struct TruncatedPostForkOutput<'a> {
+    head: &'a str,
+    omitted_bytes: usize,
+}
+
 impl Handoff {
     /// Renders this handoff as the system message body of a request.
     #[must_use]
     pub fn render(&self) -> String {
+        let body = self.body();
         TaggedBlockTemplate {
             tag: "handoff",
-            content: self.text(),
+            content: &body,
         }
         .into_text()
     }
@@ -1366,17 +1583,6 @@ fn attachment_excerpt(content: &str) -> String {
         .collect()
 }
 
-/// Drops reasoning states bound to the conversation prefix that produced them.
-///
-/// Anthropic thinking blocks verify the surrounding prefix and fail with a 400
-/// when replayed after a client-side compaction handoff, whereas `OpenAI`'s
-/// encrypted items and Gemini's signatures remain valid.
-fn strip_prefix_bound_reasoning(message: &mut Message) {
-    if let Message::Assistant { reasoning, .. } = message {
-        reasoning.retain(|state| state.provider() != "claude");
-    }
-}
-
 /// Joins the live tail blocks into their rendered text.
 fn render_tail_text(tail: &[Block]) -> Option<String> {
     let mut rendered = String::new();
@@ -1395,6 +1601,67 @@ fn render_tail_text(tail: &[Block]) -> Option<String> {
 /// Joins the live tail blocks into the single trailing system message.
 fn render_tail(tail: &[Block]) -> Option<Message> {
     render_tail_text(tail).map(Message::system)
+}
+
+/// Flushes queued system messages before the next assistant turn, promoting
+/// them to a user turn when the previous turn was not a user/tool turn.
+fn flush_pending_system(
+    messages: &mut Vec<Message>,
+    pending_system: &mut Vec<&str>,
+    last_turn_is_user: bool,
+) {
+    if pending_system.is_empty() {
+        return;
+    }
+    let joined = pending_system.join("\n");
+    pending_system.clear();
+    if last_turn_is_user {
+        messages.push(Message::system(joined));
+    } else {
+        messages.push(Message::user(joined));
+    }
+}
+
+/// Flushes pending configurations, pending system messages, and the live tail
+/// at the end of [`Context::build_request`].
+fn append_request_tail(
+    messages: &mut Vec<Message>,
+    tail: &[Block],
+    seen_turn: bool,
+    last_turn_is_user: bool,
+    pending_system: &[&str],
+    pending_configs: &mut Vec<Message>,
+) {
+    let tail_text = render_tail_text(tail);
+    if !seen_turn {
+        if let Some(tail_text) = tail_text {
+            messages.push(Message::system(tail_text));
+        }
+        messages.append(pending_configs);
+    } else if last_turn_is_user {
+        messages.append(pending_configs);
+        match (pending_system.is_empty(), tail_text) {
+            (true, Some(tail_text)) => messages.push(Message::system(tail_text)),
+            (false, Some(tail_text)) => {
+                let mut joined = pending_system.join("\n");
+                joined.push('\n');
+                joined.push_str(&tail_text);
+                messages.push(Message::system(joined));
+            }
+            (false, None) => messages.push(Message::system(pending_system.join("\n"))),
+            (true, None) => {}
+        }
+    } else {
+        messages.append(pending_configs);
+        if !pending_system.is_empty() {
+            messages.push(Message::user(pending_system.join("\n")));
+            if let Some(tail_text) = tail_text {
+                messages.push(Message::system(tail_text));
+            }
+        } else if let Some(tail_text) = tail_text {
+            messages.push(Message::user(tail_text));
+        }
+    }
 }
 
 /// Approximate rendered size of a message, tool calls included.
@@ -2078,27 +2345,47 @@ mod tests {
     }
 
     #[test]
-    fn applying_a_handoff_keeps_items_newer_than_the_fork() {
+    fn applying_a_handoff_folds_items_newer_than_the_fork_into_the_handoff() {
         let mut context = Context::new();
         context.push(Message::user("old work"));
         let fork = context.fork_point();
         context.push(Message::user("new request"));
+        context.push(Message::assistant_with_tool_calls(
+            "checking file",
+            vec![tool_call(
+                "c-post",
+                "terminal",
+                serde_json::json!({"script": "cat a.rs"}),
+            )],
+        ));
+        context.push(Message::tool("c-post", "fn main() {}"));
 
         context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
-        assert_eq!(context.len_recent(), 1);
-        assert_eq!(context.recent()[0].content(), "new request");
+        assert_eq!(context.len_recent(), 0);
+        let rendered = context.handoff().expect("handoff").render();
+        assert!(rendered.contains("task"));
+        assert!(rendered.contains("## Activity During Compaction"));
+        let user_pos = rendered.find("new request").expect("post-fork user");
+        let call_pos = rendered.find("c-post").expect("post-fork call");
+        let out_pos = rendered.find("fn main() {}").expect("post-fork output");
+        assert!(user_pos < call_pos && call_pos < out_pos, "{rendered}");
+
+        let request = context.build_messages();
+        assert_eq!(request.len(), 2);
+        assert_eq!(request[0].role(), Role::System);
+        assert_eq!(request[1].role(), Role::User);
         assert!(
-            context
-                .handoff()
-                .is_some_and(|handoff| handoff.render().contains("task"))
+            request[1]
+                .content()
+                .contains("while compaction was in flight")
         );
     }
 
-    /// Only the last effort update below the fork survives a handoff, in its
-    /// place before the newer items, so the effort in force is unchanged.
+    /// Only the newest effort update survives a handoff so the effort in force
+    /// is unchanged, while post-fork messages fold into the handoff.
     #[test]
-    fn a_handoff_keeps_the_last_effort_update_below_the_fork() {
+    fn a_handoff_keeps_the_last_effort_update() {
         use aither_core::llm::model::ReasoningEffort;
         let mut context = Context::new();
         context.push(Message::configuration(ReasoningEffort::Low));
@@ -2110,14 +2397,15 @@ mod tests {
         context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let recent: Vec<_> = context.recent().into_iter().cloned().collect();
-        assert_eq!(
-            recent,
-            [
-                Message::configuration(ReasoningEffort::Medium),
-                Message::user("new request"),
-            ]
-        );
+        assert_eq!(recent, [Message::configuration(ReasoningEffort::Medium)]);
         assert_eq!(context.configured_effort(), Some(ReasoningEffort::Medium));
+        assert!(
+            context
+                .handoff()
+                .expect("handoff")
+                .render()
+                .contains("new request")
+        );
     }
 
     fn handoff() -> Handoff {
@@ -2243,9 +2531,9 @@ mod tests {
         context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
         let kept = context.recent();
-        // Five exchanges (call and answer each) and the suffix; the turn's
-        // other call and its result were compacted.
-        assert_eq!(kept.len(), 5 * 2 + 1);
+        // Five kept exchanges (call and answer each) survive in items; the
+        // post-fork user message folds into `<handoff>`.
+        assert_eq!(kept.len(), 5 * 2);
         for index in 0..5 {
             let call = &kept[index * 2];
             assert_eq!(call.tool_calls().len(), 1);
@@ -2262,7 +2550,13 @@ mod tests {
             assert_eq!(tool_call_id, &format!("ask-{index}"));
             assert!(content.contains(if index == 2 { &long_answer } else { "short" }));
         }
-        assert_eq!(kept[10].content(), "after the fork");
+        assert!(
+            context
+                .handoff()
+                .expect("handoff")
+                .render()
+                .contains("after the fork")
+        );
     }
 
     #[test]
@@ -2289,11 +2583,19 @@ mod tests {
         );
 
         let kept = texts(&context);
-        assert_eq!(kept.len(), 4, "{kept:?}");
+        assert_eq!(kept.len(), 2, "{kept:?}");
         assert!(kept[0].starts_with("call "), "{kept:?}");
         assert!(kept[1].contains("far longer than the budget"), "{kept:?}");
-        assert_eq!(kept[2], "middle");
-        assert_eq!(kept[3], "newest");
+        let handoff_ref = context.handoff().expect("handoff");
+        assert_eq!(handoff_ref.user_messages(), ["middle", "newest"]);
+        let rendered = handoff_ref.render();
+        assert!(!rendered.contains("oldest"));
+        let mid_pos = rendered.find("middle").expect("middle");
+        let new_pos = rendered.find("newest").expect("newest");
+        assert!(
+            mid_pos < new_pos,
+            "verbatim user messages stay chronological"
+        );
     }
 
     #[test]
@@ -2307,20 +2609,22 @@ mod tests {
 
         context.apply_handoff(handoff(), fork, 1_000, &HashSet::new());
 
-        let recent = context.recent();
-        assert_eq!(recent.len(), 1);
+        let handoff_ref = context.handoff().expect("handoff");
         assert_eq!(
-            recent[0].content(),
-            "the settings panel still clips the footer on mobile"
+            handoff_ref.user_messages(),
+            ["the settings panel still clips the footer on mobile"]
         );
         assert!(
-            recent[0].attachments().is_empty(),
+            handoff_ref.attachments().is_empty(),
             "the unnamed screenshot is gone with the compacted turn"
         );
+        let request = context.build_messages();
+        assert!(request.iter().all(|m| m.attachments().is_empty()));
     }
 
-    /// A named attachment stays in the message it came with, which is kept
-    /// past the text budget too, while the message's other attachments go.
+    /// A named attachment is carried across compaction on the opening user
+    /// message, and its caption stays in the handoff's user messages past the
+    /// text budget too, while the message's other attachments go.
     #[test]
     fn a_named_attachment_keeps_its_message_past_the_budget() {
         let mut context = Context::new();
@@ -2342,18 +2646,22 @@ mod tests {
         // over it and survives on its named attachment.
         context.apply_handoff(handoff(), fork, "and keep the footer links".len(), &kept);
 
-        let recent = context.recent();
-        assert_eq!(recent.len(), 2);
+        let handoff_ref = context.handoff().expect("handoff");
         assert_eq!(
-            recent[0].content(),
-            "match this palette when you restyle the header"
+            handoff_ref.user_messages(),
+            [
+                "match this palette when you restyle the header",
+                "and keep the footer links",
+            ]
         );
         assert_eq!(
-            recent[0].attachments(),
+            handoff_ref.attachments(),
             &[screenshot("palette-reference")],
-            "only the named attachment stays, in place"
+            "only the named attachment stays"
         );
-        assert_eq!(recent[1].content(), "and keep the footer links");
+        let request = context.build_messages();
+        assert_eq!(request[1].role(), Role::User);
+        assert_eq!(request[1].attachments(), &[screenshot("palette-reference")]);
     }
 
     /// A message whose attachment is named survives even when an unnamed
@@ -2379,15 +2687,19 @@ mod tests {
         // but the scan must still reach the named attachment's message.
         context.apply_handoff(handoff(), fork, "and the header still clips".len(), &kept);
 
-        let recent = context.recent();
-        assert_eq!(recent.len(), 2, "{recent:?}");
-        assert_eq!(recent[0].content(), "use this exact spacing in the footer");
+        let handoff_ref = context.handoff().expect("handoff");
         assert_eq!(
-            recent[0].attachments(),
+            handoff_ref.user_messages(),
+            [
+                "use this exact spacing in the footer",
+                "and the header still clips",
+            ]
+        );
+        assert_eq!(
+            handoff_ref.attachments(),
             &[screenshot("footer-spacing")],
             "only the named attachment stays"
         );
-        assert_eq!(recent[1].content(), "and the header still clips");
     }
 
     #[test]
@@ -2403,9 +2715,9 @@ mod tests {
 
         context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
-        let recent = context.recent();
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].attachments(), &[screenshot("after-fork")]);
+        let request = context.build_messages();
+        assert_eq!(request[1].role(), Role::User);
+        assert_eq!(request[1].attachments(), &[screenshot("after-fork")]);
     }
 
     /// The catalog numbers every attachment below the fork in conversation
@@ -2455,7 +2767,13 @@ mod tests {
 
         context.apply_handoff(handoff(), fork, 1_000, &HashSet::new());
 
-        assert_eq!(context.recent()[0].content(), message);
+        assert!(
+            context
+                .handoff()
+                .expect("handoff")
+                .render()
+                .contains(message)
+        );
     }
 
     #[test]
@@ -2478,13 +2796,17 @@ mod tests {
     }
 
     #[test]
-    fn applying_a_handoff_strips_prefix_bound_reasoning_from_kept_items() {
+    fn applying_a_handoff_folds_post_fork_turns_and_drops_bound_reasoning() {
         let mut context = Context::new();
         context.push(Message::user("old work"));
         let fork = context.fork_point();
         context.push(Message::assistant_with_reasoning(
-            "kept turn",
-            vec![tool_call("c1", "terminal", serde_json::json!({}))],
+            "post-fork check",
+            vec![tool_call(
+                "c1",
+                "terminal",
+                serde_json::json!({"script": "ls"}),
+            )],
             vec![
                 aither_core::llm::ReasoningState::new("claude", "sig-bound"),
                 aither_core::llm::ReasoningState::new("openai", "enc-item"),
@@ -2495,16 +2817,12 @@ mod tests {
 
         context.apply_handoff(handoff(), fork, 0, &HashSet::new());
 
-        let kept: Vec<&Message> = context.recent();
-        assert_eq!(kept.len(), 2);
-        let reasoning = kept[0].reasoning();
-        assert_eq!(reasoning.len(), 2);
-        assert_eq!(reasoning[0].provider(), "openai");
-        assert_eq!(reasoning[0].payload(), "enc-item");
-        assert_eq!(reasoning[1].provider(), "gemini");
-        assert_eq!(kept[0].content(), "kept turn");
-        assert_eq!(kept[0].tool_calls().len(), 1);
-        assert_eq!(kept[1].content(), "done");
+        assert!(context.is_conversation_empty());
+        let rendered = context.handoff().expect("handoff").render();
+        assert!(rendered.contains("post-fork check"));
+        assert!(rendered.contains("c1"));
+        assert!(rendered.contains("done"));
+        assert!(!rendered.contains("sig-bound"));
     }
 
     #[test]
@@ -2530,6 +2848,57 @@ mod tests {
     }
 
     #[test]
+    fn second_compaction_carries_folded_user_messages_and_named_attachments() {
+        let mut context = Context::new();
+        context.push(Message::user("first constraint").with_attachment(screenshot("ref-diagram")));
+        let fork_1 = context.fork_point();
+        context.push(Message::user("in-flight clarification"));
+        let catalog_1 = context.attachment_catalog(fork_1);
+        let kept_1: HashSet<AttachmentRef> =
+            catalog_1.iter().map(|entry| entry.reference).collect();
+        context.apply_handoff(Handoff::new("summary-1"), fork_1, 1_000, &kept_1);
+
+        context.push(Message::user("third turn"));
+        let fork_2 = context.fork_point();
+        let catalog_2 = context.attachment_catalog(fork_2);
+        assert_eq!(catalog_2.len(), 1);
+        let kept_2: HashSet<AttachmentRef> =
+            catalog_2.iter().map(|entry| entry.reference).collect();
+        context.apply_handoff(Handoff::new("summary-2"), fork_2, 1_000, &kept_2);
+
+        let second = context.handoff().expect("second handoff");
+        assert_eq!(
+            second.user_messages(),
+            ["first constraint", "in-flight clarification", "third turn"]
+        );
+        assert_eq!(second.attachments(), &[screenshot("ref-diagram")]);
+        assert!(second.post_fork().is_none());
+    }
+
+    #[test]
+    fn unspilled_overlong_post_fork_cjk_output_truncates_on_char_boundary() {
+        let mut context = Context::new();
+        context.push(Message::user("seed"));
+        let fork = context.fork_point();
+        context.push(Message::assistant_with_tool_calls(
+            "",
+            vec![tool_call(
+                "cjk",
+                "terminal",
+                serde_json::json!({"script": "cat log"}),
+            )],
+        ));
+        let unit = "日志行・ログ行・로그줄\n";
+        context.push(Message::tool("cjk", unit.repeat(2_000)));
+
+        context.apply_handoff(handoff(), fork, 0, &HashSet::new());
+
+        let rendered = context.handoff().expect("handoff").render();
+        assert!(rendered.contains("bytes omitted during compaction"));
+        assert!(rendered.contains("日志行・ログ行・로그줄"));
+    }
+
+    #[test]
     fn mark_kept_preserves_an_existing_exchange_in_place() {
         let mut context = Context::new();
         context.push(Message::user("first"));
@@ -2546,10 +2915,13 @@ mod tests {
         context.apply_handoff(handoff(), fork, "later".len(), &HashSet::new());
 
         let recent = context.recent();
-        assert_eq!(recent.len(), 3);
+        assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].tool_calls()[0].id, "keep-me");
         assert_eq!(recent[1].content(), "confirmed");
-        assert_eq!(recent[2].content(), "later");
+        assert_eq!(
+            context.handoff().expect("handoff").user_messages(),
+            ["later"]
+        );
     }
 
     #[test]
