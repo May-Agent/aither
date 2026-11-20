@@ -826,3 +826,34 @@ async fn after_tool_replace_with_attachments_reaches_the_model() {
     assert_eq!(tool_message.content(), "attached image");
     assert_eq!(tool_message.attachments(), &[attachment]);
 }
+
+#[test]
+fn a_compaction_request_for_a_compaction_model_carries_no_session_cache_controls() {
+    use aither_core::llm::Message;
+
+    let messages = || {
+        vec![
+            Message::system("system prefix"),
+            Message::user("hello"),
+            Message::assistant("hi"),
+        ]
+    };
+    let agent = AgentBuilder::new(Scripted::new([])).build();
+    let request = agent.compaction_request(messages(), Vec::new());
+    assert!(
+        !request.parameters().cache.is_empty(),
+        "a compaction on the session model keeps the cache controls"
+    );
+
+    let agent = AgentBuilder::new(Scripted::new([]))
+        .compaction_model(
+            Scripted::new([]),
+            aither_core::llm::model::Parameters::default(),
+        )
+        .build();
+    let request = agent.compaction_request(messages(), Vec::new());
+    assert!(
+        request.parameters().cache.is_empty(),
+        "a compaction model's request carries no session cache controls"
+    );
+}
