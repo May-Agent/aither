@@ -222,7 +222,16 @@ impl Stream for PromptTurn {
                 {
                     this.text.push_str(text);
                 }
-                if let SessionEvent::TurnEnded { stop_reason, error } = &event {
+                // A turn boundary while the request is still unanswered
+                // is not this turn's end: a concurrent (steered) prompt's
+                // stream shares the session broadcast, so another turn's
+                // `TurnEnded` must not resolve it — and must not drop the
+                // armed `pending`, whose `CancelGuard` would abort the
+                // in-flight request. Its end is its own response, or the
+                // connection's close.
+                if let SessionEvent::TurnEnded { stop_reason, error } = &event
+                    && this.pending.is_none()
+                {
                     let error = error
                         .as_ref()
                         .and_then(|e| serde_json::from_value(e.clone()).ok());

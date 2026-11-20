@@ -535,9 +535,13 @@ impl<T: Transport, H: Handler> Engine<T, H> {
 
             let result = match event {
                 Event::Outbound(Ok(item)) => self.send_envelope(item).await,
-                Event::Outbound(Err(_)) | Event::Incoming(Ok(None)) => break Ok(()),
+                Event::Outbound(Err(_)) | Event::Incoming(Ok(None)) => {
+                    break Ok(());
+                }
                 Event::Incoming(Ok(Some(inbound))) => self.dispatch(inbound).await,
-                Event::Incoming(Err(error)) => break Err(PeerError::Transport(error)),
+                Event::Incoming(Err(error)) => {
+                    break Err(PeerError::Transport(error));
+                }
                 Event::Handled(handled) => self.handled(handled).await,
             };
             if let Err(error) = result {
