@@ -1,19 +1,21 @@
 //! `async_task_*` session updates and `_session/async_task/stop`.
 //!
-//! A provider-neutral convention for long-running background work — shells,
-//! dev servers, watchers — that an agent owns on the session's behalf. The
-//! agent reports spawns, progress, and terminal states through
-//! `session/update` notifications carrying `async_task_*` update kinds; the
-//! client can stop a task with [`STOP_METHOD`].
+//! A provider-neutral convention for long-running background work —
+//! shells, dev servers, watchers — that an agent owns on the session's
+//! behalf. The agent reports spawns, progress, and terminal states
+//! through `session/update` notifications carrying `async_task_*` update
+//! kinds (extension tags: they arrive as [`SessionUpdate::Custom`]/
+//! [`SessionUpdate::Unknown`] payloads — [`try_from_update`] decodes
+//! them); the client can stop a task with [`STOP_METHOD`].
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::client::{AcpClient, ClientError, ClientHandler};
-use crate::macros::string_enum;
-use crate::protocol::{ExtMethod, SessionUpdate};
+use crate::domain::open::string_enum;
+use crate::domain::{ExtMethod, SessionId, SessionUpdate, ToolCallId};
+use crate::ext::tagged_payload;
 
 /// Extension method to stop a background task.
 pub const STOP_METHOD: ExtMethod = ExtMethod::new("_session/async_task/stop");
@@ -48,7 +50,7 @@ string_enum! {
 #[serde(rename_all = "camelCase")]
 pub struct AsyncTaskStopParams {
     /// Session that owns the task.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// ID of the task to stop.
     pub async_task_id: String,
 }
@@ -56,7 +58,7 @@ pub struct AsyncTaskStopParams {
 impl AsyncTaskStopParams {
     /// Build stop params for `async_task_id` on `session_id`.
     #[must_use]
-    pub fn new(session_id: impl Into<String>, async_task_id: impl Into<String>) -> Self {
+    pub fn new(session_id: impl Into<SessionId>, async_task_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
             async_task_id: async_task_id.into(),
@@ -75,27 +77,9 @@ pub struct AsyncTaskStopResult {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// Stop a background task the agent reported.
-///
-/// Returns `true` when the agent confirmed it stopped the task.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn stop<H: ClientHandler>(
-    client: &AcpClient<H>,
-    session_id: &str,
-    async_task_id: &str,
-) -> Result<bool, ClientError> {
-    let result: AsyncTaskStopResult = client
-        .ext_request(
-            &STOP_METHOD,
-            &AsyncTaskStopParams::new(session_id, async_task_id),
-        )
-        .await?;
-    Ok(result.stopped)
-}
+// TODO(wave-3): `stop(&Client, &SessionId, &str) -> Result<bool>` — a thin
+// `Client::ext_request(&STOP_METHOD, &AsyncTaskStopParams)` wrapper —
+// once `client::Client` lands.
 
 /// An `async_task_spawned` update payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,14 +100,14 @@ pub struct AsyncTaskSpawned {
     pub can_stop: Option<bool>,
     /// Tool call the task is associated with, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+    pub tool_call_id: Option<ToolCallId>,
     /// Fields this crate does not model, preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
-/// An `async_task_progress` update payload. Task-specific progress fields
-/// land in `extra`.
+/// An `async_task_progress` update payload. Task-specific progress
+/// fields land in `extra`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AsyncTaskProgress {
@@ -131,13 +115,13 @@ pub struct AsyncTaskProgress {
     pub async_task_id: String,
     /// Tool call the task is associated with, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+    pub tool_call_id: Option<ToolCallId>,
     /// Fields this crate does not model, preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
-/// An `async_task_state_update` payload.
+/// An `async_task_state_update` update payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AsyncTaskStateUpdate {
@@ -147,7 +131,7 @@ pub struct AsyncTaskStateUpdate {
     pub state: AsyncTaskState,
     /// Tool call the task is associated with, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+    pub tool_call_id: Option<ToolCallId>,
     /// Fields this crate does not model, preserved verbatim.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -166,25 +150,19 @@ pub enum AsyncTaskUpdate {
 
 /// Interpret a [`SessionUpdate`] as an async-task update.
 ///
-/// Returns `None` for every update that is not an `async_task_*` kind, and
-/// for malformed payloads.
+/// Returns `None` for every update that is not an `async_task_*` kind,
+/// and for malformed payloads.
 #[must_use]
-pub fn update(update: &SessionUpdate) -> Option<AsyncTaskUpdate> {
-    let SessionUpdate::Other(value) = update else {
-        return None;
-    };
-    // `extra` should not absorb the `sessionUpdate` tag.
-    let mut object = value.as_object()?.clone();
-    let kind = object.remove("sessionUpdate")?.as_str()?.to_string();
-    let value = Value::Object(object);
+pub fn try_from_update(update: &SessionUpdate) -> Option<AsyncTaskUpdate> {
+    let (kind, payload) = tagged_payload(update)?;
     match kind.as_str() {
-        SPAWNED_UPDATE => serde_json::from_value(value)
+        SPAWNED_UPDATE => serde_json::from_value(payload)
             .ok()
             .map(AsyncTaskUpdate::Spawned),
-        PROGRESS_UPDATE => serde_json::from_value(value)
+        PROGRESS_UPDATE => serde_json::from_value(payload)
             .ok()
             .map(AsyncTaskUpdate::Progress),
-        STATE_UPDATE => serde_json::from_value(value)
+        STATE_UPDATE => serde_json::from_value(payload)
             .ok()
             .map(AsyncTaskUpdate::State),
         _ => None,
@@ -197,7 +175,8 @@ mod tests {
 
     use super::*;
 
-    /// All three `async_task_*` update kinds decode from `Other` payloads.
+    /// All three `async_task_*` update kinds decode from `Unknown`
+    /// payloads.
     #[test]
     fn update_parsing() {
         let update: SessionUpdate = serde_json::from_value(json!({
@@ -209,7 +188,7 @@ mod tests {
             "port": 8080,
         }))
         .expect("deserializes");
-        let Some(AsyncTaskUpdate::Spawned(spawned)) = super::update(&update) else {
+        let Some(AsyncTaskUpdate::Spawned(spawned)) = try_from_update(&update) else {
             panic!("expected spawned");
         };
         assert_eq!(spawned.async_task_id, "t1");
@@ -223,7 +202,7 @@ mod tests {
             "bytes": 128,
         }))
         .expect("deserializes");
-        let Some(AsyncTaskUpdate::Progress(progress)) = super::update(&update) else {
+        let Some(AsyncTaskUpdate::Progress(progress)) = try_from_update(&update) else {
             panic!("expected progress");
         };
         assert_eq!(progress.extra["bytes"], 128);
@@ -234,7 +213,7 @@ mod tests {
             "state": "stopped",
         }))
         .expect("deserializes");
-        let Some(AsyncTaskUpdate::State(state)) = super::update(&update) else {
+        let Some(AsyncTaskUpdate::State(state)) = try_from_update(&update) else {
             panic!("expected state");
         };
         assert_eq!(state.state, AsyncTaskState::Stopped);
@@ -243,7 +222,7 @@ mod tests {
             "sessionUpdate": "vendor_thing",
         }))
         .expect("deserializes");
-        assert!(super::update(&update).is_none());
+        assert!(try_from_update(&update).is_none());
     }
 
     /// Stop params and result carry `sessionId`/`asyncTaskId`/`stopped`.

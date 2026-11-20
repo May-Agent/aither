@@ -1,32 +1,18 @@
 //! `_session/goal` — the session goal extension, version 1.
 //!
-//! A provider-neutral convention: an agent that supports long-running goals
-//! advertises a [`GoalCapability`] under `_meta.goal` on its `initialize`
-//! result. The client steers the goal through `_session/goal` requests and
-//! reads snapshots back from `session_info_update` `_meta.goal` payloads.
-//!
-//! ```no_run
-//! # use aither_acp::{AcpClient, ext};
-//! # async fn run<H: aither_acp::ClientHandler>(client: AcpClient<H>) -> Result<(), aither_acp::ClientError> {
-//! let init = client.initialize().await?;
-//! if let Some(cap) = ext::goal::capability(&init) {
-//!     assert_eq!(cap.control_method, ext::goal::METHOD.as_str());
-//!     ext::goal::set(&client, "sess-1", "ship the feature").await?;
-//!     ext::goal::pause(&client, "sess-1").await?;
-//!     ext::goal::clear(&client, "sess-1").await?;
-//! }
-//! # Ok(())
-//! # }
-//! ```
+//! A provider-neutral convention: an agent that supports long-running
+//! goals advertises a [`GoalCapability`] under `_meta.goal` on its
+//! `initialize` result. The client steers the goal through
+//! `_session/goal` requests and reads snapshots back from
+//! `session_info_update` `_meta.goal` payloads.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::client::{AcpClient, ClientError, ClientHandler};
-use crate::macros::string_enum;
-use crate::protocol::{ExtMethod, InitializeResult, SessionInfoUpdate};
+use crate::domain::open::string_enum;
+use crate::domain::{ExtMethod, Patch, SessionId, SessionInfoUpdate};
 
 /// The goal-control extension method.
 pub const METHOD: ExtMethod = ExtMethod::new("_session/goal");
@@ -34,7 +20,7 @@ pub const METHOD: ExtMethod = ExtMethod::new("_session/goal");
 /// Extension version this module models.
 pub const VERSION: u64 = 1;
 
-/// `InitializeResult.meta` key carrying the [`GoalCapability`].
+/// `initialize` result `_meta` key carrying the [`GoalCapability`].
 pub const CAPABILITY: &str = "goal";
 
 /// `SessionInfoUpdate.meta` key carrying the [`GoalSnapshot`].
@@ -88,22 +74,18 @@ pub struct GoalCapability {
 
 /// The goal capability an agent advertised, if any.
 #[must_use]
-pub fn capability(result: &InitializeResult) -> Option<GoalCapability> {
-    result
-        .meta
-        .as_ref()?
-        .get(CAPABILITY)
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+pub fn capability(meta: &Option<Value>) -> Option<GoalCapability> {
+    serde_json::from_value(meta.as_ref()?.get(CAPABILITY)?.clone()).ok()
 }
 
 /// Whether the agent advertised goal support and accepts `action`.
 #[must_use]
-pub fn accepts(result: &InitializeResult, action: &GoalAction) -> bool {
-    capability(result).is_some_and(|cap| cap.actions.contains(action))
+pub fn accepts(meta: &Option<Value>, action: &GoalAction) -> bool {
+    capability(meta).is_some_and(|cap| cap.actions.contains(action))
 }
 
-/// A snapshot of the session's goal state, carried in `session_info_update`
-/// `_meta.goal`.
+/// A snapshot of the session's goal state, carried in
+/// `session_info_update` `_meta.goal`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalSnapshot {
@@ -145,21 +127,27 @@ pub struct GoalSnapshot {
 pub enum GoalUpdate {
     /// The current goal state; boxed to keep the enum small.
     Snapshot(Box<GoalSnapshot>),
-    /// The goal was cleared (an explicit `null` `_meta.goal`).
+    /// The goal was cleared (an explicit `null` `_meta.goal`, or a
+    /// cleared `_meta` patch).
     Cleared,
 }
 
-/// Extract the goal update from a `session_info_update` payload.
+/// Extracts the goal update from a `session_info_update` payload.
 ///
-/// Returns `None` when the update carries no `goal` key at all, and
-/// [`GoalUpdate::Cleared`] when it carries an explicit `null`.
+/// Returns `None` when the update carries no `_meta` patch or no `goal`
+/// key at all, and [`GoalUpdate::Cleared`] on an explicit `null` goal or
+/// a cleared `_meta`.
 #[must_use]
 pub fn update(update: &SessionInfoUpdate) -> Option<GoalUpdate> {
-    match update.meta.as_ref()?.get(SNAPSHOT_KEY)? {
-        Value::Null => Some(GoalUpdate::Cleared),
-        value => serde_json::from_value(value.clone())
-            .ok()
-            .map(|snapshot| GoalUpdate::Snapshot(Box::new(snapshot))),
+    match &update.meta {
+        Patch::Set(meta) => match meta.get(SNAPSHOT_KEY)? {
+            Value::Null => Some(GoalUpdate::Cleared),
+            value => serde_json::from_value(value.clone())
+                .ok()
+                .map(|snapshot| GoalUpdate::Snapshot(Box::new(snapshot))),
+        },
+        Patch::Clear => Some(GoalUpdate::Cleared),
+        Patch::Unchanged => None,
     }
 }
 
@@ -168,7 +156,7 @@ pub fn update(update: &SessionInfoUpdate) -> Option<GoalUpdate> {
 #[serde(rename_all = "camelCase")]
 pub struct GoalControlParams {
     /// Session the goal belongs to.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// Action to perform.
     pub action: GoalAction,
     /// Goal text; required by [`GoalAction::Set`], absent otherwise.
@@ -179,7 +167,7 @@ pub struct GoalControlParams {
 impl GoalControlParams {
     /// Build params for `action` on `session_id`.
     #[must_use]
-    pub fn new(session_id: impl Into<String>, action: GoalAction) -> Self {
+    pub fn new(session_id: impl Into<SessionId>, action: GoalAction) -> Self {
         Self {
             session_id: session_id.into(),
             action,
@@ -195,88 +183,9 @@ impl GoalControlParams {
     }
 }
 
-/// Send a `_session/goal` control request.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn control<H: ClientHandler>(
-    client: &AcpClient<H>,
-    params: GoalControlParams,
-) -> Result<(), ClientError> {
-    client.ext_request::<_, Value>(&METHOD, &params).await?;
-    Ok(())
-}
-
-/// Set or replace the session's goal.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn set<H: ClientHandler>(
-    client: &AcpClient<H>,
-    session_id: &str,
-    objective: &str,
-) -> Result<(), ClientError> {
-    control(
-        client,
-        GoalControlParams::new(session_id, GoalAction::Set).objective(objective),
-    )
-    .await
-}
-
-/// Pause the session's goal without clearing it.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn pause<H: ClientHandler>(
-    client: &AcpClient<H>,
-    session_id: &str,
-) -> Result<(), ClientError> {
-    control(
-        client,
-        GoalControlParams::new(session_id, GoalAction::Pause),
-    )
-    .await
-}
-
-/// Resume a paused goal.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn resume<H: ClientHandler>(
-    client: &AcpClient<H>,
-    session_id: &str,
-) -> Result<(), ClientError> {
-    control(
-        client,
-        GoalControlParams::new(session_id, GoalAction::Resume),
-    )
-    .await
-}
-
-/// Clear the session's goal.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn clear<H: ClientHandler>(
-    client: &AcpClient<H>,
-    session_id: &str,
-) -> Result<(), ClientError> {
-    control(
-        client,
-        GoalControlParams::new(session_id, GoalAction::Clear),
-    )
-    .await
-}
+// TODO(wave-3): `control`/`set`/`pause`/`resume`/`clear` — thin
+// `Client::ext_request(&METHOD, &GoalControlParams)` wrappers — once
+// `client::Client` lands.
 
 #[cfg(test)]
 mod tests {
@@ -287,41 +196,32 @@ mod tests {
     /// The capability object lives under `_meta.goal` on `initialize`.
     #[test]
     fn capability_extracted_from_meta() {
-        let result: InitializeResult = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "_meta": {
-                "goal": {
-                    "version": 1,
-                    "controlMethod": "_session/goal",
-                    "actions": ["set", "pause", "resume", "clear"],
-                    "vendor": "x",
-                }
+        let meta = Some(json!({
+            "goal": {
+                "version": 1,
+                "controlMethod": "_session/goal",
+                "actions": ["set", "pause", "resume", "clear"],
+                "vendor": "x",
             }
-        }))
-        .expect("deserializes");
-        let cap = capability(&result).expect("capability present");
+        }));
+        let cap = capability(&meta).expect("capability present");
         assert_eq!(cap.version, 1);
         assert_eq!(cap.control_method, "_session/goal");
         assert_eq!(cap.extra["vendor"], "x");
-        assert!(accepts(&result, &GoalAction::Set));
-        assert!(!accepts(&result, &GoalAction::Other("skip".to_string())));
-    }
+        assert!(accepts(&meta, &GoalAction::Set));
+        assert!(!accepts(&meta, &GoalAction::Other("skip".to_string())));
 
-    /// No capability is reported when `_meta.goal` is absent.
-    #[test]
-    fn capability_absent() {
-        let result: InitializeResult =
-            serde_json::from_value(json!({"protocolVersion": 1})).expect("deserializes");
-        assert!(capability(&result).is_none());
-        assert!(!accepts(&result, &GoalAction::Set));
+        assert!(capability(&None).is_none());
+        assert!(capability(&Some(json!({}))).is_none());
+        assert!(!accepts(&None, &GoalAction::Set));
     }
 
     /// `session_info_update._meta.goal` decodes into a snapshot; explicit
-    /// `null` means cleared.
+    /// `null` (or a cleared `_meta`) means cleared.
     #[test]
     fn update_extraction() {
         let update = SessionInfoUpdate {
-            meta: Some(json!({
+            meta: Patch::Set(json!({
                 "goal": {"objective": "ship", "status": "active", "iterations": 3}
             })),
             ..SessionInfoUpdate::default()
@@ -334,7 +234,13 @@ mod tests {
         assert_eq!(snapshot.iterations, Some(3));
 
         let update = SessionInfoUpdate {
-            meta: Some(json!({"goal": null})),
+            meta: Patch::Set(json!({"goal": null})),
+            ..SessionInfoUpdate::default()
+        };
+        assert!(matches!(super::update(&update), Some(GoalUpdate::Cleared)));
+
+        let update = SessionInfoUpdate {
+            meta: Patch::Clear,
             ..SessionInfoUpdate::default()
         };
         assert!(matches!(super::update(&update), Some(GoalUpdate::Cleared)));

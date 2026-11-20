@@ -1,256 +1,140 @@
-//! # aither-acp
+//! ACP (Agent Client Protocol) client and server for aither.
 //!
-//! `Agent Client Protocol` (ACP) client and server implementation.
+//! One ergonomic, runtime-agnostic API drives both ACP v1 and v2:
+//! [`domain`] types are canonical v2 shapes, and the [`wire`] codec
+//! layer degrades each connection to v1 when the peer negotiates it.
 //!
-//! This crate implements both directions of ACP v1:
+//! - **Serve an agent**: implement [`SessionHost`] and [`Session`], then
+//!   [`Server::serve`] over a [`Transport`] (or [`Server::serve_stdio`]
+//!   with the `stdio` feature).
+//! - **Drive an agent**: [`Client::builder`] registers agent→client
+//!   handlers (permissions, elicitation, extension methods), then
+//!   [`ClientBuilder::connect`]s over a transport, `spawn`s a child
+//!   process (`process` feature), or [`ClientBuilder::in_process`]
+//!   attaches an in-process [`SessionHost`] over the zero-serde direct
+//!   lane.
+//! - [`state`]: the canonical [`SessionReducer`] folding
+//!   `session/update`s into a [`SessionState`] snapshot plus
+//!   [`SessionEvent`]s.
 //!
-//! - [`serve`] and [`serve_stdio`] drive any [`AgentHandler`] over a
-//!   [`BidirectionalTransport`](aither_mcp::transport::BidirectionalTransport),
-//!   handing each call a [`ClientPeer`] that streams [`SessionNotification`]
-//!   updates and initiates correlated agent-to-client requests
-//!   (`session/request_permission`, `fs/*`, `terminal/*`,
-//!   `elicitation/create`, `_` extensions) while concurrent inbound
-//!   notifications such as `session/cancel` continue to flow.
-//! - With the default `agent` feature enabled, `AcpServer` runs an aither
-//!   `LanguageModel` as an ACP agent over stdio or any bidirectional
-//!   transport, connecting session MCP servers via [`mcp::connect_all`].
-//! - [`AcpClient`] connects to a spawned or piped ACP agent (such as
-//!   `devin acp`) over any
-//!   [`BidirectionalTransport`](aither_mcp::transport::BidirectionalTransport),
-//!   driving sessions, prompts, modes, config options, authentication, and
-//!   session lifecycle while a [`ClientHandler`] receives streamed updates
-//!   and answers permission, file-system, terminal, and elicitation requests
-//!   from the agent.
+//! # Serving an agent over stdio
 //!
-//! Disable default features (`default-features = false`) to depend on the
-//! protocol types, [`ext`], [`vendor`], [`mcp`], [`AcpClient`], and the generic
-//! [`serve`] / [`AgentHandler`] server without pulling `aither-agent`.
-//!
-//! Extensions follow ACP's `_`-prefixed method convention: provider-neutral
-//! conventions live under [`ext`], vendor-specific surface under [`vendor`],
-//! and [`AcpClient::ext_request`]/[`AcpClient::ext_notify`] and
-//! [`ClientPeer::ext_request`]/[`ClientPeer::ext_notify`] carry any
-//! [`ExtMethod`] a provider defines.
-//!
-//! # Protocol Overview
-//!
-//! ACP uses JSON-RPC 2.0 over newline-delimited stdio or pipes. ACP describes
-//! the client direction (editor → agent): [`serve`] / [`AgentHandler`] play the
-//! ACP **server** (agent) role and [`AcpClient`] plays the ACP **client**
-//! (editor) role.
-//!
-//! # Client
-//!
-//! ```no_run
-//! use aither_acp::{AcpClient, ContentBlock, PromptParams, SessionNewParams, TextContent};
-//! # use aither_acp::{ClientCapabilities, ClientHandler, SessionNotification};
-//! # use aither_acp::{RequestPermissionParams, RequestPermissionResult, RequestPermissionOutcome};
-//! # use aither_mcp::protocol::JsonRpcError;
-//! # use std::future::Future;
-//!
-//! # struct H;
-//! # impl ClientHandler for H {
-//! #     fn session_update(&self, _: SessionNotification) -> impl Future<Output = ()> + Send {
-//! #         async {}
-//! #     }
-//! #     fn request_permission(&self, _: RequestPermissionParams)
-//! #         -> impl Future<Output = Result<RequestPermissionResult, JsonRpcError>> + Send
-//! #     {
-//! #         async { Ok(RequestPermissionResult { outcome: RequestPermissionOutcome::Cancelled, meta: None }) }
-//! #     }
-//! # }
-//! # async fn run() -> Result<(), aither_acp::ClientError> {
-//! let (client, connection) = AcpClient::spawn(
-//!     "devin",
-//!     &["acp"],
-//!     [],
-//!     "/tmp",
-//!     H,
-//! )?;
-//! tokio::spawn(connection);
-//!
-//! let init = client.initialize().await?;
-//! let session = client
-//!     .new_session(SessionNewParams::new("/tmp"))
-//!     .await?;
-//! let result = client
-//!     .prompt(PromptParams::new(
-//!         &session.session_id,
-//!         vec![ContentBlock::Text(TextContent {
-//!             text: "hi".to_string(),
-//!             annotations: None,
-//!             meta: None,
-//!         })],
-//!     ))
-//!     .await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Generic Agent Server
-//!
-//! ```no_run
+//! ```rust,no_run
 //! use aither_acp::{
-//!     AgentCapabilities, AgentHandler, ClientPeer, ContentBlock, ContentChunk, Implementation,
-//!     InitializeParams, InitializeResult, JsonRpcError, PROTOCOL_VERSION, PromptParams,
-//!     PromptResult, SessionNewParams, SessionNewResult, SessionNotification, SessionUpdate,
-//!     StopReason, TextContent, serve_stdio,
+//!     Implementation, PendingPrompt, PromptError, Server, Session, SessionContext, SessionHost,
+//!     SessionSetupParams, StopReason, server::ServerError,
 //! };
-//! use std::future::Future;
 //!
-//! struct EchoHandler;
-//!
-//! impl AgentHandler for EchoHandler {
-//!     fn initialize(
+//! struct Echo;
+//! impl Session for Echo {
+//!     async fn prompt(
 //!         &self,
-//!         _peer: &ClientPeer,
-//!         _params: Option<InitializeParams>,
-//!     ) -> impl Future<Output = Result<InitializeResult, JsonRpcError>> + Send {
-//!         async {
-//!             Ok(InitializeResult {
-//!                 protocol_version: PROTOCOL_VERSION,
-//!                 agent_capabilities: AgentCapabilities::default(),
-//!                 agent_info: Some(Implementation {
-//!                     name: "echo-bridge".to_string(),
-//!                     title: None,
-//!                     version: "0.1.0".to_string(),
-//!                 }),
-//!                 auth_methods: vec![],
-//!                 meta: None,
-//!             })
-//!         }
+//!         pending: PendingPrompt,
+//!         _cx: &SessionContext,
+//!     ) -> Result<StopReason, PromptError> {
+//!         let turn = pending
+//!             .accept()
+//!             .await
+//!             .map_err(|e| PromptError::from(e.into_inner()))?;
+//!         turn.message().text("echo").await.ok();
+//!         Ok(StopReason::EndTurn)
 //!     }
+//! }
 //!
-//!     fn new_session(
+//! struct EchoHost;
+//! impl SessionHost for EchoHost {
+//!     type Session = Echo;
+//!     async fn new_session(
 //!         &self,
-//!         _peer: &ClientPeer,
-//!         _params: SessionNewParams,
-//!     ) -> impl Future<Output = Result<SessionNewResult, JsonRpcError>> + Send {
-//!         async {
-//!             Ok(SessionNewResult {
-//!                 session_id: "sess-1".to_string(),
-//!                 ..SessionNewResult::default()
-//!             })
-//!         }
-//!     }
-//!
-//!     fn prompt(
-//!         &self,
-//!         peer: &ClientPeer,
-//!         params: PromptParams,
-//!     ) -> impl Future<Output = Result<PromptResult, JsonRpcError>> + Send {
-//!         let peer = peer.clone();
-//!         async move {
-//!             let _ = peer
-//!                 .session_update(SessionNotification::new(
-//!                     &params.session_id,
-//!                     SessionUpdate::AgentMessageChunk(ContentChunk {
-//!                         content: ContentBlock::Text(TextContent {
-//!                             text: "hello".to_string(),
-//!                             annotations: None,
-//!                             meta: None,
-//!                         }),
-//!                         message_id: None,
-//!                         meta: None,
-//!                     }),
-//!                 ))
-//!                 .await;
-//!             Ok(PromptResult {
-//!                 stop_reason: StopReason::EndTurn,
-//!                 meta: None,
-//!             })
-//!         }
+//!         _params: SessionSetupParams,
+//!         _cx: &SessionContext,
+//!     ) -> Result<Echo, ServerError> {
+//!         Ok(Echo)
 //!     }
 //! }
 //!
 //! # async fn run() {
-//! let (_peer, connection) = serve_stdio(EchoHandler);
-//! connection.await;
+//! let server = Server::new(EchoHost, Implementation::new("echo-agent", "0.1.0"));
+//! let (peer, serve) = server.serve_stdio();
+//! // Drive `serve` on an executor: it dispatches requests and runs turns.
+//! # let _ = (peer, serve);
 //! # }
 //! ```
 //!
-//! # Aither Agent Server (`agent` feature)
+//! # Driving an agent process
 //!
-//! ```no_run
-//! # #[cfg(feature = "agent")]
-//! # mod agent_example {
-//! use aither_acp::{AcpError, AcpServer};
-//! use aither_agent::Agent;
-//! use aither_core::LanguageModel;
-//! use aither_core::llm::{Event, LLMRequest, model::Profile};
-//! use futures_lite::{Stream, stream};
-//! use std::future::Future;
+//! ```rust,no_run
+//! use std::path::Path;
 //!
-//! #[derive(Clone)]
-//! struct EchoModel;
+//! use aither_acp::domain::PermissionOptionId;
+//! use aither_acp::{
+//!     Client, Implementation, PermissionOutcome, PermissionRequest, domain::SelectedOutcome,
+//! };
 //!
-//! #[derive(Debug)]
-//! struct EchoError;
-//! impl std::fmt::Display for EchoError {
-//!     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//!         f.write_str("echo model error")
-//!     }
-//! }
-//! impl std::error::Error for EchoError {}
-//! impl aither_core::llm::Classify for EchoError {
-//!     fn failure(&self) -> aither_core::llm::Failure {
-//!         aither_core::llm::Failure::permanent()
-//!     }
-//! }
+//! # async fn run() {
+//! let (client, conn) = Client::builder(Implementation::new("my-editor", "1.0.0"))
+//!     .permissions(|_req: PermissionRequest| async move {
+//!         PermissionOutcome::Selected(SelectedOutcome {
+//!             option_id: PermissionOptionId::from("allow"),
+//!             meta: None,
+//!         })
+//!     })
+//!     .spawn("my-agent", &[], &[], Path::new("/"))
+//!     .await
+//!     .expect("connect");
+//! tokio::spawn(conn); // drive the connection
 //!
-//! impl LanguageModel for EchoModel {
-//!     type Error = EchoError;
-//!
-//!     fn respond(&self, _request: LLMRequest) -> impl Stream<Item = Result<Event, EchoError>> + Send {
-//!         stream::once(Ok(Event::Text("Hello from ACP".to_string())))
-//!     }
-//!
-//!     fn profile(&self) -> impl Future<Output = Result<Profile, EchoError>> + Send {
-//!         std::future::ready(Ok(Profile::new("echo", "test", "echo", "Echo model", 128_000)))
-//!     }
-//! }
-//!
-//! pub async fn run() -> Result<(), AcpError> {
-//!     let mut server = AcpServer::stdio(
-//!         "echo-agent",
-//!         "0.1.0",
-//!         executor_core::tokio::TokioGlobal,
-//!         |_setup| async { Ok::<_, AcpError>(Agent::new(EchoModel)) },
-//!     );
-//!     server.run().await
-//! }
+//! let session = client.new_session("/tmp").open().await.expect("session/new");
+//! let outcome = session.prompt_run("hello").await.expect("prompt");
+//! # let _ = outcome;
 //! # }
-//! # fn main() {}
 //! ```
-//!
-//! # Error Handling
-//!
-//! [`ClientError`] and [`ServerError`] distinguish a closed transport from a
-//! JSON-RPC error returned by the peer and from a protocol violation. When the
-//! connection closes, every pending request fails rather than hanging.
 
-#[cfg(feature = "agent")]
-mod adapter;
-#[cfg(feature = "agent")]
-mod child;
-mod client;
+pub mod client;
+pub mod domain;
 pub mod ext;
-mod macros;
-pub mod mcp;
-pub mod protocol;
-mod server;
-#[cfg(feature = "agent")]
-mod session;
+pub mod rpc;
+pub mod server;
+pub mod state;
 pub mod vendor;
+pub mod wire;
 
 #[cfg(feature = "agent")]
-pub use adapter::SessionUpdateMapper;
+pub mod aither;
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
+// --- the ergonomic flat surface ---------------------------------------
+//
+// The modules stay public for advanced use; the names below are the
+// everyday API: client, server, domain primitives, errors, transport.
+
+pub use client::{
+    Client, ClientBuilder, ClientError, ClientSession, IntoPrompt, PromptTurn, TurnOutcome,
+};
+pub use domain::ids::ConfigId;
+pub use domain::{
+    AgentCapabilities, AuthMethod, AvailableCommand, ClientCapabilities, ConfigOption, ConfigValue,
+    ContentBlock, ExtIdent, ExtMethod, ForegroundState, Implementation, McpServer, MessageId,
+    MetaPatch, Open, Patch, PermissionOutcome, PermissionRequest, PlanId, ResumeParams, SessionId,
+    SessionInfo, SessionPage, SessionSetupParams, SessionUpdate, SetupResult, StopReason,
+    TerminalId, ToolCallId,
+};
+#[cfg(feature = "process")]
+pub use rpc::ChildProcess;
+#[cfg(feature = "stdio")]
+pub use rpc::Stdio;
+pub use rpc::{Lines, Memory, PeerError, RpcError, Transport};
+pub use server::{
+    PendingPrompt, PromptError, Server, ServerBuilder, ServerError, Session, SessionContext,
+    SessionHost, ToolCallBuilder, ToolCallHandle, Turn,
+};
+pub use state::{SessionEvent, SessionReducer, SessionState};
+
+pub use server::AuthConfig;
+pub use server::ProtocolVersion;
+
 #[cfg(feature = "agent")]
-pub use child::{AcpChildAgent, UpdateSink, UpdateSource};
-pub use client::{AcpClient, ClientError, ClientHandler, ResponseFuture};
-pub use protocol::*;
-#[cfg(feature = "agent")]
-pub use server::{AcpServer, SessionSetup};
-pub use server::{AgentHandler, ClientPeer, ServerError, ServerResponseFuture, serve, serve_stdio};
-#[cfg(feature = "agent")]
-pub use session::AcpSession;
+pub use aither::{AcpChildAgent, AitherHost, SessionSetup};
+#[cfg(feature = "mcp")]
+pub use mcp::connect_all;
