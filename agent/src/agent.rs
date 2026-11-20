@@ -2166,9 +2166,11 @@ where
 
     /// A compaction request over `messages` and `definitions`: the
     /// compaction model's parameters when one is set, else the session
-    /// model's, under the cache controls the requests that wrote the prefix
+    /// model's under the cache controls the requests that wrote the prefix
     /// carry, so a compaction on the session's own model is served from that
-    /// cache.
+    /// cache. A configured compaction model is a different model and reads
+    /// none of that cache, so its request keeps its own parameters rather
+    /// than write an entry for the prefix being discarded.
     ///
     /// `messages` is the window as the session model's requests carry it. A
     /// compaction model runs at its own effort, so the session's effort
@@ -2178,21 +2180,20 @@ where
         mut messages: Vec<Message>,
         definitions: Vec<aither_core::llm::tool::ToolDefinition>,
     ) -> LLMRequest {
-        if self.compaction_model.is_some() {
-            messages.retain(|message| message.role() != Role::Configuration);
-        }
-        let parameters = self.compaction_model.as_ref().map_or_else(
-            || self.request_parameters(),
-            |compactor| (*compactor.parameters).clone(),
-        );
-        let parameters = self.prompt_cache.apply(
-            parameters,
-            &messages,
-            !definitions.is_empty(),
-            self.compaction_takes_mid_conversation_system(),
-        );
+        let Some(compactor) = self.compaction_model.as_ref() else {
+            let parameters = self.prompt_cache.apply(
+                self.request_parameters(),
+                &messages,
+                !definitions.is_empty(),
+                self.compaction_takes_mid_conversation_system(),
+            );
+            return LLMRequest::new(messages)
+                .with_parameters(parameters)
+                .with_tool_definitions(definitions);
+        };
+        messages.retain(|message| message.role() != Role::Configuration);
         LLMRequest::new(messages)
-            .with_parameters(parameters)
+            .with_parameters((*compactor.parameters).clone())
             .with_tool_definitions(definitions)
     }
 
