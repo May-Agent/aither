@@ -413,6 +413,9 @@ impl LanguageModel for Claude {
                 profile.abilities.push(Ability::MidConversationSystem);
             }
             profile.default_reasoning_effort = aither_models::default_reasoning_effort(&cfg.model);
+            // The Messages API offers 5-minute and 1-hour cache TTLs on
+            // every Claude model.
+            profile.prompt_cache = Some(aither_core::llm::model::PromptCacheTiers::new(300, 3600));
 
             for ability in &cfg.native_abilities {
                 if !profile.abilities.contains(ability) {

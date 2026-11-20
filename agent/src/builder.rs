@@ -313,6 +313,15 @@ where
         self
     }
 
+    /// Marks the agent's requests unable to write cache entries, keeping
+    /// the routing key that reaches the session's shard. A read-only fork —
+    /// a `/btw` side question — asks for no breakpoints: the span it would
+    /// write is never read back.
+    pub const fn read_only_cache(mut self) -> Self {
+        self.prompt_cache.set_read_only(true);
+        self
+    }
+
     /// Sets the time source idle compaction, idle reassembly and cache
     /// warmth read; the system clock by default.
     pub fn clock(mut self, clock: impl crate::Clock) -> Self {

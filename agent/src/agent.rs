@@ -1746,13 +1746,20 @@ where
     ///
     /// Returns the provider error when the keep-alive request fails.
     pub async fn keep_cache_warm(&mut self) -> Result<Option<aither_core::llm::Usage>, AgentError> {
-        if self.warmth.cold_in().is_none() {
-            return Ok(None);
+        // A refresh that lands after the entry expired buys a full-price
+        // write no one reads, so the request must leave with a margin.
+        const DISPATCH_MARGIN: Duration = Duration::from_secs(5);
+        match self.warmth.cold_in() {
+            Some(remaining) if remaining > DISPATCH_MARGIN => {}
+            _ => return Ok(None),
         }
         let Some(last_request) = self.last_request.clone() else {
             return Ok(None);
         };
         let (messages, parameters, tool_definitions) = last_request.into_parts();
+        if !self.keep_warm_replayable(&parameters) {
+            return Ok(None);
+        }
         let request = LLMRequest::new(messages)
             .with_tool_definitions(tool_definitions)
             .with_parameters(parameters.max_tokens(1).stream(false));
@@ -2108,6 +2115,65 @@ where
         self.profile = None;
         self.last_request = None;
         self.warmth.reset();
+    }
+
+    /// Whether replaying the request capped at one output token can reach
+    /// the recorded cache entry. Anthropic's budget thinking derives
+    /// `budget_tokens` from `max_tokens`, which the cache entry is keyed
+    /// on, so a reasoning request on a budget-thinking model is not
+    /// replayable (adaptive-thinking models — `PerMessageEffort` — are).
+    fn keep_warm_replayable(&self, parameters: &aither_core::llm::model::Parameters) -> bool {
+        if parameters.reasoning_effort.is_none() {
+            return true;
+        }
+        !self.profile.as_ref().is_some_and(|profile| {
+            profile.author == "Anthropic" && !profile.abilities.contains(&Ability::PerMessageEffort)
+        })
+    }
+
+    /// How long the entry `parameters` would write stays warm: the model's
+    /// published lifetime for the retention tier the cache controls ask
+    /// for, or the configured lifetime when the model publishes none.
+    fn entry_lifetime(
+        &self,
+        parameters: &aither_core::llm::model::Parameters,
+    ) -> crate::context::CacheLifetime {
+        use aither_core::llm::model::{ClaudePromptCacheTtl, OpenAIPromptCacheRetention};
+        let Some(tiers) = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.prompt_cache)
+        else {
+            return self.prompt_cache.lifetime();
+        };
+        let anthropic = self
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.author == "Anthropic");
+        let tier = if anthropic {
+            parameters
+                .cache
+                .claude
+                .as_ref()
+                .and_then(|cache| match cache.ttl {
+                    ClaudePromptCacheTtl::FiveMinutes => tiers.short,
+                    ClaudePromptCacheTtl::OneHour => tiers.long,
+                })
+        } else {
+            parameters
+                .cache
+                .openai
+                .as_ref()
+                .and_then(|cache| cache.retention)
+                .and_then(|retention| match retention {
+                    OpenAIPromptCacheRetention::InMemory => tiers.short,
+                    OpenAIPromptCacheRetention::Hours24 => tiers.long,
+                })
+        };
+        tier.map_or_else(
+            || self.prompt_cache.lifetime(),
+            |seconds| crate::context::CacheLifetime::Limited(Duration::from_secs(seconds)),
+        )
     }
 
     /// Whether the agent's own model takes reasoning effort changes inside
@@ -3090,6 +3156,7 @@ where
             has_tools,
             self.takes_mid_conversation_system(),
         );
+        self.warmth.set_lifetime(self.entry_lifetime(&parameters));
         let request = LLMRequest::new(messages)
             .with_parameters(parameters)
             .with_tool_definitions(definitions);

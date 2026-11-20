@@ -35,13 +35,14 @@ struct UsageLlm {
 }
 
 impl UsageLlm {
-    /// The keep-alive requests seen so far: those asking for no output.
+    /// The keep-alive requests seen so far: those capped at one output
+    /// token.
     fn keep_alives(&self) -> usize {
         self.requests
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| request.parameters().max_tokens == Some(0))
+            .filter(|request| request.parameters().max_tokens == Some(1))
             .count()
     }
 }
