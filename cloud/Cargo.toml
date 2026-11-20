@@ -21,7 +21,15 @@ aither-openai.workspace = true
 async-stream = "0.3"
 futures-core = "0.3"
 futures-lite = "2.6"
+schemars = { version = "1.2", default-features = false }
+serde = { version = "1.0", default-features = false }
 thiserror = "2"
+
+[dev-dependencies]
+schemars = "1.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

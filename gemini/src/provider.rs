@@ -1,10 +1,16 @@
-use crate::{GEMINI_API_BASE_URL, Gemini, config::AuthMode, error::GeminiError};
+use crate::{
+    GEMINI_API_BASE_URL, Gemini,
+    client::within_idle,
+    config::{AuthMode, DEFAULT_IDLE_TIMEOUT},
+    error::GeminiError,
+};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
 use aither_models::lookup as lookup_model_info;
 use serde::Deserialize;
-use std::{future::Future, sync::Arc};
+use std::{future::Future, sync::Arc, time::Duration};
+use url::Url;
 use zenwave::{Client, client};
 
 /// Provider capable of listing and instantiating `Gemini` models.
@@ -20,7 +26,8 @@ impl GeminiProvider {
             inner: Arc::new(ProviderConfig {
                 api_key: api_key.into(),
                 base_url: GEMINI_API_BASE_URL.to_string(),
-                auth: AuthMode::Query,
+                auth: AuthMode::Header,
+                idle_timeout: DEFAULT_IDLE_TIMEOUT,
             }),
         }
     }
@@ -32,10 +39,17 @@ impl GeminiProvider {
         self
     }
 
-    /// Select header-based authentication.
+    /// Select authentication mode (`AuthMode::Header` by default).
     #[must_use]
     pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
         Arc::make_mut(&mut self.inner).auth = mode;
+        self
+    }
+
+    /// Override the request idle timeout.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        Arc::make_mut(&mut self.inner).idle_timeout = idle_timeout;
         self
     }
 }
@@ -47,24 +61,28 @@ impl LanguageModelProvider for GeminiProvider {
     fn list_models(&self) -> impl Future<Output = Result<Vec<ModelProfile>, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
-            let mut endpoint = format!("{}/models", cfg.base_url.trim_end_matches('/'));
-            if cfg.auth == AuthMode::Query {
-                let separator = if endpoint.contains('?') { '&' } else { '?' };
-                endpoint.push(separator);
-                endpoint.push_str("key=");
-                endpoint.push_str(&cfg.api_key);
-            }
+            let raw = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+            let endpoint = if cfg.auth == AuthMode::Query {
+                let mut parsed = Url::parse(&raw)
+                    .map_err(|err| GeminiError::Api(format!("invalid Gemini models URL: {err}")))?;
+                parsed.query_pairs_mut().append_pair("key", &cfg.api_key);
+                parsed.to_string()
+            } else {
+                raw
+            };
 
             let mut backend = client();
-            let mut builder = backend.get(endpoint).map_err(GeminiError::Http)?;
+            let mut builder = backend.get(endpoint).map_err(GeminiError::from_http)?;
 
             if cfg.auth == AuthMode::Header {
                 builder = builder
                     .header("x-goog-api-key", cfg.api_key.clone())
-                    .map_err(GeminiError::Http)?;
+                    .map_err(GeminiError::from_http)?;
             }
 
-            let response: ModelListResponse = builder.json().await.map_err(GeminiError::Http)?;
+            let response: ModelListResponse = within_idle(cfg.idle_timeout, builder.json())
+                .await?
+                .map_err(GeminiError::from_http)?;
 
             Ok(response
                 .models
@@ -105,6 +123,7 @@ impl LanguageModelProvider for GeminiProvider {
             let backend = Gemini::new(cfg.api_key.clone())
                 .with_base_url(cfg.base_url.clone())
                 .with_auth_mode(cfg.auth)
+                .with_idle_timeout(cfg.idle_timeout)
                 .with_text_model(name);
             Ok(backend)
         }
@@ -115,11 +134,23 @@ impl LanguageModelProvider for GeminiProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ProviderConfig {
     api_key: String,
     base_url: String,
     auth: AuthMode,
+    idle_timeout: Duration,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("auth", &self.auth)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]

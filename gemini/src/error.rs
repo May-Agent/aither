@@ -3,34 +3,45 @@
 // few of them.
 #![allow(dead_code)]
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
 use aither_core::llm::{
     Classify, Failure, FailureKind,
-    failure::zenwave::{body_failure, failure as http_failure, sse_failure},
+    failure::zenwave::{body_failure, failure as http_failure, io_is_network, sse_failure},
 };
 use base64::DecodeError;
 use serde::Deserialize;
 use zenwave::{BodyError, Error as ZenwaveError, sse::ParseError as SseParseError};
 
 /// Errors raised by the Gemini backend.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum GeminiError {
     /// HTTP transport errors.
-    Http(ZenwaveError),
+    #[error("{}", parse_http_error_message(.0))]
+    Http(#[source] ZenwaveError),
     /// Request/response body encoding failures.
-    Body(BodyError),
+    #[error("Request failed: {0}")]
+    Body(#[from] BodyError),
     /// JSON serialization/deserialization problems.
-    Json(serde_json::Error),
+    #[error("Invalid response format: {0}")]
+    Json(#[from] serde_json::Error),
     /// Base64 decode failure (inline images/audio).
-    Decode(DecodeError),
+    #[error("Decode error: {0}")]
+    Decode(#[from] DecodeError),
+    /// Local I/O failures (e.g., reading attachments or cache files).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// API level errors or unsupported operations.
+    #[error("{0}")]
     Api(String),
     /// Other parsing errors.
+    #[error("Parse error: {0}")]
     Parse(String),
     /// SSE stream failures.
-    Stream(SseParseError),
+    #[error("Parse error: {0}")]
+    Stream(#[from] SseParseError),
     /// Rate limit exceeded (includes retry delay if available).
+    #[error("{message}{}", retry_after.map_or_default(|d| format!(" (retry after {}s)", d.as_secs())))]
     RateLimit {
         /// What the API said about the limit.
         message: String,
@@ -39,9 +50,16 @@ pub enum GeminiError {
     },
     /// A quota that resets on a long horizon, such as the daily one, is
     /// exhausted.
+    #[error("{message}")]
     QuotaExceeded {
         /// What the API said about the quota.
         message: String,
+    },
+    /// The response did not start, or the stream sent nothing, for the idle timeout.
+    #[error("the response was silent for {idle:?}")]
+    IdleTimeout {
+        /// How long the client waited.
+        idle: Duration,
     },
 }
 
@@ -178,36 +196,6 @@ impl ApiErrorResponse {
     }
 }
 
-impl From<std::io::Error> for GeminiError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Api(format!("IO error: {value}"))
-    }
-}
-
-impl fmt::Display for GeminiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(err) => write!(f, "{}", parse_http_error_message(err)),
-            Self::Body(err) => write!(f, "Request failed: {err}"),
-            Self::Json(err) => write!(f, "Invalid response format: {err}"),
-            Self::Decode(err) => write!(f, "Decode error: {err}"),
-            Self::Api(message) | Self::QuotaExceeded { message } => write!(f, "{message}"),
-            Self::Parse(message) => write!(f, "Parse error: {message}"),
-            Self::Stream(err) => write!(f, "Parse error: {err}"),
-            Self::RateLimit {
-                message,
-                retry_after,
-            } => {
-                if let Some(delay) = retry_after {
-                    write!(f, "{message} (retry after {}s)", delay.as_secs())
-                } else {
-                    write!(f, "{message}")
-                }
-            }
-        }
-    }
-}
-
 /// Parse HTTP error to extract a user-friendly message.
 fn parse_http_error_message(err: &ZenwaveError) -> String {
     // Try to parse as Gemini API error response
@@ -241,8 +229,6 @@ fn parse_http_error_message(err: &ZenwaveError) -> String {
 
     err.to_string()
 }
-
-impl std::error::Error for GeminiError {}
 
 impl GeminiError {
     /// Convert a zenwave error to a `GeminiError`, detecting rate limits and
@@ -290,30 +276,17 @@ impl Classify for GeminiError {
             }
             Self::Body(err) => body_failure(err),
             Self::Stream(err) => sse_failure(err),
-            Self::Json(_) | Self::Decode(_) | Self::Api(_) | Self::Parse(_) => Failure::permanent(),
+            Self::Json(err) if err.is_eof() => Failure::network(),
+            Self::Io(err) if io_is_network(err.kind()) => Failure::network(),
+            Self::IdleTimeout { .. } => Failure::network(),
+            Self::Json(_) | Self::Decode(_) | Self::Io(_) | Self::Api(_) | Self::Parse(_) => {
+                Failure::permanent()
+            }
             Self::RateLimit { retry_after, .. } => {
                 Failure::transient().with_retry_after(*retry_after)
             }
             Self::QuotaExceeded { .. } => Failure::quota(),
         }
-    }
-}
-
-impl From<BodyError> for GeminiError {
-    fn from(value: BodyError) -> Self {
-        Self::Body(value)
-    }
-}
-
-impl From<serde_json::Error> for GeminiError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
-    }
-}
-
-impl From<DecodeError> for GeminiError {
-    fn from(value: DecodeError) -> Self {
-        Self::Decode(value)
     }
 }
 
@@ -385,6 +358,30 @@ mod tests {
                 .retry_after
                 .is_some_and(|d| d > Duration::from_secs(3600))
         );
+    }
+
+    #[test]
+    fn error_source_and_idle_timeout_classification() {
+        use std::error::Error as _;
+
+        let json_err =
+            GeminiError::from(serde_json::from_str::<serde_json::Value>("!").unwrap_err());
+        assert!(json_err.source().is_some());
+
+        let io_err = GeminiError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "socket timed out",
+        ));
+        assert!(io_err.source().is_some());
+        assert_eq!(io_err.failure().kind, FailureKind::Network);
+
+        let http_err = http(500, &[], "");
+        assert!(http_err.source().is_some());
+
+        let idle_err = GeminiError::IdleTimeout {
+            idle: Duration::from_secs(30),
+        };
+        assert_eq!(idle_err.failure().kind, FailureKind::Network);
     }
 
     #[tokio::test]

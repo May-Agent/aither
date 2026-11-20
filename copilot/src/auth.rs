@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime};
 use zenwave::{Client, client};
 
 /// Response from the device code request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DeviceCodeResponse {
     /// The device verification code.
     pub device_code: String,
@@ -50,8 +50,20 @@ pub struct DeviceCodeResponse {
     pub interval: u64,
 }
 
+impl std::fmt::Debug for DeviceCodeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeResponse")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &"[REDACTED]")
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
 /// Token obtained from successful authentication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CopilotToken {
     /// The access token for API requests.
     pub access_token: String,
@@ -62,6 +74,17 @@ pub struct CopilotToken {
     /// When the token expires (if known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<SystemTime>,
+}
+
+impl std::fmt::Debug for CopilotToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopilotToken")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Request body for device code endpoint.
@@ -220,7 +243,7 @@ pub async fn try_get_token(device_code: &str) -> Result<CopilotToken, CopilotErr
 ///
 /// This is obtained by exchanging an OAuth token with the Copilot API.
 /// Session tokens are short-lived (typically ~30 minutes).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionToken {
     /// The session token for API calls.
     pub token: String,
@@ -230,14 +253,24 @@ pub struct SessionToken {
     pub expires_at: i64,
 }
 
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionToken")
+            .field("token", &"[REDACTED]")
+            .field("api_endpoint", &self.api_endpoint)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// Endpoints returned from the token exchange.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct EndpointsResponse {
     api: String,
 }
 
 /// Response from the Copilot token exchange endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SessionTokenResponse {
     token: String,
     endpoints: EndpointsResponse,
@@ -271,12 +304,19 @@ struct SessionTokenResponse {
 /// Returns a [`CopilotError`] if the request fails or the OAuth token is not
 /// accepted — most often because it has expired or lacks Copilot access.
 pub async fn get_session_token(oauth_token: &str) -> Result<SessionToken, CopilotError> {
-    use crate::constant::{COPILOT_TOKEN_URL, EDITOR_VERSION};
+    get_session_token_at(oauth_token, crate::constant::COPILOT_TOKEN_URL).await
+}
+
+pub(crate) async fn get_session_token_at(
+    oauth_token: &str,
+    token_url: &str,
+) -> Result<SessionToken, CopilotError> {
+    use crate::constant::EDITOR_VERSION;
 
     let mut backend = client();
 
     let response: SessionTokenResponse = backend
-        .get(COPILOT_TOKEN_URL)
+        .get(token_url)
         .map_err(CopilotError::Http)?
         .header("Authorization", format!("token {oauth_token}"))
         .map_err(CopilotError::Http)?

@@ -2,7 +2,9 @@
 
 use crate::{
     CopilotError,
-    constant::{COPILOT_BASE_URL, COPILOT_INTEGRATION_ID, DEFAULT_MODEL, EDITOR_VERSION},
+    constant::{
+        COPILOT_BASE_URL, COPILOT_INTEGRATION_ID, COPILOT_TOKEN_URL, DEFAULT_MODEL, EDITOR_VERSION,
+    },
 };
 use aither_core::time::sleep;
 use aither_core::{
@@ -15,6 +17,7 @@ use aither_core::{
         tool::ToolDefinition,
     },
 };
+use async_lock::Mutex;
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,63 @@ use std::{
     time::{Duration, Instant},
 };
 use zenwave::{Client, client, header};
+
+/// Shared short-lived session token and endpoint refreshed on 401 responses.
+#[derive(Clone)]
+pub struct SessionState {
+    pub token: String,
+    pub base_url: String,
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState")
+            .field("token", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+pub fn copilot_from_shared(
+    session: Arc<Mutex<SessionState>>,
+    token_exchange_url: String,
+    model: &str,
+    editor_version: String,
+    integration_id: String,
+    oauth_token: Option<String>,
+) -> Copilot {
+    Copilot {
+        inner: Arc::new(Config {
+            session,
+            token_exchange_url,
+            model: model.trim().to_string(),
+            editor_version,
+            integration_id,
+            oauth_token,
+        }),
+    }
+}
+
+pub async fn refresh_shared_session(
+    session: &Mutex<SessionState>,
+    failed_token: &str,
+    oauth_token: Option<&str>,
+    token_exchange_url: &str,
+) -> Result<Option<SessionState>, CopilotError> {
+    let Some(oauth_token) = oauth_token else {
+        return Ok(None);
+    };
+
+    let mut guard = session.lock().await;
+    if guard.token != failed_token {
+        return Ok(Some(guard.clone()));
+    }
+
+    let fresh = crate::auth::get_session_token_at(oauth_token, token_exchange_url).await?;
+    guard.token = fresh.token;
+    guard.base_url = fresh.api_endpoint;
+    Ok(Some(guard.clone()))
+}
 
 /// GitHub Copilot language model client.
 ///
@@ -56,7 +116,14 @@ impl Copilot {
     /// Override the REST base URL.
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).base_url = base_url.into();
+        let base_url = base_url.into();
+        let cfg = Arc::make_mut(&mut self.inner);
+        if Arc::strong_count(&cfg.session) == 1 {
+            cfg.session.lock_blocking().base_url = base_url;
+        } else {
+            let token = cfg.session.lock_blocking().token.clone();
+            cfg.session = Arc::new(Mutex::new(SessionState { token, base_url }));
+        }
         self
     }
 
@@ -129,25 +196,61 @@ impl LanguageModel for Copilot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Config {
-    token: String,
-    base_url: String,
+    session: Arc<Mutex<SessionState>>,
+    token_exchange_url: String,
     model: String,
     editor_version: String,
     integration_id: String,
     oauth_token: Option<String>,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let base_url = self
+            .session
+            .try_lock()
+            .map_or_else(|| "<locked>".to_string(), |guard| guard.base_url.clone());
+        f.debug_struct("Config")
+            .field("token", &"[REDACTED]")
+            .field("base_url", &base_url)
+            .field("model", &self.model)
+            .field("editor_version", &self.editor_version)
+            .field("integration_id", &self.integration_id)
+            .field(
+                "oauth_token",
+                &self.oauth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 /// Builder for [`Copilot`] clients.
-#[derive(Debug)]
 pub struct Builder {
     token: String,
     base_url: String,
+    token_exchange_url: String,
     model: String,
     editor_version: String,
     integration_id: String,
     oauth_token: Option<String>,
+}
+
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder")
+            .field("token", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("editor_version", &self.editor_version)
+            .field("integration_id", &self.integration_id)
+            .field(
+                "oauth_token",
+                &self.oauth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Builder {
@@ -155,6 +258,7 @@ impl Builder {
         Self {
             token: token.into(),
             base_url: COPILOT_BASE_URL.to_string(),
+            token_exchange_url: COPILOT_TOKEN_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             editor_version: EDITOR_VERSION.to_string(),
             integration_id: COPILOT_INTEGRATION_ID.to_string(),
@@ -202,8 +306,11 @@ impl Builder {
     pub fn build(self) -> Copilot {
         Copilot {
             inner: Arc::new(Config {
-                token: self.token,
-                base_url: self.base_url,
+                session: Arc::new(Mutex::new(SessionState {
+                    token: self.token,
+                    base_url: self.base_url,
+                })),
+                token_exchange_url: self.token_exchange_url,
                 model: self.model,
                 editor_version: self.editor_version,
                 integration_id: self.integration_id,
@@ -354,13 +461,22 @@ struct CompletionTokenDetails {
 struct ChunkChoice {
     delta: ChunkDelta,
     #[serde(default)]
-    #[allow(dead_code)]
     finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct ChunkDelta {
     content: Option<String>,
+    #[serde(
+        default,
+        alias = "reasoning",
+        alias = "reasoning_text",
+        alias = "reasoningContent",
+        alias = "thinking",
+        alias = "thinking_content",
+        alias = "thinkingContent"
+    )]
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<ChunkToolCall>>,
 }
 
@@ -548,10 +664,14 @@ const SSE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn open_sse_stream(
+    session: &SessionState,
     cfg: &Config,
     request: &ChatCompletionRequest,
 ) -> Result<zenwave::sse::SseStream, CopilotError> {
-    let endpoint = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let endpoint = format!(
+        "{}/chat/completions",
+        session.base_url.trim_end_matches('/')
+    );
     let mut backend = client();
 
     let build_result = backend
@@ -559,7 +679,7 @@ async fn open_sse_stream(
         .and_then(|b| {
             b.header(
                 header::AUTHORIZATION.as_str(),
-                format!("Bearer {}", cfg.token),
+                format!("Bearer {}", session.token),
             )
         })
         .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-copilot/0.1"))
@@ -588,33 +708,26 @@ const fn is_unauthorized(err: &CopilotError) -> bool {
     )
 }
 
-async fn refresh_session_config(cfg: &Config) -> Result<Option<Config>, CopilotError> {
-    let Some(oauth_token) = cfg.oauth_token.as_deref() else {
-        return Ok(None);
-    };
-
-    let session = crate::auth::get_session_token(oauth_token).await?;
-
-    let mut refreshed = cfg.clone();
-    refreshed.token = session.token;
-    refreshed.base_url = session.api_endpoint;
-
-    Ok(Some(refreshed))
-}
-
 async fn open_sse_stream_with_refresh(
-    cfg: &mut Config,
+    cfg: &Config,
     request: &ChatCompletionRequest,
 ) -> Result<zenwave::sse::SseStream, CopilotError> {
-    match open_sse_stream(cfg, request).await {
+    let snapshot = cfg.session.lock().await.clone();
+    match open_sse_stream(&snapshot, cfg, request).await {
         Ok(stream) => Ok(stream),
-        Err(err) if is_unauthorized(&err) => match refresh_session_config(cfg).await? {
-            Some(refreshed) => {
-                *cfg = refreshed;
-                open_sse_stream(cfg, request).await
+        Err(err) if is_unauthorized(&err) => {
+            match refresh_shared_session(
+                &cfg.session,
+                &snapshot.token,
+                cfg.oauth_token.as_deref(),
+                &cfg.token_exchange_url,
+            )
+            .await?
+            {
+                Some(refreshed) => open_sse_stream(&refreshed, cfg, request).await,
+                None => Err(err),
             }
-            None => Err(err),
-        },
+        }
         Err(err) => Err(err),
     }
 }
@@ -622,6 +735,7 @@ async fn open_sse_stream_with_refresh(
 struct ProcessedSse {
     events: Vec<Event>,
     saw_payload: bool,
+    saw_finish_reason: bool,
     done: bool,
 }
 
@@ -636,11 +750,13 @@ async fn next_sse_event(
     sse_stream: &mut zenwave::sse::SseStream,
     saw_payload: bool,
     last_progress: Instant,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
 ) -> SseStep {
     let timeout = if saw_payload {
-        SSE_IDLE_TIMEOUT
+        idle_timeout
     } else {
-        SSE_FIRST_EVENT_TIMEOUT
+        first_event_timeout
     };
     let elapsed = Instant::now().saturating_duration_since(last_progress);
     if elapsed >= timeout {
@@ -671,6 +787,7 @@ async fn next_sse_event(
 
 fn process_sse_data(
     data: &str,
+    include_reasoning: bool,
     usage: &mut Option<Usage>,
     tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
 ) -> Result<ProcessedSse, CopilotError> {
@@ -678,6 +795,7 @@ fn process_sse_data(
         return Ok(ProcessedSse {
             events: Vec::new(),
             saw_payload: false,
+            saw_finish_reason: false,
             done: false,
         });
     }
@@ -685,6 +803,7 @@ fn process_sse_data(
         return Ok(ProcessedSse {
             events: Vec::new(),
             saw_payload: false,
+            saw_finish_reason: false,
             done: true,
         });
     }
@@ -701,15 +820,28 @@ fn process_sse_data(
     let chunk: ChatCompletionChunk = serde_json::from_str(data).map_err(CopilotError::Json)?;
     let mut events = Vec::new();
     let mut saw_payload = chunk.usage.is_some();
+    let mut saw_finish_reason = false;
     if let Some(chunk_usage) = &chunk.usage {
         *usage = Some(usage_from_chat_completion(chunk_usage));
     }
     for choice in &chunk.choices {
+        if choice.finish_reason.is_some() {
+            saw_finish_reason = true;
+            saw_payload = true;
+        }
         if let Some(content) = &choice.delta.content
             && !content.is_empty()
         {
             saw_payload = true;
             events.push(Event::Text(content.clone()));
+        }
+        if let Some(reasoning) = &choice.delta.reasoning_content
+            && !reasoning.is_empty()
+        {
+            saw_payload = true;
+            if include_reasoning {
+                events.push(Event::Reasoning(reasoning.clone()));
+            }
         }
         if let Some(calls) = &choice.delta.tool_calls
             && !calls.is_empty()
@@ -721,6 +853,7 @@ fn process_sse_data(
     Ok(ProcessedSse {
         events,
         saw_payload,
+        saw_finish_reason,
         done: false,
     })
 }
@@ -732,11 +865,15 @@ fn accumulate_tool_calls(
     for call in calls {
         let index = call.index.unwrap_or(0);
         let acc = tool_calls.entry(index).or_default();
-        if let Some(id) = &call.id {
+        if let Some(id) = &call.id
+            && !id.is_empty()
+        {
             acc.id = Some(id.clone());
         }
         if let Some(function) = &call.function {
-            if let Some(name) = &function.name {
+            if let Some(name) = &function.name
+                && !name.is_empty()
+            {
                 acc.name = Some(name.clone());
             }
             if let Some(args) = &function.arguments {
@@ -746,30 +883,36 @@ fn accumulate_tool_calls(
     }
 }
 
-fn accumulated_tool_call_events(tool_calls: HashMap<usize, ToolCallAccumulator>) -> Vec<Event> {
+fn accumulated_tool_call_events(
+    tool_calls: HashMap<usize, ToolCallAccumulator>,
+    saw_completion: bool,
+) -> Result<Vec<Event>, CopilotError> {
     let mut sorted_calls: Vec<_> = tool_calls.into_iter().collect();
     sorted_calls.sort_by_key(|(index, _)| *index);
-    sorted_calls
-        .into_iter()
-        .filter_map(|(_, acc)| {
-            let (Some(id), Some(name)) = (acc.id, acc.name) else {
-                return None;
-            };
-            let arguments = if acc.arguments.is_empty() {
-                Value::Object(serde_json::Map::default())
-            } else {
-                serde_json::from_str(&acc.arguments)
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::default()))
-            };
-            Some(Event::ToolCall(ToolCall {
-                id,
-                name,
-                arguments,
-                // Chat Completions carries no reasoning signature to round-trip.
-                reasoning_state: None,
-            }))
-        })
-        .collect()
+    let mut events = Vec::with_capacity(sorted_calls.len());
+    for (_, acc) in sorted_calls {
+        let (Some(id), Some(name)) = (acc.id, acc.name) else {
+            continue;
+        };
+        let arguments = if acc.arguments.is_empty() {
+            if !saw_completion {
+                return Err(CopilotError::Api(
+                    "Copilot stream closed before tool call arguments completed".to_string(),
+                ));
+            }
+            Value::Object(serde_json::Map::default())
+        } else {
+            serde_json::from_str(&acc.arguments).map_err(CopilotError::Json)?
+        };
+        events.push(Event::ToolCall(ToolCall {
+            id,
+            name,
+            arguments,
+            // Chat Completions carries no reasoning signature to round-trip.
+            reasoning_state: None,
+        }));
+    }
+    Ok(events)
 }
 
 fn chat_completions_stream(
@@ -795,7 +938,6 @@ fn chat_completions_stream_inner(
 ) -> impl Stream<Item = Result<Event, CopilotError>> + Send {
     async_stream::stream! {
         let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
-        let mut cfg = cfg.as_ref().clone();
         let request = ChatCompletionRequest {
             model: cfg.model.clone(),
             messages: payload_messages,
@@ -821,7 +963,7 @@ fn chat_completions_stream_inner(
             "Sending Copilot chat completion request"
         );
 
-        let sse_stream = match open_sse_stream_with_refresh(&mut cfg, &request).await {
+        let sse_stream = match open_sse_stream_with_refresh(&cfg, &request).await {
             Ok(stream) => stream,
             Err(err) => {
                 yield Err(err);
@@ -829,7 +971,7 @@ fn chat_completions_stream_inner(
             }
         };
 
-        let events = stream_chat_completion_events(sse_stream);
+        let events = stream_chat_completion_events(sse_stream, params.include_reasoning);
         futures_lite::pin!(events);
         while let Some(event) = events.next().await {
             yield event;
@@ -839,19 +981,46 @@ fn chat_completions_stream_inner(
 
 fn stream_chat_completion_events(
     sse_stream: zenwave::sse::SseStream,
+    include_reasoning: bool,
+) -> impl Stream<Item = Result<Event, CopilotError>> + Send {
+    stream_chat_completion_events_with_timeouts(
+        sse_stream,
+        include_reasoning,
+        SSE_FIRST_EVENT_TIMEOUT,
+        SSE_IDLE_TIMEOUT,
+    )
+}
+
+fn stream_chat_completion_events_with_timeouts(
+    sse_stream: zenwave::sse::SseStream,
+    include_reasoning: bool,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
 ) -> impl Stream<Item = Result<Event, CopilotError>> + Send {
     async_stream::stream! {
         let mut event_count = 0usize;
         let mut saw_payload = false;
+        let mut saw_completion = false;
         let mut last_progress = Instant::now();
         let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
         let mut usage: Option<Usage> = None;
 
         futures_lite::pin!(sse_stream);
         loop {
-            let next = next_sse_event(&mut sse_stream, saw_payload, last_progress).await;
+            let next = next_sse_event(
+                &mut sse_stream,
+                saw_payload,
+                last_progress,
+                first_event_timeout,
+                idle_timeout,
+            )
+            .await;
             match next {
                 SseStep::Event(Ok(event)) => {
+                    // Every SSE frame received over the socket — keepalive comments,
+                    // empty data pings, reasoning chunks, or content deltas — proves
+                    // the stream is alive and resets the idle timer.
+                    last_progress = Instant::now();
                     let data = event.text_data();
                     let data = data.trim();
                     if data.is_empty() {
@@ -861,19 +1030,27 @@ fn stream_chat_completion_events(
                     event_count += 1;
                     // A `finish_reason` only ends the content: with `include_usage`
                     // the usage arrives in a later chunk, before `[DONE]`.
-                    let processed = match process_sse_data(data, &mut usage, &mut tool_calls) {
+                    let processed = match process_sse_data(
+                        data,
+                        include_reasoning,
+                        &mut usage,
+                        &mut tool_calls,
+                    ) {
                         Ok(processed) => processed,
                         Err(err) => {
                             yield Err(err);
                             return;
                         }
                     };
+                    if processed.saw_finish_reason {
+                        saw_completion = true;
+                    }
                     if processed.done {
+                        saw_completion = true;
                         break;
                     }
                     if processed.saw_payload {
                         saw_payload = true;
-                        last_progress = Instant::now();
                     }
                     for event in processed.events {
                         yield Ok(event);
@@ -884,11 +1061,8 @@ fn stream_chat_completion_events(
                     return;
                 }
                 SseStep::Closed => break,
-                SseStep::IdleTimeout => {
-                    tracing::warn!("Copilot SSE idle timeout; ending stream");
-                    break;
-                }
-                SseStep::FirstEventTimeout => {
+                SseStep::IdleTimeout | SseStep::FirstEventTimeout => {
+                    tracing::warn!("Copilot SSE stream timed out");
                     yield Err(CopilotError::Timeout);
                     return;
                 }
@@ -896,8 +1070,16 @@ fn stream_chat_completion_events(
         }
 
         tracing::debug!(event_count, "Processed Copilot SSE events");
-        for event in accumulated_tool_call_events(tool_calls) {
-            yield Ok(event);
+        match accumulated_tool_call_events(tool_calls, saw_completion) {
+            Ok(events) => {
+                for event in events {
+                    yield Ok(event);
+                }
+            }
+            Err(err) => {
+                yield Err(err);
+                return;
+            }
         }
         if let Some(final_usage) = usage {
             yield Ok(Event::Usage(final_usage));
@@ -956,7 +1138,7 @@ mod tests {
             r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#,
             "[DONE]",
         ]);
-        let events: Vec<Event> = stream_chat_completion_events(stream)
+        let events: Vec<Event> = stream_chat_completion_events(stream, false)
             .map(|event| event.expect("stream event"))
             .collect()
             .await;
@@ -996,5 +1178,291 @@ mod tests {
         assert_eq!(items[0]["content"], "seen");
         assert_eq!(items[1]["role"], "user");
         assert_eq!(items[1]["content"][0]["type"], "image_url");
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_after_payload_returns_timeout_error() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                )
+                .expect("write sse");
+            stream.flush().expect("flush");
+            let _ = release_rx.recv();
+        });
+
+        let mut backend = zenwave::client();
+        let sse = backend
+            .get(format!("http://{addr}"))
+            .expect("get")
+            .sse()
+            .await
+            .expect("sse");
+        let events = stream_chat_completion_events_with_timeouts(
+            sse,
+            false,
+            Duration::from_secs(1),
+            Duration::from_millis(80),
+        );
+        futures_lite::pin!(events);
+
+        let first = events.next().await.expect("first item").expect("text ok");
+        assert!(matches!(first, Event::Text(ref t) if t == "partial"));
+
+        let second = events
+            .next()
+            .await
+            .expect("timeout item")
+            .expect_err("must yield Timeout");
+        assert!(matches!(second, CopilotError::Timeout), "{second:?}");
+        assert!(events.next().await.is_none());
+        drop(release_tx);
+    }
+
+    #[tokio::test]
+    async fn keepalive_and_reasoning_frames_reset_idle_timer() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.set_nodelay(true);
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .expect("head");
+            stream
+                .write_all(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"step1\"},\"finish_reason\":null}]}\n\n",
+                )
+                .expect("reasoning 1");
+            stream.flush().expect("flush");
+            // 14 frames spaced 50 ms apart outlast the 500 ms idle timeout while
+            // leaving a 450 ms scheduling margin per gap on loaded CI runners.
+            for idx in 0..14 {
+                std::thread::sleep(Duration::from_millis(50));
+                if idx % 2 == 0 {
+                    stream.write_all(b"data: \n\n").expect("keepalive");
+                } else {
+                    stream
+                        .write_all(
+                            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"step\"},\"finish_reason\":null}]}\n\n",
+                        )
+                        .expect("reasoning keepalive");
+                }
+                stream.flush().expect("flush");
+            }
+            stream
+                .write_all(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+                .expect("final");
+            stream.flush().expect("flush");
+        });
+
+        let mut backend = zenwave::client();
+        let sse = backend
+            .get(format!("http://{addr}"))
+            .expect("get")
+            .sse()
+            .await
+            .expect("sse");
+        let collected: Vec<Event> = stream_chat_completion_events_with_timeouts(
+            sse,
+            true,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        )
+        .map(|res| res.expect("keepalives prevent false timeout"))
+        .collect()
+        .await;
+
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, Event::Reasoning(r) if r == "step1"))
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|e| matches!(e, Event::Text(t) if t == "done"))
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_call_json_returns_error_instead_of_empty_object() {
+        let stream = sse_body(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"delete_file","arguments":"{\"path\":\"/important"}}]},"finish_reason":null}]}"#,
+        ]);
+        let results: Vec<Result<Event, CopilotError>> =
+            stream_chat_completion_events(stream, false).collect().await;
+        assert_eq!(results.len(), 1);
+        let err = results
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect_err("truncated JSON must error");
+        assert!(matches!(err, CopilotError::Json(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn refreshed_session_token_is_shared_across_clones_and_provider() {
+        use aither_core::llm::{LanguageModelProvider, oneshot};
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let base = format!("http://{addr}");
+        let base_for_server = base.clone();
+        let exchange_hits = Arc::new(AtomicUsize::new(0));
+        let exchange_hits_server = Arc::clone(&exchange_hits);
+
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let head_end = loop {
+                    let Ok(n) = stream.read(&mut buf) else {
+                        break 0;
+                    };
+                    if n == 0 {
+                        break 0;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                if head_end == 0 {
+                    continue;
+                }
+                let head = String::from_utf8_lossy(&req[..head_end]).into_owned();
+                let lower = head.to_ascii_lowercase();
+                let chunked = lower.contains("transfer-encoding: chunked");
+                let content_len = lower
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while if chunked {
+                    !req.ends_with(b"0\r\n\r\n")
+                } else {
+                    req.len() < head_end + content_len
+                } {
+                    let Ok(n) = stream.read(&mut buf) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+
+                if head.starts_with("GET /exchange ") {
+                    exchange_hits_server.fetch_add(1, Ordering::SeqCst);
+                    let body = serde_json::json!({
+                        "token": "fresh-session-token",
+                        "endpoints": { "api": base_for_server },
+                        "expires_at": 1_999_999_999_i64
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if lower.contains("authorization: bearer fresh-session-token") {
+                    let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    let body = r#"{"error":{"message":"expired"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let provider = crate::CopilotProvider::new("stale-session-token")
+            .base_url(&base)
+            .oauth_token("gho_secret_oauth")
+            .with_token_exchange_url(format!("{base}/exchange"));
+        let client_a = provider.get_model("gpt-5.3-codex").await.expect("model a");
+        let client_b = client_a.clone().with_model("gpt-5.4");
+        let client_c = provider.get_model("gpt-5.4").await.expect("model c");
+
+        let text_a = aither_core::llm::collect_text(client_a.respond(oneshot("sys", "hi")))
+            .await
+            .expect("client_a refreshes on 401 and succeeds");
+        assert_eq!(text_a, "ok");
+        assert_eq!(exchange_hits.load(Ordering::SeqCst), 1);
+
+        let text_b = aither_core::llm::collect_text(client_b.respond(oneshot("sys", "hi")))
+            .await
+            .expect("client_b reuses refreshed session token without 401");
+        assert_eq!(text_b, "ok");
+
+        let text_c = aither_core::llm::collect_text(client_c.respond(oneshot("sys", "hi")))
+            .await
+            .expect("provider-spawned client_c shares refreshed session token");
+        assert_eq!(text_c, "ok");
+        assert_eq!(exchange_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn debug_impls_redact_copilot_secrets() {
+        let builder = Copilot::builder("secret-session-tok").oauth_token("gho_secret_oauth");
+        let builder_dbg = format!("{builder:?}");
+        assert!(!builder_dbg.contains("secret-session-tok"), "{builder_dbg}");
+        assert!(!builder_dbg.contains("gho_secret_oauth"), "{builder_dbg}");
+
+        let client = builder.build();
+        let client_dbg = format!("{client:?}");
+        assert!(!client_dbg.contains("secret-session-tok"), "{client_dbg}");
+        assert!(!client_dbg.contains("gho_secret_oauth"), "{client_dbg}");
+
+        let provider =
+            crate::CopilotProvider::new("secret-session-tok").oauth_token("gho_secret_oauth");
+        let provider_dbg = format!("{provider:?}");
+        assert!(
+            !provider_dbg.contains("secret-session-tok"),
+            "{provider_dbg}"
+        );
+        assert!(!provider_dbg.contains("gho_secret_oauth"), "{provider_dbg}");
+
+        let tok = crate::auth::CopilotToken {
+            access_token: "gho_live_secret".into(),
+            token_type: "bearer".into(),
+            scope: "copilot".into(),
+            expires_at: None,
+        };
+        assert!(!format!("{tok:?}").contains("gho_live_secret"));
+
+        let session = crate::auth::SessionToken {
+            token: "tid=secret_tid".into(),
+            api_endpoint: "https://api.githubcopilot.com".into(),
+            expires_at: 123,
+        };
+        assert!(!format!("{session:?}").contains("tid=secret_tid"));
     }
 }

@@ -128,11 +128,21 @@ impl LanguageModelProvider for OpenAIProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ProviderConfig {
     api_key: String,
     base_url: String,
     organization: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("organization", &self.organization)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]

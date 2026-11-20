@@ -1,6 +1,9 @@
 //! Claude API client implementation.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use aither_core::{
     LanguageModel,
@@ -69,14 +72,18 @@ impl Claude {
     /// Override the default model in-place.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).model = sanitize_model(model);
+        let cfg = Arc::make_mut(&mut self.inner);
+        cfg.model = sanitize_model(model);
+        cfg.cached_context_length = Arc::new(OnceLock::new());
         self
     }
 
     /// Override the base URL (useful for proxies or local deployments).
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).base_url = base_url.into();
+        let cfg = Arc::make_mut(&mut self.inner);
+        cfg.base_url = base_url.into();
+        cfg.cached_context_length = Arc::new(OnceLock::new());
         self
     }
 
@@ -128,7 +135,7 @@ impl LanguageModel for Claude {
             let (system_prompt, claude_messages) =
                 to_claude_messages(&core_messages, takes_mid_conversation_system(&cfg))
                     .await
-                    .map_err(|error| GenerateError::Provider(ClaudeError::Api(error)))?;
+                    .map_err(GenerateError::Provider)?;
             let request_body = CountTokensRequest {
                 model: cfg.model.clone(),
                 messages: claude_messages,
@@ -197,7 +204,7 @@ impl LanguageModel for Claude {
                 match to_claude_messages(&core_messages, takes_mid_conversation_system(&cfg)).await {
                     Ok(payload) => payload,
                     Err(error) => {
-                        yield Err(ClaudeError::Api(error));
+                        yield Err(error);
                         return;
                     }
                 };
@@ -295,11 +302,14 @@ impl LanguageModel for Claude {
 
             if !stream_requested {
                 match builder.json::<MessagesResponse>().await {
-                    Ok(response) => {
-                        for event in response_events(response) {
-                            yield Ok(event);
+                    Ok(response) => match response_events(response) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
                         }
-                    }
+                        Err(err) => yield Err(err),
+                    },
                     Err(e) => yield Err(ClaudeError::Http(e)),
                 }
                 return;
@@ -378,23 +388,27 @@ impl LanguageModel for Claude {
     ) -> impl core::future::Future<Output = Result<ModelProfile, Self::Error>> + Send {
         let cfg = self.inner.clone();
         async move {
-            // Try to fetch context window from proxy API (e.g., OpenRouter)
-            // Native Anthropic API doesn't expose this
-            let context_length = match fetch_model_context_length(&cfg).await {
-                Ok(len) => len,
-                Err(e) => {
-                    tracing::debug!("API did not return context_length: {e}");
-                    // Fallback to models database
-                    aither_models::lookup(&cfg.model)
-                        .and_then(aither_models::ModelEntry::max_input_tokens)
-                        .ok_or_else(|| {
-                            ClaudeError::Api(format!(
-                                "cannot determine context length for model '{model}': \
-                                 {models_url} request failed ({e}) and aither-models has no entry",
-                                model = cfg.model,
-                                models_url = cfg.request_url("/models"),
-                            ))
-                        })?
+            let context_length = if let Some(&cached) = cfg.cached_context_length.get() {
+                cached
+            } else if let Some(len) = aither_models::lookup(&cfg.model)
+                .and_then(aither_models::ModelEntry::max_input_tokens)
+            {
+                let _ = cfg.cached_context_length.set(len);
+                len
+            } else {
+                match fetch_model_context_length(&cfg).await {
+                    Ok(len) => {
+                        let _ = cfg.cached_context_length.set(len);
+                        len
+                    }
+                    Err(e) => {
+                        return Err(ClaudeError::Api(format!(
+                            "cannot determine context length for model '{model}': \
+                             {models_url} request failed ({e}) and aither-models has no entry",
+                            model = cfg.model,
+                            models_url = cfg.request_url("/v1/models"),
+                        )));
+                    }
                 }
             };
 
@@ -429,7 +443,7 @@ impl LanguageModel for Claude {
 /// itself, one of the platforms Anthropic documents the beta on (a proxy
 /// behind another base URL is not).
 fn takes_per_message_effort(cfg: &Config) -> bool {
-    cfg.base_url.trim_end_matches('/') == CLAUDE_BASE_URL
+    is_anthropic_host(&cfg.base_url)
         && aither_models::lookup(&cfg.model)
             .is_some_and(|entry| entry.has_ability(Ability::PerMessageEffort))
 }
@@ -438,9 +452,31 @@ fn takes_per_message_effort(cfg: &Config) -> bool {
 /// registry lists the model for it and the client talks to the Claude API
 /// itself.
 fn takes_mid_conversation_system(cfg: &Config) -> bool {
-    cfg.base_url.trim_end_matches('/') == CLAUDE_BASE_URL
+    is_anthropic_host(&cfg.base_url)
         && aither_models::lookup(&cfg.model)
             .is_some_and(|entry| entry.has_ability(Ability::MidConversationSystem))
+}
+
+pub fn is_anthropic_host(base_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("anthropic.com")
+        || host.to_ascii_lowercase().ends_with(".anthropic.com")
+}
+
+pub fn resolve_v1_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let rel = path.trim_start_matches('/');
+    let rel = if base.ends_with("/v1") {
+        rel.strip_prefix("v1/").unwrap_or(rel)
+    } else {
+        rel
+    };
+    format!("{base}/{rel}")
 }
 
 fn native_tool_name_enabled(snapshot: &ParameterSnapshot, name: &str) -> bool {
@@ -472,17 +508,20 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
     #[derive(serde::Deserialize)]
     struct ModelInfo {
         id: String,
-        /// Anthropic uses `max_tokens`, `OpenRouter` uses `context_length`
-        #[serde(default, alias = "max_tokens")]
+        #[serde(default, alias = "inputTokenLimit", alias = "max_input_tokens")]
+        input_token_limit: Option<u32>,
+        #[serde(default)]
         context_length: Option<u32>,
+        #[serde(default)]
+        max_tokens: Option<u32>,
     }
 
-    let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let url = cfg.request_url("/v1/models");
     let mut backend = client();
     let mut req = backend.get(&url).map_err(ClaudeError::Http)?;
 
     // Anthropic uses x-api-key header, proxies use Bearer token
-    if cfg.base_url.contains("anthropic.com") {
+    if is_anthropic_host(&cfg.base_url) {
         req = req
             .header("x-api-key", cfg.api_key.clone())
             .map_err(ClaudeError::Http)?
@@ -497,11 +536,23 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
             .map_err(ClaudeError::Http)?;
     }
 
-    let response: ModelsResponse = req.json().await.map_err(ClaudeError::Http)?;
+    let response: ModelsResponse =
+        futures_lite::future::or(async { Some(req.json().await) }, async {
+            aither_core::time::sleep(cfg.idle_timeout).await;
+            None
+        })
+        .await
+        .ok_or(ClaudeError::IdleTimeout {
+            idle: cfg.idle_timeout,
+        })?
+        .map_err(ClaudeError::Http)?;
 
     for model in response.data {
         if model.id == cfg.model
-            && let Some(ctx) = model.context_length
+            && let Some(ctx) = model
+                .input_token_limit
+                .or(model.context_length)
+                .or(model.max_tokens)
         {
             return Ok(ctx);
         }
@@ -514,7 +565,6 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
 }
 
 /// Builder for Claude clients.
-#[derive(Debug)]
 pub struct Builder {
     api_key: String,
     base_url: String,
@@ -522,6 +572,19 @@ pub struct Builder {
     default_max_tokens: u32,
     native_abilities: Vec<Ability>,
     idle_timeout: Duration,
+}
+
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("default_max_tokens", &self.default_max_tokens)
+            .field("native_abilities", &self.native_abilities)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Builder {
@@ -594,13 +657,14 @@ impl Builder {
                 default_max_tokens: self.default_max_tokens,
                 native_abilities: self.native_abilities,
                 idle_timeout: self.idle_timeout,
+                cached_context_length: Arc::new(OnceLock::new()),
             }),
         }
     }
 }
 
 /// Internal configuration for the Claude client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub(crate) api_key: String,
     pub(crate) base_url: String,
@@ -608,15 +672,25 @@ pub struct Config {
     pub(crate) default_max_tokens: u32,
     pub(crate) native_abilities: Vec<Ability>,
     pub(crate) idle_timeout: Duration,
+    pub(crate) cached_context_length: Arc<OnceLock<u32>>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("default_max_tokens", &self.default_max_tokens)
+            .field("native_abilities", &self.native_abilities)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
     pub(crate) fn request_url(&self, path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
+        resolve_v1_url(&self.base_url, path)
     }
 }
 
@@ -846,5 +920,79 @@ mod tests {
             "claude-opus-5-5",
             "https://openrouter.ai/api/v1"
         )));
+    }
+
+    #[test]
+    fn v1_url_normalization_and_host_parsing_handle_proxies_safely() {
+        assert_eq!(
+            resolve_v1_url("https://api.anthropic.com", "/v1/models"),
+            "https://api.anthropic.com/v1/models"
+        );
+        assert_eq!(
+            resolve_v1_url("https://api.anthropic.com/", "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            resolve_v1_url("https://api.anthropic.com/v1", "/v1/models"),
+            "https://api.anthropic.com/v1/models"
+        );
+        assert_eq!(
+            resolve_v1_url("https://api.anthropic.com/v1", "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            resolve_v1_url("https://openrouter.ai/api/v1", "/v1/models"),
+            "https://openrouter.ai/api/v1/models"
+        );
+
+        assert!(is_anthropic_host("https://api.anthropic.com"));
+        assert!(is_anthropic_host("https://ANTHROPIC.COM/v1"));
+        assert!(!is_anthropic_host("https://evil-anthropic.com"));
+        assert!(!is_anthropic_host("https://evil.example.com/anthropic.com"));
+        assert!(!is_anthropic_host("https://anthropic.com.evil.example.com"));
+    }
+
+    #[tokio::test]
+    async fn profile_uses_registry_without_network_and_caches_proxy_models() {
+        use aither_core::llm::LanguageModelProvider;
+
+        // Bundled registry model needs zero HTTP calls even on a dead port.
+        let known = Claude::builder("sk-ant-secret")
+            .base_url("http://127.0.0.1:1")
+            .model("claude-sonnet-4-5")
+            .build();
+        let profile = known.profile().await.expect("known model resolves locally");
+        assert!(profile.context_length > 0);
+        assert!(!format!("{known:?}").contains("sk-ant-secret"));
+
+        // Unknown proxy model hits `/v1/models` once and caches the result.
+        let (base_url, received) = responding_server(
+            r#"{"data":[{"id":"custom-claude-proxy","display_name":"Custom","context_length":131072}]}"#,
+        );
+        let custom = Claude::builder("sk-proxy-secret")
+            .base_url(&base_url)
+            .model("custom-claude-proxy")
+            .build();
+        let first = custom.profile().await.expect("first fetch");
+        assert_eq!(first.context_length, 131_072);
+        let req = received.recv().expect("single /v1/models request");
+        assert!(req.starts_with("GET /v1/models "), "{req}");
+        assert!(!req.to_ascii_lowercase().contains("x-api-key:"), "{req}");
+
+        // Second call uses cache (server only accepted 1 connection).
+        let second = custom.profile().await.expect("cached fetch");
+        assert_eq!(second.context_length, 131_072);
+
+        // Provider list_models also hits `/v1/models` and redacts Debug.
+        let (list_base, list_rx) = responding_server(
+            r#"{"data":[{"id":"custom-claude-proxy","display_name":"Custom","context_length":65536}]}"#,
+        );
+        let provider = crate::ClaudeProvider::new("sk-ant-provider").base_url(list_base);
+        assert!(!format!("{provider:?}").contains("sk-ant-provider"));
+        let models = provider.list_models().await.expect("list models");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_length, 65_536);
+        let list_req = list_rx.recv().expect("list_models request");
+        assert!(list_req.starts_with("GET /v1/models "), "{list_req}");
     }
 }

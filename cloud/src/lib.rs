@@ -13,7 +13,8 @@ pub use aither_gemini::{self as gemini, Gemini, GeminiProvider};
 pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
 
 use aither_core::{
-    EmbeddingModel, LanguageModel,
+    EmbeddingModel, ImageGenerator, LanguageModel,
+    image::{Data as ImageData, Prompt as ImagePrompt, Size as ImageSize},
     llm::{
         Classify, Event, GenerateError, LLMRequest, LanguageModelProvider, RetryPolicy,
         TokenCounting, model::Profile, provider::Profile as ProviderProfile,
@@ -21,6 +22,8 @@ use aither_core::{
 };
 use futures_core::Stream;
 use futures_lite::StreamExt;
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 
 /// Unified cloud provider wrapping `OpenAI`, Claude, Gemini, and GitHub Copilot.
 #[derive(Clone)]
@@ -103,10 +106,121 @@ impl EmbeddingModel for CloudEmbedder {
     }
 }
 
+/// Unified image-generation cloud provider.
+#[derive(Clone, Debug)]
+pub enum CloudImageGenerator {
+    /// `OpenAI` image generation.
+    OpenAI(OpenAI),
+    /// Google Gemini image generation.
+    Gemini(Gemini),
+}
+
+impl From<OpenAI> for CloudImageGenerator {
+    fn from(client: OpenAI) -> Self {
+        Self::OpenAI(client)
+    }
+}
+
+impl From<Gemini> for CloudImageGenerator {
+    fn from(client: Gemini) -> Self {
+        Self::Gemini(client)
+    }
+}
+
+/// Error returned when a cloud provider cannot be used as an image generator.
+#[derive(Debug, thiserror::Error)]
+pub enum CloudImageGeneratorError {
+    /// The provider does not implement image generation.
+    #[error("provider does not support image generation: {0}")]
+    UnsupportedProvider(&'static str),
+}
+
+impl TryFrom<CloudProvider> for CloudImageGenerator {
+    type Error = CloudImageGeneratorError;
+
+    fn try_from(value: CloudProvider) -> Result<Self, Self::Error> {
+        match value {
+            CloudProvider::OpenAI(client) => Ok(Self::OpenAI(client)),
+            CloudProvider::Gemini(client) => Ok(Self::Gemini(client)),
+            CloudProvider::Claude(_) => {
+                Err(CloudImageGeneratorError::UnsupportedProvider("claude"))
+            }
+            CloudProvider::Copilot(_) => {
+                Err(CloudImageGeneratorError::UnsupportedProvider("copilot"))
+            }
+            CloudProvider::Codex(_) => Err(CloudImageGeneratorError::UnsupportedProvider("codex")),
+        }
+    }
+}
+
+impl ImageGenerator for CloudImageGenerator {
+    type Error = CloudError;
+
+    fn create(
+        &self,
+        prompt: ImagePrompt,
+        size: ImageSize,
+    ) -> impl Stream<Item = Result<ImageData, Self::Error>> + Send {
+        let generator = self.clone();
+        async_stream::stream! {
+            match generator {
+                Self::OpenAI(client) => {
+                    let mut stream = std::pin::pin!(client.create(prompt, size));
+                    while let Some(item) = stream.next().await {
+                        yield item.map_err(CloudError::from);
+                    }
+                }
+                Self::Gemini(client) => {
+                    let mut stream = std::pin::pin!(client.create(prompt, size));
+                    while let Some(item) = stream.next().await {
+                        yield item.map_err(CloudError::from);
+                    }
+                }
+            }
+        }
+    }
+
+    fn edit(
+        &self,
+        prompt: ImagePrompt,
+        mask: &[u8],
+    ) -> impl Stream<Item = Result<ImageData, Self::Error>> + Send {
+        let generator = self.clone();
+        let mask = mask.to_vec();
+        async_stream::stream! {
+            match generator {
+                Self::OpenAI(client) => {
+                    let mut stream = std::pin::pin!(client.edit(prompt, &mask));
+                    while let Some(item) = stream.next().await {
+                        yield item.map_err(CloudError::from);
+                    }
+                }
+                Self::Gemini(client) => {
+                    let mut stream = std::pin::pin!(client.edit(prompt, &mask));
+                    while let Some(item) = stream.next().await {
+                        yield item.map_err(CloudError::from);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CloudEmbedder, CloudEmbedderError, CloudProvider};
-    use crate::{Claude, Copilot, Gemini, OpenAI};
+    use super::{
+        CloudEmbedder, CloudEmbedderError, CloudError, CloudImageGenerator,
+        CloudImageGeneratorError, CloudProvider,
+    };
+    use crate::{Claude, Codex, Copilot, Gemini, OpenAI, codex::CodexCredentials};
+    use aither_core::{
+        ImageGenerator, LanguageModel,
+        image::{Prompt, Size},
+        llm::oneshot,
+    };
+    use futures_lite::StreamExt;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
 
     #[test]
     fn openai_and_gemini_convert_to_cloud_embedder() {
@@ -130,6 +244,131 @@ mod tests {
             CloudEmbedder::try_from(CloudProvider::Copilot(Copilot::new("test"))),
             Err(CloudEmbedderError::UnsupportedProvider("copilot"))
         ));
+    }
+
+    #[test]
+    fn cloud_image_generator_converts_supported_and_rejects_unsupported() {
+        assert!(matches!(
+            CloudImageGenerator::try_from(CloudProvider::OpenAI(OpenAI::new("test"))),
+            Ok(CloudImageGenerator::OpenAI(_))
+        ));
+        assert!(matches!(
+            CloudImageGenerator::try_from(CloudProvider::Gemini(Gemini::new("test"))),
+            Ok(CloudImageGenerator::Gemini(_))
+        ));
+        assert!(matches!(
+            CloudImageGenerator::try_from(CloudProvider::Claude(Claude::new("test"))),
+            Err(CloudImageGeneratorError::UnsupportedProvider("claude"))
+        ));
+        assert!(matches!(
+            CloudImageGenerator::try_from(CloudProvider::Copilot(Copilot::new("test"))),
+            Err(CloudImageGeneratorError::UnsupportedProvider("copilot"))
+        ));
+        let codex = Codex::new(
+            CodexCredentials::new("at", "rt".to_string()),
+            "gpt-5.3-codex",
+        );
+        assert!(matches!(
+            CloudImageGenerator::try_from(CloudProvider::Codex(codex)),
+            Err(CloudImageGeneratorError::UnsupportedProvider("codex"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_generate_forwards_native_gemini_schema_generation() {
+        use std::io::{Read, Write};
+
+        #[derive(Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+        struct StructuredAnswer {
+            answer: i32,
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            let body_start = loop {
+                let n = stream.read(&mut buf).expect("read");
+                req.extend_from_slice(&buf[..n]);
+                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&req[..body_start]).to_ascii_lowercase();
+            let chunked = head.contains("transfer-encoding: chunked");
+            let content_len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while if chunked {
+                !req.ends_with(b"0\r\n\r\n")
+            } else {
+                req.len() < body_start + content_len
+            } {
+                let n = stream.read(&mut buf).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            let raw = String::from_utf8_lossy(&req[body_start..]).into_owned();
+            let body = if chunked {
+                let mut decoded = String::new();
+                let mut rest = raw.as_str();
+                while let Some((size_hex, after)) = rest.split_once("\r\n") {
+                    let size = usize::from_str_radix(size_hex.trim(), 16).expect("chunk hex");
+                    if size == 0 {
+                        break;
+                    }
+                    decoded.push_str(after.get(..size).expect("chunk bytes"));
+                    rest = after.get(size + 2..).unwrap_or("");
+                }
+                decoded
+            } else {
+                raw
+            };
+            tx.send(body).expect("send body");
+
+            let sse = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"{\\\"answer\\\":42}\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let provider = CloudProvider::Gemini(
+            Gemini::new("secret-key").with_base_url(format!("http://{addr}/v1beta")),
+        );
+        let out: StructuredAnswer =
+            Box::pin(provider.generate(oneshot("You are a calculator.", "6 * 7")))
+                .await
+                .expect("structured generate succeeds");
+        assert_eq!(out, StructuredAnswer { answer: 42 });
+
+        let request_body: serde_json::Value =
+            serde_json::from_str(&rx.recv().expect("captured body")).expect("json request");
+        assert_eq!(
+            request_body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(request_body["generationConfig"]["responseJsonSchema"].is_object());
+    }
+
+    #[tokio::test]
+    async fn cloud_image_generator_propagates_provider_errors() {
+        let generator = CloudImageGenerator::Gemini(Gemini::new("key").without_image_model());
+        let mut stream = std::pin::pin!(generator.create(Prompt::new("a fox"), Size::square(512)));
+        let err = stream
+            .next()
+            .await
+            .expect("stream yields error")
+            .expect_err("disabled image model errors");
+        assert!(matches!(err, CloudError::Gemini(_)));
     }
 }
 
@@ -266,6 +505,32 @@ impl LanguageModel for CloudProvider {
                         yield result.map_err(CloudError::from);
                     }
                 }
+            }
+        }
+    }
+
+    fn generate<T: JsonSchema + DeserializeOwned + 'static>(
+        &self,
+        request: LLMRequest,
+    ) -> impl std::future::Future<Output = Result<T, GenerateError<Self::Error>>> + Send {
+        let provider = self.clone();
+        async move {
+            match provider {
+                Self::OpenAI(inner) => Box::pin(inner.generate(request))
+                    .await
+                    .map_err(map_cloud_error),
+                Self::Claude(inner) => Box::pin(inner.generate(request))
+                    .await
+                    .map_err(map_cloud_error),
+                Self::Gemini(inner) => Box::pin(inner.generate(request))
+                    .await
+                    .map_err(map_cloud_error),
+                Self::Copilot(inner) => Box::pin(inner.generate(request))
+                    .await
+                    .map_err(map_cloud_error),
+                Self::Codex(inner) => Box::pin(inner.generate(request))
+                    .await
+                    .map_err(map_cloud_error),
             }
         }
     }

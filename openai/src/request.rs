@@ -470,12 +470,7 @@ async fn read_file_base64(url: &url::Url) -> Result<String, OpenAIError> {
     let path = url.to_file_path().map_err(|()| {
         OpenAIError::Api("Attachment file URL could not be converted to a path".to_string())
     })?;
-    let data = async_fs::read(&path).await.map_err(|error| {
-        OpenAIError::Api(format!(
-            "Failed to read attachment '{}': {error}",
-            path.display()
-        ))
-    })?;
+    let data = async_fs::read(&path).await?;
     Ok(base64::engine::general_purpose::STANDARD.encode(data))
 }
 
@@ -772,7 +767,7 @@ fn require_non_empty_call_id<'a>(
 #[derive(Debug, Serialize)]
 pub struct ResponsesRequest {
     model: String,
-    input: Vec<ResponsesInputItem>,
+    pub(crate) input: Vec<ResponsesInputItem>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -816,6 +811,7 @@ impl ResponsesRequest {
         stream: bool,
     ) -> Self {
         let has_tools = tools.as_ref().is_some_and(|items| !items.is_empty());
+        let include = responses_include(params, &input);
         Self {
             model,
             input,
@@ -829,7 +825,7 @@ impl ResponsesRequest {
             parallel_tool_calls: has_tools.then_some(params.parallel_tool_calls).flatten(),
             text: responses_text(params),
             reasoning: responses_reasoning(params),
-            include: responses_include(params),
+            include,
             prompt_cache_key: params.prompt_cache_key.clone(),
             prompt_cache_retention: prompt_cache_retention(params),
             store: None,
@@ -995,36 +991,25 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
                 ));
             }
             Role::Assistant => {
+                let reasoning = replayed_reasoning_items(message);
                 let tool_calls = message.tool_calls();
-                if tool_calls.is_empty() {
-                    // Regular text response
+                let has_other_items = !reasoning.is_empty() || !tool_calls.is_empty();
+                items.extend(reasoning);
+                if !message.content().is_empty() || !has_other_items {
                     items.push(ResponsesInputItem::message(
                         "assistant",
                         ResponsesMessageContent::Text(flatten_content(message)),
                     ));
-                } else {
-                    // Assistant message with function calls.
-                    // Reasoning leads, because it precedes the calls it
-                    // produced in the response it came from.
-                    items.extend(replayed_reasoning_items(message));
-                    // First add text content if present
-                    if !message.content().is_empty() {
-                        items.push(ResponsesInputItem::message(
-                            "assistant",
-                            ResponsesMessageContent::Text(message.content().to_string()),
-                        ));
-                    }
-                    // Add function call items
-                    for tc in tool_calls {
-                        let call_id =
-                            require_non_empty_call_id(Some(tc.id.as_str()), "assistant tool call")?;
-                        items.push(ResponsesInputItem::FunctionCall {
-                            kind: "function_call",
-                            call_id: call_id.to_string(),
-                            name: tc.name.clone(),
-                            arguments: tc.arguments.to_string(),
-                        });
-                    }
+                }
+                for tc in tool_calls {
+                    let call_id =
+                        require_non_empty_call_id(Some(tc.id.as_str()), "assistant tool call")?;
+                    items.push(ResponsesInputItem::FunctionCall {
+                        kind: "function_call",
+                        call_id: call_id.to_string(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    });
                 }
             }
             Role::Tool => {
@@ -1199,12 +1184,29 @@ fn responses_text(params: &ParameterSnapshot) -> Option<ResponseTextConfig> {
         })
 }
 
-fn responses_include(params: &ParameterSnapshot) -> Option<Vec<&'static str>> {
+fn reasoning_is_active(params: &ParameterSnapshot, input: &[ResponsesInputItem]) -> bool {
+    if params.include_reasoning {
+        return true;
+    }
+    let configured_effort = input.iter().rev().find_map(|item| match item {
+        ResponsesInputItem::ConfigurationUpdate { reasoning, .. } => Some(reasoning.effort),
+        _ => None,
+    });
+    configured_effort.map_or_else(
+        || params.reasoning_effort != Some(ReasoningEffort::None),
+        |effort| effort != "none",
+    )
+}
+
+fn responses_include(
+    params: &ParameterSnapshot,
+    input: &[ResponsesInputItem],
+) -> Option<Vec<&'static str>> {
     let mut include = Vec::new();
     if params.logprobs.unwrap_or(false) {
         include.push("message.output_text.logprobs");
     }
-    if params.include_reasoning {
+    if reasoning_is_active(params, input) {
         include.push("reasoning.encrypted_content");
     }
     if params
@@ -1882,7 +1884,66 @@ mod tests {
         assert_eq!(value["tools"][3]["type"], "image_generation");
         assert_eq!(value["tools"][3]["partial_images"], 2);
         assert_eq!(value["tools"][4]["type"], "mcp");
-        assert_eq!(value["include"][0], "file_search_call.results");
+        assert_eq!(
+            value["include"],
+            serde_json::json!(["reasoning.encrypted_content", "file_search_call.results"])
+        );
+    }
+
+    #[test]
+    fn responses_request_requests_encrypted_reasoning_by_default_and_omits_when_disabled() {
+        let default_val = responses_request_with_tool(&Parameters::default());
+        assert_eq!(
+            default_val["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(default_val.get("reasoning"), None);
+
+        let disabled_val = responses_request_with_tool(
+            &Parameters::default().reasoning_effort(ReasoningEffort::None),
+        );
+        assert_eq!(disabled_val.get("include"), None);
+
+        let overridden_input = to_responses_input(&[
+            Message::user("hi"),
+            Message::configuration(ReasoningEffort::None),
+        ])
+        .expect("responses input");
+        let snapshot =
+            ParameterSnapshot::from(&Parameters::default().reasoning_effort(ReasoningEffort::High));
+        let overridden_req = ResponsesRequest::new(
+            "gpt-6-sol".into(),
+            overridden_input,
+            &snapshot,
+            None,
+            None,
+            false,
+        );
+        let overridden_val = serde_json::to_value(&overridden_req).expect("serialize");
+        assert_eq!(overridden_val.get("include"), None);
+    }
+
+    #[test]
+    fn reasoning_state_round_trips_on_text_only_assistant_turns() {
+        let state = ReasoningState::new(
+            PROVIDER_NAME,
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_text_1",
+                "encrypted_content": "cipher_text_turn",
+            })
+            .to_string(),
+        );
+        let message = Message::assistant_with_reasoning("Final answer.", Vec::new(), vec![state]);
+        let items = to_responses_input(&[message]).expect("build responses input");
+        let value = serde_json::to_value(&items).expect("serialize input");
+
+        assert_eq!(value.as_array().expect("items array").len(), 2);
+        assert_eq!(value[0]["type"], "reasoning");
+        assert_eq!(value[0]["id"], "rs_text_1");
+        assert_eq!(value[0]["encrypted_content"], "cipher_text_turn");
+        assert_eq!(value[1]["role"], "assistant");
+        assert_eq!(value[1]["content"], "Final answer.");
     }
 
     #[test]
