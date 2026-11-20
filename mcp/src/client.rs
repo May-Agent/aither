@@ -65,6 +65,22 @@ impl Drop for RequestGuard<'_> {
 }
 
 /// MCP client for connecting to and interacting with MCP servers.
+///
+/// # Example
+///
+/// ```ignore
+/// use aither_mcp::{McpClient, ChildProcessTransport};
+/// use executor_core::tokio::TokioGlobal;
+///
+/// let transport = ChildProcessTransport::spawn("npx", &["-y", "@mcp/server"])?;
+/// let client = McpClient::connect(&TokioGlobal, transport, ()).await?;
+///
+/// // List available tools
+/// let tools = client.list_tools().await?;
+///
+/// // Call a tool
+/// let result = client.call_tool("my_tool", serde_json::json!({"arg": "value"})).await?;
+/// ```
 #[derive(Debug)]
 pub struct McpClient {
     /// Requests and notifications for the receive loop to write.
@@ -73,7 +89,9 @@ pub struct McpClient {
     finished: Receiver<()>,
     /// Next request ID; the receive loop draws from it for its own requests.
     next_id: Arc<AtomicI64>,
-    /// The server's tools as last listed.
+    /// The server's tools as last listed. Only the receive loop replaces it
+    /// once the connection is up, always with a complete list, so a reader
+    /// sees the list before or after a refresh and never a mixture.
     tools: Arc<ArcSwapOption<Vec<McpToolDefinition>>>,
     server_info: ServerInfo,
     capabilities: ServerCapabilities,
@@ -81,6 +99,14 @@ pub struct McpClient {
 
 impl McpClient {
     /// Connect to an MCP server and perform initialization.
+    ///
+    /// `executor` runs the connection's receive loop, which takes ownership of
+    /// `transport`. The loop ends with the connection: when the transport
+    /// reports EOF or fails, or when [`close`](Self::close) is called or the
+    /// client is dropped. Requests pending at that point fail with an error
+    /// that says why.
+    ///
+    /// `handler` receives the server's notifications.
     ///
     /// # Errors
     ///
@@ -99,6 +125,8 @@ impl McpClient {
             .spawn(connection::run(
                 transport,
                 command_rx,
+                // Weak, so the loop's own handle does not keep the
+                // connection open after the client is dropped.
                 commands.downgrade(),
                 Arc::new(handler),
                 connection::ToolCache {
@@ -124,6 +152,7 @@ impl McpClient {
         Ok(client)
     }
 
+    /// Perform MCP initialization handshake.
     async fn initialize(&mut self) -> Result<(), McpError> {
         let result: InitializeResult = self
             .request("initialize", Some(InitializeParams::default()))
@@ -138,6 +167,7 @@ impl McpClient {
         self.server_info = result.server_info;
         self.capabilities = result.capabilities;
 
+        // Send initialized notification
         let (reply, sent) = async_channel::bounded(1);
         self.commands
             .send(Command::Notification {
@@ -149,6 +179,7 @@ impl McpClient {
         sent.recv().await.map_err(|_| McpError::ConnectionClosed)?
     }
 
+    /// Send a request through the receive loop and decode its result.
     async fn request<P, R>(&self, method: &str, params: Option<P>) -> Result<R, McpError>
     where
         P: serde::Serialize,
@@ -239,11 +270,18 @@ impl McpClient {
     }
 
     /// The server's tools as of the latest listing the client holds.
+    ///
+    /// Empty until a listing is stored. [`McpConnection`] stores the first
+    /// one when it connects; from then on the receive loop re-lists the tools
+    /// whenever the server sends `notifications/tools/list_changed` and
+    /// replaces the whole list at once.
     #[must_use]
     pub fn tools(&self) -> Arc<Vec<McpToolDefinition>> {
         self.tools.load_full().unwrap_or_default()
     }
 
+    /// Store `tools` as the cached list unless a refresh already stored a
+    /// newer one.
     fn seed_tools(&self, tools: Vec<McpToolDefinition>) {
         let tools = Arc::new(tools);
         self.tools
@@ -251,6 +289,11 @@ impl McpClient {
     }
 
     /// Call a tool on the server.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The tool name.
+    /// * `arguments` - The tool arguments as a JSON value.
     ///
     /// Dropping the returned future before the server answers removes the
     /// pending entry and sends `notifications/cancelled`.
@@ -316,6 +359,10 @@ impl McpClient {
 
     /// Read a resource from the server.
     ///
+    /// # Arguments
+    ///
+    /// * `uri` - The resource URI.
+    ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
@@ -343,8 +390,13 @@ impl McpClient {
     }
 
     /// Close the client connection.
+    ///
+    /// Stops the receive loop, which closes the transport (terminating a
+    /// child process) and fails every request still pending, and waits for it
+    /// to finish. Closing an already closed connection does nothing.
     pub async fn close(&self) {
         self.commands.close();
+        // The loop drops its end when it is done; nothing is ever sent.
         let _ = self.finished.recv().await;
     }
 }

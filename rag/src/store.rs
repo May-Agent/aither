@@ -22,9 +22,15 @@ const MAX_CONCURRENT_EMBEDDINGS: usize = 16;
 /// # Errors
 ///
 /// Returns the first embedding error encountered.
-pub async fn embed_batch<M: EmbeddingModel>(embedder: &M, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-    stream::iter(texts.iter().copied())
-        .map(|text| async move { embedder.embed(text).await.map_err(RagError::Embedding) })
+pub async fn embed_batch<M: EmbeddingModel>(
+    embedder: &M,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>> {
+    // `embed` ties its returned future to the shared lifetime of `&self` and
+    // `&str`, so texts are owned — an `&str` parameter would leak its region
+    // into this future's opaque type and break higher-ranked callers.
+    stream::iter(texts)
+        .map(|text| async move { embedder.embed(&text).await.map_err(RagError::Embedding) })
         .buffered(MAX_CONCURRENT_EMBEDDINGS)
         .try_collect()
         .await
@@ -178,8 +184,8 @@ where
             }
         }
 
-        let texts: Vec<&str> = to_embed.iter().map(|c| c.text.as_str()).collect();
-        let embeddings = embed_batch(&self.embedder, &texts).await?;
+        let texts: Vec<String> = to_embed.iter().map(|c| c.text.clone()).collect();
+        let embeddings = embed_batch(&self.embedder, texts).await?;
         let inserted = to_embed.len();
 
         let entries: Vec<(Chunk, Vec<f32>)> = to_embed.into_iter().zip(embeddings).collect();

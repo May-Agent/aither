@@ -31,6 +31,9 @@ pub struct StreamTransport<R, W> {
     writer: W,
     /// Bytes consumed from `reader` that do not yet form a complete message.
     read_buf: Vec<u8>,
+    /// Whether a rejected oversized frame is still being drained until its
+    /// newline, persisting between `recv` calls.
+    discarding_oversized: bool,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -56,6 +59,7 @@ where
             reader,
             writer,
             read_buf: Vec::new(),
+            discarding_oversized: false,
             next_id: AtomicI64::new(1),
             closed: false,
         }
@@ -79,7 +83,12 @@ where
 
     /// Read the next inbound message, tolerating a dropped `recv` future.
     async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>> {
-        read_message(&mut self.reader, &mut self.read_buf).await
+        read_message(
+            &mut self.reader,
+            &mut self.read_buf,
+            &mut self.discarding_oversized,
+        )
+        .await
     }
 }
 

@@ -29,16 +29,21 @@ pub(super) const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// `poll_fill_buf` is polled directly once per chunk rather than through
 /// `AsyncBufReadExt::fill_buf`, which polls twice and panics when the second
 /// poll returns `Pending` after EOF on `BufReader<Unblock<Stdin>>`.
+/// `discarding_oversized` records, across calls, that a rejected oversized
+/// frame is still being drained: a future dropped mid-drain then resumes
+/// discarding rather than reading the frame's tail as a new message.
 pub(super) async fn read_message(
     reader: &mut (impl AsyncBufRead + Unpin),
     read_buf: &mut Vec<u8>,
+    discarding_oversized: &mut bool,
 ) -> Result<Option<JsonRpcMessage>> {
-    read_message_bounded(reader, read_buf, MAX_MESSAGE_BYTES).await
+    read_message_bounded(reader, read_buf, discarding_oversized, MAX_MESSAGE_BYTES).await
 }
 
 pub(super) async fn read_message_bounded(
     reader: &mut (impl AsyncBufRead + Unpin),
     read_buf: &mut Vec<u8>,
+    discarding_oversized: &mut bool,
     max_bytes: usize,
 ) -> Result<Option<JsonRpcMessage>> {
     loop {
@@ -46,7 +51,26 @@ pub(super) async fn read_message_bounded(
             loop {
                 let available = futures_lite::ready!(Pin::new(&mut *reader).poll_fill_buf(cx))?;
                 if available.is_empty() {
+                    if *discarding_oversized {
+                        // EOF reached while draining a rejected frame — the
+                        // whole frame is consumed, so report the error now.
+                        *discarding_oversized = false;
+                        return Poll::Ready(Err(oversized_error(max_bytes)));
+                    }
                     return Poll::Ready(Ok::<bool, McpError>(true));
+                }
+
+                if *discarding_oversized {
+                    // Draining a rejected frame: discard chunks without
+                    // buffering until its terminating newline arrives.
+                    if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+                        Pin::new(&mut *reader).consume(newline_pos + 1);
+                        *discarding_oversized = false;
+                        return Poll::Ready(Err(oversized_error(max_bytes)));
+                    }
+                    let chunk_len = available.len();
+                    Pin::new(&mut *reader).consume(chunk_len);
+                    continue;
                 }
 
                 if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
@@ -65,10 +89,15 @@ pub(super) async fn read_message_bounded(
 
                 let chunk_len = available.len();
                 if read_buf.len().saturating_add(chunk_len) > max_bytes {
+                    // The line is oversized before any newline: free the staged
+                    // bytes immediately and drain the rest of the frame
+                    // unbuffered so the next read resumes on the following
+                    // line.
                     Pin::new(&mut *reader).consume(chunk_len);
                     read_buf.clear();
                     read_buf.shrink_to(0);
-                    return Poll::Ready(Err(oversized_error(max_bytes)));
+                    *discarding_oversized = true;
+                    continue;
                 }
                 read_buf.extend_from_slice(available);
                 Pin::new(&mut *reader).consume(chunk_len);
@@ -140,8 +169,9 @@ mod tests {
         let oversized = vec![b'x'; 256];
         let mut reader = BufReader::with_capacity(32, Cursor::new(oversized));
         let mut read_buf = Vec::new();
+        let mut discarding = false;
 
-        let err = read_message_bounded(&mut reader, &mut read_buf, 64)
+        let err = read_message_bounded(&mut reader, &mut read_buf, &mut discarding, 64)
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::Transport(_)), "{err:?}");
@@ -157,13 +187,41 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(128, Cursor::new(payload));
         let mut read_buf = Vec::new();
+        let mut discarding = false;
 
-        let err = read_message_bounded(&mut reader, &mut read_buf, 64)
+        let err = read_message_bounded(&mut reader, &mut read_buf, &mut discarding, 64)
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::Transport(_)), "{err:?}");
 
-        let next = read_message_bounded(&mut reader, &mut read_buf, 64)
+        let next = read_message_bounded(&mut reader, &mut read_buf, &mut discarding, 64)
+            .await
+            .unwrap()
+            .expect("following valid message");
+        assert!(next.is_notification());
+    }
+
+    /// A frame over the cap spanning several fill chunks fails once and the
+    /// next read delivers the following frame, not the rejected frame's tail.
+    #[tokio::test]
+    async fn oversized_frame_spanning_chunks_drains_to_the_next_frame() {
+        let mut payload = vec![b'x'; 60];
+        payload.push(b'\n');
+        payload.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"method\":\"m\"}\n");
+
+        // An 8-byte fill buffer splits the 60-byte frame across chunks.
+        let mut reader = BufReader::with_capacity(8, Cursor::new(payload));
+        let mut read_buf = Vec::new();
+        let mut discarding = false;
+
+        let err = read_message_bounded(&mut reader, &mut read_buf, &mut discarding, 32)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::Transport(_)), "{err:?}");
+        assert!(!discarding);
+        assert_eq!(read_buf, [] as [u8; 0]);
+
+        let next = read_message_bounded(&mut reader, &mut read_buf, &mut discarding, 32)
             .await
             .unwrap()
             .expect("following valid message");
@@ -182,15 +240,16 @@ mod tests {
             },
         );
         let mut read_buf = Vec::new();
+        let mut discarding = false;
 
         {
-            let fut = read_message_bounded(&mut reader, &mut read_buf, 128);
+            let fut = read_message_bounded(&mut reader, &mut read_buf, &mut discarding, 128);
             futures_lite::pin!(fut);
             assert!(future::poll_once(&mut fut).await.is_none());
         }
         assert_ne!(read_buf, [] as [u8; 0]);
 
-        let msg = read_message_bounded(&mut reader, &mut read_buf, 128)
+        let msg = read_message_bounded(&mut reader, &mut read_buf, &mut discarding, 128)
             .await
             .unwrap()
             .expect("resumed message");
