@@ -1749,8 +1749,12 @@ where
         // A refresh that lands after the entry expired buys a full-price
         // write no one reads, so the request must leave with a margin.
         const DISPATCH_MARGIN: Duration = Duration::from_secs(5);
+        let margin = match self.warmth.lifetime() {
+            crate::context::CacheLifetime::Limited(lifetime) => DISPATCH_MARGIN.min(lifetime / 4),
+            crate::context::CacheLifetime::Permanent => return Ok(None),
+        };
         match self.warmth.cold_in() {
-            Some(remaining) if remaining > DISPATCH_MARGIN => {}
+            Some(remaining) if remaining > margin => {}
             _ => return Ok(None),
         }
         let Some(last_request) = self.last_request.clone() else {

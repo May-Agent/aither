@@ -70,7 +70,7 @@ impl CacheWarmth {
     }
 
     /// The current configured lifetime.
-    fn lifetime(&self) -> CacheLifetime {
+    pub(crate) fn lifetime(&self) -> CacheLifetime {
         **self.inner.lifetime.load()
     }
 
