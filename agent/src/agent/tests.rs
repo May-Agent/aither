@@ -1582,3 +1582,61 @@ async fn manual_clock_utc_now_and_live_cache_setters_take_effect_immediately() {
         Some(ClaudePromptCacheTtl::FiveMinutes)
     );
 }
+
+#[tokio::test]
+async fn a_compaction_on_a_compaction_model_carries_no_session_cache_controls() {
+    let handoff_json = r#"{"current_task":"t","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["reply"],"recovery_hints":[],"skills":[]}"#;
+
+    // A compaction on the session's own model reads the warm cache: its
+    // request keeps the controls.
+    let same = ClaudeScripted::new(128_000, [say("hi"), say(handoff_json)]);
+    let mut agent = AgentBuilder::new(same.clone()).build();
+    let (first, _) = run_to_end(&mut agent, "hello").await;
+    first.expect("first run");
+    let _ = agent
+        .compact(None)
+        .drive((), std::future::pending::<()>(), |(), _timed| async move {
+            ControlFlow::Continue(())
+        })
+        .await
+        .expect("same-model compaction");
+    assert!(
+        !same
+            .requests()
+            .last()
+            .expect("compaction request")
+            .parameters()
+            .cache
+            .is_empty(),
+        "a compaction on the session model keeps the cache controls"
+    );
+
+    // One on a configured compaction model reads none of that cache, so its
+    // request writes no entry for the prefix being discarded.
+    let compactor = ClaudeScripted::new(128_000, [say(handoff_json)]);
+    let main = ClaudeScripted::new(128_000, [say("hi")]);
+    let mut agent = AgentBuilder::new(main)
+        .compaction_model(
+            compactor.clone(),
+            aither_core::llm::model::Parameters::default(),
+        )
+        .build();
+    let (first, _) = run_to_end(&mut agent, "hello").await;
+    first.expect("first run");
+    let _ = agent
+        .compact(None)
+        .drive((), std::future::pending::<()>(), |(), _timed| async move {
+            ControlFlow::Continue(())
+        })
+        .await
+        .expect("compaction-model compaction");
+    let request = compactor
+        .requests()
+        .last()
+        .expect("compaction request")
+        .clone();
+    assert!(
+        request.parameters().cache.is_empty(),
+        "a compaction model's request carries no session cache controls"
+    );
+}
