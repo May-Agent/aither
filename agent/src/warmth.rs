@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use crate::clock::{AnyClock, Instant};
 use crate::context::CacheLifetime;
 
@@ -32,7 +34,7 @@ pub enum CacheState {
 
 #[derive(Debug)]
 struct Inner {
-    lifetime: CacheLifetime,
+    lifetime: ArcSwap<CacheLifetime>,
     clock: AnyClock,
     /// The latest of the last request start and the last keep-alive send, in
     /// nanoseconds on `clock`, or [`NOT_STARTED`].
@@ -54,11 +56,31 @@ impl CacheWarmth {
     pub(crate) fn new(lifetime: CacheLifetime, clock: AnyClock) -> Self {
         Self {
             inner: Arc::new(Inner {
-                lifetime,
+                lifetime: ArcSwap::from_pointee(lifetime),
                 clock,
                 entry_started_nanos: AtomicU64::new(NOT_STARTED),
             }),
         }
+    }
+
+    /// Updates how long the entry stays warm, visible immediately to every
+    /// clone of this handle.
+    pub(crate) fn set_lifetime(&self, lifetime: CacheLifetime) {
+        self.inner.lifetime.store(Arc::new(lifetime));
+    }
+
+    /// The current configured lifetime.
+    fn lifetime(&self) -> CacheLifetime {
+        **self.inner.lifetime.load()
+    }
+
+    /// Forgets the entry: every clone reads [`CacheState::Cold`] from here,
+    /// as though no request had ever run. A model swap calls it — the new
+    /// model's cache is its own.
+    pub(crate) fn reset(&self) {
+        self.inner
+            .entry_started_nanos
+            .store(NOT_STARTED, Ordering::Relaxed);
     }
 
     /// Records that a request or keep-alive started the entry at `at`.
