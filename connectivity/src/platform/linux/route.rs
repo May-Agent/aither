@@ -15,12 +15,13 @@ const GROUPS: u32 = 0x1 | 0x40 | 0x400;
 
 pub struct Watcher {
     events: Async<Socket>,
-    dump: Socket,
+    dump: Async<Socket>,
 }
 
 impl Watcher {
     /// Opens the sockets and reports the initial reachability to `sink`.
-    pub fn open(sink: &Sink) -> Result<Self, ConnectivityError> {
+    #[allow(clippy::future_not_send)]
+    pub async fn open(sink: &Sink) -> Result<Self, ConnectivityError> {
         let register = |reason: io::Error| ConnectivityError::Register {
             monitor: "rtnetlink",
             reason: reason.to_string(),
@@ -30,7 +31,9 @@ impl Watcher {
         events.set_non_blocking(true).map_err(register)?;
         let mut dump = Socket::new(NETLINK_ROUTE).map_err(register)?;
         dump.bind_auto().map_err(register)?;
-        sink.set_online(has_default_route(&dump).map_err(register)?);
+        dump.set_non_blocking(true).map_err(register)?;
+        let dump = Async::new(dump).map_err(register)?;
+        sink.set_online(has_default_route(&dump).await.map_err(register)?);
         Ok(Self {
             events: Async::new(events).map_err(register)?,
             dump,
@@ -39,6 +42,7 @@ impl Watcher {
 
     /// Re-reads the routes whenever the kernel announces a link or route
     /// change, until the socket fails.
+    #[allow(clippy::future_not_send)]
     pub async fn watch(self, sink: &Sink) -> io::Result<()> {
         loop {
             match self
@@ -57,7 +61,7 @@ impl Watcher {
             }
             // One change usually arrives as a burst; read the dump once.
             while self.events.get_ref().recv_from_full().is_ok() {}
-            match has_default_route(&self.dump) {
+            match has_default_route(&self.dump).await {
                 Ok(online) => sink.set_online(online),
                 Err(error) => {
                     tracing::error!(%error, "route dump failed, reachability is no longer tracked");
@@ -68,16 +72,43 @@ impl Watcher {
     }
 }
 
-/// Dumps every route and reports whether one is a default route.
-fn has_default_route(dump: &Socket) -> io::Result<bool> {
-    dump.send_to(&decode::dump_request(), &SocketAddr::new(0, 0), 0)?;
+/// Dumps every route asynchronously and reports whether one is a default route.
+async fn has_default_route(dump: &Async<Socket>) -> io::Result<bool> {
+    let request = decode::dump_request();
+    let kernel = SocketAddr::new(0, 0);
+    let sent = dump
+        .write_with(|sock| sock.send_to(&request, &kernel, 0))
+        .await?;
+    if sent != request.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short netlink dump request write",
+        ));
+    }
     let mut default_route = false;
     loop {
-        let (datagram, _) = dump.recv_from_full()?;
+        let (datagram, _) = dump.read_with(netlink_sys::Socket::recv_from_full).await?;
         let scan = decode::scan(&datagram).map_err(io::Error::other)?;
         default_route |= scan.default_route;
         if scan.done {
             return Ok(default_route);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn async_route_dump_succeeds_without_blocking() {
+        let mut dump = Socket::new(NETLINK_ROUTE).expect("open netlink route socket");
+        dump.bind_auto().expect("bind dump socket");
+        dump.set_non_blocking(true).expect("set non-blocking");
+        let dump = Async::new(dump).expect("wrap in Async");
+
+        let _online = has_default_route(&dump)
+            .await
+            .expect("async netlink route dump should succeed");
     }
 }

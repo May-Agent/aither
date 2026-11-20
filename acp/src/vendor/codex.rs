@@ -3,21 +3,21 @@
 //! What codex-acp-compatible agents speak beyond the common protocol:
 //!
 //! - the `_meta.codex` namespace (subagent refs, collaboration routing,
-//!   phase labels) plus codex-emitted top-level `_meta` keys on tool calls;
-//! - the `models` extra on `session/new|load|resume` results;
+//!   phase labels) plus codex-emitted top-level `_meta` keys on tool
+//!   calls;
+//! - the `models` extra on `session/new|load|resume|fork` results;
 //! - auth method IDs and the gateway auth flow;
-//! - legacy methods that predate the `_` naming rule (`session/set_model`,
-//!   `authentication/status`, `authentication/logout`) and the
-//!   `_codex/session/goal_control` alias for
-//!   [`crate::ext::goal::METHOD`].
+//! - legacy methods that predate the `_` naming rule
+//!   (`session/set_model`, `authentication/status`,
+//!   `authentication/logout`) and the `_codex/session/goal_control`
+//!   alias for [`crate::ext::goal::METHOD`].
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::client::{AcpClient, ClientError, ClientHandler};
-use crate::protocol::ExtMethod;
+use crate::domain::{ExtMethod, SessionId};
 
 /// The `_meta` namespace Codex writes under.
 pub const NAMESPACE: &str = "codex";
@@ -26,7 +26,8 @@ pub const NAMESPACE: &str = "codex";
 /// predate the provider-neutral method name.
 pub const LEGACY_GOAL_CONTROL_METHOD: ExtMethod = ExtMethod::new("_codex/session/goal_control");
 
-/// Legacy model-switch method; superseded by `session/set_config_option`.
+/// Legacy model-switch method; superseded by
+/// `session/set_config_option`.
 pub const SET_MODEL_METHOD: &str = "session/set_model";
 
 /// Legacy pull-style auth status request; superseded by
@@ -94,7 +95,8 @@ pub fn phase(meta: Option<&Value>) -> Option<&str> {
 /// Top-level `_meta` key marking a tool call as backed by an MCP tool.
 pub const IS_MCP_TOOL_CALL: &str = "is_mcp_tool_call";
 
-/// Whether a tool call's `_meta.is_mcp_tool_call` marks it as MCP-backed.
+/// Whether a tool call's `_meta.is_mcp_tool_call` marks it as
+/// MCP-backed.
 #[must_use]
 pub fn is_mcp_tool_call(meta: Option<&Value>) -> bool {
     meta.and_then(|meta| meta.get(IS_MCP_TOOL_CALL))
@@ -129,7 +131,8 @@ pub fn terminal_info(meta: Option<&Value>) -> Option<TerminalInfo> {
     serde_json::from_value(meta?.get(TERMINAL_INFO)?.clone()).ok()
 }
 
-/// The `_meta.terminal_exit` object on a terminal-backed tool call update.
+/// The `_meta.terminal_exit` object on a terminal-backed tool call
+/// update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalExit {
@@ -153,7 +156,8 @@ pub fn terminal_exit(meta: Option<&Value>) -> Option<TerminalExit> {
     serde_json::from_value(meta?.get(TERMINAL_EXIT)?.clone()).ok()
 }
 
-/// The `models` extra Codex returns on `session/new|load|resume` results.
+/// The `models` extra Codex returns on
+/// `session/new|load|resume|fork` results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModels {
@@ -172,7 +176,8 @@ pub struct SessionModels {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModel {
-    /// Model identifier for [`set_model`].
+    /// Model identifier for `session/set_model` (or a model-category
+    /// config option).
     pub model_id: String,
     /// Human-readable name.
     pub name: String,
@@ -187,10 +192,8 @@ pub struct SessionModel {
 /// The `models` key on session results' `extra` fields.
 pub const MODELS: &str = "models";
 
-/// Extract the [`SessionModels`] extra from a session result.
-///
-/// Works on the `extra` map of `SessionNewResult`, `SessionLoadResult`,
-/// and `SessionResumeResult`.
+/// Extract the [`SessionModels`] extra from a session result's `extra`
+/// map (e.g. [`crate::domain::SetupResult::extra`]).
 #[must_use]
 pub fn models(extra: &BTreeMap<String, Value>) -> Option<SessionModels> {
     serde_json::from_value(extra.get(MODELS)?.clone()).ok()
@@ -199,38 +202,26 @@ pub fn models(extra: &BTreeMap<String, Value>) -> Option<SessionModels> {
 /// `session/set_model` request parameters (legacy method).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SetModelParams {
-    session_id: String,
-    model_id: String,
+pub struct SetModelParams {
+    /// Target session.
+    pub session_id: SessionId,
+    /// Model to select.
+    pub model_id: String,
 }
 
-/// Legacy `session/set_model` request; superseded by
-/// `session/set_config_option` but still the only model switch on older
-/// agents.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn set_model<H: ClientHandler>(
-    client: &AcpClient<H>,
-    session_id: &str,
-    model_id: &str,
-) -> Result<(), ClientError> {
-    client
-        .request::<_, Value>(
-            SET_MODEL_METHOD,
-            &SetModelParams {
-                session_id: session_id.to_string(),
-                model_id: model_id.to_string(),
-            },
-        )
-        .await?;
-    Ok(())
+impl SetModelParams {
+    /// Params selecting `model_id` on `session_id`.
+    #[must_use]
+    pub fn new(session_id: impl Into<SessionId>, model_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            model_id: model_id.into(),
+        }
+    }
 }
 
-/// The legacy `authentication/status` response (pull-style; superseded by
-/// [`crate::ext::auth_status`]).
+/// The legacy `authentication/status` response (pull-style; superseded
+/// by [`crate::ext::auth_status`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AuthenticationStatus {
@@ -254,45 +245,19 @@ pub enum AuthenticationStatus {
     Unauthenticated,
 }
 
-/// Legacy `authentication/status` request.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn authentication_status<H: ClientHandler>(
-    client: &AcpClient<H>,
-) -> Result<AuthenticationStatus, ClientError> {
-    client
-        .request(AUTHENTICATION_STATUS_METHOD, &json!({}))
-        .await
-}
+// TODO(wave-3): `set_model(&Client, &SessionId, &str)`,
+// `authentication_status(&Client) -> AuthenticationStatus`,
+// `authentication_logout(&Client)` — thin `Client::request` wrappers
+// over the legacy methods — once `client::Client` lands.
 
-/// Legacy `authentication/logout` request; superseded by the standard
-/// `logout`.
-///
-/// # Errors
-///
-/// Returns an error if the connection is closed or the agent replies with an
-/// error or a malformed result.
-pub async fn authentication_logout<H: ClientHandler>(
-    client: &AcpClient<H>,
-) -> Result<(), ClientError> {
-    client
-        .request::<_, Value>(AUTHENTICATION_LOGOUT_METHOD, &json!({}))
-        .await?;
-    Ok(())
-}
-
-/// Codex `authenticate` method IDs and the gateway auth flow.
+/// Codex `auth/login` method IDs and the gateway auth flow.
 pub mod auth {
     use std::collections::HashMap;
 
     use serde::Serialize;
     use serde_json::json;
 
-    use crate::client::{AcpClient, ClientError, ClientHandler};
-    use crate::protocol::{AuthenticateParams, ClientCapabilities};
+    use crate::domain::{ClientAuthCaps, ClientCapabilities};
 
     /// Paste an API key.
     pub const API_KEY: &str = "api-key";
@@ -300,32 +265,33 @@ pub mod auth {
     /// Browser sign-in with a `ChatGPT` account.
     pub const CHAT_GPT: &str = "chat-gpt";
 
-    /// Device-code sign-in with a `ChatGPT` account. Requires the client to
-    /// advertise URL elicitation support.
+    /// Device-code sign-in with a `ChatGPT` account. Requires the
+    /// client to advertise URL elicitation support.
     pub const CHAT_GPT_DEVICE_CODE: &str = "chat-gpt-device-code";
 
-    /// Authenticate through a custom model gateway. Only offered when the
-    /// client advertised [`advertise_gateway`].
+    /// Authenticate through a custom model gateway. Only offered when
+    /// the client advertised [`advertise_gateway`].
     pub const GATEWAY: &str = "gateway";
 
-    /// The `clientCapabilities.auth._meta` key gating the gateway method.
+    /// The `clientCapabilities.auth._meta` key gating the gateway
+    /// method.
     pub const GATEWAY_CAPABILITY: &str = "gateway";
 
-    /// The `_meta` key carrying [`GatewayParams`] on `authenticate`.
+    /// The `_meta` key carrying [`GatewayParams`] on `auth/login`.
     pub const GATEWAY_META: &str = "gateway";
 
     /// Advertise gateway-auth support on client capabilities.
     ///
     /// Sets `clientCapabilities.auth._meta.gateway: true`.
     pub fn advertise_gateway(caps: &mut ClientCapabilities) {
-        let auth = caps.auth.get_or_insert_with(Default::default);
+        let auth = caps.auth.get_or_insert_with(ClientAuthCaps::default);
         let meta = auth.meta.get_or_insert_with(|| json!({}));
         if let Some(object) = meta.as_object_mut() {
             object.insert(GATEWAY_CAPABILITY.to_string(), json!(true));
         }
     }
 
-    /// The `_meta.gateway` payload for a gateway `authenticate`.
+    /// The `_meta.gateway` payload for a gateway `auth/login`.
     #[derive(Debug, Clone, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct GatewayParams {
@@ -365,22 +331,9 @@ pub mod auth {
         }
     }
 
-    /// `authenticate` with `methodId: "gateway"` and the connection details
-    /// under `_meta.gateway`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection is closed or the agent replies with
-    /// an error or a malformed result.
-    pub async fn authenticate_gateway<H: ClientHandler>(
-        client: &AcpClient<H>,
-        params: GatewayParams,
-    ) -> Result<(), ClientError> {
-        client
-            .authenticate(AuthenticateParams::new(GATEWAY).meta(json!({ GATEWAY_META: params })))
-            .await?;
-        Ok(())
-    }
+    // TODO(wave-3): `authenticate_gateway(&Client, GatewayParams)` —
+    // `Client::login`/`authenticate` with `methodId: "gateway"` and the
+    // params under `_meta.gateway` — once `client::Client` lands.
 }
 
 #[cfg(test)]
@@ -388,7 +341,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::protocol::ClientCapabilities;
+    use crate::domain::ClientCapabilities;
 
     /// `_meta.codex.*` accessors decode their payloads.
     #[test]
@@ -465,6 +418,13 @@ mod tests {
         assert!(matches!(status, AuthenticationStatus::Unauthenticated));
     }
 
+    /// `set_model` params carry `sessionId`/`modelId`.
+    #[test]
+    fn set_model_params_wire_format() {
+        let json = serde_json::to_value(SetModelParams::new("s1", "m2")).expect("serializes");
+        assert_eq!(json, json!({"sessionId": "s1", "modelId": "m2"}));
+    }
+
     /// `advertise_gateway` sets `auth._meta.gateway: true`.
     #[test]
     fn advertise_gateway_capability() {
@@ -474,7 +434,7 @@ mod tests {
         assert_eq!(json["auth"]["_meta"]["gateway"], true);
     }
 
-    /// Gateway params nest under `_meta.gateway` on `authenticate`.
+    /// Gateway params nest under `_meta.gateway` on `auth/login`.
     #[test]
     fn gateway_params_wire_format() {
         let params = auth::GatewayParams::new("http://localhost:8787")

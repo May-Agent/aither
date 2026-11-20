@@ -826,3 +826,734 @@ async fn after_tool_replace_with_attachments_reaches_the_model() {
     assert_eq!(tool_message.content(), "attached image");
     assert_eq!(tool_message.attachments(), &[attachment]);
 }
+
+/// Validates Claude's `MidConversationSystem` placement rule: after the
+/// leading `Role::System` prefix, every `Role::System` turn must follow a
+/// `Role::User` or `Role::Tool` turn, never follow another `Role::System`, and
+/// be either last or followed by `Role::Assistant` (skipping `Configuration`).
+fn assert_valid_claude_system_turns(messages: &[aither_core::llm::Message]) {
+    use aither_core::llm::Role;
+
+    let leading = messages
+        .iter()
+        .take_while(|msg| msg.role() == Role::System)
+        .count();
+    let turns: Vec<(usize, Role)> = messages[leading..]
+        .iter()
+        .enumerate()
+        .filter(|(_, msg)| msg.role() != Role::Configuration)
+        .map(|(offset, msg)| (leading + offset, msg.role()))
+        .collect();
+    for (pos, &(index, role)) in turns.iter().enumerate() {
+        if role != Role::System {
+            continue;
+        }
+        let follows_user = pos
+            .checked_sub(1)
+            .is_some_and(|prev| matches!(turns[prev].1, Role::User | Role::Tool));
+        assert!(
+            follows_user,
+            "mid-conversation system turn at index {index} must follow User/Tool: {messages:?}"
+        );
+        if let Some(&(_, next_role)) = turns.get(pos + 1) {
+            assert_eq!(
+                next_role,
+                Role::Assistant,
+                "mid-conversation system turn at index {index} must be last or before Assistant: {messages:?}"
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ClaudeScripted {
+    script: Arc<Mutex<VecDeque<Vec<Event>>>>,
+    requests: Arc<Mutex<Vec<LLMRequest>>>,
+    context_length: u32,
+}
+
+impl ClaudeScripted {
+    fn new(context_length: u32, script: impl IntoIterator<Item = Vec<Event>>) -> Self {
+        Self {
+            script: Arc::new(Mutex::new(script.into_iter().collect())),
+            requests: Arc::default(),
+            context_length,
+        }
+    }
+
+    fn requests(&self) -> Vec<LLMRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl LanguageModel for ClaudeScripted {
+    type Error = NeverFails;
+
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+        self.requests.lock().unwrap().push(request);
+        let response = self
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted response");
+        futures_lite::stream::iter(response.into_iter().map(Ok))
+    }
+
+    fn profile(&self) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
+        let context_length = self.context_length;
+        std::future::ready(Ok(Profile::new(
+            "claude-sonnet-5-5",
+            "anthropic",
+            "claude-sonnet-5-5",
+            "Claude",
+            context_length,
+        )
+        .with_ability(aither_core::llm::model::Ability::MidConversationSystem)))
+    }
+}
+
+struct MultiAlertSource {
+    object_once: Mutex<bool>,
+}
+
+impl ContextSource for MultiAlertSource {
+    fn id(&self) -> SourceId {
+        SourceId::new("multi-alert")
+    }
+
+    async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        match moment {
+            Moment::Request { .. } => vec![
+                ContextBlock::stable("alert-a", "source-stable-a"),
+                ContextBlock::stable("alert-b", "source-stable-b"),
+                ContextBlock::tail("clock", "live-tail-clock"),
+            ],
+            Moment::FinalTurn => {
+                let mut pending = self.object_once.lock().unwrap();
+                if std::mem::take(&mut *pending) {
+                    vec![ContextBlock::stable("objection", "source-final-objection")]
+                } else {
+                    Vec::new()
+                }
+            }
+            Moment::ToolTurnEnd => Vec::new(),
+        }
+    }
+
+    async fn peek(&self, _moment: Moment) -> Vec<ContextBlock> {
+        Vec::new()
+    }
+}
+
+struct HookAlertsAndHold {
+    hold_once: Mutex<bool>,
+}
+
+impl Hooks for HookAlertsAndHold {
+    async fn before_request(&self, _cx: &crate::RequestCx<'_>) -> Vec<ContextBlock> {
+        vec![ContextBlock::stable("hook-note", "hook-stable-note")]
+    }
+
+    async fn on_stop(&self, _cx: &StopCx<'_>) -> StopDecision {
+        let mut hold = self.hold_once.lock().unwrap();
+        if std::mem::take(&mut *hold) {
+            StopDecision::Continue {
+                reason: "verify output".into(),
+            }
+        } else {
+            StopDecision::End
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_mid_conversation_system_adjacency_holds_across_hooks_compaction_and_next_run() {
+    let restore_root = tempfile::tempdir().expect("tempdir");
+    async_fs::write(restore_root.path().join("guide.md"), "important context")
+        .await
+        .expect("write guide");
+
+    let handoff_json = r#"{"current_task":"finish","key_decisions":[],"context_files":[{"path":"guide.md","why":"keep handy"}],"errors_fixes":[],"pending_work":["reply"],"recovery_hints":[],"skills":[]}"#;
+    let llm = ClaudeScripted::new(
+        128_000,
+        [
+            say("first draft"),
+            say("revised draft"),
+            say(handoff_json),
+            say("follow-up answer"),
+        ],
+    );
+    let mut agent = AgentBuilder::new(llm.clone())
+        .instruction("system prefix")
+        .restore_roots([restore_root.path().to_path_buf()])
+        .context_source(MultiAlertSource {
+            object_once: Mutex::new(true),
+        })
+        .hooks(HookAlertsAndHold {
+            hold_once: Mutex::new(true),
+        })
+        .build();
+
+    let (first_run, _) = run_to_end(&mut agent, "start task").await;
+    first_run.expect("first run completes");
+
+    let compact_flow = agent
+        .compact(None)
+        .drive((), std::future::pending::<()>(), |(), _timed| async move {
+            ControlFlow::Continue(())
+        })
+        .await;
+    let _ = compact_flow.expect("compaction completes");
+
+    let (second_run, _) = run_to_end(&mut agent, "next user turn").await;
+    second_run.expect("second run completes");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 4);
+    for request in &requests {
+        assert_valid_claude_system_turns(request.messages());
+    }
+    let last_text: String = requests[3]
+        .messages()
+        .iter()
+        .map(aither_core::llm::Message::content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        last_text.contains("<external-content boundary=\""),
+        "restored file must be wrapped in ExternalContent: {last_text}"
+    );
+}
+
+#[derive(Clone)]
+struct NamedTool {
+    name: &'static str,
+    reply: String,
+}
+
+impl Tool for NamedTool {
+    fn name(&self) -> Cow<'static, str> {
+        self.name.into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        "Test tool.".into()
+    }
+
+    type Arguments = NoArguments;
+    type Res = ToolResult;
+
+    fn call(
+        &self,
+        _arguments: Self::Arguments,
+        _cx: ToolContext,
+    ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+        std::future::ready(Ok(ToolResult::text(self.reply.clone())))
+    }
+}
+
+struct KeepDecisionHook;
+
+impl Hooks for KeepDecisionHook {
+    async fn after_tool(&self, outcome: &crate::ToolOutcome) -> crate::AfterTool {
+        if outcome.name == "decision" {
+            crate::AfterTool::Keep.kept()
+        } else {
+            crate::AfterTool::Keep
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_after_tool_kept_exchanges_survive_in_run_compactions_in_order() {
+    let handoff_json = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["finish"],"recovery_hints":[],"skills":[]}"#;
+    let pad = "x".repeat(6_000);
+    let compactor = ClaudeScripted::new(128_000, [say(handoff_json), say(handoff_json)]);
+    let main_llm = ClaudeScripted::new(
+        10_000,
+        [
+            vec![
+                Event::ToolCall(ToolCall::new("k1", "decision", serde_json::json!({}))),
+                Event::ToolCall(ToolCall::new("s1", "scratch", serde_json::json!({}))),
+            ],
+            call("k2", "decision"),
+            say("all done"),
+            say("after cold cache"),
+        ],
+    );
+    let clock = crate::ManualClock::new();
+    let policy = crate::ContextPolicy {
+        handoff_reserve: 2_000,
+        compact_ceiling: 1_200,
+        start_distance: 100,
+        warn_distance: 200,
+        user_message_budget: 0,
+        ..crate::ContextPolicy::default()
+    };
+    let config = crate::AgentConfig {
+        context_policy: policy,
+        ..crate::AgentConfig::default()
+    };
+    let mut agent = AgentBuilder::new(main_llm.clone())
+        .config(config)
+        .clock(clock.clone())
+        .cache_lifetime(crate::context::CacheLifetime::Limited(Duration::from_secs(
+            600,
+        )))
+        .compaction_model(compactor, aither_core::llm::model::Parameters::default())
+        .tool(NamedTool {
+            name: "decision",
+            reply: "approved-choice".into(),
+        })
+        .tool(NamedTool {
+            name: "scratch",
+            reply: pad,
+        })
+        .hooks(KeepDecisionHook)
+        .build();
+
+    let (result, _) = run_to_end(&mut agent, "go").await;
+    result.expect("in-run pause-point compaction succeeds");
+
+    // Advance past the cache lifetime to trigger ColdCache compaction on the next run too.
+    clock.advance(Duration::from_secs(601));
+    let (second, _) = run_to_end(&mut agent, "resume").await;
+    second.expect("cold-cache compaction succeeds");
+
+    let final_messages = main_llm
+        .requests()
+        .last()
+        .expect("final request")
+        .messages()
+        .to_vec();
+    let kept_tool_ids: Vec<&str> = final_messages
+        .iter()
+        .filter_map(|msg| msg.tool_call_id())
+        .collect();
+    assert_eq!(
+        kept_tool_ids,
+        ["k1", "k2"],
+        "kept exchanges survive in chronological order without duplicates while unkept `s1` is compacted"
+    );
+    let assistant_call_ids: Vec<&str> = final_messages
+        .iter()
+        .flat_map(|msg| msg.tool_calls().iter().map(|call| call.id.as_str()))
+        .collect();
+    assert_eq!(assistant_call_ids, ["k1", "k2"]);
+}
+
+#[derive(Clone)]
+struct YieldingClaudeScripted {
+    inner: ClaudeScripted,
+}
+
+impl LanguageModel for YieldingClaudeScripted {
+    type Error = NeverFails;
+
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+        self.inner.requests.lock().unwrap().push(request);
+        let response = self
+            .inner
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted response");
+        futures_lite::stream::unfold(Some(response), |state| async move {
+            let mut events = state?;
+            futures_lite::future::yield_now().await;
+            if events.is_empty() {
+                return None;
+            }
+            let next = events.remove(0);
+            Some((Ok(next), Some(events)))
+        })
+    }
+
+    fn profile(&self) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
+        self.inner.profile()
+    }
+}
+
+#[tokio::test]
+async fn generic_async_compaction_strips_claude_bound_thinking_from_post_fork_turns_and_rotates_epoch()
+ {
+    use aither_core::llm::ReasoningState;
+
+    let handoff_json = r#"{"current_task":"post-fork","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["finish"],"recovery_hints":[],"skills":[]}"#;
+    let claude_thinking = ReasoningState::new(
+        "claude",
+        serde_json::json!({
+            "type": "thinking",
+            "thinking": "bound to pre-compaction prefix",
+            "signature": "sig-old"
+        })
+        .to_string(),
+    );
+    let openai_reasoning = ReasoningState::new("openai", "enc-item-1");
+    let gemini_reasoning = ReasoningState::new("gemini", "thought-sig-1");
+
+    let compactor = ClaudeScripted::new(128_000, [say(handoff_json), say(handoff_json)]);
+    let main_llm = YieldingClaudeScripted {
+        inner: ClaudeScripted::new(
+            20_000,
+            [
+                vec![
+                    Event::ReasoningState(claude_thinking),
+                    Event::ReasoningState(openai_reasoning.clone()),
+                    Event::ReasoningState(gemini_reasoning.clone()),
+                    Event::Text("post-fork tool step".to_string()),
+                    Event::ToolCall(ToolCall::new("c_post", "probe", serde_json::json!({}))),
+                ],
+                say("finished"),
+            ],
+        ),
+    };
+    let policy = crate::ContextPolicy {
+        handoff_reserve: 2_000,
+        compact_ceiling: 10_000,
+        // High `start_distance` forks `WindowFilling` compaction on Turn 1 without hitting `should_pause`.
+        start_distance: 9_900,
+        warn_distance: 9_950,
+        user_message_budget: 0,
+        ..crate::ContextPolicy::default()
+    };
+    let mut agent = AgentBuilder::new(main_llm.clone())
+        .config(crate::AgentConfig {
+            context_policy: policy,
+            ..crate::AgentConfig::default()
+        })
+        .prompt_cache(crate::PromptCache::new("sess-196"))
+        .compaction_model(compactor, aither_core::llm::model::Parameters::default())
+        .tool(Probe::default())
+        .build();
+
+    let (result, events) = run_to_end(&mut agent, &"seed ".repeat(300)).await;
+    result.expect("run with async WindowFilling compaction completes");
+
+    assert!(events.iter().any(|timed| matches!(
+        timed.event,
+        AgentEvent::CompactionStarted {
+            trigger: crate::CompactionTrigger::WindowFilling
+        }
+    )));
+    assert!(events.iter().any(|timed| matches!(
+        timed.event,
+        AgentEvent::CompactionEnded {
+            outcome: crate::CompactionOutcome::Applied(_)
+        }
+    )));
+
+    let requests = main_llm.inner.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0]
+            .parameters()
+            .cache
+            .openai
+            .as_ref()
+            .and_then(|c| c.key.as_deref()),
+        Some("sess-196:0")
+    );
+    assert_eq!(
+        requests[1]
+            .parameters()
+            .cache
+            .openai
+            .as_ref()
+            .and_then(|c| c.key.as_deref()),
+        Some("sess-196:1"),
+        "PromptCache epoch must advance when compaction rewrites the prefix"
+    );
+
+    assert_post_fork_assistant_stripped(
+        requests[1].messages(),
+        &[openai_reasoning, gemini_reasoning],
+    );
+}
+
+fn assert_post_fork_assistant_stripped(
+    messages: &[aither_core::llm::Message],
+    expected_non_claude: &[aither_core::llm::ReasoningState],
+) {
+    let post_fork_assistant = messages
+        .iter()
+        .find(|msg| msg.role() == aither_core::llm::Role::Assistant)
+        .expect("post-fork assistant turn kept across async compaction");
+    assert_eq!(post_fork_assistant.content(), "post-fork tool step");
+    assert_eq!(post_fork_assistant.tool_calls().len(), 1);
+    assert_eq!(post_fork_assistant.tool_calls()[0].id, "c_post");
+    assert!(
+        post_fork_assistant
+            .reasoning()
+            .iter()
+            .all(|state| state.provider() != "claude"),
+        "Claude prefix-bound thinking must be stripped from post-fork turns"
+    );
+    assert_eq!(post_fork_assistant.reasoning(), expected_non_claude);
+    assert!(
+        messages
+            .iter()
+            .any(|msg| msg.tool_call_id() == Some("c_post"))
+    );
+}
+
+struct StableEveryRequestSource;
+
+impl ContextSource for StableEveryRequestSource {
+    fn id(&self) -> SourceId {
+        SourceId::new("dup-check")
+    }
+
+    async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        match moment {
+            Moment::Request { .. } => vec![ContextBlock::stable("dup-src", "unique-source-alert")],
+            _ => Vec::new(),
+        }
+    }
+
+    async fn peek(&self, _moment: Moment) -> Vec<ContextBlock> {
+        Vec::new()
+    }
+}
+
+struct StableBeforeRequestHook;
+
+impl Hooks for StableBeforeRequestHook {
+    async fn before_request(&self, _cx: &crate::RequestCx<'_>) -> Vec<ContextBlock> {
+        vec![ContextBlock::stable("dup-hook", "unique-hook-alert")]
+    }
+}
+
+#[tokio::test]
+async fn pause_point_compaction_deduplicates_before_request_and_source_stable_blocks() {
+    let handoff_json = r#"{"current_task":"dedup","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["done"],"recovery_hints":[],"skills":[]}"#;
+    let compactor = ClaudeScripted::new(128_000, [say(handoff_json), say(handoff_json)]);
+    let main_llm = ClaudeScripted::new(20_000, [say("ok")]);
+    let policy = crate::ContextPolicy {
+        handoff_reserve: 2_000,
+        compact_ceiling: 600,
+        start_distance: 200,
+        warn_distance: 300,
+        user_message_budget: 0,
+        ..crate::ContextPolicy::default()
+    };
+    let mut agent = AgentBuilder::new(main_llm.clone())
+        .config(crate::AgentConfig {
+            context_policy: policy,
+            ..crate::AgentConfig::default()
+        })
+        .compaction_model(compactor, aither_core::llm::model::Parameters::default())
+        .context_source(StableEveryRequestSource)
+        .hooks(StableBeforeRequestHook)
+        .build();
+    // Pre-populate delivered conversation above `compact_ceiling` (600 tokens) so
+    // `prepare_request` enters pause-point `make_room` and runs `collect_request_context` twice.
+    agent
+        .context_mut()
+        .push(aither_core::llm::Message::user("x".repeat(4_000)));
+    agent
+        .context_mut()
+        .push(aither_core::llm::Message::assistant("y".repeat(4_000)));
+    agent.context_mut().mark_prefix_sent();
+
+    let (result, _) = run_to_end(&mut agent, "short").await;
+    result.expect("pause-point compaction succeeds");
+
+    let sent = format!("{:?}", main_llm.requests()[0].messages());
+    assert_eq!(
+        sent.matches("unique-source-alert").count(),
+        1,
+        "source stable alert must appear once across pause-point make_room: {sent}"
+    );
+    assert_eq!(
+        sent.matches("unique-hook-alert").count(),
+        1,
+        "before_request stable alert must appear once across pause-point make_room: {sent}"
+    );
+}
+
+struct PendingBeforeRequestHook {
+    entered: async_channel::Sender<()>,
+}
+
+impl Hooks for PendingBeforeRequestHook {
+    async fn before_request(&self, _cx: &crate::RequestCx<'_>) -> Vec<ContextBlock> {
+        let _ = self.entered.send(()).await;
+        std::future::pending::<Vec<ContextBlock>>().await
+    }
+}
+
+#[tokio::test]
+async fn cancelling_preview_request_messages_with_leaves_context_and_seq_untouched() {
+    let (entered_tx, entered_rx) = async_channel::bounded(1);
+    let mut agent = AgentBuilder::new(Scripted::new([say("ok")]))
+        .hooks(PendingBeforeRequestHook {
+            entered: entered_tx,
+        })
+        .build();
+    agent
+        .context_mut()
+        .push(aither_core::llm::Message::user("initial"));
+    let seq_before = agent.context().fork_point();
+    let len_before = agent.context().len_recent();
+
+    {
+        let preview_fut = agent.preview_request_messages_with(
+            "preview prompt",
+            [aither_core::llm::Message::user("extra hidden")],
+            std::iter::empty(),
+        );
+        futures_lite::pin!(preview_fut);
+        futures_lite::future::or(
+            async {
+                let _ = (&mut preview_fut).await;
+            },
+            async {
+                entered_rx.recv().await.expect("reached before_request");
+            },
+        )
+        .await;
+    }
+
+    assert_eq!(agent.context().len_recent(), len_before);
+    assert_eq!(agent.context().fork_point(), seq_before);
+    assert_eq!(agent.history().len(), 1);
+    assert_eq!(agent.history()[0].content(), "initial");
+}
+
+struct BarrierSource {
+    name: &'static str,
+    tx: async_channel::Sender<()>,
+    rx: async_channel::Receiver<()>,
+    committed_order: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl ContextSource for BarrierSource {
+    fn id(&self) -> SourceId {
+        SourceId::new(self.name)
+    }
+
+    async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
+        self.peek(moment).await
+    }
+
+    async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
+        self.tx.send(()).await.expect("barrier send");
+        self.rx.recv().await.expect("barrier recv");
+        match moment {
+            Moment::Request { .. } => vec![ContextBlock::tail(self.name, self.name)],
+            _ => Vec::new(),
+        }
+    }
+
+    async fn committed(&mut self, _tail: &[Block]) {
+        self.tx.send(()).await.expect("commit barrier send");
+        self.rx.recv().await.expect("commit barrier recv");
+        self.committed_order.lock().unwrap().push(self.name);
+    }
+}
+
+#[tokio::test]
+async fn context_sources_execute_concurrently_and_preserve_registration_order() {
+    let (a_to_b_tx, a_to_b_rx) = async_channel::bounded(2);
+    let (b_to_a_tx, b_to_a_rx) = async_channel::bounded(2);
+    let committed_order = Arc::new(Mutex::new(Vec::new()));
+
+    let llm = Scripted::new([say("done")]);
+    let mut agent = AgentBuilder::new(llm.clone())
+        .context_source(BarrierSource {
+            name: "first-src",
+            tx: a_to_b_tx,
+            rx: b_to_a_rx,
+            committed_order: Arc::clone(&committed_order),
+        })
+        .context_source(BarrierSource {
+            name: "second-src",
+            tx: b_to_a_tx,
+            rx: a_to_b_rx,
+            committed_order: Arc::clone(&committed_order),
+        })
+        .build();
+
+    let preview = agent
+        .preview_request_messages("check", std::iter::empty())
+        .await
+        .expect("concurrent peek succeeds without deadlocking");
+    let preview_tail = preview.last().expect("tail message").content();
+    let first_pos = preview_tail.find("first-src").expect("first-src present");
+    let second_pos = preview_tail.find("second-src").expect("second-src present");
+    assert!(
+        first_pos < second_pos,
+        "registration order preserved: {preview_tail}"
+    );
+
+    let (result, _) = run_to_end(&mut agent, "check").await;
+    result.expect("concurrent blocks and committed succeed without deadlocking");
+    assert_eq!(committed_order.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn manual_clock_utc_now_and_live_cache_setters_take_effect_immediately() {
+    use aither_core::llm::model::ClaudePromptCacheTtl;
+
+    let start = jiff::Timestamp::from_second(1_800_000_000).expect("valid timestamp");
+    let clock = crate::ManualClock::at_utc(start);
+    let llm = ClaudeScripted::new(128_000, [say("one"), say("two")]);
+    let mut agent = AgentBuilder::new(llm.clone())
+        .clock(clock.clone())
+        .cache_lifetime(crate::context::CacheLifetime::Limited(Duration::from_secs(
+            600,
+        )))
+        .claude_cache_ttl(ClaudePromptCacheTtl::OneHour)
+        .instruction("system")
+        .build();
+    let warmth = agent.cache_warmth();
+
+    let (first, events) = run_to_end(&mut agent, "hello").await;
+    first.expect("first run");
+    assert!(events.iter().all(|timed| timed.at == start));
+    assert!(
+        agent
+            .context()
+            .checkpoint()
+            .items()
+            .iter()
+            .all(|item| item.committed_at() == start)
+    );
+    assert_eq!(warmth.cold_in(), Some(Duration::from_secs(600)));
+
+    // Live updates take effect immediately on existing `CacheWarmth` clones and next request.
+    agent.set_cache_lifetime(crate::context::CacheLifetime::Limited(Duration::from_secs(
+        120,
+    )));
+    assert_eq!(warmth.cold_in(), Some(Duration::from_secs(120)));
+    agent.set_claude_cache_ttl(ClaudePromptCacheTtl::FiveMinutes);
+    assert_eq!(
+        agent.cache_lifetime(),
+        crate::context::CacheLifetime::Limited(Duration::from_secs(120))
+    );
+    assert_eq!(agent.claude_cache_ttl(), ClaudePromptCacheTtl::FiveMinutes);
+
+    clock.advance(Duration::from_secs(30));
+    let expected_second =
+        jiff::Timestamp::from_second(1_800_000_030).expect("valid advanced timestamp");
+    let (second, second_events) = run_to_end(&mut agent, "again").await;
+    second.expect("second run");
+    assert!(
+        second_events
+            .iter()
+            .all(|timed| timed.at == expected_second)
+    );
+    assert_eq!(
+        llm.requests()[1].parameters().cache.claude.map(|c| c.ttl),
+        Some(ClaudePromptCacheTtl::FiveMinutes)
+    );
+}

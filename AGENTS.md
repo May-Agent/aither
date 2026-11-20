@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` hosts the core traits (`llm`, `embedding`, `audio`, `image`, `moderation`) plus `lib.rs` for re-exports; keep shared types here.
+- `core/src/` hosts the core traits (`llm`, `embedding`, `audio`, `image`, `moderation`) plus `core/src/lib.rs` for re-exports; root `src/lib.rs` is the `aither` facade crate.
 - `derive/` is the `aither-derive` proc-macro crate—limit it to macro glue and avoid depending on provider code.
 - `openai/` contains the integration crate that maps the traits onto OpenAI endpoints; keep it lean so other providers can re-use the core API.
 - `examples/` (notably `tool_macro.rs`) provides runnable flows; extend it and validate via `cargo run --example tool_macro`.

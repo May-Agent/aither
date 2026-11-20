@@ -75,6 +75,26 @@ macro_rules! impl_image_generator {
 
 impl_image_generator!(Arc, Box);
 
+impl<T: ImageGenerator> ImageGenerator for &T {
+    type Error = T::Error;
+
+    fn create(
+        &self,
+        prompt: Prompt,
+        size: Size,
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
+        T::create(self, prompt, size)
+    }
+
+    fn edit(
+        &self,
+        prompt: Prompt,
+        mask: &[u8],
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
+        T::edit(self, prompt, mask)
+    }
+}
+
 /// Represents a prompt for image generation, including text and optional images.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -310,5 +330,30 @@ mod tests {
         assert_eq!(data.len(), 1027);
         assert_eq!(data[1025], 0x01);
         assert_eq!(data[1026], 0x02);
+    }
+
+    #[tokio::test]
+    async fn smart_pointer_forwarding_works_for_image_generator() {
+        async fn count_chunks(g: impl ImageGenerator) -> usize {
+            let create_stream = g.create(Prompt::new("cat"), Size::square(64));
+            futures_lite::pin!(create_stream);
+            let mut count = 0;
+            while let Some(chunk) = create_stream.next().await {
+                let _ = chunk.unwrap();
+                count += 1;
+            }
+            let edit_stream = g.edit(Prompt::new("cat"), &[1, 2, 3]);
+            futures_lite::pin!(edit_stream);
+            while let Some(chunk) = edit_stream.next().await {
+                let _ = chunk.unwrap();
+                count += 1;
+            }
+            count
+        }
+
+        let g = MockImageGenerator;
+        assert_eq!(count_chunks(&g).await, 6);
+        assert_eq!(count_chunks(Box::new(MockImageGenerator)).await, 6);
+        assert_eq!(count_chunks(Arc::new(MockImageGenerator)).await, 6);
     }
 }

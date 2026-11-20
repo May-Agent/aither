@@ -1,6 +1,6 @@
 //! Skill loader for loading skills from the filesystem.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use async_fs as afs;
 use futures_lite::stream::StreamExt;
@@ -79,15 +79,11 @@ impl SkillLoader {
                     })?
             {
                 let path = entry.path();
-                let file_type = entry
-                    .file_type()
-                    .await
-                    .map_err(|source| SkillError::ReadFile {
-                        path: path.clone(),
-                        source,
-                    })?;
+                let Some(meta) = entry_metadata(&path).await? else {
+                    continue;
+                };
 
-                if file_type.is_dir() {
+                if meta.is_dir() {
                     let skill = Self::load_from_dir(&path).await?;
                     skills.push(skill);
                 }
@@ -103,9 +99,17 @@ impl SkillLoader {
     ///
     /// # Errors
     ///
-    /// Returns `SkillError::NotFound` if no skill with the given name exists,
-    /// or other errors if the skill cannot be parsed.
+    /// Returns `SkillError::InvalidStructure` if `name` is not a single normal
+    /// path component, `SkillError::NotFound` if no skill with the given name
+    /// exists, or other errors if the skill cannot be parsed.
     pub async fn load(&self, name: &str) -> Result<Skill, SkillError> {
+        if !is_single_normal_component(name) {
+            return Err(SkillError::InvalidStructure {
+                path: PathBuf::from(name),
+                reason: "skill name must be a single normal path component".to_string(),
+            });
+        }
+
         for base_path in &self.paths {
             let skill_path = base_path.join(name);
             if path_exists_async(&skill_path).await? {
@@ -184,26 +188,24 @@ impl SkillLoader {
             })?
         {
             let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .await
-                .map_err(|source| SkillError::ReadFile {
-                    path: path.clone(),
-                    source,
-                })?;
+            let Some(meta) = entry_metadata(&path).await? else {
+                continue;
+            };
 
-            if !file_type.is_file() {
+            if !meta.is_file() {
                 continue;
             }
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let content =
-                    afs::read_to_string(&path)
-                        .await
-                        .map_err(|source| SkillError::ReadFile {
-                            path: path.clone(),
-                            source,
-                        })?;
+                let bytes = afs::read(&path)
+                    .await
+                    .map_err(|source| SkillError::ReadFile {
+                        path: path.clone(),
+                        source,
+                    })?;
+                let Ok(content) = String::from_utf8(bytes) else {
+                    continue;
+                };
                 let key = format!("{prefix}{name}");
                 skill.resources.insert(key, content);
             }
@@ -213,15 +215,27 @@ impl SkillLoader {
     }
 }
 
-async fn path_exists_async(path: &Path) -> Result<bool, SkillError> {
+fn is_single_normal_component(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) && !name.contains('\\')
+}
+
+async fn entry_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, SkillError> {
     match afs::metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(SkillError::ReadFile {
             path: path.to_path_buf(),
             source: err,
         }),
     }
+}
+
+async fn path_exists_async(path: &Path) -> Result<bool, SkillError> {
+    Ok(entry_metadata(path).await?.is_some())
 }
 
 #[cfg(test)]
@@ -345,5 +359,128 @@ mod tests {
 
         let result = loader.load_all().await;
         assert!(matches!(result, Err(SkillError::InvalidStructure { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_path_traversal_and_non_single_names() {
+        let (dir, loader) = prepare_loader();
+        let outside = tempdir().expect("outside temp dir");
+        create_skill_with_content(
+            outside.path(),
+            "secret-skill",
+            &minimal_skill_content("secret-skill", "Outside skill"),
+        );
+
+        let relative = format!(
+            "../{}",
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
+        for bad_name in [
+            "",
+            ".",
+            "..",
+            "../secret-skill",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            &relative,
+            outside.path().join("secret-skill").to_str().unwrap(),
+        ] {
+            let result = loader.load(bad_name).await;
+            assert!(
+                matches!(result, Err(SkillError::InvalidStructure { .. })),
+                "expected InvalidStructure for {bad_name:?}, got {result:?}"
+            );
+        }
+        drop(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_all_follows_symlinked_skill_directories() {
+        let target_root = tempdir().expect("target dir");
+        let target_skill = create_skill_with_content(
+            target_root.path(),
+            "linked-skill",
+            &minimal_skill_content("linked-skill", "Symlinked skill"),
+        );
+
+        let (dir, loader) = prepare_loader();
+        std::os::unix::fs::symlink(&target_skill, dir.path().join("linked-skill"))
+            .expect("create symlink");
+
+        let skills = loader.load_all().await.expect("load symlinked skill");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "linked-skill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_all_skips_dangling_symlinks_beside_valid_skills() {
+        let target_root = tempdir().expect("target dir");
+        let target_skill = create_skill_with_content(
+            target_root.path(),
+            "linked-skill",
+            &minimal_skill_content("linked-skill", "Symlinked skill"),
+        );
+
+        let (dir, loader) = prepare_loader();
+        std::os::unix::fs::symlink(&target_skill, dir.path().join("linked-skill"))
+            .expect("create valid symlink");
+        std::os::unix::fs::symlink(
+            target_root.path().join("missing-target"),
+            dir.path().join("dangling-skill"),
+        )
+        .expect("create dangling skill symlink");
+
+        let scripts_dir = target_skill.join("scripts");
+        fs::create_dir(&scripts_dir).expect("create scripts dir");
+        std::os::unix::fs::symlink(
+            target_root.path().join("missing-script.sh"),
+            scripts_dir.join("dangling.sh"),
+        )
+        .expect("create dangling script symlink");
+
+        let skills = loader.load_all().await.expect("skip dangling symlinks");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "linked-skill");
+    }
+
+    #[tokio::test]
+    async fn test_load_tolerates_non_utf8_files_in_scripts_and_templates() {
+        let (dir, loader) = prepare_loader();
+        let skill_dir = create_skill_with_content(
+            dir.path(),
+            "binary-scripts",
+            "---\nname: binary-scripts\ndescription: Skill with binary\nlicense: MIT\n---\n\nBody.\n",
+        );
+
+        let scripts_dir = skill_dir.join("scripts");
+        fs::create_dir(&scripts_dir).expect("create scripts dir");
+        fs::write(scripts_dir.join("tool.bin"), [0xff, 0xfe, 0x00, 0x80]).expect("write bin");
+        fs::write(scripts_dir.join("run.sh"), "#!/bin/sh\necho hi\n").expect("write script");
+
+        let templates_dir = skill_dir.join("templates");
+        fs::create_dir(&templates_dir).expect("create templates dir");
+        fs::write(
+            templates_dir.join("icon.bin"),
+            [0x89, 0x50, 0x4e, 0x47, 0xff],
+        )
+        .expect("write");
+
+        let skills = loader
+            .load_all()
+            .await
+            .expect("load all with binary scripts");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0]
+                .resources
+                .get("scripts/run.sh")
+                .map(String::as_str),
+            Some("#!/bin/sh\necho hi\n")
+        );
+        assert!(!skills[0].resources.contains_key("scripts/tool.bin"));
+        assert!(!skills[0].resources.contains_key("templates/icon.bin"));
     }
 }

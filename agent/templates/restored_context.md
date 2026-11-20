@@ -1,21 +1,14 @@
 These files and skills were named by the handoff above and have been restored for you. Do not read them again unless you need a part that was truncated.
-{% for file in files %}
+{% if !files.is_empty() %}
 
-### {{ file.path }}{% if file.truncated %} (truncated){% endif %}
-{% if let Some(why) = file.why %}
-_{{ why }}_
+{% include "external_notice.txt" %}
 {% endif %}
-
-```
-{{ file.content }}
-```
-{% endfor %}
-{% for skill in skills %}
-
-### Skill: {{ skill.name }}
-
-{{ skill.instructions }}
-{% endfor %}
+{%- for file in files -%}
+{{ file }}
+{%- endfor -%}
+{%- for skill in skills -%}
+{{ skill }}
+{%- endfor -%}
 {% if !unavailable.is_empty() %}
 
 ### Named but not restored

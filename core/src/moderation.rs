@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::future::Future;
 
 /// Trait for content moderation services.
@@ -15,6 +15,36 @@ pub trait Moderation {
         &self,
         content: &str,
     ) -> impl Future<Output = Result<ModerationResult, Self::Error>> + Send;
+}
+
+macro_rules! impl_moderation {
+    ($($name:ident),*) => {
+        $(
+            impl<T: Moderation> Moderation for $name<T> {
+                type Error = T::Error;
+
+                fn moderate(
+                    &self,
+                    content: &str,
+                ) -> impl Future<Output = Result<ModerationResult, Self::Error>> + Send {
+                    T::moderate(self, content)
+                }
+            }
+        )*
+    };
+}
+
+impl_moderation!(Arc, Box);
+
+impl<T: Moderation> Moderation for &T {
+    type Error = T::Error;
+
+    fn moderate(
+        &self,
+        content: &str,
+    ) -> impl Future<Output = Result<ModerationResult, Self::Error>> + Send {
+        T::moderate(self, content)
+    }
 }
 
 /// The result of a moderation operation.
@@ -372,5 +402,17 @@ mod tests {
 
         assert!(!result.is_flagged());
         assert!(!result.has_violations());
+    }
+
+    #[tokio::test]
+    async fn smart_pointer_forwarding_works_for_moderation() {
+        async fn check_flagged(m: impl Moderation, text: &str) -> bool {
+            m.moderate(text).await.unwrap().is_flagged()
+        }
+
+        let m = MockModeration;
+        assert!(check_flagged(&m, "bad").await);
+        assert!(check_flagged(Box::new(MockModeration), "bad").await);
+        assert!(check_flagged(Arc::new(MockModeration), "bad").await);
     }
 }

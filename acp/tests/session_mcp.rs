@@ -1,19 +1,17 @@
 //! A session's MCP servers are connected and their tools reach its agent.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use aither_acp::{
-    AcpClient, AcpServer, ClientHandler, ContentBlock, McpServerStdio, PromptParams,
-    RequestPermissionParams, RequestPermissionResult, SessionNewParams, SessionNotification,
-    SessionUpdate, StopReason, TextContent, ToolCallContent, ToolCallStatus,
+use aither_acp::aither::AitherHost;
+use aither_acp::client::{Client, SessionEvent, TurnOutcome};
+use aither_acp::domain::{
+    EnvVar, Implementation, McpServer, McpServerStdio, Open, StopReason, ToolCallStatus,
 };
+use aither_acp::server::Server;
 use aither_agent::Agent;
 use aither_core::LanguageModel;
-use aither_core::llm::{Event, LLMRequest, model::Profile};
-use aither_mcp::protocol::JsonRpcError;
-use aither_mcp::transport::DuplexTransport;
-use futures_lite::Stream;
+use aither_core::llm::{Classify, Event, Failure, LLMRequest, model::Profile};
+use futures_lite::{Stream, StreamExt, stream};
 
 #[derive(Debug)]
 struct ModelError;
@@ -26,9 +24,9 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-impl aither_core::llm::Classify for ModelError {
-    fn failure(&self) -> aither_core::llm::Failure {
-        aither_core::llm::Failure::permanent()
+impl Classify for ModelError {
+    fn failure(&self) -> Failure {
+        Failure::permanent()
     }
 }
 
@@ -50,105 +48,90 @@ impl LanguageModel for PingsOnce {
         } else {
             Event::Text("done".to_string())
         };
-        futures_lite::stream::once(Ok(event))
+        stream::once(Ok(event))
     }
 
-    fn profile(&self) -> impl Future<Output = Result<Profile, ModelError>> + Send {
+    fn profile(&self) -> impl std::future::Future<Output = Result<Profile, ModelError>> + Send {
         std::future::ready(Ok(Profile::new("ping", "test", "ping", "Ping", 128_000)))
     }
 }
 
-#[derive(Default)]
-struct Recorder {
-    updates: Mutex<Vec<SessionNotification>>,
-}
-
-impl ClientHandler for Recorder {
-    fn session_update(&self, notification: SessionNotification) -> impl Future<Output = ()> + Send {
-        self.updates.lock().expect("updates").push(notification);
-        std::future::ready(())
-    }
-
-    fn request_permission(
-        &self,
-        _params: RequestPermissionParams,
-    ) -> impl Future<Output = Result<RequestPermissionResult, JsonRpcError>> + Send {
-        std::future::ready(Err(JsonRpcError::method_not_found("request_permission")))
-    }
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_agent_can_call_the_tools_of_the_mcp_servers_it_was_opened_with() {
-    let (client_end, server_end) = DuplexTransport::pair();
-    let (client, connection) = AcpClient::connect(client_end, Recorder::default());
-    let connection = tokio::spawn(connection);
-    let mut server = AcpServer::new(
-        server_end,
-        "test",
-        "0",
-        executor_core::tokio::TokioGlobal,
-        |setup| async move {
-            let builder = setup.mcp.into_iter().fold(
-                Agent::builder(PingsOnce::default()),
-                aither_agent::AgentBuilder::mcp,
-            );
-            Ok(builder.build())
-        },
+    let (client_t, agent_t) = aither_acp::rpc::Memory::pair();
+    let server = Server::new(
+        AitherHost::new(
+            executor_core::tokio::TokioGlobal,
+            |setup: aither_acp::aither::SessionSetup| async move {
+                let builder = setup.mcp.into_iter().fold(
+                    Agent::builder(PingsOnce::default()),
+                    aither_agent::AgentBuilder::mcp,
+                );
+                Ok(builder.build())
+            },
+        ),
+        Implementation::new("test", "0"),
     );
-    let server = tokio::spawn(async move { server.run().await });
+    let (_agent_peer, serve) = server.serve(agent_t);
+    // The server must be driven for `connect`'s handshake to resolve.
+    tokio::spawn(serve);
+    let (client, conn) = Client::builder(Implementation::new("test-client", "0"))
+        .connect(client_t)
+        .await
+        .expect("initialize");
+    let _drive = tokio::spawn(conn);
 
-    client.initialize().await.expect("initialize");
     let script = format!(
         "{}/tests/fixtures/ping_mcp_server.sh",
         env!("CARGO_MANIFEST_DIR")
     );
     let session = client
-        .new_session(
-            SessionNewParams::new(std::env::temp_dir()).mcp_servers(vec![
-                McpServerStdio::new("ping", "sh").args(vec![script]).into(),
-            ]),
-        )
+        .new_session(std::env::temp_dir())
+        .mcp_server(McpServer::Stdio(McpServerStdio {
+            name: "ping".to_string(),
+            command: "sh".to_string(),
+            args: vec![script],
+            env: Vec::<EnvVar>::new(),
+            meta: None,
+            extra: std::collections::BTreeMap::new(),
+        }))
+        .open()
         .await
         .expect("session/new");
-    let result = client
-        .prompt(PromptParams::new(
-            session.session_id.clone(),
-            vec![ContentBlock::Text(TextContent {
-                text: "ping".to_string(),
-                annotations: None,
-                meta: None,
-            })],
-        ))
-        .await
-        .expect("prompt");
-    assert_eq!(result.stop_reason, StopReason::EndTurn);
 
-    let updates = client.handler().updates.lock().expect("updates");
-    let finished = updates
+    let mut events = session.subscribe();
+    let outcome = session.prompt_run("ping").await.expect("prompt");
+    let TurnOutcome::Finished { stop_reason, .. } = outcome else {
+        panic!("expected a finished turn, got {outcome:?}");
+    };
+    assert_eq!(stop_reason, Some(Open::Known(StopReason::EndTurn)));
+
+    // The ping tool call completed; its result text is the server's `pong`.
+    let mut calls = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(20), events.next()).await
+    {
+        calls.push(event);
+    }
+    let finished = calls.iter().find_map(|event| match event {
+        SessionEvent::ToolCall(call)
+            if call.status == Some(Open::Known(ToolCallStatus::Completed)) =>
+        {
+            Some(call)
+        }
+        _ => None,
+    });
+    let finished = finished.expect("the agent called a tool");
+    let text = finished
+        .content
         .iter()
-        .find_map(|n| match &n.update {
-            SessionUpdate::ToolCallUpdate(update)
-                if update.status == Some(ToolCallStatus::Completed) =>
-            {
-                Some(update)
+        .filter_map(|content| match content {
+            aither_acp::domain::ToolCallContent::Content(c) => {
+                c.content.as_text().map(str::to_owned)
             }
             _ => None,
         })
-        .expect("the agent called a tool");
-    assert_eq!(finished.status, Some(ToolCallStatus::Completed));
-    let Some(
-        [
-            ToolCallContent::Content {
-                content: ContentBlock::Text(text),
-            },
-        ],
-    ) = finished.content.as_deref()
-    else {
-        panic!("expected text content, got {:?}", finished.content);
-    };
-    assert_eq!(text.text, "pong");
-
-    drop(updates);
-    server.abort();
-    connection.abort();
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text, "pong");
 }

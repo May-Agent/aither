@@ -372,6 +372,63 @@ pub struct ShellArgs {
     pub background: bool,
 }
 
+/// The arguments of [`Shell::run_service`]: [`ShellArgs`] without the bounds
+/// a session-scoped service does not take — it is always detached and never
+/// times out.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ServiceArgs {
+    /// A short, human-readable explanation of what this command does.
+    pub description: String,
+    /// The source to run.
+    pub script: String,
+    /// The interpreter the source runs under.
+    #[serde(default)]
+    pub interpreter: Interpreter,
+    /// How the command runs.
+    #[serde(default)]
+    pub sandbox: SandboxMode,
+    /// Where the command runs.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// The resolution media in the output is delivered at.
+    #[serde(default)]
+    pub resolution: MediaResolution,
+    /// The most output lines to include inline.
+    #[serde(default)]
+    pub max_lines: Option<u32>,
+    /// Whether the output is returned verbatim.
+    #[serde(default)]
+    pub raw: bool,
+}
+
+impl From<ServiceArgs> for ShellArgs {
+    fn from(arguments: ServiceArgs) -> Self {
+        let ServiceArgs {
+            description,
+            script,
+            interpreter,
+            sandbox,
+            location,
+            resolution,
+            max_lines,
+            raw,
+        } = arguments;
+        Self {
+            description,
+            script,
+            interpreter,
+            sandbox,
+            location,
+            resolution,
+            max_lines,
+            raw,
+            // Unused by a service spawn: it runs detached and unbounded.
+            timeout: 0,
+            background: true,
+        }
+    }
+}
+
 /// Time bounds applied to every execution this terminal spawns.
 #[derive(Debug, Clone)]
 struct TerminalLimits {
@@ -1748,8 +1805,10 @@ where
         let (taken_tx, taken_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         let background_startup = BackgroundStartup::new(startup_tx);
-        self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
-        self.spawn_long_job_alert(&task_id);
+        if let Some(timeout) = timeout {
+            self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
+            self.spawn_long_job_alert(&task_id);
+        }
 
         let info = crate::LaunchInfo::new(task_id.to_string(), call.clone(), mode);
         let lifetime = if background {
@@ -1961,7 +2020,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             max_lines: prepared.max_lines,
             stdout: StdoutTreatment::of_call(arguments.raw, prepared.treatment),
             background: arguments.background,
-            timeout,
+            timeout: Some(timeout),
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
@@ -2376,6 +2435,62 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             Execution::Finished(_) => unreachable!("a background call detaches its job"),
         }
     }
+
+    /// Runs `arguments`' script as a detached background job with no time
+    /// bound: the job runs until it ends, the shell does, or
+    /// [`crate::Jobs::kill`] reaches it, for embedders that offer
+    /// session-scoped services such as preview servers. No kill watchdog or
+    /// long-running alert is armed, and the job is announced as a
+    /// background task like one of [`Self::run_background`].
+    ///
+    /// # Errors
+    ///
+    /// Fails the way a `terminal` call does apart from a `timeout`, which
+    /// `ServiceArgs` does not take: a refused permission, a blocked command
+    /// or a spawn failure.
+    pub async fn run_service(&self, arguments: ServiceArgs) -> aither_core::Result<crate::Job> {
+        let arguments = ShellArgs::from(arguments);
+        if !self.interpreters.contains(&arguments.interpreter) {
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::InterpreterNotConfigured {
+                    interpreter: arguments.interpreter,
+                },
+            ));
+        }
+        let prepared = self
+            .prepare_execution(&arguments, &mut ToolContext::new())
+            .await?;
+        let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
+            target: prepared.target,
+            task_id: prepared.task_id.clone(),
+            execution_id: prepared.execution_id,
+            script: arguments.script,
+            interpreter: arguments.interpreter,
+            expect: OutputFormat::Auto,
+            resolution: arguments.resolution,
+            max_lines: prepared.max_lines,
+            stdout: StdoutTreatment::of_call(arguments.raw, prepared.treatment),
+            background: true,
+            timeout: None,
+            carry: None,
+            call: None,
+        });
+        wait_for_background_startup(&spawned.startup, &**self.wording()).await?;
+        let detached = detach_job(
+            &self.job_registry,
+            &prepared.outputs,
+            &prepared.task_id,
+            prepared.max_lines,
+            &self.events_tx,
+        )
+        .await?;
+        Ok(crate::Job::new(
+            self.jobs(),
+            detached.task_id,
+            detached.watch,
+        ))
+    }
 }
 
 impl<E> Shell<E>
@@ -2686,7 +2801,7 @@ where
             max_lines: prepared.max_lines,
             stdout: StdoutTreatment::Cleaned(prepared.treatment),
             background: false,
-            timeout: run.timeout,
+            timeout: Some(run.timeout),
             carry: Some(start),
             call: None,
         });
@@ -3176,7 +3291,8 @@ struct TerminalSpawnRequest {
     max_lines: usize,
     stdout: StdoutTreatment,
     background: bool,
-    timeout: Duration,
+    /// The bound the job runs under; `None` for a job that never times out.
+    timeout: Option<Duration>,
     carry: Option<CwdCarry>,
     /// The `terminal` call this execution belongs to.
     call: Option<CallIdentity>,
@@ -3216,8 +3332,8 @@ struct SpawnedTerminalTask<E> {
     info: crate::LaunchInfo,
     execution_id: String,
     background: bool,
-    /// The bound the job runs under.
-    timeout: Duration,
+    /// The bound the job runs under; `None` for a job that never times out.
+    timeout: Option<Duration>,
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
@@ -3280,7 +3396,9 @@ where
         outages,
     } = task;
     // Before the job registers, so the registry reports the bound it runs under.
-    job_registry.bound_by_timeout(&task_id, timeout).await;
+    if let Some(timeout) = timeout {
+        job_registry.bound_by_timeout(&task_id, timeout).await;
+    }
     // Before the process starts, so a command it calls over IPC can already
     // append to this job's output.
     job_registry.launching(&task_id).await;
@@ -8363,6 +8481,65 @@ mod tests {
         (task_id, child)
     }
 
+    /// A service's args for a test, on `terminal_args`' script shape.
+    fn service_args(description: &str, script: &str) -> ServiceArgs {
+        ServiceArgs {
+            description: description.to_string(),
+            script: script.to_string(),
+            interpreter: Interpreter::Shell,
+            sandbox: SandboxMode::Sandboxed,
+            location: None,
+            resolution: MediaResolution::Auto,
+            max_lines: Some(50),
+            raw: false,
+        }
+    }
+
+    /// A service carries no bound: it outlives a cap that would kill a
+    /// bounded job, and `terminal_kill` still stops it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_service_runs_unbounded_until_it_is_killed() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let job = tool
+            .run_service(service_args("a service", "sleep 60"))
+            .await
+            .expect("the service starts");
+        let task_id = job.task_id().to_owned();
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the service is registered");
+        assert!(info.timeout.is_none(), "a service is unbounded: {info:?}");
+
+        // Past the timeout cap a bounded job would already be dead.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let info = tool
+            .job_registry()
+            .get_by_task_id(&task_id)
+            .await
+            .expect("the service stays in the registry");
+        assert!(
+            matches!(info.status, JobStatus::Running),
+            "the service outlives the timeout cap: {:?}",
+            info.status
+        );
+
+        assert!(
+            tool.job_registry().kill_by_task_id(&task_id).await,
+            "a service is killable like any job"
+        );
+    }
+
     #[cfg(unix)]
     async fn background_job_stays_running_until_its_descendant_exits(descendant: Descendant) {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -12077,6 +12254,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_for_monitored_line(
+        receiver: &ShellEvents,
+        lines: &mut Vec<String>,
+        expected: &str,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !lines.iter().any(|line| line == expected) {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let Some(alert) = receiver.recv_timeout(remaining).await else {
+                break;
+            };
+            if let ShellEvent::MonitorIncrement(increment) = alert {
+                lines.extend(increment.lines);
+            }
+        }
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "appended line {expected:?} is delivered, across rotation: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn monitored_file_delivers_appends_and_refuses_an_unreadable_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -12118,40 +12319,31 @@ mod tests {
             )
             .await
             .expect("monitor starts");
+        let receiver = tool.background_receiver();
+        let mut lines = Vec::new();
         async_io::Timer::after(Duration::from_millis(1500)).await;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut file, b"appended\n").unwrap();
+        drop(file);
+        wait_for_monitored_line(&receiver, &mut lines, "appended").await;
         std::fs::rename(&path, tool.working_dir().join("followed.log.1")).unwrap();
         std::fs::write(&path, "rotated\n").unwrap();
-        async_io::Timer::after(Duration::from_millis(500)).await;
+        wait_for_monitored_line(&receiver, &mut lines, "rotated").await;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut file, b"after\n").unwrap();
+        drop(file);
+        wait_for_monitored_line(&receiver, &mut lines, "after").await;
 
-        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
-        let lines: Vec<&String> = alerts
-            .iter()
-            .filter_map(|alert| match alert {
-                ShellEvent::MonitorIncrement(increment) => Some(&increment.lines),
-                _ => None,
-            })
-            .flatten()
-            .collect();
         assert!(
-            !lines.iter().any(|line| *line == "existing"),
+            !lines.iter().any(|line| line == "existing"),
             "content written before the monitor started is not delivered: {lines:?}"
         );
-        for expected in ["appended", "rotated", "after"] {
-            assert!(
-                lines.iter().any(|line| *line == expected),
-                "appended line {expected:?} is delivered, across rotation: {lines:?}"
-            );
-        }
         tool.job_registry().kill_running().await;
     }
 

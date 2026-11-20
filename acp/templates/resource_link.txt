@@ -1,1 +1,0 @@
-Resource link {% if let Some(title) = title %}{{ title }} ({{ name }}){% else %}{{ name }}{% endif %}: {{ uri }}{% if let Some(mime) = mime_type %} ({{ mime }}){% endif %}{% if let Some(size) = size %} [{{ size }} bytes]{% endif %}{% if let Some(desc) = description %} — {{ desc }}{% endif %}

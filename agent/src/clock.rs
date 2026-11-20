@@ -68,8 +68,8 @@ pub trait Clock: Send + Sync + 'static {
     /// The current instant.
     fn now(&self) -> Instant;
 
-    /// The current wall-clock time, stamped on the user messages the model
-    /// reads.
+    /// The current wall-clock time, stamped on emitted events and committed
+    /// context items.
     fn utc_now(&self) -> Timestamp;
 }
 

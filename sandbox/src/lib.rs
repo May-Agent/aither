@@ -177,8 +177,8 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    CompletedCommand, DirectoryResetReason, Given, Missing, Script, Shell, ShellArgs, ShellBuilder,
-    ShellRunError, ShellTool, TerminalError, TimeoutKill, open_network_audit_log,
+    CompletedCommand, DirectoryResetReason, Given, Missing, Script, ServiceArgs, Shell, ShellArgs,
+    ShellBuilder, ShellRunError, ShellTool, TerminalError, TimeoutKill, open_network_audit_log,
 };
 pub use wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,

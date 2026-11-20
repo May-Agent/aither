@@ -134,6 +134,7 @@ struct Slot {
 struct Shared {
     runs: Mutex<HashMap<u64, Slot>>,
     next_id: AtomicU64,
+    clock: arc_swap::ArcSwap<crate::AnyClock>,
     events: async_channel::Sender<TimedEvent>,
     incoming: async_channel::Receiver<TimedEvent>,
 }
@@ -157,6 +158,7 @@ impl Default for SubagentRuns {
             shared: Arc::new(Shared {
                 runs: Mutex::default(),
                 next_id: AtomicU64::new(0),
+                clock: arc_swap::ArcSwap::from_pointee(crate::AnyClock::default()),
                 events,
                 incoming,
             }),
@@ -165,6 +167,9 @@ impl Default for SubagentRuns {
 }
 
 impl SubagentRuns {
+    pub(crate) fn set_clock(&self, clock: crate::AnyClock) {
+        self.shared.clock.store(Arc::new(clock));
+    }
     /// Registers a child named `name` that the call `started_by` starts
     /// with `prompt`, and announces it on the parent's stream.
     ///
@@ -360,7 +365,7 @@ impl SubagentRun {
     /// Reports `event` on the parent's stream.
     fn announce(&self, event: AgentEvent) {
         let _ = self.runs.shared.events.try_send(TimedEvent {
-            at: jiff::Timestamp::now(),
+            at: self.runs.shared.clock.load().utc_now(),
             agent: self.parent.clone(),
             event,
         });
