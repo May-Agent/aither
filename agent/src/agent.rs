@@ -846,6 +846,25 @@ pub struct CompactResult {
     pub summary: String,
 }
 
+/// The cheapest refresh worth paying for, in dollars: below this expected
+/// saving the entry is left to expire.
+const MINIMUM_EXPECTED_WARM_SAVINGS: f64 = 0.05;
+
+/// The arithmetic of one [`Agent::keep_warm_economics`] call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeepWarmEconomics {
+    /// Price of the refresh itself: a cached-prefix read plus one output
+    /// token.
+    pub warm_cost: f64,
+    /// Extra price the next real request pays on a cold entry over a warm
+    /// one.
+    pub miss_cost: f64,
+    /// `continuation_probability * miss_cost - warm_cost`.
+    pub expected_savings: f64,
+    /// Whether the refresh is expected to pay for itself.
+    pub warm: bool,
+}
+
 /// A stop hook's reminder, as the model reads it.
 #[derive(Template)]
 #[template(path = "system_reminder.txt", escape = "none")]

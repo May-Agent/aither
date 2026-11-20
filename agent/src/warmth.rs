@@ -106,7 +106,7 @@ impl CacheWarmth {
     /// Whether the entry was started and has since expired, as opposed to
     /// never having been started.
     pub(crate) fn has_expired(&self) -> bool {
-        match (self.inner.lifetime, self.idle()) {
+        match (self.lifetime(), self.idle()) {
             (CacheLifetime::Limited(lifetime), Some(idle)) => idle >= lifetime,
             _ => false,
         }
@@ -118,7 +118,7 @@ impl CacheWarmth {
         let Some(idle) = self.idle() else {
             return CacheState::Cold;
         };
-        match self.inner.lifetime {
+        match self.lifetime() {
             CacheLifetime::Permanent => CacheState::Warm { cold_in: None },
             CacheLifetime::Limited(lifetime) => match lifetime.checked_sub(idle) {
                 Some(remaining) if !remaining.is_zero() => CacheState::Warm {
