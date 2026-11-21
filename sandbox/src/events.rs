@@ -25,7 +25,7 @@ use crate::terminal::{CompletedCommand, TerminalError, TimeoutKill};
 #[non_exhaustive]
 pub struct JobStarted {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) output_preview: String,
     pub(crate) output_file: StoredFile,
 }
@@ -37,10 +37,10 @@ impl JobStarted {
         &self.agent
     }
 
-    /// Task ID of the job, a word leased from the shell's id allocator.
+    /// Process ID of the job inside its execution environment.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// First lines of the redirected output; empty when nothing was written
@@ -122,7 +122,7 @@ impl JobEnded {
 #[non_exhaustive]
 pub struct LongRunning {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) script: String,
     pub(crate) after: Duration,
 }
@@ -134,10 +134,10 @@ impl LongRunning {
         &self.agent
     }
 
-    /// Task ID of the job.
+    /// Process ID of the job.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// The script the job runs.
@@ -162,7 +162,7 @@ impl LongRunning {
 #[non_exhaustive]
 pub struct StdinBlocked {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) script: String,
 }
 
@@ -173,10 +173,10 @@ impl StdinBlocked {
         &self.agent
     }
 
-    /// Task ID of the job.
+    /// Process ID of the job.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// The script the job runs.
@@ -192,7 +192,7 @@ impl StdinBlocked {
 #[non_exhaustive]
 pub struct StdinWatchFailed {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) script: String,
     pub(crate) error: String,
 }
@@ -204,10 +204,10 @@ impl StdinWatchFailed {
         &self.agent
     }
 
-    /// Task ID of the job.
+    /// Process ID of the job.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// The script the job runs.
@@ -231,7 +231,7 @@ impl StdinWatchFailed {
 #[non_exhaustive]
 pub struct DescendantsKilled {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) call: Option<CallIdentity>,
     pub(crate) processes: Vec<JobProcess>,
 }
@@ -243,10 +243,10 @@ impl DescendantsKilled {
         &self.agent
     }
 
-    /// Task ID of the command.
+    /// Process ID of the command.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// The tool call that ran the command, when it came from one.
@@ -503,10 +503,10 @@ mod tests {
     use super::*;
     use crate::monitor::MonitorStalled;
 
-    fn stalled(task_id: &str) -> ShellEvent {
+    fn stalled(pid: u32) -> ShellEvent {
         ShellEvent::MonitorStalled(MonitorStalled {
             agent: AgentPath::main(),
-            task_id: task_id.to_string(),
+            pid,
             stall_secs: 1,
         })
     }
@@ -524,13 +524,13 @@ mod tests {
         );
         events
             .sender(AgentPath::main())
-            .send(stalled("late"))
+            .send(stalled(99))
             .await
             .unwrap();
         let ShellEvent::MonitorStalled(event) = reader.recv().await else {
             panic!("the raised event is the one read");
         };
-        assert_eq!(event.task_id(), "late");
+        assert_eq!(event.pid(), 99);
     }
 
     #[tokio::test]
@@ -540,15 +540,11 @@ mod tests {
             events.sender(AgentPath::main()),
             events.sender(AgentPath::main()),
         );
-        first.send(stalled("one")).await.unwrap();
-        second.send(stalled("two")).await.unwrap();
+        first.send(stalled(1)).await.unwrap();
+        second.send(stalled(2)).await.unwrap();
         let reader = events.clone();
-        assert!(
-            matches!(events.try_recv(), Some(ShellEvent::MonitorStalled(e)) if e.task_id() == "one")
-        );
-        assert!(
-            matches!(reader.try_recv(), Some(ShellEvent::MonitorStalled(e)) if e.task_id() == "two")
-        );
+        assert!(matches!(events.try_recv(), Some(ShellEvent::MonitorStalled(e)) if e.pid() == 1));
+        assert!(matches!(reader.try_recv(), Some(ShellEvent::MonitorStalled(e)) if e.pid() == 2));
         assert!(events.is_empty());
     }
 }

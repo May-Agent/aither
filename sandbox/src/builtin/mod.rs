@@ -3,6 +3,5 @@
 mod terminal;
 
 pub use terminal::{
-    JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
-    ShellToolSettings, ToolIdentity,
+    JobInputArgs, JobInputTool, JobReadArgs, JobReadTool, ShellToolSettings, ToolIdentity,
 };

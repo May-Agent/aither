@@ -1,4 +1,4 @@
-//! Where a [`Sandbox`](crate::Sandbox) runs its processes.
+//! Where a [`Sandbox`] runs its processes.
 
 use heel::HeelBinary;
 

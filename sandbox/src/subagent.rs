@@ -36,7 +36,7 @@ use futures::future::join_all;
 pub use repository::Spelling;
 use sandboxed::Bounds;
 pub use sandboxed::ExportError;
-pub use sandboxed::{SandboxedExit, SandboxedGitImpl, SandboxedRun, SubagentGit};
+pub use sandboxed::{SandboxedExit, SandboxedGit, SandboxedRun, SubagentGit};
 pub use space::{
     AnySubagentSpaces, PreparedSpace, RunSpace, SpacePreparationError, SubagentSpaces,
 };

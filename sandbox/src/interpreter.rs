@@ -27,12 +27,12 @@ pub enum Interpreter {
 #[template(path = "python_script.sh", escape = "none")]
 struct PythonScriptTemplate<'a> {
     interpreter: &'a str,
-    task_id: &'a str,
+    nonce: u64,
     code: &'a str,
 }
 
 impl Interpreter {
-    /// The shell script that runs `script` for the job `task_id`.
+    /// The shell script that runs `script` for launch `nonce`.
     ///
     /// Shell source runs as it is. Python source is written to a file under
     /// the sandbox's `TMPDIR`, which the job removes when it ends, and run
@@ -42,16 +42,16 @@ impl Interpreter {
     /// # Errors
     ///
     /// Fails when the wrapper template does not render.
-    pub(crate) fn launch_script<'a>(
+    pub(crate) fn launch_script(
         self,
-        script: &'a str,
-        task_id: &str,
-    ) -> Result<Cow<'a, str>, askama::Error> {
+        script: &str,
+        nonce: u64,
+    ) -> Result<Cow<'_, str>, askama::Error> {
         match self {
             Self::Shell => Ok(Cow::Borrowed(script)),
             Self::Python => PythonScriptTemplate {
                 interpreter: PYTHON_COMMAND,
-                task_id,
+                nonce,
                 code: script,
             }
             .render()
@@ -66,14 +66,14 @@ mod tests {
 
     #[test]
     fn shell_runs_as_written() {
-        let script = Interpreter::Shell.launch_script("echo hi", "t1").unwrap();
+        let script = Interpreter::Shell.launch_script("echo hi", 1).unwrap();
         assert_eq!(script, "echo hi");
     }
 
     #[test]
-    fn python_is_written_to_a_file_of_its_task() {
-        let script = Interpreter::Python.launch_script("print(1)", "t1").unwrap();
-        assert!(script.contains("aither-t1.py"));
+    fn python_is_written_to_a_file_of_its_launch() {
+        let script = Interpreter::Python.launch_script("print(1)", 7).unwrap();
+        assert!(script.contains("aither-7.py"));
         assert!(script.contains("print(1)"));
     }
 

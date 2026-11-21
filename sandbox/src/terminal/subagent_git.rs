@@ -1,9 +1,8 @@
 //! Git inside a subagent's sandbox: the same filesystem grants and network
 //! denial as the subagent's commands, as the subagent, with stdout streamed.
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
 use async_channel::Sender;
 use blocking::Unblock;
@@ -17,9 +16,7 @@ use heel::{
 use super::{ContainerConfinement, prioritized_container_script};
 use crate::MountRoot;
 use crate::shell_session::ContainerExecOutcome;
-use crate::subagent::{
-    CommittingWorktree, ExportError, SandboxedExit, SandboxedGitImpl, SandboxedRun,
-};
+use crate::subagent::{CommittingWorktree, ExportError, SandboxedExit, SandboxedGit, SandboxedRun};
 
 /// How much of what a command printed on stderr is kept for a message.
 const STDERR_KEPT: usize = 8 * 1024;
@@ -61,13 +58,15 @@ pub(super) struct LocalGit<E> {
     pub priority: ProcessPriority,
     /// The parent terminal's `heel` binary.
     pub heel: heel::HeelBinary,
+    /// Cached host `git` binary `(path, parent_dir)` shared across subagents.
+    pub host_git: Arc<OnceLock<Option<(PathBuf, PathBuf)>>>,
 }
 
 /// The host's own `git` as an absolute path, so a sandboxed git does not
 /// depend on the sandbox's `PATH` — which holds only system directories on
 /// Windows, where `git` never lives. The directory that holds it is granted
 /// beside it: the binary's sibling libraries live there.
-fn host_git_binary() -> Option<(PathBuf, PathBuf)> {
+fn locate_host_git_binary() -> Option<(PathBuf, PathBuf)> {
     // `/usr/bin/git` on macOS is the xcode-select stub: it execs the real
     // toolchain git, which a grant on `/usr/bin` does not cover. `xcrun`
     // names the resolved binary.
@@ -122,85 +121,59 @@ fn borrowed_object_stores(repository: &Path) -> Vec<PathBuf> {
 }
 
 impl<E: Executor + Clone + 'static> LocalGit<E> {
-    /// The worktree the repository answers to: the committing grant knows
-    /// which worktree holds the `.git` file that names it. `git` enters the
-    /// worktree — the subagent's authorized space — and discovers the
-    /// repository through that file, opening only paths the grants cover.
-    fn enter<'a>(&'a self, repository: &'a Path) -> &'a Path {
-        self.committing
-            .iter()
-            .find(|granted| canonical(repository).parent() == Some(&*canonical(granted.git_dir())))
-            .map_or(repository, CommittingWorktree::worktree)
-    }
-
-    /// The sandbox the export's git runs in, and the program it launches:
-    /// the host's resolved `git`, falling back to a bare `git` when the host
-    /// itself cannot find one — the error then is the launch's to report.
-    /// The working directory is the worktree the run enters: it lives inside
-    /// the subagent's authorized space, and a sandbox denies exec beneath a
-    /// working directory, so the git binary's own directory could never be
-    /// chosen. The repository is granted read beside the subagent's grants:
-    /// it lives inside the main worktree's git directory, outside them. So
-    /// are the pieces of the main repository the export's reads resolve to —
-    /// the object store its alternates name and the configuration its own
-    /// includes — spelled exactly, because a directory grant would open
-    /// everything beneath it.
-    async fn sandbox(
-        &self,
-        repository: &Path,
-        enter: &Path,
-    ) -> Result<(Sandbox, String), ExportError> {
-        let git = host_git_binary();
-        // On Windows the working directory is the git binary's own: git's
-        // resolution of the directory it runs in asks more of ancestors than
-        // the traverse the sandbox grants them — reading a directory's entry
-        // needs its parent's list — where the binary's system ancestors are
-        // legible to every package.
-        #[cfg(windows)]
-        let working_dir = git
-            .as_ref()
-            .map_or_else(|| enter.to_path_buf(), |(_, dir)| dir.clone());
-        #[cfg(not(windows))]
-        let working_dir = enter.to_path_buf();
-        let grants: Vec<Grant> =
-            self.writable
+    async fn sandbox(&self, repository: &Path) -> Result<(Sandbox, String, PathBuf), ExportError> {
+        let writable = self.writable.clone();
+        let space_dir = self.working_dir.clone();
+        let readable = self.readable.clone();
+        let committing = self.committing.clone();
+        let repository = repository.to_path_buf();
+        let heel = self.heel.clone();
+        let priority = self.priority;
+        let host_git = Arc::clone(&self.host_git);
+        let (config, program, git_dir) = blocking::unblock(move || -> Result<_, ExportError> {
+            let enter = committing
+                .iter()
+                .find(|granted| {
+                    canonical(&repository).parent() == Some(&*canonical(granted.git_dir()))
+                })
+                .map_or(repository.as_path(), CommittingWorktree::worktree);
+            let git = host_git.get_or_init(locate_host_git_binary).clone();
+            // On Windows the working directory is the git binary's own: git's
+            // resolution of the directory it runs in asks more of ancestors than
+            // the traverse the sandbox grants them — reading a directory's entry
+            // needs its parent's list — where the binary's system ancestors are
+            // legible to every package.
+            #[cfg(windows)]
+            let working_dir = git
+                .as_ref()
+                .map_or_else(|| enter.to_path_buf(), |(_, dir)| dir.clone());
+            #[cfg(not(windows))]
+            let working_dir = enter.to_path_buf();
+            let borrowed = borrowed_object_stores(&repository);
+            let grants: Vec<Grant> = writable
                 .iter()
                 .map(|path| resolved(path).map(|p| Grant::new(p, Access::WRITE)))
-                .chain([resolved(&self.working_dir).map(|p| Grant::new(p, Access::READ))])
+                .chain([resolved(&space_dir).map(|p| Grant::new(p, Access::READ))])
                 .chain(
-                    self.readable
+                    readable
                         .iter()
                         .map(|path| resolved(path).map(|p| Grant::new(p, Access::READ))),
                 )
                 .chain(git.as_ref().map(|(_, dir)| {
                     resolved(dir).map(|p| Grant::new(p, Access::READ | Access::EXEC))
                 }))
+                .chain([resolved(&repository).map(|p| Grant::new(p, Access::READ))])
+                .chain(committing.iter().map(|granted| {
+                    resolved(granted.worktree()).map(|p| Grant::new(p, Access::READ))
+                }))
                 .chain(
-                    // The repository `git -C` enters: it lives inside the main
-                    // worktree's git directory, outside the subagent's grants.
-                    [resolved(repository).map(|p| Grant::new(p, Access::READ))],
+                    borrowed
+                        .iter()
+                        .map(|store| resolved(store).map(|p| Grant::new(p, Access::READ))),
                 )
                 .chain(
-                    // The worktrees `git -C` may enter: the repository lives
-                    // inside the main worktree's git directory, and the worktree
-                    // is outside the subagent's grants — its `.git` file names
-                    // the repository.
-                    self.committing.iter().map(|granted| {
-                        resolved(granted.worktree()).map(|p| Grant::new(p, Access::READ))
-                    }),
-                )
-                .chain(
-                    // The alternates the repository's object store names: the
-                    // main object store, as a subtree.
-                    borrowed_object_stores(repository)
-                        .into_iter()
-                        .map(|store| resolved(&store).map(|p| Grant::new(p, Access::READ))),
-                )
-                .chain(
-                    // The configuration `include.path` reaches: one file, never
-                    // its directory.
-                    borrowed_object_stores(repository)
-                        .into_iter()
+                    borrowed
+                        .iter()
                         .filter_map(|store| store.parent().map(Path::to_path_buf))
                         .map(|common| common.join("config"))
                         .filter(|config| config.is_file())
@@ -208,30 +181,30 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
                 )
                 .collect::<heel::Result<_>>()
                 .map_err(|error| ExportError::Launch(error.to_string()))?;
-        let config = SandboxConfig::builder()
-            .heel_binary(self.heel.clone())
-            .network(DenyAll)
-            .working_dir(canonical(&working_dir))
-            .grants(grants)
-            .security(SecurityConfig::interactive())
-            .priority(self.priority)
-            .build();
+            let config = SandboxConfig::builder()
+                .heel_binary(heel)
+                .network(DenyAll)
+                .working_dir(canonical(&working_dir))
+                .grants(grants)
+                .security(SecurityConfig::interactive())
+                .priority(priority)
+                .build();
+            let program = git.map_or_else(
+                || "git".to_string(),
+                |(path, _)| canonical(&path).to_string_lossy().into_owned(),
+            );
+            let git_dir = canonical(&repository);
+            Ok((config, program, git_dir))
+        })
+        .await?;
         let sandbox = Sandbox::with_config_and_executor(config, self.executor.clone())
             .await
             .map_err(|error| ExportError::Launch(error.to_string()))?;
-        let program = git.map_or_else(
-            || "git".to_string(),
-            // The binary is spelled canonically the same way its directory's
-            // grant is: a firmlinked `/Applications` or an 8.3 alias resolves
-            // to the object the grant names, where the spelled path does not.
-            |(path, _)| canonical(&path).to_string_lossy().into_owned(),
-        );
-        Ok((sandbox, program))
+        Ok((sandbox, program, git_dir))
     }
 
     async fn run_in_sandbox(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
-        let enter = self.enter(run.repository);
-        let (sandbox, program) = self.sandbox(run.repository, enter).await?;
+        let (sandbox, program, git_dir) = self.sandbox(run.repository).await?;
         let child = sandbox
             .command(program)
             .args(run.args)
@@ -239,7 +212,7 @@ impl<E: Executor + Clone + 'static> LocalGit<E> {
             // An absolute `GIT_DIR` is used as it stands — `git` discovers a
             // relative one by resolving it, a read on every ancestor that a
             // traverse grant does not carry.
-            .env("GIT_DIR", canonical(run.repository).to_string_lossy())
+            .env("GIT_DIR", git_dir.to_string_lossy())
             .stdin(StdioConfig::Piped)
             .stdout(StdioConfig::Piped)
             .stderr(StdioConfig::Piped)
@@ -324,12 +297,9 @@ fn ignore_broken_pipe(error: std::io::Error) -> Result<(), ExportError> {
     }
 }
 
-impl<E: Executor + Clone + 'static> SandboxedGitImpl for LocalGit<E> {
-    fn run<'a>(
-        &'a self,
-        run: SandboxedRun<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<SandboxedExit, ExportError>> + Send + 'a>> {
-        Box::pin(self.run_in_sandbox(run))
+impl<E: Executor + Clone + 'static> SandboxedGit for LocalGit<E> {
+    async fn run<'a>(&'a self, run: SandboxedRun<'a>) -> Result<SandboxedExit, ExportError> {
+        self.run_in_sandbox(run).await
     }
 }
 
@@ -389,7 +359,7 @@ impl<E: Executor + Clone + 'static> ContainerGit<E> {
                         kill_rx,
                         stdin_rx,
                         stdout,
-                        crate::ExecLifetime::Foreground,
+                        crate::ExecLifetime::foreground(),
                     )
                     .await;
                 let _ = done_tx.send(outcome).await;
@@ -412,11 +382,8 @@ impl<E: Executor + Clone + 'static> ContainerGit<E> {
     }
 }
 
-impl<E: Executor + Clone + 'static> SandboxedGitImpl for ContainerGit<E> {
-    fn run<'a>(
-        &'a self,
-        run: SandboxedRun<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<SandboxedExit, ExportError>> + Send + 'a>> {
-        Box::pin(self.run_in_container(run))
+impl<E: Executor + Clone + 'static> SandboxedGit for ContainerGit<E> {
+    async fn run<'a>(&'a self, run: SandboxedRun<'a>) -> Result<SandboxedExit, ExportError> {
+        self.run_in_container(run).await
     }
 }

@@ -19,6 +19,7 @@ where
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => emit(Some(buffer[..count].to_vec())),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     warn!(%error, "a process pipe failed to read");
                     break;

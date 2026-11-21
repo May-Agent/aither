@@ -29,8 +29,8 @@
 //! right before every signal.
 //!
 //! The job's own task owns its member set; [`JobTree`] is the handle that
-//! sends it messages. The job's root is kept unreaped until the job ends
-//! ([`wait_for_exit`]), so its pid and process group stay reserved. A kill
+//! sends it messages. The job's root stays unreaped inside the persistent
+//! runner until the job ends, so its pid and process group stay reserved. A kill
 //! freezes the members with `SIGSTOP` until a pass finds nothing new, then
 //! sends `SIGKILL`, and a tracked member that survives is an error.
 //!
@@ -63,7 +63,7 @@
 use std::time::Duration;
 
 /// The environment variable that marks every process of a job; its value is
-/// the job's [`JobMarker`].
+/// the job's `JobMarker`.
 pub const JOB_MARKER_VAR: &str = "AITHER_JOB";
 
 /// How often a job whose shell has exited is checked for remaining
@@ -193,7 +193,7 @@ impl Default for JobMarker {
 ///
 /// On Unix `pid` must lead its own process group (spawned with
 /// `process_group(0)`), and the group receives `SIGKILL`; descendants that
-/// left the group are [`JobTree`]'s business. On Windows `taskkill /F /T` ends
+/// left the group are `JobTree`'s business. On Windows `taskkill /F /T` ends
 /// the tree.
 ///
 /// # Errors
@@ -273,7 +273,7 @@ fn kill_group(pid: u32) -> Result<(), KillTreeError> {
 /// # Errors
 ///
 /// Returns the OS error when `pid` is not a child of this process.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub async fn wait_for_exit(pid: u32) -> std::io::Result<()> {
     // Registered before the check, so an exit between them is not missed.
     let watch = platform::ExitWatch::new(pid)?;
@@ -284,7 +284,7 @@ pub async fn wait_for_exit(pid: u32) -> std::io::Result<()> {
 }
 
 /// Whether the child `pid` has exited, without reaping it.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
     wait_unreaped(pid, libc::WNOHANG)
 }
@@ -293,14 +293,14 @@ fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
 ///
 /// Called only once the kernel reported the child exiting, so it returns
 /// within the kernel's own exit teardown.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn block_until_exited_unreaped(pid: u32) -> std::io::Result<()> {
     wait_unreaped(pid, 0).map(drop)
 }
 
 /// `waitid` for the exit of the child `pid` with `WNOWAIT` and `flags`;
 /// whether it reported the exit.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn wait_unreaped(pid: u32, flags: libc::c_int) -> std::io::Result<bool> {
     loop {
         // SAFETY: `siginfo_t` is plain data for which all-zero bytes are valid.
@@ -901,6 +901,7 @@ mod unix {
     /// The task that owns one job's member set.
     pub(super) struct Task<S> {
         root: u32,
+        root_identity: Option<Identity>,
         root_name: String,
         /// Whether the root has exited and waits to be reaped. A process
         /// group that holds only that zombie cannot be signalled on macOS.
@@ -953,8 +954,9 @@ mod unix {
                     (None, Some(error.to_string()))
                 }
             };
-            Self {
+            let mut task = Self {
                 root,
+                root_identity: None,
                 root_name: "the job's shell".to_string(),
                 root_zombie: false,
                 marker,
@@ -966,6 +968,73 @@ mod unix {
                 lineage: platform::unique_of(mode, root).into_iter().collect(),
                 waiters: Vec::new(),
                 signals,
+            };
+            task.initial_scan();
+            task
+        }
+
+        /// Captures any children the root already forked before the async
+        /// watcher task is first polled.
+        fn initial_scan(&mut self) {
+            let pre_tracked = self
+                .watch
+                .as_mut()
+                .and_then(|watch| watch.sync_tracked().ok())
+                .unwrap_or_default();
+            let Ok(table) = self.scanner.table(Duration::ZERO, self.mode, false) else {
+                return;
+            };
+            let post_tracked = self
+                .watch
+                .as_mut()
+                .and_then(|watch| watch.sync_tracked().ok())
+                .unwrap_or_default();
+            let host = std::process::id();
+            let mut found = members(
+                &table.procs,
+                self.root,
+                host,
+                &self.marker,
+                &self.known,
+                &self.lineage,
+            );
+            for process in &table.procs {
+                let pid = process.pid();
+                if pid != self.root
+                    && pid != host
+                    && pre_tracked.contains(&pid)
+                    && post_tracked.contains(&pid)
+                    && found
+                        .iter()
+                        .all(|existing| existing.identity != process.identity)
+                {
+                    found.push(process);
+                }
+            }
+            if let Some(root_proc) = table
+                .procs
+                .iter()
+                .find(|process| process.pid() == self.root)
+            {
+                self.root_identity = Some(root_proc.identity);
+                self.root_name.clone_from(&root_proc.name);
+                self.root_zombie = root_proc.zombie;
+                self.lineage.extend(root_proc.unique());
+            } else {
+                self.root_zombie = true;
+            }
+            self.lineage
+                .extend(found.iter().filter_map(|process| process.unique()));
+            self.known = found.iter().map(|process| process.identity).collect();
+            let live: Vec<u32> = found
+                .iter()
+                .filter(|process| !process.zombie)
+                .map(|process| process.pid())
+                .collect();
+            if !live.is_empty()
+                && let Some(watch) = self.watch.as_mut()
+            {
+                let _ = watch.follow(self.root, &live);
             }
         }
 
@@ -1058,8 +1127,13 @@ mod unix {
             max_age: Duration,
             markers: bool,
         ) -> Result<Vec<Member>, ProcessTableError> {
+            let pre_tracked = self
+                .watch
+                .as_mut()
+                .and_then(|watch| watch.sync_tracked().ok())
+                .unwrap_or_default();
             let scanner = self.scanner.clone();
-            let (root, mode) = (self.root, self.mode);
+            let (root, root_identity, mode) = (self.root, self.root_identity, self.mode);
             // The seen sets move into the read and back, so a long job's
             // history is never copied per scan.
             let (marker, known, lineage) = (
@@ -1073,29 +1147,69 @@ mod unix {
                     .map_err(ProcessTableError::Table)
                     .map(|table| {
                         let host = std::process::id();
-                        let members = members(&table.procs, root, host, &marker, &known, &lineage)
-                            .into_iter()
+                        let pid_holder = table.procs.iter().find(|process| process.pid() == root);
+                        let recycled = match (root_identity, pid_holder) {
+                            (Some(id), Some(holder)) => holder.identity != id,
+                            _ => false,
+                        };
+                        let effective_root = if recycled { 0 } else { root };
+                        let members = members(
+                            &table.procs,
+                            effective_root,
+                            host,
+                            &marker,
+                            &known,
+                            &lineage,
+                        )
+                        .into_iter()
+                        .map(|process| Member {
+                            identity: process.identity,
+                            name: process.name.clone(),
+                            zombie: process.zombie,
+                        })
+                        .collect::<Vec<_>>();
+                        let tracked = table
+                            .procs
+                            .iter()
+                            .filter(|process| {
+                                let pid = process.pid();
+                                pid != effective_root && pid != host && pre_tracked.contains(&pid)
+                            })
                             .map(|process| Member {
                                 identity: process.identity,
                                 name: process.name.clone(),
                                 zombie: process.zombie,
                             })
                             .collect::<Vec<_>>();
-                        let root = table
-                            .procs
-                            .iter()
-                            .find(|process| process.pid() == root)
-                            .map(|process| {
+                        let root = if recycled {
+                            None
+                        } else {
+                            pid_holder.map(|process| {
                                 (process.name.clone(), process.zombie, process.unique())
-                            });
-                        (members, root)
+                            })
+                        };
+                        (members, tracked, root)
                     });
                 (known, lineage, outcome)
             })
             .await;
             self.known = known;
             self.lineage = lineage;
-            let (members, root) = outcome?;
+            let (mut members, tracked, root) = outcome?;
+            let post_tracked = self
+                .watch
+                .as_mut()
+                .and_then(|watch| watch.sync_tracked().ok())
+                .unwrap_or_default();
+            for candidate in tracked {
+                if post_tracked.contains(&candidate.identity.pid)
+                    && members
+                        .iter()
+                        .all(|existing| existing.identity != candidate.identity)
+                {
+                    members.push(candidate);
+                }
+            }
             // An unreaped root that the table does not list is a zombie.
             self.root_zombie = root.as_ref().is_none_or(|(_, zombie, _)| *zombie);
             if let Some((name, _, unique)) = root {
@@ -1276,15 +1390,11 @@ mod unix {
 #[cfg(target_os = "linux")]
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 mod platform {
-    use std::{
-        fs, io,
-        os::{
-            fd::{FromRawFd, OwnedFd},
-            unix::fs::MetadataExt,
-        },
-        time::Duration,
-    };
+    #[cfg(test)]
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::{fs, io, os::unix::fs::MetadataExt, time::Duration};
 
+    #[cfg(test)]
     use async_io::Async;
 
     use super::unix::{Birth, Identity, Proc, Table};
@@ -1442,6 +1552,10 @@ mod platform {
             Ok(false)
         }
 
+        pub(super) fn sync_tracked(&mut self) -> io::Result<std::collections::HashSet<u32>> {
+            Ok(std::collections::HashSet::new())
+        }
+
         /// Polling already spaces the scans.
         pub(super) const fn rest(&mut self, _duration: Duration) {}
 
@@ -1452,11 +1566,13 @@ mod platform {
     }
 
     /// A pidfd of a child, readable once the child has exited.
+    #[cfg(test)]
     pub(super) struct ExitWatch {
         pid: u32,
         pidfd: Async<OwnedFd>,
     }
 
+    #[cfg(test)]
     impl ExitWatch {
         pub(super) fn new(pid: u32) -> io::Result<Self> {
             // SAFETY: `pidfd_open` takes plain integers.
@@ -1918,8 +2034,13 @@ mod platform {
         }
     }
 
-    /// Drains pending events; whether there was any.
-    fn drain(queue: &Async<OwnedFd>) -> io::Result<bool> {
+    /// Drains pending events into `followed` and `tracked_live`; whether there
+    /// was any event.
+    fn drain(
+        queue: &Async<OwnedFd>,
+        followed: &mut HashSet<u32>,
+        tracked_live: &mut HashSet<u32>,
+    ) -> io::Result<bool> {
         let mut any = false;
         loop {
             // SAFETY: `kevent` is plain data for which all-zero bytes are valid.
@@ -1942,6 +2063,24 @@ mod platform {
             if count < 0 {
                 return Err(io::Error::last_os_error());
             }
+            let count = usize::try_from(count).unwrap_or(0);
+            for ev in &events[..count] {
+                if (ev.flags & libc::EV_ERROR) != 0 || ev.ident == 0 {
+                    continue;
+                }
+                let Ok(pid) = u32::try_from(ev.ident) else {
+                    continue;
+                };
+                if (ev.fflags & libc::NOTE_EXIT) != 0 {
+                    tracked_live.remove(&pid);
+                    followed.remove(&pid);
+                } else if (ev.fflags & libc::NOTE_TRACKERR) == 0
+                    && (ev.fflags & (libc::NOTE_CHILD | libc::NOTE_FORK | libc::NOTE_EXEC)) != 0
+                {
+                    tracked_live.insert(pid);
+                    followed.insert(pid);
+                }
+            }
             any |= count > 0;
             if count < 16 {
                 return Ok(any);
@@ -1949,13 +2088,22 @@ mod platform {
         }
     }
 
-    /// What a job's processes are followed for.
-    const FOLLOWED: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT;
+    /// What a job's processes are followed for, including kernel-side fork
+    /// tracking (`NOTE_TRACK`) so fast fork+exit+reparent+exec chains cannot
+    /// escape between userspace scans.
+    const FOLLOWED: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT | libc::NOTE_TRACK;
+
+    /// [`FOLLOWED`] without `NOTE_TRACK`, for a kernel that answers its
+    /// registration `ENOTSUP`; there scans alone attribute children.
+    const FOLLOWED_NO_TRACK: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT;
 
     /// A kqueue that signals when a watched process forks, execs or exits.
     pub(super) struct Watch {
         queue: Async<OwnedFd>,
+        /// The notes the kernel accepted on this queue.
+        fflags: u32,
         followed: HashSet<u32>,
+        tracked_live: HashSet<u32>,
         /// Until when the watch rests after a scan.
         rest_until: Option<Instant>,
     }
@@ -1965,21 +2113,48 @@ mod platform {
         /// was spawned, it misses none of its forks.
         pub(super) fn new(root: u32) -> io::Result<Self> {
             let queue = new_queue()?;
+            // A kernel that does not track forks over kqueue answers the
+            // registration ENOTSUP; the watch then reports the root's own
+            // notes and table scans keep attributing children.
+            let (fflags, watched) = match register(&queue, root, FOLLOWED) {
+                Ok(watched) => (FOLLOWED, watched),
+                Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => (
+                    FOLLOWED_NO_TRACK,
+                    register(&queue, root, FOLLOWED_NO_TRACK)?,
+                ),
+                Err(error) => return Err(error),
+            };
             let mut followed = HashSet::new();
-            if register(&queue, root, FOLLOWED)? {
+            let mut tracked_live = HashSet::new();
+            if watched {
                 followed.insert(root);
             }
+            let _ = drain(&queue, &mut followed, &mut tracked_live)?;
             Ok(Self {
                 queue,
+                fflags,
                 followed,
+                tracked_live,
                 rest_until: None,
             })
+        }
+
+        /// Synchronously drains pending kqueue events and returns the set of
+        /// kernel-tracked PIDs that have not emitted `NOTE_EXIT`.
+        pub(super) fn sync_tracked(&mut self) -> io::Result<HashSet<u32>> {
+            let _ = drain(&self.queue, &mut self.followed, &mut self.tracked_live)?;
+            Ok(self.tracked_live.clone())
         }
 
         /// Watches the root and the `live` pids; returns whether any process
         /// was newly watched.
         pub(super) fn follow(&mut self, root: u32, live: &[u32]) -> io::Result<bool> {
-            let wanted: HashSet<u32> = live.iter().copied().chain([root]).collect();
+            let wanted: HashSet<u32> = live
+                .iter()
+                .copied()
+                .chain(self.tracked_live.iter().copied())
+                .chain([root])
+                .collect();
             self.followed.retain(|pid| wanted.contains(pid));
             let mut added = false;
             for pid in wanted {
@@ -1987,7 +2162,7 @@ mod platform {
                     continue;
                 }
                 // A process that exited already is seen by the scan that follows.
-                if register(&self.queue, pid, FOLLOWED)? {
+                if register(&self.queue, pid, self.fflags)? {
                     self.followed.insert(pid);
                 }
                 added = true;
@@ -2012,7 +2187,7 @@ mod platform {
                     async_io::Timer::at(until).await;
                 }
                 self.queue.readable().await?;
-                if drain(&self.queue)? {
+                if drain(&self.queue, &mut self.followed, &mut self.tracked_live)? {
                     return Ok(());
                 }
             }
@@ -2020,12 +2195,14 @@ mod platform {
     }
 
     /// A kqueue that signals when one child exits.
+    #[cfg(test)]
     pub(super) struct ExitWatch {
         pid: u32,
         queue: Async<OwnedFd>,
         watched: bool,
     }
 
+    #[cfg(test)]
     impl ExitWatch {
         pub(super) fn new(pid: u32) -> io::Result<Self> {
             let queue = new_queue()?;
@@ -2048,9 +2225,11 @@ mod platform {
         /// of this process fails that wait.
         pub(super) async fn exited(self) -> io::Result<()> {
             if self.watched {
+                let mut ignored_followed = HashSet::new();
+                let mut ignored_tracked = HashSet::new();
                 loop {
                     self.queue.readable().await?;
-                    if drain(&self.queue)? {
+                    if drain(&self.queue, &mut ignored_followed, &mut ignored_tracked)? {
                         break;
                     }
                 }
@@ -2500,12 +2679,26 @@ mod tests {
     async fn an_env_cleaned_setsid_descendant_is_still_killed() {
         let marker = JobMarker::new();
         #[cfg(target_os = "macos")]
-        let script = "/usr/bin/env -i /usr/bin/perl -e \
-            'use POSIX; POSIX::setsid(); exec \"sleep\", \"300\"' & exit 0";
+        let script = "IFS= read -r _ || true; /usr/bin/env -i /usr/bin/perl -e \
+            'use POSIX; POSIX::setsid(); exec \"sleep\", \"300\"' </dev/null & exit 0";
         #[cfg(not(target_os = "macos"))]
-        let script = "/usr/bin/env -i sleep 300 & exit 0";
-        let mut root = spawn_group_leader(script, &marker);
+        let script = "IFS= read -r _ || true; /usr/bin/env -i sleep 300 </dev/null & exit 0";
+        let (name, value) = marker.entry();
+        let mut root = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env(name, value)
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sh should start");
         let tree = JobTree::spawn(&TokioGlobal, ProcessScanner::default(), root.id(), &marker);
+        // Release the root shell only after the tree watch is attached so OS
+        // preemption before `JobTree::spawn` cannot finish the entire job
+        // ahead of attachment.
+        drop(root.stdin.take());
         wait_for_exit(root.id()).await.expect("root exit observed");
         let killed = tree.kill_descendants().await.expect("kill succeeds");
         assert_eq!(killed.len(), 1, "{killed:?}");
@@ -2563,7 +2756,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kill_descendants_names_what_it_killed() {
         let marker = JobMarker::new();
-        let mut root = spawn_group_leader("sleep 300 & sleep 300 & exit 0", &marker);
+        let mut root = spawn_group_leader("sleep 300 & sleep 300 & sleep 0.05; exit 0", &marker);
         let tree = JobTree::spawn(&TokioGlobal, ProcessScanner::default(), root.id(), &marker);
         wait_for_exit(root.id()).await.expect("root exit observed");
         let killed = tree.kill_descendants().await.expect("kill succeeds");
@@ -2668,7 +2861,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_kill_that_leaves_survivors_is_not_ok() {
         let marker = JobMarker::new();
-        let mut root = spawn_group_leader("sleep 300 & exit 0", &marker);
+        let mut root = spawn_group_leader("sleep 300 & sleep 0.05; exit 0", &marker);
         let (commands, inbox) = async_channel::unbounded();
         let task = Task::with_signals(
             IgnoresKill,

@@ -104,13 +104,15 @@ snapshot() {
 membership() {
   member=no
   snapshot "$1" || return 0
-  if [ "$snap_stack" = 0 ]; then
-    # The kernel sets startstack after it has laid out a new image's
-    # environment. stat prints 0 for it without an mm — a kernel thread, or
-    # a process that released its memory on its way out, both with vsize 0 —
-    # and for a process the caller may not inspect, whose start_code then
-    # reads 1; otherwise the process is in an exec, past the point where its
-    # new, empty mm replaced the old one.
+  if [ "$snap_stack" = 0 ] || [ "$snap_env_end" = 0 ]; then
+    # The kernel sets startstack before the interpreter is mapped and the
+    # environment bounds only when it lays out the new image's stack, so an
+    # exec inside that window still reads env_end 0. stat prints 0 for both
+    # without an mm — a kernel thread, or a process that released its memory
+    # on its way out, both with vsize 0 — and for a process the caller may
+    # not inspect, whose start_code then reads 1; otherwise the process is
+    # in an exec, past the point where its new, empty mm replaced the old
+    # one. A finished exec always left env_end nonzero, even for `env -i`.
     [ "$snap_vsize" = 0 ] || [ "$snap_code" = 1 ] || member=moving
     return 0
   fi

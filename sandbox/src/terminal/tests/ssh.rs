@@ -979,7 +979,7 @@ async fn a_server_command_reads_a_stdin_pipe_only_in_the_background() {
     input_tool(terminal.jobs())
         .call(
             JobInputArgs {
-                task_id: job.task_id().to_owned(),
+                pid: job.pid(),
                 input: "lexo".to_string(),
                 append_newline: true,
             },

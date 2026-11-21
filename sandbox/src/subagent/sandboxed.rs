@@ -112,11 +112,37 @@ pub async fn within<T>(limit: Duration, future: impl Future<Output = T>) -> Opti
 /// A backend that runs git inside a subagent's sandbox.
 ///
 /// A run is killed with everything it started when its future is dropped.
-pub trait SandboxedGitImpl: Send + Sync {
+pub trait SandboxedGit: Send + Sync + 'static {
+    /// Runs `run` inside the subagent's sandbox.
     fn run<'a>(
         &'a self,
         run: SandboxedRun<'a>,
+    ) -> impl Future<Output = Result<SandboxedExit, ExportError>> + Send + 'a;
+}
+
+impl<T: SandboxedGit> SandboxedGit for Arc<T> {
+    fn run<'a>(
+        &'a self,
+        run: SandboxedRun<'a>,
+    ) -> impl Future<Output = Result<SandboxedExit, ExportError>> + Send + 'a {
+        (**self).run(run)
+    }
+}
+
+trait SandboxedGitImpl: Send + Sync {
+    fn run_boxed<'a>(
+        &'a self,
+        run: SandboxedRun<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<SandboxedExit, ExportError>> + Send + 'a>>;
+}
+
+impl<T: SandboxedGit> SandboxedGitImpl for T {
+    fn run_boxed<'a>(
+        &'a self,
+        run: SandboxedRun<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<SandboxedExit, ExportError>> + Send + 'a>> {
+        Box::pin(self.run(run))
+    }
 }
 
 /// Runs git in a subagent's sandbox: the same filesystem grants and network
@@ -142,13 +168,15 @@ pub struct Collected {
 pub const PIPE_DEPTH: usize = 8;
 
 impl SubagentGit {
-    pub fn new(backend: Arc<dyn SandboxedGitImpl>) -> Self {
-        Self { backend }
+    pub fn new(backend: impl SandboxedGit) -> Self {
+        Self {
+            backend: Arc::new(backend),
+        }
     }
 
     /// Runs the command, streaming its stdout to `stdout`.
     pub async fn run(&self, run: SandboxedRun<'_>) -> Result<SandboxedExit, ExportError> {
-        self.backend.run(run).await
+        self.backend.run_boxed(run).await
     }
 
     /// Runs the command and collects its stdout, failing when it prints more

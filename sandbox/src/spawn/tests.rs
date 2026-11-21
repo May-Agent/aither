@@ -145,7 +145,13 @@ async fn kill_ends_the_whole_process_tree() {
         .expect("the descendant reports its id")
         .expect("stdout is open");
     let grandchild = String::from_utf8(grandchild).unwrap().trim().to_string();
-    assert!(alive(&grandchild), "the descendant runs");
+    let grandchild_sandbox_pid: u32 = grandchild.parse().expect("numeric grandchild pid");
+    let grandchild_host = sandbox
+        .resolve_host_pid(grandchild_sandbox_pid)
+        .await
+        .expect("the descendant runs")
+        .to_string();
+    assert!(alive(&grandchild_host), "the descendant runs");
 
     child.kill().await.expect("the tree is killed");
     let exit = tokio::time::timeout(BOUND, child.wait())
@@ -153,7 +159,7 @@ async fn kill_ends_the_whole_process_tree() {
         .expect("the killed process is waited for");
     assert!(!exit.success(), "{exit:?}");
     tokio::time::timeout(BOUND, async {
-        while alive(&grandchild) {
+        while alive(&grandchild_host) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -472,12 +478,12 @@ impl ContainerExec for ReportingExec {
         _stdout: Sender<Vec<u8>>,
         lifetime: crate::ExecLifetime,
     ) -> Result<ContainerExecOutcome, String> {
-        let foreground = matches!(lifetime, crate::ExecLifetime::Foreground);
+        let foreground = matches!(lifetime, crate::ExecLifetime::Foreground { .. });
         self.started
             .lock()
             .unwrap()
             .push((script.to_string(), foreground));
-        if let crate::ExecLifetime::Background { stdin_blocked } = lifetime {
+        if let crate::ExecLifetime::Background { stdin_blocked, .. } = lifetime {
             let _ = stdin_blocked.send(crate::StdinWatchSignal::Blocked).await;
         }
         Ok(ContainerExecOutcome::Completed {
@@ -620,7 +626,7 @@ async fn a_container_setup_runs_outside_the_sandbox_that_a_confined_child_gets()
     assert!(script.starts_with("AITHER_IPC_BIN="), "{script}");
     assert!(
         script.contains(
-            r#"--commands '{"probe":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+            r#"--commands '{"probe":{"positional_args":[],"raw_args":false,"stdin_arg":null}}'"#
         ),
         "{script}"
     );
@@ -829,7 +835,7 @@ async fn a_foreground_host_child_reports_the_descendants_it_killed() {
     let (_work, work) = canonical_tempdir();
     let sandbox = host_sandbox(&work).await;
     let spec = SpawnSpec::new("/bin/sh")
-        .args(["-c", "sleep 300 & sleep 300 & exit 0"])
+        .args(["-c", "sleep 300 & sleep 300 & sleep 0.05; exit 0"])
         .lifetime(crate::TreeLifetime::Foreground);
     let child = sandbox.spawn(spec).await.expect("the process starts");
     let exit = tokio::time::timeout(BOUND, child.wait())

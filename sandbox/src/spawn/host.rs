@@ -1,16 +1,21 @@
-//! The host backend: a process under heel's sandbox on this machine.
+//! The host backend: processes inside a persistent `heel` sandbox per agent.
 
 use std::any::Any;
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
+use async_lock::OnceCell;
 use executor_core::Executor;
 use heel::{
-    Access, Audited, Grant, IpcRouter, NetworkPolicy, ResolvedPath, SandboxConfig, SecurityConfig,
-    StdioConfig,
+    Access, Audited, Grant, NetworkPolicy, ResolvedPath, SandboxConfig, SecurityConfig, StdioConfig,
 };
 
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
 use super::domain::DomainGate;
+use super::host_ipc::{HostIpcLease, HostIpcMux, prepend_shim_path};
 use super::stdio::{read_chunks, write_chunks};
 use super::{
     Backend, LaunchInfo, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio,
@@ -32,7 +37,7 @@ pub enum TreeLifetime {
 }
 
 /// A process spawned on the host: the child, the handle that ends its tree
-/// and heel's sandbox, whose drop ends the processes under it.
+/// and the runtime/IPC guard kept alive while the process runs.
 pub struct LocalSpawn {
     pub(crate) child: LocalChild,
     pub(crate) tree: JobTree,
@@ -40,20 +45,236 @@ pub struct LocalSpawn {
     pub(crate) sandbox: Box<dyn Any + Send>,
 }
 
-/// The object a spelled path names, in the spelling a resolved grant checks:
-/// canonicalized, without the verbatim prefix Windows adds; an 8.3 alias or a
-/// symlinked component does not name the same object.
+/// Lazily initialized persistent `heel::Sandbox` owned by one `Sandbox`.
+pub struct HostRuntimeSlot {
+    cell: OnceCell<Arc<HostRuntime>>,
+}
+
+impl HostRuntimeSlot {
+    pub(crate) const fn new() -> Self {
+        Self {
+            cell: OnceCell::new(),
+        }
+    }
+}
+
+struct Launch {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: PathBuf,
+    stdio: Stdio,
+    lifetime: TreeLifetime,
+    marker: JobMarker,
+}
+
+type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SpawnError>> + Send + 'a>>;
+
+trait HeelSandboxOps: Send + Sync {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn handle(&self) -> heel::SandboxHandle;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn pid_in_sandbox(&self, host_pid: u32) -> Option<u32>;
+
+    fn set_grants_boxed(
+        &self,
+        grants: Vec<Grant>,
+        read_denied: Vec<ResolvedPath>,
+    ) -> BoxedFuture<'_, ()>;
+
+    fn spawn_boxed<'a>(
+        &'a self,
+        launch: Launch,
+        executor: &'a executor_core::AnyExecutor,
+        scanner: crate::process_tree::ProcessScanner,
+    ) -> BoxedFuture<'a, (LocalChild, JobTree)>;
+}
+
+impl<N: NetworkPolicy + 'static> HeelSandboxOps for heel::Sandbox<N> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn handle(&self) -> heel::SandboxHandle {
+        Self::handle(self)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn pid_in_sandbox(&self, host_pid: u32) -> Option<u32> {
+        Self::pid_in_sandbox(self, host_pid)
+    }
+
+    fn set_grants_boxed(
+        &self,
+        grants: Vec<Grant>,
+        read_denied: Vec<ResolvedPath>,
+    ) -> BoxedFuture<'_, ()> {
+        Box::pin(async move {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                Self::set_grants(self, grants, read_denied)
+                    .await
+                    .map_err(|error| SpawnError::Setup(error.to_string()))?;
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let _ = (grants, read_denied);
+            Ok(())
+        })
+    }
+
+    fn spawn_boxed<'a>(
+        &'a self,
+        launch: Launch,
+        executor: &'a executor_core::AnyExecutor,
+        scanner: crate::process_tree::ProcessScanner,
+    ) -> BoxedFuture<'a, (LocalChild, JobTree)> {
+        Box::pin(async move {
+            let Launch {
+                program,
+                args,
+                env,
+                cwd,
+                stdio,
+                lifetime,
+                marker,
+            } = launch;
+            let command = self
+                .command(program)
+                .current_dir(cwd)
+                .args(args)
+                .envs(env)
+                .stdin(stdio_config(stdio.stdin))
+                .stdout(stdio_config(stdio.stdout))
+                .stderr(stdio_config(stdio.stderr));
+            let start = |error: heel::Error| SpawnError::Start(error.to_string());
+
+            #[cfg(target_os = "linux")]
+            {
+                let _ = (executor, scanner, marker);
+                let reap_timeout = crate::terminal::SUPERVISED_REAP_TIMEOUT;
+                let child = match lifetime {
+                    TreeLifetime::Foreground => LocalChild::Foreground(
+                        command
+                            .spawn_supervised(heel::supervisor::Foreground { reap_timeout })
+                            .await
+                            .map_err(start)?,
+                    ),
+                    TreeLifetime::Background => LocalChild::Background(
+                        command
+                            .spawn_supervised(heel::supervisor::Background { reap_timeout })
+                            .await
+                            .map_err(start)?,
+                    ),
+                };
+                let tree = JobTree::supervised(child.tree_control());
+                Ok((child, tree))
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = lifetime;
+                let child = command.spawn().await.map_err(start)?;
+                let tree = JobTree::spawn(executor, scanner, child.id(), &marker);
+                Ok((LocalChild::Plain(child), tree))
+            }
+        })
+    }
+}
+
+pub struct HostRuntime {
+    sandbox: Box<dyn HeelSandboxOps>,
+    mux: HostIpcMux,
+    active_extras: Mutex<HashMap<(PathBuf, Access), (Grant, usize)>>,
+}
+
+struct ActiveExtrasLease {
+    runtime: Arc<HostRuntime>,
+    keys: Vec<(PathBuf, Access)>,
+}
+
+impl Drop for ActiveExtrasLease {
+    fn drop(&mut self) {
+        if self.keys.is_empty() {
+            return;
+        }
+        let mut map = self
+            .runtime
+            .active_extras
+            .lock()
+            .expect("host runtime active_extras lock is never poisoned");
+        for key in &self.keys {
+            if let Some((_, count)) = map.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(key);
+                }
+            }
+        }
+    }
+}
+
+fn grant_key(grant: &Grant) -> (PathBuf, Access) {
+    let path: &Path = grant.path();
+    (path.to_path_buf(), grant.access())
+}
+
+impl HostRuntime {
+    fn new<N: NetworkPolicy + 'static>(sandbox: heel::Sandbox<N>, mux: HostIpcMux) -> Self {
+        Self {
+            sandbox: Box::new(sandbox),
+            mux,
+            active_extras: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire_extras(self: &Arc<Self>, extras: Vec<Grant>) -> ActiveExtrasLease {
+        let keys: Vec<_> = extras.iter().map(grant_key).collect();
+        if !extras.is_empty() {
+            let mut map = self
+                .active_extras
+                .lock()
+                .expect("host runtime active_extras lock is never poisoned");
+            for (grant, key) in extras.into_iter().zip(keys.iter().cloned()) {
+                map.entry(key)
+                    .and_modify(|(_, count)| *count += 1)
+                    .or_insert((grant, 1));
+            }
+            drop(map);
+        }
+        ActiveExtrasLease {
+            runtime: Arc::clone(self),
+            keys,
+        }
+    }
+
+    async fn sync_grants(
+        &self,
+        mut grants: Vec<Grant>,
+        read_denied: &[PathBuf],
+    ) -> Result<(), SpawnError> {
+        {
+            let map = self
+                .active_extras
+                .lock()
+                .expect("host runtime active_extras lock is never poisoned");
+            grants.extend(map.values().map(|(grant, _)| grant.clone()));
+        }
+        let mut resolved_denied = Vec::with_capacity(read_denied.len());
+        for path in read_denied {
+            if matches!(path.try_exists(), Ok(false)) {
+                continue;
+            }
+            resolved_denied
+                .push(resolved(path).map_err(|error| SpawnError::Setup(error.to_string()))?);
+        }
+        self.sandbox.set_grants_boxed(grants, resolved_denied).await
+    }
+}
+
+/// The object a spelled path names, in the spelling a resolved grant checks.
 pub fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
     ResolvedPath::new(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
-/// The grants that let git work in a granted linked worktree: its common git
-/// directory, with the access `git_dir` gives a writable worktree's (the
-/// session's own for the main agent, read for a child). The directory is the
-/// repository's, outside the worktree, and a strict sandbox reads only what
-/// is granted. Only a pointer git's back-links confirm
-/// ([`crate::subagent::confirmed_common_dir`]) grants anything, because the
-/// `.git` file sits in a directory the session can write.
+/// The grants that let git work in a granted linked worktree.
 pub async fn linked_worktree_grants(
     writable: &[PathBuf],
     readable: &[PathBuf],
@@ -72,8 +293,6 @@ pub async fn linked_worktree_grants(
     Ok(grants)
 }
 
-/// The paths a host sandbox must not read: heel's credential table plus the
-/// embedder's `denied` absolute paths. Everything else stays readable.
 #[cfg(not(windows))]
 fn read_denylist(denied: &[PathBuf]) -> heel::ReadDenylist {
     denied
@@ -90,17 +309,6 @@ const fn stdio_config(pipe: Pipe) -> StdioConfig {
     }
 }
 
-/// What a launch needs besides heel's configuration.
-struct Launch {
-    program: String,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-    cwd: Option<PathBuf>,
-    stdio: Stdio,
-    lifetime: TreeLifetime,
-    marker: JobMarker,
-}
-
 impl Sandbox {
     fn heel_binary(&self) -> Result<&heel::HeelBinary, SpawnError> {
         match &self.inner.backend {
@@ -111,16 +319,11 @@ impl Sandbox {
         }
     }
 
-    /// The canonical spelling of the working directory: a symlink in it fails
-    /// heel's own resolution, which does not follow a link a sandboxed
-    /// process could have planted.
     fn canonical_working_dir(&self) -> PathBuf {
         std::fs::canonicalize(&self.inner.working_dir)
             .unwrap_or_else(|_| self.inner.working_dir.clone())
     }
 
-    /// The environment of a host spawn: the sandbox's own, its source's, its
-    /// space's, then the spec's, each overriding the one before.
     fn host_environment(
         &self,
         spec_env: Vec<(String, String)>,
@@ -143,12 +346,6 @@ impl Sandbox {
         Ok(env)
     }
 
-    /// The grants a confined spawn carries: the embedder's fixed ones, every
-    /// live writable path with write and execute access (a sandboxed process
-    /// can already run anything it writes through an interpreter, and builds
-    /// must execute their own outputs), every readable path with read access,
-    /// the common git directory of a granted linked worktree, and the spec's
-    /// own.
     async fn confined_grants(
         &self,
         snapshot: &super::GrantSnapshot,
@@ -162,8 +359,6 @@ impl Sandbox {
             .map(|path| (path, Access::WRITE | Access::EXEC))
             .chain(snapshot.readable.iter().map(|path| (path, Access::READ)))
         {
-            // A grant deleted since it was made grants nothing, and the
-            // sandbox cannot resolve it.
             if matches!(path.try_exists(), Ok(false)) {
                 continue;
             }
@@ -178,19 +373,16 @@ impl Sandbox {
         Ok(grants)
     }
 
-    fn confined_config<N: NetworkPolicy>(
+    fn build_confined_config<N: NetworkPolicy>(
         &self,
         policy: N,
         grants: Vec<Grant>,
         snapshot: &super::GrantSnapshot,
         heel: heel::HeelBinary,
-        ipc: Option<IpcRouter>,
+        endpoint: heel::ipc::TcpIpcEndpoint,
+        #[cfg(any(target_os = "macos", target_os = "linux"))] parent: Option<heel::SandboxHandle>,
     ) -> SandboxConfig<N> {
         let builder = SandboxConfig::builder().network(policy);
-        // The Windows backend refuses a write denylist rather than run
-        // weaker, and the same holds for the read denylist: reads are open
-        // everywhere except the credential table and the embedder's
-        // additions.
         #[cfg(not(windows))]
         let builder = {
             let builder = match &self.inner.write_denylist {
@@ -208,27 +400,24 @@ impl Sandbox {
             .grants(grants)
             .heel_binary(heel)
             .security(SecurityConfig::interactive())
-            // The session's own processes run their build outputs: anything
-            // written here could already run through an interpreter.
             .executable_working_dir(true)
             .priority(self.inner.priority);
         #[cfg(target_os = "linux")]
         let builder = builder.supervised_spawn(true);
-        // `ipc` changes the builder's type, so both arms build where they are.
-        match ipc {
-            Some(router) => builder.ipc(router).build(),
-            None => builder.build(),
-        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let builder = match parent {
+            Some(parent) => builder.parent(parent),
+            None => builder,
+        };
+        builder.external_ipc(endpoint).build()
     }
 
-    fn unconfined_config(
+    fn build_unconfined_config(
         &self,
         heel: heel::HeelBinary,
-        ipc: Option<IpcRouter>,
+        endpoint: heel::ipc::TcpIpcEndpoint,
+        #[cfg(any(target_os = "macos", target_os = "linux"))] parent: Option<heel::SandboxHandle>,
     ) -> SandboxConfig<heel::HostAccess> {
-        // Host access is approved execution: the user runs the script
-        // themselves in every respect except IPC plumbing, so no credential
-        // or filesystem protection may apply.
         let builder = SandboxConfig::builder()
             .working_dir(self.canonical_working_dir())
             .host_access()
@@ -237,35 +426,171 @@ impl Sandbox {
             .priority(self.inner.priority);
         #[cfg(target_os = "linux")]
         let builder = builder.supervised_spawn(true);
-        match ipc {
-            Some(router) => builder.ipc(router).build(),
-            None => builder.build(),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let builder = match parent {
+            Some(parent) => builder.parent(parent),
+            None => builder,
+        };
+        builder.external_ipc(endpoint).build()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ensure_parent_handle(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<heel::SandboxHandle, SpawnError>> + Send + '_>> {
+        Box::pin(async move {
+            let runtime = self.ensure_host_runtime().await?;
+            Ok(runtime.sandbox.handle())
+        })
+    }
+
+    async fn ensure_host_runtime(&self) -> Result<Arc<HostRuntime>, SpawnError> {
+        let heel = self.heel_binary()?.clone();
+        if self.inner.unconfined {
+            return self
+                .inner
+                .unconfined_host
+                .cell
+                .get_or_try_init(|| async {
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    let parent = match &self.inner.parent {
+                        Some(parent) => Some(parent.ensure_parent_handle().await?),
+                        None => None,
+                    };
+                    let mux = HostIpcMux::start(&self.inner.executor)?;
+                    let config = self.build_unconfined_config(
+                        heel,
+                        mux.endpoint(),
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        parent,
+                    );
+                    let sandbox = heel::Sandbox::with_config_and_executor(
+                        config,
+                        self.inner.executor.clone(),
+                    )
+                    .await
+                    .map_err(|error| SpawnError::Setup(error.to_string()))?;
+                    Ok(Arc::new(HostRuntime::new(sandbox, mux)))
+                })
+                .await
+                .cloned();
+        }
+
+        self.inner
+            .confined_host
+            .cell
+            .get_or_try_init(|| async {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                let parent = match &self.inner.parent {
+                    Some(parent) => Some(parent.ensure_parent_handle().await?),
+                    None => None,
+                };
+                let snapshot = self.inner.grants.snapshot();
+                let grants = self.confined_grants(&snapshot, Vec::new()).await?;
+                let mux = HostIpcMux::start(&self.inner.executor)?;
+                let gate = DomainGate {
+                    lists: self.inner.network.clone(),
+                    approver: self.inner.approver.clone(),
+                    agent: self.inner.agent.clone(),
+                };
+                if let Some(log) = self.inner.audit.clone() {
+                    let config = self.build_confined_config(
+                        Audited::new(gate, log),
+                        grants,
+                        &snapshot,
+                        heel,
+                        mux.endpoint(),
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        parent,
+                    );
+                    let sandbox = heel::Sandbox::with_config_and_executor(
+                        config,
+                        self.inner.executor.clone(),
+                    )
+                    .await
+                    .map_err(|error| SpawnError::Setup(error.to_string()))?;
+                    Ok(Arc::new(HostRuntime::new(sandbox, mux)))
+                } else {
+                    let config = self.build_confined_config(
+                        gate,
+                        grants,
+                        &snapshot,
+                        heel,
+                        mux.endpoint(),
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        parent,
+                    );
+                    let sandbox = heel::Sandbox::with_config_and_executor(
+                        config,
+                        self.inner.executor.clone(),
+                    )
+                    .await
+                    .map_err(|error| SpawnError::Setup(error.to_string()))?;
+                    Ok(Arc::new(HostRuntime::new(sandbox, mux)))
+                }
+            })
+            .await
+            .cloned()
+    }
+
+    /// Maps `host_pid` into the PID visible inside this host sandbox's
+    /// execution environment, or `None` when `host_pid` is outside it.
+    ///
+    /// # Errors
+    /// Returns an error if the host sandbox is not configured or fails to start.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub async fn pid_in_sandbox(&self, host_pid: u32) -> Result<Option<u32>, SpawnError> {
+        let runtime = self.ensure_host_runtime().await?;
+        Ok(runtime.sandbox.pid_in_sandbox(host_pid))
+    }
+
+    /// Resolves a live `sandbox_pid` inside this host sandbox back to its host OS PID.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn resolve_host_pid(&self, sandbox_pid: u32) -> Option<u32> {
+        if self.inner.unconfined {
+            return Some(sandbox_pid);
+        }
+        let runtime = self.ensure_host_runtime().await.ok()?;
+        #[cfg(target_os = "macos")]
+        {
+            runtime.sandbox.pid_in_sandbox(sandbox_pid)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+                if let Some(host_pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u32>().ok())
+                    && runtime.sandbox.pid_in_sandbox(host_pid) == Some(sandbox_pid)
+                {
+                    return Some(host_pid);
+                }
+            }
+            None
         }
     }
 
-    /// Starts `spec` on the host under heel and hands back the raw child, for
-    /// an embedder that supervises the job itself.
+    /// Starts `spec` on the host under this sandbox's persistent `heel::Sandbox`.
     pub(crate) async fn spawn_local(&self, spec: SpawnSpec) -> Result<LocalSpawn, SpawnError> {
-        let heel = self.heel_binary()?.clone();
+        let _ = self.heel_binary()?;
         let SpawnSpec {
             command,
             env,
             cwd,
             stdio,
             grants: extra_grants,
-            ipc,
+            ipc: router,
             lifetime,
             info,
         } = spec;
-        // A process on the host is a program: only a container or a server
-        // has a managed shell to run a script in.
         let SpawnCommand::Program { program, args } = command else {
             return Err(SpawnError::Unsupported {
                 backend: "host",
                 what: "a script",
             });
         };
-        let extra_grants = extra_grants
+        let mut extra_grants = extra_grants
             .into_iter()
             .map(|grant| match grant {
                 SpawnGrant::Host(grant) => Ok(grant),
@@ -275,116 +600,61 @@ impl Sandbox {
                 }),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let marker = JobMarker::new();
+
+        let runtime = self.ensure_host_runtime().await?;
         let mut env = self.host_environment(env, &info)?;
+        let ipc_lease: Option<HostIpcLease> = match router {
+            Some(router) => {
+                let lease = runtime.mux.register(router).await?;
+                let resolved_shim = resolved(lease.shim_dir())
+                    .map_err(|error| SpawnError::Setup(error.to_string()))?;
+                prepend_shim_path(&mut env, resolved_shim.as_ref());
+                extra_grants.push(Grant::new(resolved_shim, Access::READ | Access::EXEC));
+                Some(lease)
+            }
+            None => None,
+        };
+
+        let effective_cwd = cwd.map_or_else(
+            || self.canonical_working_dir(),
+            |cwd| std::fs::canonicalize(&cwd).unwrap_or(cwd),
+        );
+        let extras_lease = if self.inner.unconfined {
+            None
+        } else {
+            if matches!(effective_cwd.try_exists(), Ok(true)) {
+                let resolved_cwd = resolved(&effective_cwd)
+                    .map_err(|error| SpawnError::Setup(error.to_string()))?;
+                extra_grants.push(Grant::new(resolved_cwd, Access::READ | Access::EXEC));
+            }
+            let lease = runtime.acquire_extras(extra_grants);
+            let snapshot = self.inner.grants.snapshot();
+            let desired = self.confined_grants(&snapshot, Vec::new()).await?;
+            runtime.sync_grants(desired, &snapshot.read_denied).await?;
+            Some(lease)
+        };
+
+        let marker = JobMarker::new();
         env.push(marker.entry());
         let launch = Launch {
             program,
             args,
             env,
-            cwd,
+            cwd: effective_cwd,
             stdio,
             lifetime,
             marker,
         };
-        if self.inner.unconfined {
-            let config = self.unconfined_config(heel, ipc);
-            return self.launch(config, launch).await;
-        }
-        let snapshot = self.inner.grants.snapshot();
-        let grants = self.confined_grants(&snapshot, extra_grants).await?;
-        let gate = DomainGate {
-            lists: self.inner.network.clone(),
-            approver: self.inner.approver.clone(),
-            agent: self.inner.agent.clone(),
-        };
-        if let Some(log) = self.inner.audit.clone() {
-            let config =
-                self.confined_config(Audited::new(gate, log), grants, &snapshot, heel, ipc);
-            self.launch(config, launch).await
-        } else {
-            let config = self.confined_config(gate, grants, &snapshot, heel, ipc);
-            self.launch(config, launch).await
-        }
-    }
+        let (child, tree) = runtime
+            .sandbox
+            .spawn_boxed(launch, &self.inner.executor, self.inner.scanner.clone())
+            .await?;
 
-    async fn launch<N: NetworkPolicy + 'static>(
-        &self,
-        config: SandboxConfig<N>,
-        launch: Launch,
-    ) -> Result<LocalSpawn, SpawnError> {
-        let sandbox = heel::Sandbox::with_config_and_executor(config, self.inner.executor.clone())
-            .await
-            .map_err(|error| SpawnError::Setup(error.to_string()))?;
-        let Launch {
-            program,
-            args,
-            env,
-            cwd,
-            stdio,
-            lifetime,
-            marker,
-        } = launch;
-        let mut command = sandbox.command(program);
-        if let Some(cwd) = cwd {
-            command = command.current_dir(cwd);
-        }
-        let command = command
-            .args(args)
-            .envs(env)
-            .stdin(stdio_config(stdio.stdin))
-            .stdout(stdio_config(stdio.stdout))
-            .stderr(stdio_config(stdio.stderr));
-        let start = |error: heel::Error| SpawnError::Start(error.to_string());
-
-        // On Linux the sandbox was built with `supervised_spawn(true)`, so the
-        // command runs under `heel supervise`: a child subreaper inside the
-        // sandbox that owns the whole tree however its members change
-        // session, group or environment.
-        #[cfg(target_os = "linux")]
-        {
-            let _ = marker;
-            let reap_timeout = crate::terminal::SUPERVISED_REAP_TIMEOUT;
-            let child = match lifetime {
-                TreeLifetime::Foreground => LocalChild::Foreground(
-                    command
-                        .spawn_supervised(heel::supervisor::Foreground { reap_timeout })
-                        .await
-                        .map_err(start)?,
-                ),
-                TreeLifetime::Background => LocalChild::Background(
-                    command
-                        .spawn_supervised(heel::supervisor::Background { reap_timeout })
-                        .await
-                        .map_err(start)?,
-                ),
-            };
-            let tree = JobTree::supervised(child.tree_control());
-            Ok(LocalSpawn {
-                child,
-                tree,
-                sandbox: Box::new(sandbox),
-            })
-        }
-
-        // Everywhere else the root's process group is watched through the
-        // process table, keyed by the job's marker.
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = lifetime;
-            let child = command.spawn().await.map_err(start)?;
-            let tree = JobTree::spawn(
-                &self.inner.executor,
-                self.inner.scanner.clone(),
-                child.id(),
-                &marker,
-            );
-            Ok(LocalSpawn {
-                child: LocalChild::Plain(child),
-                tree,
-                sandbox: Box::new(sandbox),
-            })
-        }
+        Ok(LocalSpawn {
+            child,
+            tree,
+            sandbox: Box::new((runtime, ipc_lease, extras_lease)),
+        })
     }
 
     pub(super) async fn spawn_host(&self, spec: SpawnSpec) -> Result<SandboxedChild, SpawnError> {
@@ -395,7 +665,8 @@ impl Sandbox {
             tree,
             sandbox,
         } = self.spawn_local(spec).await?;
-        let id = child.id();
+        let sandbox_id = child.sandbox_id();
+        let host_id = child.id();
 
         let mut streams = Streams::default();
         let mut stdin_watch = None;
@@ -404,11 +675,10 @@ impl Sandbox {
         {
             let feed = FeedCounter::default();
             let (signal_tx, signal_rx) = async_channel::unbounded();
-            match LocalStdinProbe::new(id, &stdin) {
+            match LocalStdinProbe::new(host_id, &stdin) {
                 Ok(probe) => {
                     stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
                 }
-                // The watch cannot run: say so once, as a running watch would.
                 Err(error) => {
                     let _ = signal_tx.try_send(StdinWatchSignal::Failed(error.to_string()));
                 }
@@ -432,15 +702,15 @@ impl Sandbox {
         self.inner
             .executor
             .spawn(async move {
-                // Dropping heel's sandbox ends the processes under it.
                 let _sandbox = sandbox;
                 let (exit, descendants) =
                     wait_for_exit(&mut child, &watched, lifetime, stdin_watch).await;
                 setter.finish(exit, descendants);
             })
             .detach();
-        Ok(SandboxedChild::new(
-            id,
+        Ok(SandboxedChild::with_host_id(
+            sandbox_id,
+            host_id,
             streams,
             KillHandle::Tree(tree),
             watch,
@@ -460,17 +730,14 @@ fn pump(file: std::fs::File) -> async_channel::Receiver<Vec<u8>> {
 }
 
 /// Waits until the root process has exited and then ends its descendants as
-/// `lifetime` says: a foreground child's are killed, a background child's
-/// waited for. The root stays unreaped until its tree is gone, so its pid and
-/// process group stay reserved while the job's descendants are tracked by
-/// them.
+/// `lifetime` says.
 async fn wait_for_exit(
     child: &mut LocalChild,
     tree: &JobTree,
     lifetime: TreeLifetime,
-    stdin_watch: Option<LocalStdinWatch>,
+    mut stdin_watch: Option<LocalStdinWatch>,
 ) -> (ChildExit, Descendants) {
-    let exited = match wait_for_local_process_exit(child, stdin_watch).await {
+    let (status, report) = match wait_for_local_process_exit(child, stdin_watch.as_mut()).await {
         Ok(exited) => exited,
         Err(error) => {
             tree.finish().await;
@@ -486,41 +753,34 @@ async fn wait_for_exit(
             .kill_descendants()
             .await
             .map(|processes| killed = processes),
-        TreeLifetime::Background => tree.wait_descendants_exit().await,
+        TreeLifetime::Background => match stdin_watch.as_mut() {
+            Some(watch) => {
+                futures_lite::future::or(tree.wait_descendants_exit(), async {
+                    match watch.run_borrowed().await {}
+                })
+                .await
+            }
+            None => tree.wait_descendants_exit().await,
+        },
     };
-    // The task ends first: afterwards the root's pid may belong to anyone.
     tree.finish().await;
-    let status = match exited {
-        Some(status) => Ok(status),
-        None => child
-            .wait_reported()
-            .await
-            .map(|(status, report)| {
-                // A supervised foreground job's teardown killed what it found.
-                #[cfg(target_os = "linux")]
-                if let Some(report) = report {
-                    killed.extend(report.killed.into_iter().map(|process| JobProcess {
-                        pid: process.pid,
-                        name: process.name,
-                    }));
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = report;
-                status
-            })
-            .map_err(|error| error.to_string()),
-    };
-    // A kill that failed ended an unknown part of the tree, so what it did
-    // name is not the whole of it; Windows sees no descendants at all.
+    #[cfg(target_os = "linux")]
+    if let Some(report) = report {
+        killed.extend(report.killed.into_iter().map(|process| JobProcess {
+            pid: process.pid,
+            name: process.name,
+        }));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = report;
     let descendants = if cfg!(windows) || ended.is_err() {
         Descendants::Unobserved
     } else {
         Descendants::Killed(killed)
     };
-    let exit = match (ended, status) {
-        (Ok(()), Ok(status)) => ChildExit::Exited(status),
-        (Err(error), _) => ChildExit::Failed(error.to_string()),
-        (Ok(()), Err(error)) => ChildExit::Failed(error),
+    let exit = match ended {
+        Ok(()) => ChildExit::Exited(status),
+        Err(error) => ChildExit::Failed(error.to_string()),
     };
     (exit, descendants)
 }
