@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/aither-connectivity-v0.31.0...aither-connectivity-v0.32.0) - 2026-11-21
+
+### Fixed
+
+- *(connectivity)* box linux watcher futures to avoid large_futures lint
+- *(models,skills,attachments,connectivity)* address review feedback on #796
+- *(models,skills,attachments,connectivity)* fix pricing mapping, fallible fetch, path validation, and Linux watchers
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/aither-connectivity-v0.30.0...aither-connectivity-v0.31.0) - 2026-11-13
 
 ### Added

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/sandbox-v0.31.0...sandbox-v0.32.0) - 2026-11-21
+
+### Fixed
+
+- *(sandbox)* keep the heel-shim file stem when the IPC prelude renames it
+- *(sandbox)* treat an exec inside load_elf_interp as moving in container_job.sh
+- *(sandbox)* fail closed on canonicalize errors and dangling symlinks in container IPC working dir
+- *(sandbox,tools,cli)* complete approval gating and job lifecycle hardening
+- *(sandbox,tools,cli)* harden ContainerIpc, SSRF/path guards, job buffers, Magika pooling, and CLI approvals
+- *(core,derive)* fix schema/macro correctness, feature gates, token counting, and command rendering
+
+### Other
+
+- Pass only fixed_grants to macOS SandboxConfig::grants
+- Re-export LaunchLease from aither-sandbox root
+- Keep internal host_pid and launch off public JobInfo
+- Merge pull request #819 from May-Agent/feat/816-pid-jobs
+- Merge remote-tracking branch 'origin/main' into feat/816-pid-jobs
+- Expose real PIDs for jobs and enforce signal isolation in heel
+- Replace anyhow with typed errors across the workspace
+- Merge remote-tracking branch 'origin/main' into fix/793-sandbox-tools
+- Test run_service jobs carry no bound
+- Add Shell::run_service for unbounded session-scoped jobs
+- *(sandbox)* await each monitored line before rotating followed.log
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/sandbox-v0.30.0...sandbox-v0.31.0) - 2026-11-13
 
 ### Added

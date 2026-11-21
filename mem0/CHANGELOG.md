@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/mem0-v0.31.0...mem0-v0.32.0) - 2026-11-21
+
+### Fixed
+
+- *(acp,mem0)* harden acp rpc and prompt rendering
+- *(mcp,acp,rag,mem0)* harden protocol, rag, and mem0 crates
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/mem0-v0.30.0...mem0-v0.31.0) - 2026-11-13
 
 ### Added

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/derive-v0.31.0...derive-v0.32.0) - 2026-11-21
+
+### Fixed
+
+- *(core,derive)* fix schema/macro correctness, feature gates, token counting, and command rendering
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+
 ## [0.11.0](https://github.com/lexoliu/aither/compare/derive-v0.10.1...derive-v0.11.0) - 2026-10-29
 
 ### Fixed
