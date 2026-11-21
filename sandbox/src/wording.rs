@@ -342,8 +342,8 @@ impl<R> Refused<R> {
 
 impl Refused<CallRefusal> {
     /// The error of a call refused for `refusal`, worded by `wording`.
-    pub(crate) fn call(wording: &dyn ShellWording, refusal: CallRefusal) -> anyhow::Error {
-        Self::rendered(refusal, |refusal| wording.call_refused(refusal)).into()
+    pub(crate) fn call(wording: &dyn ShellWording, refusal: CallRefusal) -> Self {
+        Self::rendered(refusal, |refusal| wording.call_refused(refusal))
     }
 }
 

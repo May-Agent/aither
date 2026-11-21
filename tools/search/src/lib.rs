@@ -466,12 +466,13 @@ where
 
     type Arguments = SearchArgs;
     type Res = ToolResult;
+    type Error = SearchToolError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         _cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         let result = async {
             let mut args = Self::normalize_args(arguments)?;
             if let Some(path) = args.path.as_deref() {
@@ -1662,6 +1663,8 @@ mod tests {
     struct NoopEmbedding;
 
     impl EmbeddingModel for NoopEmbedding {
+        type Error = core::convert::Infallible;
+
         fn dim(&self) -> usize {
             3
         }
@@ -1669,7 +1672,7 @@ mod tests {
         fn embed(
             &self,
             _text: &str,
-        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+        ) -> impl std::future::Future<Output = Result<Vec<f32>, Self::Error>> + Send {
             std::future::ready(Ok(vec![0.0, 0.0, 0.0]))
         }
     }

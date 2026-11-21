@@ -3,7 +3,8 @@
 //! All registered tools are always loaded into the LLM context.
 
 use aither_core::llm::tool::{
-    RegisterError, Tool, ToolContext, ToolDefinition, ToolResult, Tools as CoreTools,
+    RegisterError, Tool, ToolContext, ToolDefinition, ToolDispatchError, ToolResult,
+    Tools as CoreTools,
 };
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
@@ -97,7 +98,7 @@ impl AgentTools {
         name: &str,
         args: &str,
         cx: ToolContext,
-    ) -> aither_core::Result<ToolResult> {
+    ) -> Result<ToolResult, ToolDispatchError> {
         if self.eager.definitions().iter().any(|d| d.name() == name) {
             return self.eager.call(name, args, cx).await;
         }
@@ -106,19 +107,30 @@ impl AgentTools {
         for conn in &self.mcp {
             if conn.has_tool(name) {
                 let args_value: serde_json::Value =
-                    serde_json::from_str(args).map_err(|e| anyhow::anyhow!("Invalid JSON: {e}"))?;
+                    serde_json::from_str(args).map_err(|source| {
+                        ToolDispatchError::InvalidArguments {
+                            tool: name.to_string(),
+                            source,
+                        }
+                    })?;
 
-                let result = conn
-                    .call(name, args_value)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"))?;
+                let result = conn.call(name, args_value).await.map_err(|e| {
+                    ToolDispatchError::Execution {
+                        tool: name.to_string(),
+                        source: Box::new(e),
+                    }
+                })?;
 
-                return aither_mcp::call_result_to_tool_result(result)
-                    .map_err(|e| anyhow::anyhow!("MCP tool error: {e}"));
+                return aither_mcp::call_result_to_tool_result(result).map_err(|e| {
+                    ToolDispatchError::Execution {
+                        tool: name.to_string(),
+                        source: Box::new(e),
+                    }
+                });
             }
         }
 
-        Err(anyhow::anyhow!("Tool '{name}' not found"))
+        Err(ToolDispatchError::NotFound(name.to_string()))
     }
 
     /// Returns a reference to the underlying eager tools.
@@ -182,11 +194,13 @@ mod tests {
 
         type Res = ToolResult;
 
+        type Error = core::convert::Infallible;
+
         fn call(
             &self,
             _args: Self::Arguments,
             _cx: aither_core::llm::ToolContext,
-        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+        ) -> impl std::future::Future<Output = Result<Self::Res, Self::Error>> + Send {
             std::future::ready(Ok(ToolResult::text("ok")))
         }
     }
@@ -205,11 +219,13 @@ mod tests {
 
         type Res = ToolResult;
 
+        type Error = core::convert::Infallible;
+
         fn call(
             &self,
             _args: Self::Arguments,
             _cx: aither_core::llm::ToolContext,
-        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+        ) -> impl std::future::Future<Output = Result<Self::Res, Self::Error>> + Send {
             std::future::ready(Ok(ToolResult::image(
                 vec![0x89, b'P', b'N', b'G'],
                 "image/png",

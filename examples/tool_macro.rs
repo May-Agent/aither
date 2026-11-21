@@ -6,11 +6,11 @@
 //! Run this example with: `cargo run --example tool_macro`
 
 #![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
 #![allow(missing_docs)]
 #![allow(clippy::unused_async)]
-use aither::Result;
 use aither::llm::ToolContext;
-use aither::llm::tool::Progress;
+use aither::llm::tool::{Progress, ProgressError};
 use aither_derive::tool;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -19,14 +19,17 @@ use serde::Deserialize;
 // tool description.
 /// Get the current UTC time.
 #[tool]
-pub async fn time() -> Result<&'static str> {
+pub async fn time() -> Result<&'static str, core::convert::Infallible> {
     Ok("2023-10-01T12:00:00Z")
 }
 
 // Tool with multiple simple parameters
 /// Search the web for the given keywords.
 #[tool]
-pub async fn search(keywords: Vec<String>, max_results: u32) -> Result<String> {
+pub async fn search(
+    keywords: Vec<String>,
+    max_results: u32,
+) -> Result<String, core::convert::Infallible> {
     // Simulate a search result
     let results = keywords
         .into_iter()
@@ -47,7 +50,7 @@ pub struct GenerateImageArgs {
 
 // Tool with complex documented arguments using a single struct parameter
 #[tool]
-pub async fn generate_image(args: GenerateImageArgs) -> aither::Result<String> {
+pub async fn generate_image(args: GenerateImageArgs) -> Result<String, core::convert::Infallible> {
     let file_name = format!("image_{}.png", args.prompt.replace(' ', "_"));
     // Simulate image generation
     Ok(format!(
@@ -61,8 +64,8 @@ pub async fn generate_image(args: GenerateImageArgs) -> aither::Result<String> {
 // no-op when the caller does not listen for progress.
 /// Fetch every URL, reporting each one as it completes.
 #[tool]
-pub async fn crawl(urls: Vec<String>, mut cx: ToolContext) -> Result<String> {
-    let total = u32::try_from(urls.len())?;
+pub async fn crawl(urls: Vec<String>, mut cx: ToolContext) -> Result<String, ProgressError> {
+    let total = u32::try_from(urls.len()).expect("url count fits u32");
     for (done, url) in (1..=total).zip(&urls) {
         // Simulate fetching `url`
         let progress = Progress::new(f64::from(done))

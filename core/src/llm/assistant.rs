@@ -78,8 +78,9 @@ impl<LLM: LanguageModel> Assistant<LLM> {
     /// - `message`: The user message to send to the assistant.
     ///
     /// # Errors
-    /// Returns an error if the language model fails to generate a response or if message processing fails.
-    pub async fn send(&mut self, message: impl Into<String>) -> anyhow::Result<()> {
+    /// Returns [`LanguageModel::Error`] if the language model fails to
+    /// generate a response.
+    pub async fn send(&mut self, message: impl Into<String>) -> Result<(), LLM::Error> {
         self.messages.push(Message::user(message));
         let request = LLMRequest::new(self.messages.as_slice()).with_tools(&mut self.tools);
         let stream = self.llm.respond_with_tools(request);

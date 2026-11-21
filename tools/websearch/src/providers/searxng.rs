@@ -8,7 +8,7 @@
 //! ```no_run
 //! use aither_websearch::{SearXNG, SearchProvider};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Use the default public endpoint
 //! let provider = SearXNG::default();
 //! let results = provider.search("rust programming", 5).await?;
@@ -19,8 +19,7 @@
 //! # }
 //! ```
 
-use crate::{SearchProvider, SearchResult};
-use anyhow::{Result, anyhow};
+use crate::{SearchError, SearchProvider, SearchResult};
 use serde::Deserialize;
 use std::fmt::Write as _;
 use zenwave::{Client, client, header};
@@ -83,7 +82,7 @@ impl SearXNG {
 }
 
 impl SearchProvider for SearXNG {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, SearchError> {
         ensure_rustls_provider();
         let mut url = format!(
             "{}/search?q={}&format=json",
@@ -98,14 +97,14 @@ impl SearchProvider for SearXNG {
         let mut backend = client();
         let response: SearxngResponse = backend
             .get(&url)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::ACCEPT.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json()
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(SearchError::from)?;
 
         // Check for CAPTCHA errors when no results
         if response.results.is_empty() {
@@ -117,10 +116,10 @@ impl SearchProvider for SearXNG {
                 .collect();
 
             if !captcha_engines.is_empty() {
-                return Err(anyhow!(
+                return Err(SearchError::Captcha(format!(
                     "CAPTCHA detected for engines: {}. Try a different SearXNG instance.",
                     captcha_engines.join(", ")
-                ));
+                )));
             }
         }
 

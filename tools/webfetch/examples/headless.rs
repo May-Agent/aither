@@ -6,7 +6,7 @@
 use aither_webfetch::{fetch_html_raw, fetch_with_browser};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().collect();
     let raw_mode = args.iter().any(|a| a == "--raw");
     let url = args

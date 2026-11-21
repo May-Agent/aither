@@ -16,7 +16,7 @@
 //! ```no_run
 //! use aither_websearch::{GoogleSearch, SearchProvider};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let provider = GoogleSearch::new("YOUR_API_KEY", "YOUR_SEARCH_ENGINE_ID");
 //! let results = provider.search("machine learning tutorials", 5).await?;
 //! for result in results {
@@ -26,8 +26,7 @@
 //! # }
 //! ```
 
-use crate::{SearchProvider, SearchResult};
-use anyhow::{Result, anyhow};
+use crate::{SearchError, SearchProvider, SearchResult};
 use serde::Deserialize;
 use zenwave::{Client, client, header};
 
@@ -61,7 +60,7 @@ impl GoogleSearch {
 }
 
 impl SearchProvider for GoogleSearch {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, SearchError> {
         // Google CSE has a max of 10 results per request
         let num = limit.min(10);
 
@@ -77,14 +76,14 @@ impl SearchProvider for GoogleSearch {
         let mut backend = client();
         let response: GoogleResponse = backend
             .get(&url)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::ACCEPT.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json()
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(SearchError::from)?;
 
         Ok(response
             .items

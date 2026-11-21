@@ -4,13 +4,13 @@
 
 use std::sync::mpsc;
 
-use aither::llm::tool::{Progress, ProgressSink, Tools};
+use aither::llm::tool::{Progress, ProgressError, ProgressSink, Tools};
 use aither::llm::{Tool, ToolContext};
 use aither_derive::tool;
 
 /// Counts up to `steps`, reporting each step as progress.
 #[tool]
-async fn count(steps: u32, mut cx: ToolContext, label: String) -> aither::Result<String> {
+async fn count(steps: u32, mut cx: ToolContext, label: String) -> Result<String, ProgressError> {
     for step in 1..=steps {
         cx.report_progress(Progress::new(f64::from(step)).with_total(f64::from(steps)))
             .await?;

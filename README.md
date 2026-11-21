@@ -66,7 +66,7 @@ use aither::{LanguageModel, llm::{Event, LLMRequest, Message}};
 use aither_openai::OpenAI;
 use futures_lite::StreamExt;
 
-async fn basic_chat(api_key: &str) -> anyhow::Result<String> {
+async fn basic_chat(api_key: &str) -> Result<String, Box<dyn std::error::Error>> {
     let model = OpenAI::new(api_key);
     let request = LLMRequest::new([
         Message::system("You are a multilingual assistant."),
@@ -92,7 +92,9 @@ Reasoning-focused models (OpenAI O-series, Gemini Flash Thinking, etc.) expose c
 use aither::{LanguageModel, llm::{Event, LLMRequest, Message, model::Parameters}};
 use futures_lite::StreamExt;
 
-async fn inspect_reasoning(model: impl LanguageModel) -> anyhow::Result<()> {
+async fn inspect_reasoning(
+    model: impl LanguageModel,
+) -> Result<(), Box<dyn std::error::Error>> {
     let request = LLMRequest::new([
         Message::user("Solve 24 using numbers 4,4,4,4."),
     ])

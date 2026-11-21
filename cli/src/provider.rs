@@ -1,7 +1,7 @@
 //! Provider detection and construction for the CLI.
 
 use aither_cloud::{Claude, CloudProvider, Gemini, OpenAI};
-use anyhow::{Result, bail};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Supported cloud providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,7 +69,7 @@ impl Provider {
     /// Returns an error if the provider's API-key environment variable is unset.
     pub fn create(self, model: &str, base_url: Option<&str>) -> Result<CloudProvider> {
         let api_key = std::env::var(self.env_var())
-            .map_err(|_| anyhow::anyhow!("Set {} in your environment", self.env_var()))?;
+            .map_err(|_| format!("Set {} in your environment", self.env_var()))?;
 
         Ok(match self {
             Self::OpenAI => {
@@ -114,7 +114,7 @@ impl std::fmt::Display for Provider {
 impl std::str::FromStr for Provider {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Self::parse(s).ok_or_else(|| format!("Unknown provider: {s}"))
     }
 }
@@ -147,5 +147,5 @@ pub fn auto_detect(model: Option<&str>, base_url: Option<&str>) -> Result<(Cloud
         }
     }
 
-    bail!("No API key found. Set one of: GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY");
+    Err("No API key found. Set one of: GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY".into())
 }

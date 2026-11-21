@@ -16,6 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     impl Tool for Add {
         type Arguments = Arguments;
         type Res = ToolResult;
+        type Error = core::convert::Infallible;
         fn name(&self) -> Cow<'static, str> {
             "add".into()
         }
@@ -26,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &self,
             args: Arguments,
             _: ToolContext,
-        ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
+        ) -> impl Future<Output = Result<ToolResult, Self::Error>> + Send {
             std::future::ready(Ok(ToolResult::text(
                 (i64::from(args.left) + i64::from(args.right)).to_string(),
             )))

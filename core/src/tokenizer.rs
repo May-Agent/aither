@@ -445,12 +445,14 @@ mod tests {
             }
             type Arguments = LineCountArgs;
             type Res = ToolResult;
+            type Error = core::convert::Infallible;
 
             fn call(
                 &self,
                 _args: Self::Arguments,
                 _cx: ToolContext,
-            ) -> impl core::future::Future<Output = crate::Result<Self::Res>> + Send {
+            ) -> impl core::future::Future<Output = Result<Self::Res, Self::Error>> + Send
+            {
                 core::future::ready(Ok(ToolResult::Done))
             }
         }

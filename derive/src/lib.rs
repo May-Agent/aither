@@ -12,7 +12,6 @@
 //! none, the rustdoc on its single Args struct:
 //!
 //! ```rust
-//! use aither::Result;
 //! use aither_derive::tool;
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
@@ -22,10 +21,14 @@
 //! pub struct GetTimeArgs;
 //!
 //! #[tool]
-//! pub async fn get_time(_args: GetTimeArgs) -> Result<&'static str> {
-//!     Ok("2023-10-01T12:00:00Z")
+//! pub async fn get_time(_args: GetTimeArgs) -> &'static str {
+//!     "2023-10-01T12:00:00Z"
 //! }
 //! ```
+//!
+//! A function returning `Result<T, E>` fails with `E` as its
+//! [`Tool::Error`](aither_core::llm::Tool::Error); any other return type makes
+//! the tool infallible.
 //!
 //! ## Requirements
 //!
@@ -210,6 +213,34 @@ fn is_field_attr(attr: &Attribute) -> bool {
     attr.path().is_ident("doc") || attr.path().is_ident("serde") || attr.path().is_ident("schemars")
 }
 
+/// The tool's `Error` type and the call expression the impl emits: a
+/// `Result<T, E>` return makes `E` the error and the call `?`-propagates;
+/// anything else stays infallible.
+fn tool_error_and_call(
+    input_fn: &ItemFn,
+    call_expr: &proc_macro2::TokenStream,
+    krate: &syn::Path,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let error_ty = match &input_fn.sig.output {
+        syn::ReturnType::Type(_, ty) => result_error_type(ty).cloned(),
+        syn::ReturnType::Default => None,
+    };
+    error_ty.map_or_else(
+        || {
+            (
+                quote! { ::core::convert::Infallible },
+                quote! { #krate::llm::IntoToolResult::into_tool_result(#call_expr) },
+            )
+        },
+        |error_ty| {
+            (
+                quote! { #error_ty },
+                quote! { #krate::llm::IntoToolResult::into_tool_result(#call_expr?) },
+            )
+        },
+    )
+}
+
 /// Implementation details for the `#[tool]` macro.
 fn tool_impl(args: ToolArgs, mut input_fn: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     if !input_fn.sig.generics.params.is_empty() {
@@ -285,6 +316,11 @@ fn tool_impl(args: ToolArgs, mut input_fn: ItemFn) -> syn::Result<proc_macro2::T
     }
     let call_expr = quote! { #fn_name(#(#call_args),*).await };
 
+    // A `Result<T, E>` return type makes `E` the tool's error; anything else —
+    // including single-argument aliases like `io::Result<T>` — converts through
+    // `IntoToolResult` and stays infallible.
+    let (error_type, call_body) = tool_error_and_call(&input_fn, &call_expr, &krate);
+
     let extractor = if uses_generated_struct {
         quote! { let Self::Arguments { #(#params),* } = args; }
     } else {
@@ -318,19 +354,48 @@ fn tool_impl(args: ToolArgs, mut input_fn: ItemFn) -> syn::Result<proc_macro2::T
             #description
             type Arguments = #args_type;
             type Res = #krate::llm::ToolResult;
+            type Error = #error_type;
 
             async fn call(
                 &self,
                 #args_binding: Self::Arguments,
                 #context_binding: #krate::llm::ToolContext,
-            ) -> #krate::Result<Self::Res> {
+            ) -> ::core::result::Result<Self::Res, Self::Error> {
                 #extractor
-                #krate::llm::IntoToolResult::into_tool_result(#call_expr)
+                ::core::result::Result::Ok(#call_body)
             }
         }
     };
 
     Ok(expanded)
+}
+
+/// The `E` in a `Result<T, E>` return type, when the function returns one.
+///
+/// A single generic argument is a `Result<T>`-style alias whose error type
+/// cannot be named here; it converts through `IntoToolResult` instead.
+fn result_error_type(ty: &Type) -> Option<&Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    let mut types = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    match (types.next(), types.next(), types.next()) {
+        (Some(_ok), Some(error), None) => Some(error),
+        _ => None,
+    }
 }
 
 /// The text of the `///` comments in `attrs`, one line per attribute with the

@@ -9,12 +9,41 @@ use std::{
 
 use aither_core::llm::ToolContext;
 use aither_core::llm::{Tool, ToolResult};
-use anyhow::{Context, Result, bail};
 use askama::Template;
 use async_process::Command;
 use futures_lite::io::AsyncReadExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Why a [`CommandTool`] call failed.
+#[derive(Debug, thiserror::Error)]
+pub enum CommandToolError {
+    /// The program is not in the tool's allow list.
+    #[error("Program '{program}' is not allowed. Allowed commands: {allowed}")]
+    NotAllowed {
+        /// Program the model asked to run.
+        program: String,
+        /// The allow list, joined for display.
+        allowed: String,
+    },
+    /// Spawning or awaiting the process failed.
+    #[error("failed to run '{program}' in {cwd}: {source}")]
+    Run {
+        /// Program that was executed.
+        program: String,
+        /// Working directory it ran in.
+        cwd: String,
+        /// The underlying IO failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The process ended without an exit code or signal.
+    #[error("process ended with neither an exit code nor a signal: {0}")]
+    UnknownTermination(ExitStatus),
+    /// Rendering the tool's output failed.
+    #[error("{0}")]
+    Render(#[from] askama::Error),
+}
 
 /// Execute a shell command with arguments.
 ///
@@ -63,7 +92,7 @@ impl Termination {
     /// # Errors
     /// Fails when the process neither exited with a code nor was killed by a
     /// signal, which the platform does not report.
-    pub fn of(status: ExitStatus) -> Result<Self> {
+    pub fn of(status: ExitStatus) -> Result<Self, CommandToolError> {
         if let Some(code) = status.code() {
             return Ok(Self::Exited(code));
         }
@@ -71,7 +100,7 @@ impl Termination {
         if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
             return Ok(Self::Signaled(signal));
         }
-        bail!("process ended with neither an exit code nor a signal: {status}")
+        Err(CommandToolError::UnknownTermination(status))
     }
 }
 
@@ -132,14 +161,14 @@ impl CommandTool {
         self
     }
 
-    fn ensure_allowed(&self, program: &str) -> Result<()> {
+    fn ensure_allowed(&self, program: &str) -> Result<(), CommandToolError> {
         if let Some(allowed) = &self.allowed
             && !allowed.iter().any(|entry| entry == program)
         {
-            bail!(
-                "Program '{program}' is not allowed. Allowed commands: {}",
-                allowed.join(", ")
-            );
+            return Err(CommandToolError::NotAllowed {
+                program: program.to_string(),
+                allowed: allowed.join(", "),
+            });
         }
         Ok(())
     }
@@ -168,12 +197,13 @@ impl Tool for CommandTool {
 
     type Arguments = CommandArgs;
     type Res = ToolResult;
+    type Error = CommandToolError;
 
     async fn call(
         &self,
         arguments: Self::Arguments,
         cx: ToolContext,
-    ) -> aither_core::Result<Self::Res> {
+    ) -> Result<Self::Res, Self::Error> {
         self.ensure_allowed(&arguments.program)?;
 
         let working_dir = arguments.cwd.unwrap_or_else(|| self.default_cwd.clone());
@@ -185,12 +215,10 @@ impl Tool for CommandTool {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to execute '{}' in {}",
-                    arguments.program,
-                    working_dir.display()
-                )
+            .map_err(|source| CommandToolError::Run {
+                program: arguments.program.clone(),
+                cwd: working_dir.display().to_string(),
+                source,
             })?;
 
         let stdout_pipe = child.stdout.take();
@@ -218,12 +246,10 @@ impl Tool for CommandTool {
             ))
         })
         .await
-        .with_context(|| {
-            format!(
-                "failed while running '{}' in {}",
-                arguments.program,
-                working_dir.display()
-            )
+        .map_err(|source| CommandToolError::Run {
+            program: arguments.program.clone(),
+            cwd: working_dir.display().to_string(),
+            source,
         })?;
 
         let response = CommandOutput {

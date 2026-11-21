@@ -279,7 +279,7 @@ async fn run_socks5_gate<R, P>(
     resolver: R,
     policy: P,
     refusal: Arc<Mutex<Option<UrlPolicyError>>>,
-) -> Result<GuardedHttpResponse, anyhow::Error>
+) -> Result<GuardedHttpResponse, GuardedGetError>
 where
     R: Resolver,
     P: AddressPolicy,
@@ -304,7 +304,7 @@ where
             }));
         }
         active.retain_mut(|fut| fut.as_mut().poll(cx).is_pending());
-        Poll::<Result<GuardedHttpResponse, anyhow::Error>>::Pending
+        Poll::<Result<GuardedHttpResponse, GuardedGetError>>::Pending
     })
     .await
 }
@@ -320,7 +320,7 @@ pub(crate) async fn guarded_get<R, P>(
     timeout: Duration,
     resolver: R,
     policy: P,
-) -> Result<GuardedHttpResponse, anyhow::Error>
+) -> Result<GuardedHttpResponse, GuardedGetError>
 where
     R: Resolver,
     P: AddressPolicy,
@@ -336,7 +336,7 @@ where
     let transport = Transport::builder()
         .proxy(proxy)
         .build()
-        .map_err(|e| anyhow::anyhow!("transport build failed: {e}"))?;
+        .map_err(|e| GuardedGetError::Transport(e.into()))?;
 
     let gate_future = run_socks5_gate(listener, resolver, policy, Arc::clone(&refusal));
 
@@ -347,7 +347,7 @@ where
             let mut backend = DefaultClient::raw(transport.clone()).timeout(timeout);
             let mut builder = backend
                 .get(current.as_str())
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(|e| GuardedGetError::Transport(e.into()))?;
             let same_origin = current.origin() == initial_origin;
             for (name, value) in headers {
                 if !same_origin
@@ -359,7 +359,7 @@ where
                 }
                 builder = builder
                     .header(*name, value.clone())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(|e| GuardedGetError::Transport(e.into()))?;
             }
             let response = match builder.await {
                 Ok(resp) => resp,
@@ -371,7 +371,7 @@ where
                     if let Some(policy_err) = taken_refusal {
                         return Err(policy_err.into());
                     }
-                    return Err(anyhow::anyhow!("{err}"));
+                    return Err(GuardedGetError::Transport(err.into()));
                 }
             };
 
@@ -389,18 +389,18 @@ where
             let response = response
                 .error_for_status()
                 .await
-                .map_err(|err| anyhow::anyhow!("{err}"))?;
+                .map_err(|err| GuardedGetError::Transport(err.into()))?;
             let resp_headers = response.headers().clone();
             let bytes = response
                 .into_bytes_with_limit(MAX_HTTP_BODY_BYTES)
                 .await
-                .map_err(|e| anyhow::Error::from(DecodeFailure(format!("{e}"))))?;
+                .map_err(|e| GuardedGetError::from(DecodeFailure(e.to_string())))?;
             return Ok(GuardedHttpResponse {
                 headers: resp_headers,
                 body: bytes.to_vec(),
             });
         }
-        Err(anyhow::anyhow!("too many HTTP redirects"))
+        Err(GuardedGetError::RedirectLimit)
     };
 
     futures_lite::future::or(request_future, gate_future).await
@@ -409,6 +409,26 @@ where
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct DecodeFailure(pub String);
+
+/// Why a guarded HTTP `GET` failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GuardedGetError {
+    /// The URL policy refused the target.
+    #[error("{0}")]
+    Policy(#[from] UrlPolicyError),
+    /// The local gate or an I/O step failed.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    /// Decoding the response body failed.
+    #[error("{0}")]
+    Decode(#[from] DecodeFailure),
+    /// The HTTP transport or the request itself failed.
+    #[error("{0}")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The redirect chain exceeded the limit.
+    #[error("too many HTTP redirects")]
+    RedirectLimit,
+}
 
 fn parse_http_url(raw: &str) -> Result<Url, UrlPolicyError> {
     let url = Url::parse(raw)?;

@@ -132,7 +132,6 @@ aither-gemini.workspace = true
 aither-mem0.workspace = true
 aither-webfetch.workspace = true
 aither-rag.workspace = true
-anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = "0.4"

@@ -113,6 +113,7 @@ impl LanguageModel for Llama {
 }
 
 impl EmbeddingModel for Llama {
+    type Error = LlamaError;
     fn dim(&self) -> usize {
         usize::try_from(self.model.n_embd())
             .expect("llama embedding dimension must be non-negative")
@@ -121,7 +122,7 @@ impl EmbeddingModel for Llama {
     fn embed(
         &self,
         text: &str,
-    ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+    ) -> impl std::future::Future<Output = Result<Vec<f32>, Self::Error>> + Send {
         let model = self.model.clone();
         let backend = self.backend.clone();
         let cfg = self.inner.clone();

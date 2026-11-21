@@ -7,13 +7,17 @@ use std::io::{self, Write};
 use aither::llm::{Event, LLMRequest};
 use aither_core::{LanguageModel, llm::Message};
 use aither_openai::{GPT5_MINI, OpenAI};
-use anyhow::{Context, Result};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 use futures_lite::{StreamExt, pin};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .context("set OPENROUTER_API_KEY in your environment")?;
+    let api_key = std::env::var("OPENROUTER_API_KEY").map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("set OPENROUTER_API_KEY in your environment: {e}").into()
+        },
+    )?;
 
     let model = OpenAI::openrouter(api_key).with_model(GPT5_MINI);
     let mut messages = vec![Message::system(

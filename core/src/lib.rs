@@ -39,7 +39,9 @@
 //! use aither_core::llm::{LanguageModel, Event, Message, LLMRequest, model::Parameters};
 //! use futures_lite::StreamExt;
 //!
-//! async fn event_demo(model: impl LanguageModel) -> aither_core::Result {
+//! async fn event_demo<M: LanguageModel>(
+//!     model: M,
+//! ) -> Result<String, M::Error> {
 //!     let request = LLMRequest::new([
 //!         Message::user("Explain how rainbows form like I'm five."),
 //!     ])
@@ -84,12 +86,13 @@
 //!
 //!     type Arguments = WeatherQuery;
 //!     type Res = ToolResult;
+//!     type Error = core::convert::Infallible;
 //!
 //!     async fn call(
 //!         &self,
 //!         args: Self::Arguments,
 //!         _cx: ToolContext,
-//!     ) -> aither_core::Result<Self::Res> {
+//!     ) -> Result<Self::Res, Self::Error> {
 //!         Ok(ToolResult::text(format!("Weather in {}: 22°C, sunny", args.location)))
 //!     }
 //! }
@@ -107,10 +110,10 @@
 //! ```rust
 //! use aither_core::EmbeddingModel;
 //!
-//! async fn embed_query(
-//!     model: impl EmbeddingModel,
+//! async fn embed_query<M: EmbeddingModel>(
+//!     model: M,
 //!     query: &str,
-//! ) -> aither_core::Result<Vec<f32>> {
+//! ) -> Result<Vec<f32>, M::Error> {
 //!     // Compare this against your stored document embeddings with cosine
 //!     // similarity, or hand it to `aither-rag`.
 //!     model.embed(query).await
@@ -182,12 +185,10 @@ pub mod tokenizer;
 /// Contains traits and types for detecting and handling unsafe or inappropriate content.
 pub mod moderation;
 
-use alloc::string::String;
-
 #[doc(inline)]
 pub use audio::{AudioGenerator, AudioTranscriber};
 #[doc(inline)]
-pub use embedding::EmbeddingModel;
+pub use embedding::{AnyEmbeddingError, AnyEmbeddingModel, EmbeddingModel};
 #[doc(inline)]
 pub use ids::{
     AnyIdAllocator, IdAllocator, IdLease, IdsExhausted, WeakIdLease, WordAllocator, WordUnavailable,
@@ -198,13 +199,6 @@ pub use image::ImageGenerator;
 pub use llm::{LanguageModel, TokenCounting};
 #[doc(inline)]
 pub use moderation::Moderation;
-
-/// Result type used throughout the crate.
-///
-/// Type alias for [`anyhow::Result<T>`](anyhow::Result) with [`String`] as default success type.
-pub type Result<T = String> = anyhow::Result<T>;
-
-pub use anyhow::Error;
 
 // Re-export procedural macros
 #[cfg(feature = "derive")]

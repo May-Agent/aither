@@ -8,7 +8,7 @@
 //! ```no_run
 //! use aither_websearch::{BraveSearch, SearchProvider};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let provider = BraveSearch::new("YOUR_API_KEY");
 //! let results = provider.search("rust programming", 5).await?;
 //! for result in results {
@@ -18,8 +18,7 @@
 //! # }
 //! ```
 
-use crate::{SearchProvider, SearchResult};
-use anyhow::{Result, anyhow};
+use crate::{SearchError, SearchProvider, SearchResult};
 use serde::Deserialize;
 use zenwave::{Client, client, header};
 
@@ -46,22 +45,22 @@ impl BraveSearch {
 }
 
 impl SearchProvider for BraveSearch {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, SearchError> {
         let url = format!("{}?q={}&count={}", BRAVE_API_URL, urlencoded(query), limit);
 
         let mut backend = client();
         let response: BraveResponse = backend
             .get(&url)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header("X-Subscription-Token", &self.api_key)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::ACCEPT.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json()
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(SearchError::from)?;
 
         Ok(response.web.map_or_default(|web| {
             web.results

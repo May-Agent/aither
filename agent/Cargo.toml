@@ -14,7 +14,6 @@ categories = ["api-bindings"]
 [dependencies]
 aither-core.workspace = true
 aither-attachments.workspace = true
-anyhow = "1.0.104"
 arc-swap.workspace = true
 askama = "0.16"
 schemars = "1.2.3"

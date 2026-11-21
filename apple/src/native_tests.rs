@@ -82,6 +82,7 @@ struct Echo;
 impl Tool for Echo {
     type Arguments = EchoArgs;
     type Res = ToolResult;
+    type Error = core::convert::Infallible;
     fn name(&self) -> Cow<'static, str> {
         "echo".into()
     }
@@ -92,7 +93,7 @@ impl Tool for Echo {
         &self,
         args: EchoArgs,
         _: ToolContext,
-    ) -> impl Future<Output = aither_core::Result<ToolResult>> + Send {
+    ) -> impl Future<Output = Result<ToolResult, Self::Error>> + Send {
         core::future::ready(Ok(if args.value == "fail" {
             ToolResult::Error {
                 message: "deliberate failure".into(),

@@ -38,13 +38,13 @@
 //! ```rust,ignore
 //! use aither::EmbeddingModel;
 //!
-//! async fn example<T: EmbeddingModel>(model: &mut T) -> aither::Result<()> {
+//! async fn example<T: EmbeddingModel>(model: &mut T) -> Result<(), Box<dyn std::error::Error>> {
 //!     // Get the embedding dimension
-//!     let dim = model.dim();
+//!     let dim = EmbeddingModel::dim(&model);
 //!     println!("Model produces {}-dimensional embeddings", dim);
 //!
 //!     // Convert text to embedding
-//!     let embedding = model.embed("Hello, world!").await?;
+//!     let embedding = EmbeddingModel::embed(&model, "Hello, world!").await?;
 //!     assert_eq!(embedding.len(), dim);
 //!
 //!     Ok(())
@@ -52,7 +52,7 @@
 //! ```
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::future::Future;
+use core::{future::Future, pin::Pin};
 
 /// A type alias for an embedding vector of 32-bit floats.
 ///
@@ -89,7 +89,9 @@ pub type Embedding = Vec<f32>;
 ///         1536 // OpenAI text-embedding-ada-002 dimension
 ///     }
 ///     
-///     async fn embed(&mut self, text: &str) -> aither::Result<Vec<f32>> {
+///     type Error = core::convert::Infallible;
+///
+///     async fn embed(&mut self, text: &str) -> Result<Vec<f32>, Self::Error> {
 ///         // In a real implementation, this would call the embedding API
 ///         Ok(vec![0.0; self.dim()])
 ///     }
@@ -97,7 +99,7 @@ pub type Embedding = Vec<f32>;
 ///
 /// # async {
 /// let mut model = MyEmbedding { api_key: "sk-...".to_string() };
-/// let embedding = model.embed("The quick brown fox").await.unwrap();
+/// let embedding = EmbeddingModel::embed(&model, "The quick brown fox").await.unwrap();
 /// assert_eq!(embedding.len(), 1536);
 /// # };
 /// ```
@@ -108,6 +110,12 @@ pub type Embedding = Vec<f32>;
 /// - Consider caching embeddings for frequently used texts
 /// - Be aware of rate limits when using cloud-based embedding services
 pub trait EmbeddingModel: Send + Sized + Sync {
+    /// Error type `embed` can fail with.
+    ///
+    /// [`AnyEmbeddingModel`] erases it into a boxed `dyn Error`; infallible
+    /// models use [`core::convert::Infallible`].
+    type Error: core::error::Error + Send + Sync + 'static;
+
     /// Returns the embedding vector dimension.
     ///
     /// This value determines the length of vectors returned by [`embed`](EmbeddingModel::embed).
@@ -130,18 +138,116 @@ pub trait EmbeddingModel: Send + Sized + Sync {
     /// The vector represents the semantic meaning of the input text in high-dimensional space.
     ///
     /// Implementations that need mutable state should use interior mutability.
-    fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send;
+    fn embed(&self, text: &str) -> impl Future<Output = Result<Vec<f32>, Self::Error>> + Send;
+}
+
+/// An [`EmbeddingModel::Error`] erased for dynamic storage.
+///
+/// The concrete error is boxed at the [`AnyEmbeddingModel`] boundary; [`Self::inner`]
+/// recovers it for downcasting.
+#[derive(Debug)]
+pub struct AnyEmbeddingError(Box<dyn core::error::Error + Send + Sync>);
+
+impl AnyEmbeddingError {
+    /// The error the boxed model returned.
+    #[must_use]
+    pub fn inner(&self) -> &(dyn core::error::Error + Send + Sync + 'static) {
+        &*self.0
+    }
+}
+
+impl core::fmt::Display for AnyEmbeddingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl core::error::Error for AnyEmbeddingError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// Object-safe counterpart of [`EmbeddingModel`]; boxing lives inside
+/// [`AnyEmbeddingModel`], never in the public trait.
+trait EmbeddingModelImpl: Send + Sync {
+    fn dim(&self) -> usize;
+
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, AnyEmbeddingError>> + Send + 'a>>;
+}
+
+impl<T: EmbeddingModel> EmbeddingModelImpl for T {
+    fn dim(&self) -> usize {
+        T::dim(self)
+    }
+
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, AnyEmbeddingError>> + Send + 'a>> {
+        Box::pin(async move {
+            T::embed(self, text)
+                .await
+                .map_err(|error| AnyEmbeddingError(Box::new(error)))
+        })
+    }
+}
+
+/// A dynamically-stored [`EmbeddingModel`].
+///
+/// `AnyEmbeddingModel` boxes the model and erases its error to
+/// [`AnyEmbeddingError`], so a consumer can hold embedders of different types
+/// behind one concrete type. Cloning shares the boxed model.
+#[derive(Clone)]
+pub struct AnyEmbeddingModel {
+    inner: Arc<dyn EmbeddingModelImpl>,
+}
+
+impl core::fmt::Debug for AnyEmbeddingModel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AnyEmbeddingModel").finish_non_exhaustive()
+    }
+}
+
+impl AnyEmbeddingModel {
+    /// Boxes `model` for dynamic storage.
+    pub fn new<M: EmbeddingModel + 'static>(model: M) -> Self {
+        Self {
+            inner: Arc::new(model),
+        }
+    }
+}
+
+impl EmbeddingModel for AnyEmbeddingModel {
+    type Error = AnyEmbeddingError;
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn embed(&self, text: &str) -> impl Future<Output = Result<Vec<f32>, Self::Error>> + Send {
+        let inner = Arc::clone(&self.inner);
+        async move { inner.embed(text).await }
+    }
 }
 
 macro_rules! impl_embedding_model {
     ($($name:ident),*) => {
         $(
             impl<T: EmbeddingModel> EmbeddingModel for $name<T> {
+                type Error = T::Error;
+
                 fn dim(&self) -> usize {
                     T::dim(self)
                 }
 
-                fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send {
+                fn embed(
+                    &self,
+                    text: &str,
+                ) -> impl Future<Output = Result<Vec<f32>, Self::Error>> + Send {
                     T::embed(self, text)
                 }
             }
@@ -152,11 +258,13 @@ macro_rules! impl_embedding_model {
 impl_embedding_model!(Arc, Box);
 
 impl<T: EmbeddingModel> EmbeddingModel for &T {
+    type Error = T::Error;
+
     fn dim(&self) -> usize {
         T::dim(self)
     }
 
-    fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send {
+    fn embed(&self, text: &str) -> impl Future<Output = Result<Vec<f32>, Self::Error>> + Send {
         T::embed(self, text)
     }
 }
@@ -171,12 +279,14 @@ mod tests {
     }
 
     impl EmbeddingModel for MockEmbeddingModel {
+        type Error = core::convert::Infallible;
+
         fn dim(&self) -> usize {
             self.dimension
         }
 
         #[allow(clippy::cast_precision_loss)]
-        fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send {
+        fn embed(&self, text: &str) -> impl Future<Output = Result<Vec<f32>, Self::Error>> + Send {
             // Create a simple mock embedding based on text length
             let mut embedding = vec![0.0; self.dimension];
             let text_len = text.len();
@@ -192,13 +302,13 @@ mod tests {
     #[tokio::test]
     async fn embedding_model_dimension() {
         let model = MockEmbeddingModel { dimension: 768 };
-        assert_eq!(model.dim(), 768);
+        assert_eq!(EmbeddingModel::dim(&model), 768);
     }
 
     #[tokio::test]
     async fn embedding_generation() {
         let model = MockEmbeddingModel { dimension: 4 };
-        let embedding = model.embed("test").await.unwrap();
+        let embedding = EmbeddingModel::embed(&model, "test").await.unwrap();
 
         assert_eq!(embedding.len(), 4);
         assert!((embedding[0] - 0.04).abs() < f32::EPSILON); // text length 4 + index 0 = 4 * 0.01
@@ -212,8 +322,8 @@ mod tests {
     async fn embedding_different_texts() {
         let model = MockEmbeddingModel { dimension: 2 };
 
-        let embedding1 = model.embed("a").await.unwrap();
-        let embedding2 = model.embed("ab").await.unwrap();
+        let embedding1 = EmbeddingModel::embed(&model, "a").await.unwrap();
+        let embedding2 = EmbeddingModel::embed(&model, "ab").await.unwrap();
 
         assert_eq!(embedding1.len(), 2);
         assert_eq!(embedding2.len(), 2);
@@ -227,7 +337,7 @@ mod tests {
     #[allow(clippy::float_cmp)]
     async fn embedding_empty_text() {
         let model = MockEmbeddingModel { dimension: 3 };
-        let embedding = model.embed("").await.unwrap();
+        let embedding = EmbeddingModel::embed(&model, "").await.unwrap();
 
         assert_eq!(embedding.len(), 3);
         assert_eq!(embedding[0], 0.00); // length 0 + index 0 = 0 * 0.01
@@ -238,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn embedding_large_dimension() {
         let model = MockEmbeddingModel { dimension: 1536 }; // Common OpenAI dimension
-        let embedding = model.embed("test text").await.unwrap();
+        let embedding = EmbeddingModel::embed(&model, "test text").await.unwrap();
 
         assert_eq!(embedding.len(), 1536);
         assert!((embedding[0] - 0.09).abs() < f32::EPSILON); // text length 9 + index 0 = 9 * 0.01

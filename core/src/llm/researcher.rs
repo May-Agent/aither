@@ -330,7 +330,7 @@ pub trait Researcher: Sized + Send + Sync {
     fn report(
         &self,
         request: &ResearchRequest,
-    ) -> impl Future<Output = crate::Result<ResearchReport>> + Send {
+    ) -> impl Future<Output = Result<ResearchReport, Self::Error>> + Send {
         research_report(self, request)
     }
 
@@ -354,7 +354,7 @@ macro_rules! impl_researcher {
                 fn report(
                     &self,
                     request: &ResearchRequest,
-                ) -> impl Future<Output = crate::Result<ResearchReport>> + Send {
+                ) -> impl Future<Output = Result<ResearchReport, Self::Error>> + Send {
                     T::report(self, request)
                 }
 
@@ -381,7 +381,7 @@ impl<T: Researcher> Researcher for &T {
     fn report(
         &self,
         request: &ResearchRequest,
-    ) -> impl Future<Output = crate::Result<ResearchReport>> + Send {
+    ) -> impl Future<Output = Result<ResearchReport, Self::Error>> + Send {
         T::report(self, request)
     }
 
@@ -394,13 +394,13 @@ impl<T: Researcher> Researcher for &T {
 async fn research_report<R: Researcher>(
     researcher: &R,
     request: &ResearchRequest,
-) -> crate::Result<ResearchReport> {
+) -> Result<ResearchReport, R::Error> {
     let stream = researcher.research(request);
     pin!(stream);
 
     let mut report = ResearchReport::default();
 
-    while let Some(event) = stream.try_next().await.map_err(anyhow::Error::new)? {
+    while let Some(event) = stream.try_next().await? {
         match event {
             ResearchEvent::Finding(finding) => report.push_finding(finding),
             ResearchEvent::Citation(citation) => report.push_citation(citation),

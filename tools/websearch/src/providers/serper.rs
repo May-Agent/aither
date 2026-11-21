@@ -8,7 +8,7 @@
 //! ```no_run
 //! use aither_websearch::{Serper, SearchProvider};
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let provider = Serper::new("YOUR_API_KEY");
 //! let results = provider.search("best programming practices", 5).await?;
 //! for result in results {
@@ -18,8 +18,7 @@
 //! # }
 //! ```
 
-use crate::{SearchProvider, SearchResult};
-use anyhow::{Result, anyhow};
+use crate::{SearchError, SearchProvider, SearchResult};
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
 
@@ -88,7 +87,7 @@ impl Serper {
 }
 
 impl SearchProvider for Serper {
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, SearchError> {
         let request = SerperRequest {
             q: query,
             num: Some(limit.min(100)), // Serper supports up to 100 results
@@ -99,20 +98,20 @@ impl SearchProvider for Serper {
         let mut backend = client();
         let response: SerperResponse = backend
             .post(SERPER_API_URL)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header("X-API-KEY", &self.api_key)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::CONTENT_TYPE.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::ACCEPT.as_str(), "application/json")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .header(header::USER_AGENT.as_str(), "aither-websearch/0.1")
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json_body(&request)
-            .map_err(|e| anyhow!("{e}"))?
+            .map_err(SearchError::from)?
             .json()
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(SearchError::from)?;
 
         Ok(response
             .organic

@@ -405,11 +405,12 @@ mod tests {
         }
         type Arguments = Args;
         type Res = aither_core::llm::tool::ToolResult;
+        type Error = core::convert::Infallible;
         fn call(
             &self,
             _args: Self::Arguments,
             _cx: aither_core::llm::tool::ToolContext,
-        ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
+        ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
             core::future::ready(Ok(aither_core::llm::tool::ToolResult::text("ok")))
         }
     }
@@ -420,11 +421,12 @@ mod tests {
         }
         type Arguments = Args;
         type Res = aither_core::llm::tool::ToolResult;
+        type Error = core::convert::Infallible;
         fn call(
             &self,
             _args: Self::Arguments,
             _cx: aither_core::llm::tool::ToolContext,
-        ) -> impl Future<Output = aither_core::Result<Self::Res>> + Send {
+        ) -> impl Future<Output = Result<Self::Res, Self::Error>> + Send {
             core::future::ready(Ok(aither_core::llm::tool::ToolResult::text("ok")))
         }
     }

@@ -90,7 +90,7 @@ pub struct ToolOutcome {
     /// The arguments the call ran with.
     pub arguments: serde_json::Value,
     /// What the tool returned. A call a hook denied is an `Ok` error result.
-    pub result: Result<ToolResult, aither_core::Error>,
+    pub result: Result<ToolResult, aither_core::llm::tool::ToolDispatchError>,
     /// How long the tool ran.
     pub duration: Duration,
 }
