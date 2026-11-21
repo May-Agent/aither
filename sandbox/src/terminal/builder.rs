@@ -502,7 +502,7 @@ mod tests {
         );
         let launches = provider.launches.lock().unwrap();
         assert_eq!(launches.len(), 1, "one process, one question");
-        assert!(launches[0].task_id.is_some(), "{:?}", launches[0]);
+        assert!(launches[0].launch.is_some(), "{:?}", launches[0]);
         assert_eq!(launches[0].mode, crate::SandboxMode::Sandboxed);
     }
 

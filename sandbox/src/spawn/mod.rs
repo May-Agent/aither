@@ -27,6 +27,7 @@ mod domain;
 mod env;
 mod grants;
 pub mod host;
+pub mod host_ipc;
 mod ipc;
 mod launch;
 mod route;
@@ -46,7 +47,7 @@ pub use child::{ChildExit, Descendants, SandboxedChild};
 pub use domain::{
     AnyDomainApprover, ApproveAllDomains, DenyAllDomains, DomainApprover, DomainRequest,
 };
-pub use env::{EnvSource, LaunchInfo};
+pub use env::{EnvSource, LaunchId, LaunchInfo};
 pub use grants::{GitDirAccess, GrantSnapshot, Grants};
 #[cfg(all(unix, feature = "jobserver"))]
 pub use host::resolved;
@@ -338,6 +339,9 @@ struct SandboxInner {
     scanner: ProcessScanner,
     unconfined: bool,
     ssh_client: crate::ssh::SshClient,
+    parent: Option<Sandbox>,
+    confined_host: Arc<host::HostRuntimeSlot>,
+    unconfined_host: Arc<host::HostRuntimeSlot>,
 }
 
 /// One home environment's sandbox: grants, environment, network policy and
@@ -390,6 +394,9 @@ impl Sandbox {
                 scanner: ProcessScanner::default(),
                 unconfined: false,
                 ssh_client: crate::ssh::SshClient::default(),
+                parent: None,
+                confined_host: Arc::new(host::HostRuntimeSlot::new()),
+                unconfined_host: Arc::new(host::HostRuntimeSlot::new()),
             }),
         }
     }
@@ -399,11 +406,19 @@ impl Sandbox {
         self
     }
 
+    fn edit_reset_host(self, edit: impl FnOnce(&mut SandboxInner)) -> Self {
+        self.edit(|inner| {
+            edit(inner);
+            inner.confined_host = Arc::new(host::HostRuntimeSlot::new());
+            inner.unconfined_host = Arc::new(host::HostRuntimeSlot::new());
+        })
+    }
+
     /// Uses `grants` as the sandbox's live grants; the sandbox sees every
     /// change made through any clone of the handle.
     #[must_use]
     pub fn with_grants(self, grants: Grants) -> Self {
-        self.edit(|inner| inner.grants = grants)
+        self.edit_reset_host(|inner| inner.grants = grants)
     }
 
     /// Heel grants every spawn on the host carries ahead of the live
@@ -411,7 +426,7 @@ impl Sandbox {
     /// in, and what its `PATH` lists.
     #[must_use]
     pub fn with_fixed_grants(self, grants: Vec<heel::Grant>) -> Self {
-        self.edit(|inner| inner.fixed_grants = grants)
+        self.edit_reset_host(|inner| inner.fixed_grants = grants)
     }
 
     /// The environment every spawn on the host starts with: the session's
@@ -444,26 +459,26 @@ impl Sandbox {
     /// rather than run weaker, so it is not applied there.
     #[must_use]
     pub fn with_write_denylist(self, denylist: heel::WriteDenylist) -> Self {
-        self.edit(|inner| inner.write_denylist = Some(denylist))
+        self.edit_reset_host(|inner| inner.write_denylist = Some(denylist))
     }
 
     /// The network lists: a host they allow or deny is decided without the
     /// approver.
     #[must_use]
     pub fn with_network_policy(self, policy: CompiledNetworkPolicy) -> Self {
-        self.edit(|inner| inner.network = Some(policy))
+        self.edit_reset_host(|inner| inner.network = Some(policy))
     }
 
     /// Decides the connections the network lists leave open.
     #[must_use]
     pub fn with_domain_approver(self, approver: impl DomainApprover + 'static) -> Self {
-        self.edit(|inner| inner.approver = Some(AnyDomainApprover::new(approver)))
+        self.edit_reset_host(|inner| inner.approver = Some(AnyDomainApprover::new(approver)))
     }
 
     /// Records every network decision of a spawn on the host in `log`.
     #[must_use]
     pub fn with_audit_log(self, log: heel::NetworkAuditLog) -> Self {
-        self.edit(|inner| inner.audit = Some(log))
+        self.edit_reset_host(|inner| inner.audit = Some(log))
     }
 
     /// Lowers the scheduling priority of what the sandbox spawns on the host,
@@ -471,7 +486,7 @@ impl Sandbox {
     /// `heel` for a non-normal priority; an SSH server's priority is its own.
     #[must_use]
     pub fn with_priority(self, priority: heel::ProcessPriority) -> Self {
-        self.edit(|inner| inner.priority = priority)
+        self.edit_reset_host(|inner| inner.priority = priority)
     }
 
     /// Labels the agent this sandbox serves; the label is the `agent` of
@@ -479,7 +494,7 @@ impl Sandbox {
     #[must_use]
     pub fn with_agent(self, agent: impl Into<String>) -> Self {
         let agent: Arc<str> = Arc::from(agent.into());
-        self.edit(|inner| inner.agent = Some(agent))
+        self.edit_reset_host(|inner| inner.agent = Some(agent))
     }
 
     /// A child's sandbox: the same backend, environment and network policy,
@@ -492,10 +507,12 @@ impl Sandbox {
     #[must_use]
     pub fn derived(&self, own: GrantSnapshot) -> Self {
         let grants = self.inner.grants.derived(own);
-        self.clone().edit(|inner| {
+        let parent = self.clone();
+        self.clone().edit_reset_host(|inner| {
             inner.grants = grants;
             inner.agent = None;
             inner.space_environment = Vec::new();
+            inner.parent = Some(parent);
         })
     }
 
@@ -521,7 +538,7 @@ impl Sandbox {
     /// policy are kept.
     #[must_use]
     pub fn with_backend(self, backend: Backend) -> Self {
-        self.edit(|inner| inner.backend = backend)
+        self.edit_reset_host(|inner| inner.backend = backend)
     }
 
     /// The `heel` binary of a sandbox on the host.
@@ -574,7 +591,9 @@ impl Sandbox {
     pub async fn spawn(&self, spec: SpawnSpec) -> Result<SandboxedChild, SpawnError> {
         match &self.inner.backend {
             Backend::Host { .. } => self.spawn_host(spec).await,
-            Backend::Container { runtime, launch } => self.spawn_container(runtime, launch, spec),
+            Backend::Container { runtime, launch } => {
+                self.spawn_container(runtime, launch, spec).await
+            }
             Backend::Ssh {
                 server,
                 heel,

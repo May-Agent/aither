@@ -37,6 +37,7 @@ use crate::OutputTreatment;
 use crate::output::OutputStore;
 use crate::wording::{JsonAsTsv, ShellWording};
 
+pub use fold::CodeFolder;
 pub use preview::stored_preview;
 
 /// Renders the folded view of cut source code for the model, or `None` when
@@ -45,8 +46,12 @@ pub use preview::stored_preview;
 /// The folded view carries the line numbers of the unfolded `text`, which the
 /// caller stores.
 #[must_use]
-pub fn folded_code_content(text: &str, wording: &dyn ShellWording) -> Option<String> {
-    let folded = fold::fold_source_code(text, wording)?;
+pub fn folded_code_content(
+    code_folder: &CodeFolder,
+    text: &str,
+    wording: &dyn ShellWording,
+) -> Option<String> {
+    let folded = code_folder.fold_source_code(text, wording)?;
     Some(wording.folded_code(folded.trim_end_matches('\n')))
 }
 

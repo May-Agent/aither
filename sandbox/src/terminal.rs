@@ -10,7 +10,7 @@
 //! executions share this directory, but each execution gets a fresh sandbox
 //! (new TTY/process). The ids the model addresses — task ids, stored output
 //! names, subagent spaces — are leased from the terminal's
-//! [`AnyIdAllocator`](aither_core::AnyIdAllocator).
+//! [`AnyIdAllocator`].
 
 use crate::foreground_wait::ForegroundWait;
 use crate::memory::{
@@ -27,7 +27,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -35,14 +35,15 @@ use std::{
 
 use crate::spawn::container_ipc::ExecSetup;
 use aither_core::llm::tool::{
-    AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
+    AgentIdentity, AnyApprover, Approval, ApprovalError, ApprovalKind, ApprovalRequest, Approver,
+    SubagentIdentity, ToolCallId,
 };
 use aither_core::llm::{AgentPath, CallIdentity, ToolContext};
 use aither_core::llm::{
     CommandOutcome, CommandResult, CommandStream, Interruption, IntoToolResult, StoredFile, Tool,
     ToolResult,
 };
-use aither_core::{AnyIdAllocator, IdLease, IdsExhausted, WeakIdLease};
+use aither_core::{AnyIdAllocator, IdLease, IdsExhausted};
 use askama::Template;
 use async_channel::{Receiver, Sender};
 use executor_core::{Executor, Task};
@@ -171,31 +172,62 @@ fn looks_like_env_assignment(token: &str) -> bool {
 fn is_shell_builtin(program: &str) -> bool {
     matches!(
         program,
-        "alias"
+        "." | ":"
+            | "["
+            | "alias"
             | "bg"
             | "break"
+            | "builtin"
+            | "caller"
             | "cd"
             | "command"
             | "continue"
+            | "declare"
+            | "dirs"
+            | "disown"
+            | "echo"
+            | "enable"
             | "eval"
             | "exec"
             | "exit"
             | "export"
+            | "false"
+            | "fc"
             | "fg"
+            | "getopts"
+            | "hash"
+            | "help"
+            | "history"
             | "jobs"
+            | "kill"
+            | "let"
+            | "local"
+            | "logout"
+            | "mapfile"
+            | "popd"
+            | "printf"
+            | "pushd"
+            | "pwd"
             | "read"
+            | "readarray"
             | "readonly"
             | "return"
             | "set"
             | "shift"
+            | "shopt"
             | "source"
+            | "suspend"
+            | "test"
             | "times"
             | "trap"
+            | "true"
             | "type"
+            | "typeset"
             | "ulimit"
             | "umask"
             | "unalias"
             | "unset"
+            | "wait"
     )
 }
 
@@ -218,16 +250,17 @@ pub fn shell_launch(managed_shell: &str, script: &str) -> (String, Vec<String>) 
     }
 }
 
-/// The shell script that runs `script`, written in `language`, for the job
-/// `task_id`.
-fn launch_script<'a>(
+/// The shell script that runs `script`, written in `interpreter`, for `launch`.
+fn launch_script(
     interpreter: Interpreter,
-    script: &'a str,
-    task_id: &str,
-) -> Result<Cow<'a, str>, TerminalError> {
-    interpreter.launch_script(script, task_id).map_err(|error| {
-        TerminalError::Execution(format!("failed to render the launch script: {error}"))
-    })
+    script: &str,
+    launch: crate::LaunchId,
+) -> Result<Cow<'_, str>, TerminalError> {
+    interpreter
+        .launch_script(script, launch.raw())
+        .map_err(|error| {
+            TerminalError::Execution(format!("failed to render the launch script: {error}"))
+        })
 }
 
 /// Turns `script` into the process to launch. A shell launch with a `report`
@@ -273,7 +306,7 @@ fn runs_in_shell(script: &str) -> bool {
 /// A command killed because its `timeout` bound passed, with the UTC times it
 /// started and was killed at.
 ///
-/// [`ShellWording::command_killed`](crate::ShellWording::command_killed)
+/// [`ShellWording::command_killed`]
 /// renders the sentence the model reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutKill {
@@ -787,6 +820,8 @@ struct ContainerCarry {
     start: ContainerPath,
 }
 
+type SubagentApproverFactory = Arc<dyn Fn(&AgentPath) -> Option<AnyApprover> + Send + Sync>;
+
 /// The terminal tool for executing scripts in a sandbox.
 ///
 /// Creates a shared working directory that persists across all executions,
@@ -800,8 +835,10 @@ pub struct Shell<E> {
     /// The SSH servers scripts may name as their `location`.
     sessions: ShellSessionRegistry,
     /// Approves what no call's context can: a script run with no tool call
-    /// to ask through. Shared with the subagents' terminals.
+    /// to ask through. Shared with or scoped for the subagents' terminals.
     approver: Option<AnyApprover>,
+    /// Optional factory deriving a subagent-scoped approver from its path.
+    subagent_approver: Option<SubagentApproverFactory>,
     executor: E,
     /// Leases the words naming what the model addresses: task ids, stored
     /// outputs and subagent spaces. Shared with the output store and every
@@ -862,6 +899,8 @@ pub struct Shell<E> {
     /// The shell scripts run under when the sandbox runs on the host; `None`
     /// on a container, whose launch names it.
     host_launch: Option<crate::HostLaunch>,
+    /// Cached host `git` binary `(path, parent_dir)` shared across subagents.
+    host_git: Arc<OnceLock<Option<(PathBuf, PathBuf)>>>,
 }
 
 impl<E: Clone> Clone for Shell<E> {
@@ -870,6 +909,7 @@ impl<E: Clone> Clone for Shell<E> {
             working_dir: self.working_dir.clone(),
             sessions: self.sessions.clone(),
             approver: self.approver.clone(),
+            subagent_approver: self.subagent_approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
@@ -893,6 +933,7 @@ impl<E: Clone> Clone for Shell<E> {
             committed: self.committed.clone(),
             launches: self.launches.clone(),
             host_launch: self.host_launch.clone(),
+            host_git: self.host_git.clone(),
         }
     }
 }
@@ -905,6 +946,18 @@ impl<E: Executor + Clone + 'static> Shell<E> {
     #[must_use]
     pub fn with_approver(mut self, approver: impl Approver) -> Self {
         self.approver = Some(AnyApprover::new(approver));
+        self
+    }
+
+    /// Configures a factory that derives the [`Approver`] handed to subagent
+    /// shells launched from this terminal (and nested subagents beneath them).
+    /// Returning `None` leaves the subagent without an approver.
+    #[must_use]
+    pub fn with_subagent_approver(
+        mut self,
+        factory: impl Fn(&AgentPath) -> Option<AnyApprover> + Send + Sync + 'static,
+    ) -> Self {
+        self.subagent_approver = Some(Arc::new(factory));
         self
     }
 
@@ -997,6 +1050,8 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         // Start job registry service
         let (job_registry, job_registry_service) =
             job_registry_channel(output_store.policy().clone());
+        let job_registry_service =
+            job_registry_service.with_wording(output_store.wording().clone());
         executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1012,6 +1067,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             working_dir: working_dir_path,
             sessions: ShellSessionRegistry::default(),
             approver: None,
+            subagent_approver: None,
             executor,
             ids,
             output_store,
@@ -1035,6 +1091,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
             host_launch: parts.host_shell,
+            host_git: Arc::new(OnceLock::new()),
         })
     }
 
@@ -1514,11 +1571,24 @@ where
         // The subagent's jobs raise their facts on the parent's handle, as
         // the agent named beneath this shell's.
         let agent = self.events_tx.agent().child(name);
+        let derived_approver = self.subagent_approver.as_ref().map_or_else(
+            || {
+                self.approver.as_ref().map(|parent| {
+                    AnyApprover::new(SubagentIdentityApprover {
+                        inner: parent.clone(),
+                        agent: agent.clone(),
+                    })
+                })
+            },
+            |factory| factory(&agent),
+        );
         let events_rx = self.events_rx.clone();
         let events_tx = events_rx.sender(agent);
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (job_registry, job_registry_service) =
             job_registry_channel(self.output_store.policy().clone());
+        let job_registry_service =
+            job_registry_service.with_wording(self.output_store.wording().clone());
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1565,12 +1635,14 @@ where
                     .host_heel()
                     .expect("a subagent outside a container runs on the host")
                     .clone(),
+                host_git: self.host_git.clone(),
             })),
         };
         Ok(Self {
             working_dir: space,
             sessions: self.sessions.clone(),
-            approver: self.approver.clone(),
+            approver: derived_approver,
+            subagent_approver: self.subagent_approver.clone(),
             executor: self.executor.clone(),
             ids: self.ids.clone(),
             output_store: self.output_store.clone(),
@@ -1600,6 +1672,7 @@ where
             committed: self.committed.clone(),
             launches: Arc::default(),
             host_launch: self.host_launch.clone(),
+            host_git: self.host_git.clone(),
         })
     }
 
@@ -1787,7 +1860,7 @@ where
     fn spawn_terminal_execution(&self, request: TerminalSpawnRequest) -> SpawnedTerminal {
         let TerminalSpawnRequest {
             target,
-            task_id,
+            launch,
             execution_id,
             script,
             interpreter,
@@ -1806,30 +1879,30 @@ where
         let (startup_tx, startup_rx) = async_channel::bounded(1);
         let background_startup = BackgroundStartup::new(startup_tx);
         if let Some(timeout) = timeout {
-            self.spawn_kill_watchdog(&task_id, timeout, background_startup.settled());
-            self.spawn_long_job_alert(&task_id);
+            self.spawn_kill_watchdog(&launch, timeout, background_startup.settled());
+            self.spawn_long_job_alert(&launch);
         }
 
-        let info = crate::LaunchInfo::new(task_id.to_string(), call.clone(), mode);
+        let info = crate::LaunchInfo::new(launch.id(), call.clone(), mode);
         let lifetime = if background {
             JobLifetime::Background {
                 stdin: StdinAlerts {
                     tx: self.events_tx.clone(),
-                    task_id: task_id.to_string(),
+                    pid: 0,
                     script: script.clone(),
                 },
             }
         } else {
             JobLifetime::Foreground {
                 alerts: self.events_tx.clone(),
-                task_id: task_id.to_string(),
+                pid: 0,
                 call,
             }
         };
         let running_tasks = self.running_tasks.clone();
         let completed_tx = self.events_tx.clone();
         let outages = self.outages.clone();
-        outages.begin(&task_id);
+        outages.begin(launch.id());
 
         running_tasks.fetch_add(1, Ordering::AcqRel);
         self.executor
@@ -1840,7 +1913,7 @@ where
                 ipc: self.ipc.clone(),
                 committed: self.committed_worktrees(),
                 job_registry: self.job_registry.clone(),
-                task_id,
+                launch,
                 info,
                 execution_id,
                 background,
@@ -2001,6 +2074,11 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 CallRefusal::TimeoutOutOfRange { cap },
             ));
         }
+        if let Some(call) = self.effective_call_identity(cx.identity(), "terminal")
+            && cx.identity() != Some(&call)
+        {
+            cx = cx.with_identity(call);
+        }
         let prepared = self.prepare_execution(&arguments, &mut cx).await?;
         // A detached job cannot report a directory carry: its final
         // directory is unknowable when the call returns.
@@ -2011,7 +2089,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
-            task_id: prepared.task_id.clone(),
+            launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
             script: arguments.script,
             interpreter: arguments.interpreter,
@@ -2024,16 +2102,12 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             carry: carry.clone(),
             call: cx.identity().cloned(),
         });
-        // Registration, and a background job's stdin pipe, precede
-        // `report_ready` on every backend, so once startup returns the job
-        // is killable through the registry, takes input when it has a pipe,
-        // and the foreground clock only measures the command's own runtime.
         wait_for_background_startup(&spawned.startup, &**self.wording()).await?;
         if arguments.background {
             return detach_job(
                 &self.job_registry,
                 &prepared.outputs,
-                &prepared.task_id,
+                prepared.launch.id(),
                 prepared.max_lines,
                 &self.events_tx,
             )
@@ -2042,19 +2116,18 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         }
         let outcome =
             wait_for_foreground_result(&spawned.result, self.limits.foreground_wait.get()).await;
-        // A result that raced in at the window's edge counts as a
-        // foreground finish.
         let outcome = outcome.or_else(|| spawned.result.try_recv().ok());
         match outcome {
             Some(Ok(result)) => {
-                let killed = self
+                let settled = self
                     .job_registry
-                    .get_by_task_id_settled(&prepared.task_id)
-                    .await
-                    .and_then(|job| job.status.kill_cause());
+                    .get_by_launch_settled(prepared.launch.id())
+                    .await;
+                let pid = settled.as_ref().map_or(0, |job| job.pid);
+                let killed = settled.and_then(|job| job.status.kill_cause());
                 let command = result
                     .into_script_result(killed)
-                    .into_command_result(&prepared.task_id, &self.output_store);
+                    .into_command_result(pid, &self.output_store);
                 spawned.took_result().await;
                 Ok(Execution::Finished(command))
             }
@@ -2062,12 +2135,10 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 spawned.took_result().await;
                 Err(failed_run(&**self.wording(), &detail))
             }
-            // The command outlived its foreground window: promote it to a
-            // background task.
             None => detach_job(
                 &self.job_registry,
                 &prepared.outputs,
-                &prepared.task_id,
+                prepared.launch.id(),
                 prepared.max_lines,
                 &self.events_tx,
             )
@@ -2087,7 +2158,6 @@ enum Execution {
 
 /// A job a call detached, with the output file it was redirected to.
 struct Detached {
-    task_id: String,
     redirect: BackgroundRedirect,
     /// Holds the job until the caller took it over.
     watch: crate::job_registry::JobWatch,
@@ -2096,9 +2166,8 @@ struct Detached {
 impl Detached {
     /// The result the model reads for the job's start.
     fn into_command_result(self) -> CommandResult {
-        let Self {
-            task_id, redirect, ..
-        } = self;
+        let pid = self.watch.pid();
+        let Self { redirect, .. } = self;
         let stdout = if redirect.truncated {
             CommandStream::Stored {
                 file: redirect.file.clone(),
@@ -2115,7 +2184,7 @@ impl Detached {
             stderr: None,
             interruptions: Vec::new(),
             outcome: CommandOutcome::Running {
-                task_id,
+                pid,
                 output: redirect.file,
             },
         }
@@ -2148,7 +2217,9 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             }
             (None, None) => (None, false),
         };
-        let report = self.working_dir.join(format!(".cwd-{}", prepared.task_id));
+        let report = self
+            .working_dir
+            .join(format!(".cwd-{}", prepared.launch.id()));
         let container = match mount {
             None => None,
             Some(mount) => {
@@ -2427,11 +2498,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             )
             .await?;
         match execution {
-            Execution::Detached(detached) => Ok(crate::Job::new(
-                self.jobs(),
-                detached.task_id,
-                detached.watch,
-            )),
+            Execution::Detached(detached) => Ok(crate::Job::new(self.jobs(), detached.watch)),
             Execution::Finished(_) => unreachable!("a background call detaches its job"),
         }
     }
@@ -2463,7 +2530,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             .await?;
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
-            task_id: prepared.task_id.clone(),
+            launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
             script: arguments.script,
             interpreter: arguments.interpreter,
@@ -2480,16 +2547,12 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         let detached = detach_job(
             &self.job_registry,
             &prepared.outputs,
-            &prepared.task_id,
+            prepared.launch.id(),
             prepared.max_lines,
             &self.events_tx,
         )
         .await?;
-        Ok(crate::Job::new(
-            self.jobs(),
-            detached.task_id,
-            detached.watch,
-        ))
+        Ok(crate::Job::new(self.jobs(), detached.watch))
     }
 }
 
@@ -2567,15 +2630,14 @@ where
     /// it ends; one admission fails is reported here, unrun.
     async fn admit_command(
         &self,
-        admission: Admission<'_>,
+        mut admission: Admission<'_>,
         cx: Option<&mut ToolContext>,
     ) -> Result<ExecutionPreparation, ShellRunError> {
-        // Leased for as long as the command can be addressed: the registry
-        // keeps a clone once the job is registered.
-        let task_id = self.ids.lease()?;
+        let launch = crate::job_registry::LaunchLease::fresh();
+        let launch_id = launch.id();
+        admission.call =
+            self.effective_call_identity(admission.call.as_ref(), &format!("launch-{launch_id}"));
         let environment = self.resolve_location(admission.location)?;
-        // Decided once, here: the policies see the directory the command
-        // then starts in, and so does its launch.
         let carried_start = if admission.origin == ScriptOrigin::Foreground {
             carried_start(self.carried_dir.as_ref()).await
         } else {
@@ -2595,13 +2657,13 @@ where
             ),
         };
         let checked = self
-            .check_script(&task_id, &admission, &start)
+            .check_script(launch_id, &admission, &start)
             .await
             .map_err(ShellRunError::Refused);
         let (clearance, treatment) = match checked {
             Ok(checked) => checked,
             Err(refusal) => {
-                self.end_unrun(&task_id).await;
+                self.end_unrun(launch_id).await;
                 return Err(refusal);
             }
         };
@@ -2609,13 +2671,13 @@ where
             .admit_checked(&admission, environment.as_deref(), clearance, cx)
             .await;
         if admitted.is_err() {
-            self.end_unrun(&task_id).await;
+            self.end_unrun(launch_id).await;
         }
         let (target, max_lines) = admitted?;
         Ok(ExecutionPreparation {
             target,
-            execution_id: format!("exec-{task_id}"),
-            task_id,
+            execution_id: format!("exec-{launch_id}"),
+            launch,
             outputs: self.output_store.clone(),
             max_lines,
             treatment,
@@ -2625,7 +2687,7 @@ where
 
     /// Tells the policies a script they were asked about never started, and
     /// where the next foreground script starts.
-    async fn end_unrun(&self, task_id: &str) {
+    async fn end_unrun(&self, launch: crate::LaunchId) {
         let policies = &self.policies;
         if policies.is_empty() {
             return;
@@ -2633,16 +2695,13 @@ where
         let own = self.own_dir().await;
         let end = self.home_script_dir(carried_start(self.carried_dir.as_ref()).await, &own);
         policies
-            .ended(task_id, ScriptOutcome::NotRun, &end, Carry::NotCarried)
+            .ended(launch, ScriptOutcome::NotRun, &end, Carry::NotCarried)
             .await;
     }
 
-    /// Puts the script to the shell's script policies and its output
-    /// treatment, the shell parsed once for all of them, and folds the
-    /// policies' decisions into what admission does next.
     async fn check_script(
         &self,
-        task_id: &str,
+        launch: crate::LaunchId,
         admission: &Admission<'_>,
         start: &ScriptDir,
     ) -> Result<(Clearance, OutputTreatment), ScriptRefusal> {
@@ -2653,7 +2712,7 @@ where
         let shell = (admission.interpreter == Interpreter::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
         let check = crate::ScriptCheck {
-            task_id,
+            launch,
             script: admission.script,
             interpreter: admission.interpreter,
             shell: shell.as_ref().map(Result::as_ref),
@@ -2721,6 +2780,30 @@ where
         self.approve(request, admission.call(), cx).await
     }
 
+    /// Ensures a subagent shell's [`AgentPath`] is reflected on `call` even
+    /// when a caller attached no identity or attached [`AgentIdentity::Main`]
+    /// from an inner agent loop.
+    fn effective_call_identity(
+        &self,
+        call: Option<&CallIdentity>,
+        fallback_call_id: &str,
+    ) -> Option<CallIdentity> {
+        let path = self.events_tx.agent();
+        if path.is_main() {
+            return call.cloned();
+        }
+        if let Some(existing) = call
+            && AgentPath::of(existing.agent()) == *path
+        {
+            return Some(existing.clone());
+        }
+        let call_id = call.map_or_else(
+            || ToolCallId::new(fallback_call_id),
+            |existing| existing.call().clone(),
+        );
+        Some(CallIdentity::new(call_id, agent_identity_from_path(path)))
+    }
+
     /// Puts `request` to the approver of the call that carries the script, or
     /// to the terminal's own when the script has no call to ask through:
     /// a run, a background script started directly, or a call whose
@@ -2731,6 +2814,10 @@ where
         call: Option<&CallIdentity>,
         cx: Option<&mut ToolContext>,
     ) -> Result<(), TerminalError> {
+        let request = match call {
+            Some(call) => request.with_call(call.clone()),
+            None => request,
+        };
         let kind = request.kind().clone();
         let answer = match cx {
             Some(cx) => match cx.approve(request.clone()).await {
@@ -2744,10 +2831,6 @@ where
         } else {
             let Some(approver) = &self.approver else {
                 return Err(TerminalError::NoApprover(kind));
-            };
-            let request = match call {
-                Some(call) => request.with_call(call.clone()),
-                None => request,
             };
             approver
                 .approve(request)
@@ -2786,13 +2869,13 @@ where
         let start = match run_start(&prepared.target, run.dir) {
             Ok(start) => start,
             Err(error) => {
-                self.end_unrun(&prepared.task_id).await;
+                self.end_unrun(prepared.launch.id()).await;
                 return Err(error);
             }
         };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
-            task_id: prepared.task_id.clone(),
+            launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
             script: run.source,
             interpreter: Interpreter::Shell,
@@ -2810,8 +2893,6 @@ where
             Ok(Err(error)) => return Err(TerminalError::Execution(error).into()),
             Err(_) => return Err(TerminalError::TaskLost.into()),
         }
-        // The run is never announced as a background task, so its end is
-        // told to the caller alone, however long it takes.
         let result = spawned
             .result
             .recv()
@@ -2819,7 +2900,7 @@ where
             .map_err(|_| TerminalError::TaskLost);
         let killed = self
             .job_registry
-            .get_by_task_id_settled(&prepared.task_id)
+            .get_by_launch_settled(prepared.launch.id())
             .await
             .and_then(|job| job.status.kill_cause());
         spawned.took_result().await;
@@ -2827,32 +2908,28 @@ where
         Ok(result.into_script_result(killed))
     }
 
-    /// Kills the job through the registry once its timeout passes, the job
-    /// then reading [`KillCause::Timeout`](crate::KillCause::Timeout).
-    ///
-    /// A bound that passes before the job registered is enforced the moment
-    /// `registered` closes, which is when the job's startup was reported.
-    fn spawn_kill_watchdog(&self, task_id: &IdLease, timeout: Duration, registered: Receiver<()>) {
+    fn spawn_kill_watchdog(
+        &self,
+        launch: &crate::job_registry::LaunchLease,
+        timeout: Duration,
+        registered: Receiver<()>,
+    ) {
         let job_registry = self.job_registry.clone();
         let started = jiff::Timestamp::now();
-        // Weak, so a job that ended gives its word back before the timer
-        // fires; a word that went back may name another job by then.
-        let task_id = task_id.downgrade();
+        let launch = launch.downgrade();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(timeout).await;
-                // Nothing is ever sent: the channel closes once the startup
-                // was reported or its flow is gone.
                 let _ = registered.recv().await;
-                let Some(task_id) = task_id.upgrade() else {
+                let Some(launch) = launch.upgrade() else {
                     return;
                 };
-                if let Some(job) = job_registry.get_by_task_id(&task_id).await
+                if let Some(job) = job_registry.get_by_launch(launch.id()).await
                     && matches!(job.status, JobStatus::Running)
                 {
                     job_registry
                         .kill_timed_out(
-                            &job.task_id,
+                            launch.id(),
                             TimeoutKill {
                                 timeout,
                                 started,
@@ -2865,27 +2942,24 @@ where
             .detach();
     }
 
-    /// Raises one [`LongRunning`] when the job crosses the configured
-    /// long-running threshold.
-    fn spawn_long_job_alert(&self, task_id: &IdLease) {
+    fn spawn_long_job_alert(&self, launch: &crate::job_registry::LaunchLease) {
         let job_registry = self.job_registry.clone();
         let alert_tx = self.events_tx.clone();
-        // Weak for the same reason as the watchdog's.
-        let task_id = task_id.downgrade();
+        let launch = launch.downgrade();
         let alert_after = self.limits.long_job_alert.get();
         self.executor
             .spawn(async move {
                 async_io::Timer::after(alert_after).await;
-                let Some(task_id) = task_id.upgrade() else {
+                let Some(launch) = launch.upgrade() else {
                     return;
                 };
-                if let Some(job) = job_registry.get_by_task_id(&task_id).await
+                if let Some(job) = job_registry.get_by_launch(launch.id()).await
                     && matches!(job.status, JobStatus::Running)
                 {
                     let _ = alert_tx
                         .send(ShellEvent::LongRunning(LongRunning {
                             agent: alert_tx.agent().clone(),
-                            task_id: task_id.to_string(),
+                            pid: job.pid,
                             script: job.script,
                             after: job.started_at.elapsed(),
                         }))
@@ -2954,15 +3028,11 @@ enum Clearance {
 
 struct ExecutionPreparation {
     target: ExecutionTarget,
-    task_id: IdLease,
+    launch: crate::job_registry::LaunchLease,
     execution_id: String,
     outputs: OutputStore,
     max_lines: usize,
-    /// How the script's output is cleaned, as the shell's
-    /// [`TreatOutput`](crate::TreatOutput) chose.
     treatment: OutputTreatment,
-    /// The carried directory a foreground command starts in, when the
-    /// terminal carries one and it still exists.
     carried_start: Option<PathBuf>,
 }
 
@@ -3055,31 +3125,26 @@ async fn wait_for_foreground_result(
 async fn detach_job(
     job_registry: &JobRegistry,
     outputs: &OutputStore,
-    task_id: &str,
+    launch: crate::LaunchId,
     max_lines: usize,
     started_tx: &EventSender,
 ) -> aither_core::Result<Detached> {
-    // The call still owns the job's completion, so the job is registered; the
-    // hold keeps it past a consumer that takes the completion at once.
     let watch = job_registry
-        .watch(task_id)
+        .watch_launch(launch)
         .await
         .expect("a job whose call has not returned is registered");
+    let pid = watch.pid();
     let redirect =
-        start_background_output_redirect(job_registry, outputs, task_id, max_lines).await?;
+        start_background_output_redirect(job_registry, outputs, launch, max_lines).await?;
     let _ = started_tx
         .send(ShellEvent::JobStarted(JobStarted {
             agent: started_tx.agent().clone(),
-            task_id: task_id.to_string(),
+            pid,
             output_preview: redirect.preview.clone(),
             output_file: redirect.file.clone(),
         }))
         .await;
-    Ok(Detached {
-        task_id: task_id.to_string(),
-        redirect,
-        watch,
-    })
+    Ok(Detached { redirect, watch })
 }
 
 /// Output file a background job was redirected to, with what it holds so far.
@@ -3093,7 +3158,7 @@ struct BackgroundRedirect {
 async fn start_background_output_redirect(
     job_registry: &JobRegistry,
     outputs: &OutputStore,
-    task_id: &str,
+    launch: crate::LaunchId,
     max_lines: usize,
 ) -> Result<BackgroundRedirect, anyhow::Error> {
     let (url, output_path) = outputs.save_raw(&[]).await?;
@@ -3102,7 +3167,7 @@ async fn start_background_output_redirect(
         path: output_path.display().to_string(),
     };
     let snapshot = job_registry
-        .start_output_redirect(task_id, output_path)
+        .start_output_redirect(launch, output_path)
         .await
         .map_err(anyhow::Error::msg)?;
     let (preview, truncated) = preview_first_lines(&snapshot, max_lines);
@@ -3125,17 +3190,12 @@ fn background_preview(preview: &str) -> String {
 }
 
 struct StandaloneExecution<E> {
-    /// The shell's sandbox: its directory, live grants, environment source,
-    /// network policy, priority and home backend.
     sandbox: Sandbox,
     executor: E,
-    /// The commands the job's processes may call back into the host with.
     ipc: Option<crate::AnyIpcProvider>,
-    /// The worktrees the host's `git` shim maps for the command.
     committed: Vec<CommittingWorktree>,
     job_registry: JobRegistry,
-    task_id: IdLease,
-    /// What the job's processes are launched as.
+    launch: crate::job_registry::LaunchLease,
     info: crate::LaunchInfo,
     execution_id: String,
     background: bool,
@@ -3162,7 +3222,7 @@ struct StandaloneStart<'a, E> {
     ipc: Option<&'a crate::AnyIpcProvider>,
     committed: &'a [CommittingWorktree],
     job_registry: &'a JobRegistry,
-    task_id: &'a IdLease,
+    launch: &'a crate::job_registry::LaunchLease,
     info: crate::LaunchInfo,
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
@@ -3177,13 +3237,12 @@ struct StandaloneStart<'a, E> {
 }
 
 struct LocalBackgroundExecution<'a, E> {
-    /// The shell program scripts run under.
     shell: &'a str,
     sandbox: &'a Sandbox,
     executor: E,
     ipc: Option<&'a crate::AnyIpcProvider>,
     committed: &'a [CommittingWorktree],
-    task_id: &'a IdLease,
+    launch: &'a crate::job_registry::LaunchLease,
     info: crate::LaunchInfo,
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
@@ -3202,7 +3261,7 @@ struct ContainerJobExecution<'a, E> {
     sandbox: &'a Sandbox,
     ipc: Option<&'a crate::AnyIpcProvider>,
     committed: &'a [CommittingWorktree],
-    task_id: &'a IdLease,
+    launch: &'a crate::job_registry::LaunchLease,
     info: crate::LaunchInfo,
     execution_id: &'a str,
     script: &'a str,
@@ -3213,8 +3272,6 @@ struct ContainerJobExecution<'a, E> {
     job_registry: &'a JobRegistry,
     lifetime: JobLifetime,
     background_startup: &'a BackgroundStartup,
-    /// The command's jobserver fifo inside the container, held until its
-    /// exec has ended.
     #[cfg(all(unix, feature = "jobserver"))]
     job_fifo: Option<crate::container_jobserver::ContainerJobFifo>,
 }
@@ -3222,8 +3279,8 @@ struct ContainerJobExecution<'a, E> {
 struct SshBackgroundExecution<'a, E> {
     executor: E,
     sandbox: &'a Sandbox,
-    launch: &'a RemoteLaunch,
-    task_id: &'a IdLease,
+    launch_cfg: &'a RemoteLaunch,
+    launch: &'a crate::job_registry::LaunchLease,
     info: crate::LaunchInfo,
     execution_id: &'a str,
     script: &'a str,
@@ -3239,7 +3296,7 @@ struct SshBackgroundExecution<'a, E> {
 
 struct CompletedProcessOutput<'a> {
     job_registry: &'a JobRegistry,
-    task_id: &'a IdLease,
+    launch: &'a crate::job_registry::LaunchLease,
     output: std::process::Output,
     background_output: bool,
     outputs: &'a OutputStore,
@@ -3282,7 +3339,7 @@ struct ExecutionTarget {
 
 struct TerminalSpawnRequest {
     target: ExecutionTarget,
-    task_id: IdLease,
+    launch: crate::job_registry::LaunchLease,
     execution_id: String,
     script: String,
     interpreter: Interpreter,
@@ -3327,7 +3384,7 @@ struct SpawnedTerminalTask<E> {
     ipc: Option<crate::AnyIpcProvider>,
     committed: Vec<CommittingWorktree>,
     job_registry: JobRegistry,
-    task_id: IdLease,
+    launch: crate::job_registry::LaunchLease,
     /// What the job's processes are launched as.
     info: crate::LaunchInfo,
     execution_id: String,
@@ -3369,7 +3426,7 @@ where
         ipc,
         committed,
         job_registry,
-        task_id,
+        launch,
         info,
         execution_id,
         background,
@@ -3395,16 +3452,12 @@ where
         jobserver,
         outages,
     } = task;
-    // Before the job registers, so the registry reports the bound it runs under.
+    let launch_id = launch.id();
     if let Some(timeout) = timeout {
-        job_registry.bound_by_timeout(&task_id, timeout).await;
+        job_registry.bound_by_timeout(&launch, timeout).await;
     }
-    // Before the process starts, so a command it calls over IPC can already
-    // append to this job's output.
-    job_registry.launching(&task_id).await;
+    job_registry.launching(&launch).await;
     let status_registry = job_registry.clone();
-    // What the policies are told the next script starts in, spelled as this
-    // script's backend names a directory.
     let end_view = (!policies.is_empty()).then(|| {
         (
             DirSpelling::of(&backend),
@@ -3418,7 +3471,7 @@ where
         ipc,
         committed,
         job_registry,
-        task_id: task_id.clone(),
+        launch: launch.clone(),
         info,
         execution_id,
         background,
@@ -3439,9 +3492,8 @@ where
         stdout,
     })
     .await;
-    // A process that never started leaves no job to register.
-    status_registry.abandon_launch(&task_id).await;
-    let interruptions = outages.end(&task_id).await;
+    status_registry.abandon_launch(&launch).await;
+    let interruptions = outages.end(launch_id).await;
     let (result, settled) = match result {
         Ok((command, settled)) => (Ok(command), Some(settled)),
         Err(error) => (Err(error), None),
@@ -3450,16 +3502,12 @@ where
         interruptions,
         ..command
     });
-    // Ahead of the result, so what a policy records of this end holds for
-    // the agent's next call.
     let outcome = result
         .as_ref()
         .map_or(ScriptOutcome::Failed, |command| ScriptOutcome::Exited {
             code: command.exit_code,
         });
     if let Some((spelling, carried, working_dir)) = &end_view {
-        // A settled script already read the carried directory under the
-        // lock that recorded it; one that settled nothing reads it now.
         let (carry, host) = match settled {
             Some(Settled { carry, carried }) => (carry, carried),
             None => (
@@ -3471,7 +3519,7 @@ where
             .await
             .unwrap_or_else(|_| working_dir.clone());
         let end = spelling.dir(host, &own);
-        policies.ended(&task_id, outcome, &end, carry).await;
+        policies.ended(launch_id, outcome, &end, carry).await;
     }
 
     let quick_result = match &result {
@@ -3479,24 +3527,16 @@ where
         Err(err) => Err(err.detail().into_owned()),
     };
     let _ = result_tx.send(quick_result).await;
-    // The call answers at once, taking the result or leaving it to a
-    // background task.
     let foreground = taken.recv().await.ok();
-    // A kill's signal can end the process before the kill records its
-    // outcome, so the registry settles the ending once no kill is in flight.
     let ending = match &result {
         Ok(command) => Ok(command.exit_code),
         Err(error) => Err(error.detail().into_owned()),
     };
-    // The job as it ended, settled before a foreground result takes it.
-    let (info, pending) = match status_registry.owe_completion(&task_id, ending).await {
+    let (info, pending) = match status_registry.owe_completion(launch_id, ending).await {
         Some(owed) => (Some(owed.info), owed.pending),
         None => (None, None),
     };
     let kill = info.as_ref().and_then(|info| info.status.kill_cause());
-    // A result the call returned leaves nothing for the agent to take: the
-    // completion is taken here, so the registry forgets the job, and the end
-    // is no fact to raise: the call already told it.
     let pending = match foreground {
         Some(_) => {
             if let Some(pending) = pending {
@@ -3506,9 +3546,6 @@ where
         }
         None => pending,
     };
-    // Only a job, one promoted past the foreground window or started in the
-    // background, reports its end. A command the shell never registered, one
-    // that failed to start, has no job to report.
     if foreground.is_none()
         && let Some(info) = info
     {
@@ -3527,8 +3564,7 @@ where
             .await;
     }
     running_tasks.fetch_sub(1, Ordering::AcqRel);
-    // The flow's own hold on the word ends before the call returns.
-    drop(task_id);
+    drop(launch);
     if let Some(done) = foreground {
         let _ = done.send(()).await;
     }
@@ -3548,7 +3584,7 @@ where
         ipc,
         committed,
         job_registry,
-        task_id,
+        launch,
         info,
         execution_id,
         background,
@@ -3581,7 +3617,7 @@ where
         ipc: ipc.as_ref(),
         committed: &committed,
         job_registry: &job_registry,
-        task_id: &task_id,
+        launch: &launch,
         info,
         execution_id: &execution_id,
         carry: carry.as_ref(),
@@ -3605,7 +3641,7 @@ where
 
     let result = save_completed_process_output(CompletedProcessOutput {
         job_registry: &job_registry,
-        task_id: &task_id,
+        launch: &launch,
         output,
         background_output: background,
         outputs: &outputs,
@@ -3620,9 +3656,7 @@ where
     debug!(exit_code, "background script completed");
 
     let output_path = stored_path(&result.stdout);
-    job_registry
-        .complete(&task_id, exit_code, output_path)
-        .await;
+    job_registry.complete(&launch, exit_code, output_path).await;
 
     // The command's directory report arrives with its end, whether the call
     // answered in the foreground window or the command promoted: the task
@@ -3683,7 +3717,7 @@ where
                 sandbox: request.sandbox,
                 ipc: request.ipc,
                 committed: request.committed,
-                task_id: request.task_id,
+                launch: request.launch,
                 info: request.info,
                 execution_id: request.execution_id,
                 script: request.script,
@@ -3705,13 +3739,11 @@ where
             heel,
             launch,
         } => {
-            // The pool bounds the jobs of this machine; the server is another
-            // machine, so its commands take no token and get no fifo.
             return execute_ssh_background(SshBackgroundExecution {
                 executor: request.executor,
                 sandbox: request.sandbox,
-                launch,
-                task_id: request.task_id,
+                launch_cfg: launch,
+                launch: request.launch,
                 info: request.info,
                 execution_id: request.execution_id,
                 script: request.script,
@@ -3738,7 +3770,7 @@ where
         executor: request.executor,
         ipc: request.ipc,
         committed: request.committed,
-        task_id: request.task_id,
+        launch: request.launch,
         info: request.info,
         execution_id: request.execution_id,
         carry: request.carry,
@@ -3751,8 +3783,6 @@ where
         #[cfg(all(unix, feature = "jobserver"))]
         job_fifo,
     };
-    // Unsafe mode bypasses the proxy entirely, so its connections are not
-    // audited at this layer.
     execute_local_background(local).await
 }
 
@@ -3761,7 +3791,7 @@ async fn save_completed_process_output(
 ) -> Result<CompletedCommand, TerminalError> {
     let CompletedProcessOutput {
         job_registry,
-        task_id,
+        launch,
         output,
         background_output,
         outputs,
@@ -3772,7 +3802,7 @@ async fn save_completed_process_output(
     } = request;
     let stdout = save_completed_stdout(
         job_registry,
-        task_id,
+        launch,
         &output.stdout,
         CompletedStdoutFormat {
             background_output,
@@ -3784,7 +3814,7 @@ async fn save_completed_process_output(
         },
     )
     .await?;
-    let stderr = save_completed_stderr(job_registry, task_id, outputs, &output.stderr).await?;
+    let stderr = save_completed_stderr(job_registry, launch, outputs, &output.stderr).await?;
     let exit_code = output.status.code().unwrap_or(-1);
 
     Ok(CompletedCommand {
@@ -3804,12 +3834,67 @@ struct CompletedStdoutFormat<'a> {
     stdout: StdoutTreatment,
 }
 
+fn agent_identity_from_path(path: &AgentPath) -> AgentIdentity {
+    let mut current = AgentIdentity::Main;
+    for segment in path.segments() {
+        let started_by = match current {
+            AgentIdentity::Main => None,
+            AgentIdentity::Subagent(_) => {
+                Some(CallIdentity::new(ToolCallId::new("subagent"), current))
+            }
+        };
+        current = AgentIdentity::Subagent(SubagentIdentity::new(segment.clone(), started_by));
+    }
+    current
+}
+
+#[derive(Clone)]
+struct SubagentIdentityApprover {
+    inner: AnyApprover,
+    agent: AgentPath,
+}
+
+impl Approver for SubagentIdentityApprover {
+    fn approve(
+        &self,
+        request: ApprovalRequest,
+    ) -> impl std::future::Future<Output = Result<Approval, aither_core::llm::tool::ApproverFailure>>
+    + Send {
+        let request = match request.call() {
+            Some(existing) if AgentPath::of(existing.agent()) == self.agent => request,
+            Some(existing) => {
+                let call_id = existing.call().clone();
+                request.with_call(CallIdentity::new(
+                    call_id,
+                    agent_identity_from_path(&self.agent),
+                ))
+            }
+            None => request.with_call(CallIdentity::new(
+                ToolCallId::new("subagent"),
+                agent_identity_from_path(&self.agent),
+            )),
+        };
+        let inner = self.inner.clone();
+        async move { inner.approve(request).await }
+    }
+}
+
 async fn save_completed_stdout(
     job_registry: &JobRegistry,
-    task_id: &IdLease,
+    launch: &crate::job_registry::LaunchLease,
     stdout: &[u8],
     format: CompletedStdoutFormat<'_>,
 ) -> Result<CommandStream, TerminalError> {
+    if let Some(redirect_path) = job_registry.flush_output_redirect(launch.id()).await {
+        return match format.outputs.stream_of_file(&redirect_path).await {
+            Ok(entry) => Ok(entry),
+            Err(err) => {
+                job_registry.fail(launch, &err.to_string(), None).await;
+                Err(TerminalError::Io(err))
+            }
+        };
+    }
+
     let byte_limit = Some(format.outputs.policy().get().inline_bytes);
     let data_to_save = if format.background_output {
         Cow::Borrowed(stdout)
@@ -3830,7 +3915,7 @@ async fn save_completed_stdout(
     {
         Ok(entry) => Ok(entry),
         Err(err) => {
-            job_registry.fail(task_id, &err.to_string(), None).await;
+            job_registry.fail(launch, &err.to_string(), None).await;
             Err(TerminalError::Io(err))
         }
     }
@@ -3869,7 +3954,7 @@ async fn compressed_stdout_data<'a>(
 
 async fn save_completed_stderr(
     job_registry: &JobRegistry,
-    task_id: &IdLease,
+    launch: &crate::job_registry::LaunchLease,
     outputs: &OutputStore,
     stderr: &[u8],
 ) -> Result<Option<CommandStream>, TerminalError> {
@@ -3887,7 +3972,7 @@ async fn save_completed_stderr(
     {
         Ok(entry) => Ok(Some(entry)),
         Err(err) => {
-            job_registry.fail(task_id, &err.to_string(), None).await;
+            job_registry.fail(launch, &err.to_string(), None).await;
             Err(TerminalError::Io(err))
         }
     }
@@ -4010,7 +4095,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
         SandboxMode::Unsandboxed => context.sandbox.clone().unconfined(),
     };
 
-    let launch_script = launch_script(context.interpreter, context.script, context.task_id)?;
+    let launch_script = launch_script(context.interpreter, context.script, context.launch.id())?;
     let launch = build_terminal_launch(
         context.shell,
         &launch_script,
@@ -4040,12 +4125,15 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
         sandbox: _sandbox,
     } = sandbox.spawn_local(spec).await?;
 
-    let pid = child.id();
+    let pid = child.sandbox_id();
+    let host_pid = child.id();
+    let lifetime = context.lifetime.with_pid(pid);
     context
         .job_registry
         .register_with_tree(
             pid,
-            context.task_id,
+            host_pid,
+            context.launch,
             context.execution_id,
             context.script,
             context.interpreter,
@@ -4060,11 +4148,11 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
         child,
         context.executor,
         context.job_registry,
-        context.task_id,
+        context.launch,
         LocalJob {
-            pid,
+            pid: host_pid,
             tree,
-            lifetime: context.lifetime,
+            lifetime,
             startup: context.background_startup,
         },
         "missing stdout pipe for local process",
@@ -4075,33 +4163,27 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
     Ok(output)
 }
 
-/// How long a command's descendants may outlive its top-level shell, and
-/// what the command reads on stdin.
-///
-/// Both follow from whether the call waits for the command: nothing feeds a
-/// call that waits, so its stdin is the null device, and a background job's
-/// is a pipe the agent feeds through the input tool. [`Self::applied_to`] is
-/// the one place a spawn takes them from, on every backend.
 #[derive(Clone)]
 enum JobLifetime {
-    /// None: the survivors are killed and reported on `alerts`, as those of
-    /// the command `task_id` that the tool call `call` ran. Its stdin reads
-    /// EOF at once, and still does once the call promotes it to a job past
-    /// the foreground window.
     Foreground {
         alerts: EventSender,
-        task_id: String,
+        pid: u32,
         call: Option<CallIdentity>,
     },
-    /// All of them: the job runs until its whole tree has exited. Its stdin
-    /// is a pipe, and a reader blocked on it is reported through `stdin`
-    /// where the backend can watch it.
-    Background { stdin: StdinAlerts },
+    Background {
+        stdin: StdinAlerts,
+    },
 }
 
 impl JobLifetime {
-    /// `spec` spawned under this lifetime: what the backend does with the
-    /// descendants its top-level process leaves, and its stdin.
+    const fn with_pid(mut self, pid: u32) -> Self {
+        match &mut self {
+            Self::Foreground { pid: slot, .. } => *slot = pid,
+            Self::Background { stdin } => stdin.pid = pid,
+        }
+        self
+    }
+
     const fn applied_to(&self, spec: SpawnSpec) -> SpawnSpec {
         let (tree, stdin) = match self {
             Self::Foreground { .. } => (TreeLifetime::Foreground, Pipe::Null),
@@ -4114,8 +4196,6 @@ impl JobLifetime {
         })
     }
 
-    /// Where a reader blocked on the job's stdin pipe is reported; `None` for
-    /// a foreground command, which has no pipe.
     const fn stdin_alerts(&self) -> Option<&StdinAlerts> {
         match self {
             Self::Foreground { .. } => None,
@@ -4123,21 +4203,14 @@ impl JobLifetime {
         }
     }
 
-    /// Reports `killed` as the descendants a foreground command left; a
-    /// background job's are never killed, so it reports nothing.
     async fn report_descendants_killed(&self, killed: Vec<JobProcess>) {
-        let Self::Foreground {
-            alerts,
-            task_id,
-            call,
-        } = self
-        else {
+        let Self::Foreground { alerts, pid, call } = self else {
             return;
         };
         let _ = alerts
             .send(ShellEvent::DescendantsKilled(DescendantsKilled {
                 agent: alerts.agent().clone(),
-                task_id: task_id.clone(),
+                pid: *pid,
                 call: call.clone(),
                 processes: killed,
             }))
@@ -4145,18 +4218,14 @@ impl JobLifetime {
     }
 }
 
-/// Where a background job's stdin alerts go: the job of `task_id`, running
-/// `script`.
 #[derive(Clone)]
 struct StdinAlerts {
     tx: EventSender,
-    task_id: String,
+    pid: u32,
     script: String,
 }
 
 impl StdinAlerts {
-    /// Raises an alert for each signal a stdin watch sends, until the watch
-    /// ends.
     async fn relay(self, signals: async_channel::Receiver<StdinWatchSignal>) {
         while let Ok(signal) = signals.recv().await {
             match signal {
@@ -4167,26 +4236,24 @@ impl StdinAlerts {
     }
 
     async fn raise(&self) {
-        debug!(task_id = %self.task_id, "background job is blocked on stdin");
+        debug!(pid = %self.pid, "background job is blocked on stdin");
         let _ = self
             .tx
             .send(ShellEvent::StdinBlocked(StdinBlocked {
                 agent: self.tx.agent().clone(),
-                task_id: self.task_id.clone(),
+                pid: self.pid,
                 script: self.script.clone(),
             }))
             .await;
     }
 
-    /// Tells the agent this job's stdin watch died: no blocked-on-stdin
-    /// alert can come for it anymore.
     async fn raise_failure(&self, error: String) {
-        warn!(task_id = %self.task_id, error = %error, "stdin watch failed");
+        warn!(pid = %self.pid, error = %error, "stdin watch failed");
         let _ = self
             .tx
             .send(ShellEvent::StdinWatchFailed(StdinWatchFailed {
                 agent: self.tx.agent().clone(),
-                task_id: self.task_id.clone(),
+                pid: self.pid,
                 script: self.script.clone(),
                 error,
             }))
@@ -4196,7 +4263,7 @@ impl StdinAlerts {
 
 /// Watches one local background job's stdin pipe for a waiting reader.
 pub struct LocalStdinWatch {
-    probe: LocalStdinProbe,
+    probe: Option<LocalStdinProbe>,
     feed: FeedCounter,
     detector: EpisodeDetector,
     signals: async_channel::Sender<StdinWatchSignal>,
@@ -4211,7 +4278,7 @@ impl LocalStdinWatch {
         signals: async_channel::Sender<StdinWatchSignal>,
     ) -> Self {
         Self {
-            probe,
+            probe: Some(probe),
             feed,
             detector: EpisodeDetector::default(),
             signals,
@@ -4221,52 +4288,69 @@ impl LocalStdinWatch {
     /// Probes the pipe every [`STDIN_WATCH_INTERVAL`] and signals one
     /// [`StdinWatchSignal::Blocked`] per blocking episode, for as long as the
     /// future is polled.
-    async fn run(mut self) -> std::convert::Infallible {
+    pub(crate) async fn run_borrowed(&mut self) -> std::convert::Infallible {
         loop {
             async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
-            let Self {
-                probe,
-                feed,
-                mut detector,
-                signals,
-            } = self;
-            let fed = feed.count();
+            let Some(probe) = self.probe.take() else {
+                std::future::pending::<()>().await;
+                unreachable!()
+            };
+            let fed = self.feed.count();
             let (probe, observed) = blocking::unblock(move || {
                 let observed = probe.probe();
                 (probe, observed)
             })
             .await;
+            self.probe = Some(probe);
             match observed {
                 Ok(observed) => {
-                    if detector.observe(fed, observed) {
-                        let _ = signals.send(StdinWatchSignal::Blocked).await;
+                    if self.detector.observe(fed, observed) {
+                        let _ = self.signals.send(StdinWatchSignal::Blocked).await;
                     }
                 }
                 Err(error) => {
-                    // Detection cannot run: surface it once, then park — the
-                    // job's exit still ends the race in
-                    // `wait_for_local_process_exit`.
-                    let _ = signals
+                    let _ = self
+                        .signals
                         .send(StdinWatchSignal::Failed(error.to_string()))
                         .await;
                     std::future::pending::<()>().await;
                 }
             }
-            self = Self {
-                probe,
-                feed,
-                detector,
-                signals,
-            };
         }
     }
+}
+
+async fn attach_local_stdin_watch<E: Executor + Clone + 'static>(
+    child: &mut LocalChild,
+    executor: &E,
+    job_registry: &JobRegistry,
+    launch: &crate::job_registry::LaunchLease,
+    pid: u32,
+    lifetime: &JobLifetime,
+) -> Result<Option<LocalStdinWatch>, TerminalError> {
+    let Some(alerts) = lifetime.stdin_alerts() else {
+        return Ok(None);
+    };
+    let stdin = child
+        .take_stdin()
+        .ok_or_else(|| TerminalError::Execution("missing stdin pipe for local process".into()))?;
+    let feed = FeedCounter::default();
+    let probe = LocalStdinProbe::new(pid, &stdin)
+        .map_err(|error| TerminalError::Execution(format!("stdin probe: {error}")))?;
+    let (signal_tx, signal_rx) = async_channel::unbounded();
+    executor.spawn(alerts.clone().relay(signal_rx)).detach();
+    let watch = LocalStdinWatch::new(probe, feed.clone(), signal_tx);
+    job_registry
+        .attach_terminal_input(launch, write_chunks(stdin, feed))
+        .await;
+    Ok(Some(watch))
 }
 
 async fn collect_local_process_output<E: Executor + Clone + 'static>(
     mut child: LocalChild,
     executor: E,
     job_registry: &JobRegistry,
-    task_id: &IdLease,
+    launch: &crate::job_registry::LaunchLease,
     job: LocalJob<'_>,
     missing_stdout_message: &'static str,
     missing_stderr_message: &'static str,
@@ -4277,25 +4361,9 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         lifetime,
         startup,
     } = job;
-    // A background job's stdin pipe is fed through the registry and watched;
-    // a foreground command reads the null device and has none.
-    let mut stdin_watch = None;
-    if let Some(alerts) = lifetime.stdin_alerts() {
-        let stdin = child.take_stdin().ok_or_else(|| {
-            TerminalError::Execution("missing stdin pipe for local process".into())
-        })?;
-        let feed = FeedCounter::default();
-        let probe = LocalStdinProbe::new(pid, &stdin)
-            .map_err(|error| TerminalError::Execution(format!("stdin probe: {error}")))?;
-        let (signal_tx, signal_rx) = async_channel::unbounded();
-        executor.spawn(alerts.clone().relay(signal_rx)).detach();
-        stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
-        job_registry
-            .attach_terminal_input(task_id, write_chunks(stdin, feed))
-            .await;
-    }
-    // Only now: a job that has a pipe takes input from the moment its call
-    // can name it.
+    let stdin_watch =
+        attach_local_stdin_watch(&mut child, &executor, job_registry, launch, pid, &lifetime)
+            .await?;
     startup.report_ready().await;
 
     let stdout = child
@@ -4312,32 +4380,33 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
     executor
         .spawn(drain_terminal_chunks(
             job_registry.clone(),
-            task_id.downgrade(),
+            launch.downgrade(),
             chunk_rx,
+            None,
         ))
         .detach();
 
-    // The root stays unreaped until its tree is gone, so its pid and process
-    // group stay reserved while the job's descendants are tracked by them.
-    let exited = match wait_for_local_process_exit(&mut child, stdin_watch).await {
+    let mut stdin_watch = stdin_watch;
+    let (status, report) = match wait_for_local_process_exit(&mut child, stdin_watch.as_mut()).await
+    {
         Ok(exited) => exited,
         Err(error) => {
             tree.finish().await;
-            job_registry.close_stdout(task_id).await;
-            job_registry.close_stderr(task_id).await;
+            job_registry.close_stdout(launch).await;
+            job_registry.close_stderr(launch).await;
             return Err(error);
         }
     };
-    let descendants = end_descendants(&tree, &lifetime).await;
-    // The task ends first: afterwards the root's pid may belong to anyone.
-    tree.finish().await;
-    let (status, report) = match exited {
-        Some(status) => (Ok(status), None),
-        None => match child.wait_reported().await {
-            Ok((status, report)) => (Ok(status), report),
-            Err(error) => (Err(TerminalError::Execution(error.to_string())), None),
-        },
+    let descendants = match stdin_watch.as_mut() {
+        Some(watch) => {
+            futures_lite::future::or(end_descendants(&tree, &lifetime), async {
+                match watch.run_borrowed().await {}
+            })
+            .await
+        }
+        None => end_descendants(&tree, &lifetime).await,
     };
+    tree.finish().await;
     let _ = &report;
     #[cfg(target_os = "linux")]
     if let Some(report) = report {
@@ -4357,19 +4426,20 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
             lifetime.report_descendants_killed(killed).await;
         }
     }
-    let status = match (descendants, status) {
-        (Ok(()), Ok(status)) => status,
-        (Err(error), _) | (Ok(()), Err(error)) => {
-            job_registry.close_stdout(task_id).await;
-            job_registry.close_stderr(task_id).await;
-            job_registry.fail(task_id, &error.detail(), None).await;
-            return Err(error);
-        }
-    };
-    wait_for_terminal_stream_close(job_registry, task_id).await;
-    let (stdout, stderr) = job_registry.terminal_output(task_id).await.ok_or_else(|| {
-        TerminalError::Execution(format!("missing terminal output for task {task_id}"))
-    })?;
+    if let Err(error) = descendants {
+        job_registry.close_stdout(launch).await;
+        job_registry.close_stderr(launch).await;
+        job_registry.fail(launch, &error.detail(), None).await;
+        return Err(error);
+    }
+    let launch_id = launch.id();
+    wait_for_terminal_stream_close(job_registry, launch_id).await;
+    let (stdout, stderr) = job_registry
+        .terminal_output(launch_id)
+        .await
+        .ok_or_else(|| {
+            TerminalError::Execution(format!("missing terminal output for launch {launch_id}"))
+        })?;
     let output = std::process::Output {
         status,
         stdout,
@@ -4415,7 +4485,7 @@ pub enum LocalChild {
 }
 
 impl LocalChild {
-    /// The spawned process's id: the supervisor's on Linux.
+    /// Host OS process ID (supervisor PID on Linux).
     pub(crate) fn id(&self) -> u32 {
         match self {
             Self::Plain(child) => child.id(),
@@ -4423,6 +4493,17 @@ impl LocalChild {
             Self::Foreground(child) => child.id(),
             #[cfg(target_os = "linux")]
             Self::Background(child) => child.id(),
+        }
+    }
+
+    /// Process ID inside the sandbox's execution environment.
+    pub(crate) fn sandbox_id(&self) -> u32 {
+        match self {
+            Self::Plain(child) => child.sandbox_id(),
+            #[cfg(target_os = "linux")]
+            Self::Foreground(child) => child.sandbox_id(),
+            #[cfg(target_os = "linux")]
+            Self::Background(child) => child.sandbox_id(),
         }
     }
 
@@ -4491,8 +4572,8 @@ impl LocalChild {
 ///
 /// A foreground command's surviving descendants are killed and reported in one
 /// [`ShellEvent::DescendantsKilled`]; a background job stays running until every
-/// descendant has exited, which its timeout, `terminal_kill` and the registry's
-/// kills end by killing the tree.
+/// descendant has exited, which its timeout and the registry's teardown kills
+/// end by killing the tree.
 async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), TerminalError> {
     match lifetime {
         JobLifetime::Foreground { .. } => {
@@ -4517,34 +4598,20 @@ async fn end_descendants(tree: &JobTree, lifetime: &JobLifetime) -> Result<(), T
 }
 
 /// Waits for the child to exit, raising stdin alerts meanwhile.
-///
-/// On Unix the child is only observed to have exited and stays unreaped (the
-/// answer is `None`); the caller waits for it once its tree is gone. Windows
-/// has no such state and answers the exit status.
-#[cfg_attr(unix, allow(clippy::needless_pass_by_ref_mut))]
 pub async fn wait_for_local_process_exit(
     child: &mut LocalChild,
-    stdin_watch: Option<LocalStdinWatch>,
-) -> Result<Option<std::process::ExitStatus>, TerminalError> {
-    #[cfg(unix)]
-    let exit = async {
-        crate::process_tree::wait_for_exit(child.id())
-            .await
-            .map(|()| None)
-            .map_err(|error| TerminalError::Execution(error.to_string()))
-    };
-    #[cfg(not(unix))]
+    stdin_watch: Option<&mut LocalStdinWatch>,
+) -> Result<(std::process::ExitStatus, Option<TreeReport>), TerminalError> {
     let exit = async {
         child
             .wait_reported()
             .await
-            .map(|(status, _)| Some(status))
             .map_err(|error| TerminalError::Execution(error.to_string()))
     };
     let Some(stdin_watch) = stdin_watch else {
         return exit.await;
     };
-    futures_lite::future::or(exit, async { match stdin_watch.run().await {} }).await
+    futures_lite::future::or(exit, async { match stdin_watch.run_borrowed().await {} }).await
 }
 
 /// A container command's script as the shell hands it to the sandbox. A main
@@ -4584,20 +4651,13 @@ async fn execute_container_job<E: Executor + Clone + 'static>(
 async fn spawn_container_job<E: Executor + Clone + 'static>(
     context: &ContainerJobExecution<'_, E>,
 ) -> Result<std::process::Output, TerminalError> {
-    // The spec's variables are exported after the sandbox's source's, so they
-    // win over a source variable of the same name, as they do for a local
-    // command.
     #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
-    let mut environment = vec![(
-        crate::memory::JOB_MARKER_ENV.to_string(),
-        context.task_id.to_string(),
-    )];
+    let mut environment = Vec::new();
     #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
     let mut grants = Vec::new();
     #[cfg(all(unix, feature = "jobserver"))]
     if let Some(fifo) = &context.job_fifo {
         environment.extend(fifo.environment());
-        // The build tools write tokens back to the fifo.
         grants.push(crate::SpawnGrant::Container {
             path: fifo.path().clone(),
             access: heel::Access::WRITE,
@@ -4613,7 +4673,7 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
         carry
             .and_then(|carry| carry.container.as_ref())
             .and_then(|container| container.report.as_ref()),
-        &launch_script(context.interpreter, context.script, context.task_id)?,
+        &launch_script(context.interpreter, context.script, context.launch.id())?,
     )?;
     let mut spec = context.lifetime.applied_to(
         SpawnSpec::script(script)
@@ -4635,7 +4695,7 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
             job_registry: context.job_registry,
             background_startup: context.background_startup,
             place: crate::JobPlace::Container,
-            task_id: context.task_id,
+            launch: context.launch,
             execution_id: context.execution_id,
             script: context.script,
             interpreter: context.interpreter,
@@ -4691,24 +4751,20 @@ async fn forward_stream(
 async fn execute_ssh_background<E: Executor + Clone + 'static>(
     context: SshBackgroundExecution<'_, E>,
 ) -> Result<std::process::Output, TerminalError> {
-    // Only what the spec names travels to a server: the sandbox's own
-    // environment, source and grants never leave this machine.
     let sandbox = context
         .sandbox
         .clone()
         .with_backend(crate::Backend::Ssh {
             server: context.server.clone(),
             heel: context.heel.map(str::to_owned),
-            launch: context.launch.clone(),
+            launch: context.launch_cfg.clone(),
         })
         .with_ssh_client(context.client.clone());
     let sandbox = match context.mode {
         SandboxMode::Sandboxed => sandbox,
         SandboxMode::Unsandboxed => sandbox.unconfined(),
     };
-    let script = launch_script(context.interpreter, context.script, context.task_id)?;
-    // No `.ipc(..)`: a server has no way back to this machine, and its
-    // backend refuses a router with `SpawnError::Unsupported`.
+    let script = launch_script(context.interpreter, context.script, context.launch.id())?;
     let child = sandbox
         .spawn(
             context
@@ -4722,10 +4778,8 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
             executor: context.executor,
             job_registry: context.job_registry,
             background_startup: context.background_startup,
-            // The local `ssh` process stands for a job that runs on the
-            // remote host, whose memory is never judged.
             place: crate::JobPlace::Remote,
-            task_id: context.task_id,
+            launch: context.launch,
             execution_id: context.execution_id,
             script: context.script,
             interpreter: context.interpreter,
@@ -4736,27 +4790,51 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
     .await
 }
 
-/// A job whose process a [`Sandbox`] spawned, and where its results go.
 struct SpawnedJob<'a, E> {
     executor: E,
     job_registry: &'a JobRegistry,
     background_startup: &'a BackgroundStartup,
     place: crate::JobPlace,
-    task_id: &'a IdLease,
+    launch: &'a crate::job_registry::LaunchLease,
     execution_id: &'a str,
     script: &'a str,
     interpreter: Interpreter,
     mode: SandboxMode,
-    /// How long its descendants live, and where a reader blocked on its
-    /// stdin pipe is alerted, for a child whose backend watches it.
     lifetime: JobLifetime,
 }
 
-/// Registers a spawned child as a job, streams its output into the registry
-/// and answers what it produced when it ended.
+async fn attach_backend_killer<E: Executor + Clone + 'static>(
+    job: &SpawnedJob<'_, E>,
+    child: &Arc<crate::SandboxedChild>,
+    drained_rx: Receiver<()>,
+) {
+    let (kill_tx, kill_rx) = async_channel::bounded::<Sender<bool>>(1);
+    job.job_registry
+        .attach_backend_killer(job.launch, kill_tx)
+        .await;
+    let killed = Arc::clone(child);
+    job.executor
+        .spawn(async move {
+            if let Ok(done_tx) = kill_rx.recv().await {
+                let ok = match killed.kill().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "ending the job failed");
+                        false
+                    }
+                };
+                if ok {
+                    let _ = drained_rx.recv().await;
+                }
+                let _ = done_tx.send(ok).await;
+            }
+        })
+        .detach();
+}
+
 async fn run_spawned_job<E: Executor + Clone + 'static>(
     mut child: crate::SandboxedChild,
-    job: SpawnedJob<'_, E>,
+    mut job: SpawnedJob<'_, E>,
 ) -> Result<std::process::Output, TerminalError> {
     let stdout = child
         .take_stdout()
@@ -4769,11 +4847,12 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
     let child = Arc::new(child);
 
     let pid = child.id();
+    job.lifetime = job.lifetime.with_pid(pid);
     job.job_registry
         .register_at(
             job.place,
             pid,
-            job.task_id,
+            job.launch,
             job.execution_id,
             job.script,
             job.interpreter,
@@ -4782,29 +4861,13 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
         .await;
     if let Some(stdin) = stdin {
         job.job_registry
-            .attach_terminal_input(job.task_id, stdin)
+            .attach_terminal_input(job.launch, stdin)
             .await;
     }
     if let (Some(signals), Some(alerts)) = (stdin_blocked, job.lifetime.stdin_alerts()) {
         job.executor.spawn(alerts.clone().relay(signals)).detach();
     }
-    // A kill of the job ends the whole process tree, wherever it runs.
-    let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-    job.job_registry
-        .attach_kill_switch(job.task_id, kill_tx)
-        .await;
-    let killed = Arc::clone(&child);
-    job.executor
-        .spawn(async move {
-            if kill_rx.recv().await.is_ok()
-                && let Err(error) = killed.kill().await
-            {
-                warn!(%error, "ending the job failed");
-            }
-        })
-        .detach();
-    job.background_startup.report_ready().await;
-
+    let (drained_tx, drained_rx) = async_channel::bounded::<()>(1);
     let (chunk_tx, chunk_rx) = async_channel::unbounded();
     for (stream, is_stderr) in [(stdout, false), (stderr, true)] {
         job.executor
@@ -4815,20 +4878,22 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
     job.executor
         .spawn(drain_terminal_chunks(
             job.job_registry.clone(),
-            job.task_id.downgrade(),
+            job.launch.downgrade(),
             chunk_rx,
+            Some(drained_tx),
         ))
         .detach();
 
+    attach_backend_killer(&job, &child, drained_rx).await;
+    job.background_startup.report_ready().await;
+
     let status = match child.wait().await {
         crate::ChildExit::Exited(status) => status,
-        // A kill ended it, and the backend has no status to report: what it
-        // wrote before is the job's output, and the registry knows the cause.
         crate::ChildExit::Killed => killed_exit_status(),
         crate::ChildExit::Failed(error) => {
-            job.job_registry.close_stdout(job.task_id).await;
-            job.job_registry.close_stderr(job.task_id).await;
-            job.job_registry.fail(job.task_id, &error, None).await;
+            job.job_registry.close_stdout(job.launch).await;
+            job.job_registry.close_stderr(job.launch).await;
+            job.job_registry.fail(job.launch, &error, None).await;
             return Err(TerminalError::Execution(error));
         }
     };
@@ -4842,13 +4907,14 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
         );
         job.lifetime.report_descendants_killed(killed).await;
     }
-    wait_for_terminal_stream_close(job.job_registry, job.task_id).await;
+    let launch_id = job.launch.id();
+    wait_for_terminal_stream_close(job.job_registry, launch_id).await;
     let (stdout, stderr) = job
         .job_registry
-        .terminal_output(job.task_id)
+        .terminal_output(launch_id)
         .await
         .ok_or_else(|| {
-            TerminalError::Execution(format!("missing terminal output for task {}", job.task_id))
+            TerminalError::Execution(format!("missing terminal output for launch {launch_id}"))
         })?;
     Ok(std::process::Output {
         status,
@@ -5145,42 +5211,41 @@ where
 /// closes, may have answered its call, which must find the word free.
 async fn drain_terminal_chunks(
     job_registry: JobRegistry,
-    task_id: WeakIdLease,
+    launch: crate::job_registry::WeakLaunchLease,
     rx: async_channel::Receiver<TerminalChunk>,
+    _drained: Option<Sender<()>>,
 ) {
     while let Ok(chunk) = rx.recv().await {
-        // The flow holds the lease until both streams closed: one gone means
-        // the job ended, and its output has nowhere to go.
-        let Some(task_id) = task_id.upgrade() else {
+        let Some(launch) = launch.upgrade() else {
             return;
         };
         match chunk {
             TerminalChunk::Stdout(bytes) => {
                 job_registry
-                    .append_output(task_id, TerminalStream::Stdout, bytes)
+                    .append_output(launch, TerminalStream::Stdout, bytes)
                     .await;
             }
             TerminalChunk::Stderr(bytes) => {
                 job_registry
-                    .append_output(task_id, TerminalStream::Stderr, bytes)
+                    .append_output(launch, TerminalStream::Stderr, bytes)
                     .await;
             }
             TerminalChunk::StdoutClosed => {
                 job_registry
-                    .close_output(task_id, TerminalStream::Stdout)
+                    .close_output(launch, TerminalStream::Stdout)
                     .await;
             }
             TerminalChunk::StderrClosed => {
                 job_registry
-                    .close_output(task_id, TerminalStream::Stderr)
+                    .close_output(launch, TerminalStream::Stderr)
                     .await;
             }
         }
     }
 }
 
-async fn wait_for_terminal_stream_close(job_registry: &JobRegistry, task_id: &str) {
-    while !job_registry.terminal_streams_closed(task_id).await {
+async fn wait_for_terminal_stream_close(job_registry: &JobRegistry, launch: crate::LaunchId) {
+    while !job_registry.terminal_streams_closed(launch).await {
         async_io::Timer::after(Duration::from_millis(10)).await;
     }
 }
@@ -5343,10 +5408,11 @@ mod tests {
         executor_core::tokio::TokioGlobal
             .spawn(async move { service.serve().await })
             .detach();
+        let writer_lease = crate::job_registry::LaunchLease::fresh();
         registry
             .register(
                 9001,
-                &crate::test_ids::lease("writer"),
+                &writer_lease,
                 "exec-writer",
                 "cat",
                 SandboxMode::Sandboxed,
@@ -5356,17 +5422,15 @@ mod tests {
         let (ended_tx, ended_rx) = async_channel::bounded::<()>(1);
         let input_tx = write_chunks(DropSignal(ended_tx), FeedCounter::default());
         registry
-            .attach_terminal_input(&crate::test_ids::lease("writer"), input_tx)
+            .attach_terminal_input(&writer_lease, input_tx)
             .await;
         registry
-            .terminal_input("writer", b"hi\n".to_vec())
+            .terminal_input(9001, b"hi\n".to_vec())
             .await
             .expect("a running job takes input");
         assert!(ended_rx.is_empty(), "the writer lives while the job runs");
 
-        registry
-            .complete(&crate::test_ids::lease("writer"), 0, None)
-            .await;
+        registry.complete(&writer_lease, 0, None).await;
 
         tokio::time::timeout(Duration::from_secs(10), ended_rx.recv())
             .await
@@ -5429,10 +5493,10 @@ mod tests {
         result.render_for_model()
     }
 
-    fn started_task_id(receiver: &ShellEvents) -> String {
+    fn started_pid(receiver: &ShellEvents) -> u32 {
         let started = receiver.take_started();
         assert_eq!(started.len(), 1, "expected one started-task event");
-        started[0].task_id.clone()
+        started[0].pid
     }
 
     #[cfg(unix)]
@@ -5469,10 +5533,10 @@ mod tests {
         ] {
             assert_eq!(direct_command(script).unwrap(), None, "{script}");
         }
-        for (script, arg) in [("echo '$HOME'", "$HOME"), ("echo \"\\$HOME\"", "$HOME")] {
+        for (script, arg) in [("env '$HOME'", "$HOME"), ("env \"\\$HOME\"", "$HOME")] {
             assert_eq!(
                 direct_command(script).unwrap(),
-                Some(("echo".to_string(), vec![arg.to_string()])),
+                Some(("env".to_string(), vec![arg.to_string()])),
                 "{script}"
             );
         }
@@ -5517,13 +5581,13 @@ mod tests {
         }
     }
 
-    async fn wait_for_completed_task(receiver: &ShellEvents, task_id: &str) -> JobEnded {
+    async fn wait_for_completed_task(receiver: &ShellEvents, pid: u32) -> JobEnded {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(task) = receiver
                     .take_completed()
                     .into_iter()
-                    .find(|task| task.info.task_id == task_id)
+                    .find(|task| task.info.pid == pid)
                 {
                     return task;
                 }
@@ -5665,7 +5729,7 @@ mod tests {
     fn foreground_lifetime(alerts: EventSender) -> JobLifetime {
         JobLifetime::Foreground {
             alerts,
-            task_id: "probe".to_string(),
+            pid: 0,
             call: None,
         }
     }
@@ -5747,7 +5811,7 @@ mod tests {
         .expect("wrap script");
         assert!(wrapped.contains("tcp://host.containers.internal:43123"));
         assert!(wrapped.contains(
-            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"stdin_arg":null,"raw_args":false},"session":{"positional_args":[],"stdin_arg":null,"raw_args":false}}'"#
+            r#"shims --dir "$AITHER_IPC_DIR" --commands '{"environment":{"positional_args":[],"raw_args":false,"stdin_arg":null},"session":{"positional_args":[],"raw_args":false,"stdin_arg":null}}'"#
         ));
     }
 
@@ -5767,7 +5831,7 @@ mod tests {
         )
         .expect("wrap script");
         assert!(wrapped.contains(
-            r#"--commands '{"issue":{"positional_args":["number"],"stdin_arg":"body","raw_args":false}}'"#
+            r#"--commands '{"issue":{"positional_args":["number"],"raw_args":false,"stdin_arg":"body"}}'"#
         ));
         assert!(!wrapped.contains("printf"));
     }
@@ -5965,6 +6029,64 @@ mod tests {
         assert!(error.to_string().contains("no approver"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subagent_shell_stamps_subagent_identity_and_scopes_approver() {
+        use aither_core::llm::tool::{AgentIdentity, ToolCallId};
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let parent_approvals = Approvals::default();
+        let subagent_approvals = Approvals::default();
+        let scoped = subagent_approvals.clone();
+        let parent = approval_tool(dir.path(), [], Some(parent_approvals.clone()))
+            .await
+            .with_subagent_approver(move |_path| Some(AnyApprover::new(scoped.clone())));
+
+        let child = parent
+            .subagent(SubagentGrant::new(), None, "worker")
+            .await
+            .expect("subagent shell launches");
+
+        // Even when ToolContext carries AgentIdentity::Main (as a nested Agent loop does),
+        // Shell::execute stamps the subagent's own identity onto ApprovalRequest::call().
+        let call_approvals = Approvals::default();
+        let main_call = CallIdentity::new(ToolCallId::new("sub-call-1"), AgentIdentity::Main);
+        child
+            .call(
+                unsandboxed_args("true"),
+                ToolContext::new()
+                    .with_identity(main_call)
+                    .with_approver(AnyApprover::new(call_approvals.clone())),
+            )
+            .await
+            .expect("call approver allows");
+        let asked_call = call_approvals.asked();
+        assert_eq!(asked_call.len(), 1);
+        assert!(
+            matches!(
+                asked_call[0].call().map(CallIdentity::agent),
+                Some(AgentIdentity::Subagent(sub)) if sub.name() == "worker"
+            ),
+            "subagent approval request must carry AgentIdentity::Subagent: {:?}",
+            asked_call[0].call()
+        );
+
+        // Without a call approver, child uses the derived subagent_approver rather than parent's.
+        child
+            .run_background(ShellArgs {
+                background: true,
+                ..unsandboxed_args("true")
+            })
+            .await
+            .expect("scoped subagent approver allows");
+        assert_eq!(parent_approvals.asked().len(), 0);
+        let scoped_asked = subagent_approvals.asked();
+        assert_eq!(scoped_asked.len(), 1);
+        assert!(matches!(
+            scoped_asked[0].call().map(CallIdentity::agent),
+            Some(AgentIdentity::Subagent(_))
+        ));
+    }
+
     #[test]
     fn sandbox_is_sandboxed_or_unsandboxed_and_location_replaces_the_ssh_arguments() {
         for (text, mode) in [
@@ -5994,10 +6116,11 @@ mod tests {
     async fn child_terminal_isolates_jobs() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let tool = fresh_terminal(dir.path()).await;
+        let parent_lease = crate::job_registry::LaunchLease::fresh();
         tool.job_registry()
             .register(
                 424_242,
-                &crate::test_ids::lease("parent"),
+                &parent_lease,
                 "parent-execution",
                 "sleep 30",
                 SandboxMode::Sandboxed,
@@ -6108,7 +6231,7 @@ mod tests {
         tool.run_background(background_args("a job", "sleep 60"))
             .await
             .expect("the job starts");
-        let task_id = started_task_id(&events);
+        let pid = started_pid(&events);
         drop(tool);
 
         async_io::Timer::after(Duration::from_millis(500)).await;
@@ -6116,7 +6239,7 @@ mod tests {
         assert!(
             matches!(
                 listed.as_slice(),
-                [job] if job.task_id == task_id && matches!(job.status, crate::JobStatus::Running)
+                [job] if job.pid == pid && matches!(job.status, crate::JobStatus::Running)
             ),
             "the job keeps running: {listed:?}"
         );
@@ -6159,33 +6282,33 @@ mod tests {
             .await
             .expect("terminal call should succeed");
         let [started] = <[_; 1]>::try_from(receiver.take_started()).expect("one started task");
-        assert_eq!(ids.leased(), ["alfa", "bravo"]);
-        assert_eq!(started.task_id, "alfa");
-        assert_eq!(started.output_file.url, "outputs/bravo.txt");
+        assert_eq!(ids.leased(), ["alfa"]);
+        assert!(started.pid > 0);
+        assert_eq!(started.output_file.url, "outputs/alfa.txt");
         receiver.recv_completed().await;
 
         let child = terminal
             .subagent_without_grant()
             .await
             .expect("an empty grant is always given");
-        assert_eq!(ids.leased(), ["alfa", "bravo", "charlie"]);
+        assert_eq!(ids.leased(), ["alfa", "bravo"]);
         assert_eq!(
             child
                 .working_dir()
                 .file_name()
                 .and_then(|name| name.to_str()),
-            Some("charlie")
+            Some("bravo")
         );
         // The child's terminal leases from the parent's allocator.
         let from_child = child.id_allocator().lease().expect("a free word");
-        assert_eq!(&*from_child, "delta");
+        assert_eq!(&*from_child, "charlie");
         drop(from_child);
 
         drop((child, terminal, receiver));
         for _ in 0..500 {
             let released = ids.released();
-            if released.iter().any(|word| word == "bravo")
-                && released.iter().any(|word| word == "charlie")
+            if released.iter().any(|word| word == "alfa")
+                && released.iter().any(|word| word == "bravo")
             {
                 return;
             }
@@ -6239,9 +6362,9 @@ mod tests {
     /// the id answers as an unknown task and can be leased again.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_finished_background_job_gives_its_id_back_once_its_completion_is_delivered() {
+    async fn a_finished_background_job_is_forgotten_once_its_completion_is_delivered() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
-        let ids = AnyIdAllocator::new(aither_core::WordAllocator::new(["river", "stone"]));
+        let ids = AnyIdAllocator::new(aither_core::WordAllocator::new(["stone"]));
         let terminal = terminal_leasing_from(dir.path(), ids.clone()).await;
         let receiver = terminal.background_receiver();
         let jobs = terminal.job_registry();
@@ -6250,35 +6373,23 @@ mod tests {
             .await
             .expect("terminal call should succeed");
         let [started] = <[_; 1]>::try_from(receiver.take_started()).expect("one started task");
-        assert_eq!(started.task_id, "river");
+        let pid = started.pid;
+        assert!(pid > 0);
         assert_eq!(started.output_file.url, "outputs/stone.txt");
 
         let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv_completed())
             .await
             .expect("the job should deliver its completion");
         let pending = jobs
-            .get_by_task_id("river")
+            .get_by_pid(pid)
             .await
             .expect("an undelivered completion keeps the job");
         assert!(pending.status.completion_pending(), "{pending:?}");
-        assert!(
-            ids.lease().is_err(),
-            "the job and its output hold both words"
-        );
 
         drop(completed);
         assert!(jobs.list().await.is_empty(), "a delivered job is forgotten");
-        assert!(jobs.terminal_read("river", 0, 1024).await.is_err());
-        assert!(!jobs.kill_by_task_id("river").await);
-        // The job's flow lets go of the word as it ends.
-        for _ in 0..500 {
-            if let Ok(again) = ids.lease() {
-                assert_eq!(&*again, "river");
-                return;
-            }
-            async_io::Timer::after(Duration::from_millis(10)).await;
-        }
-        panic!("a delivered job keeps its word");
+        assert!(jobs.terminal_read(pid, 0, 1024).await.is_err());
+        assert!(!jobs.kill_by_pid(pid).await);
     }
 
     // These four drive a real sandbox running `/bin/pwd`. `heel` reports
@@ -6326,7 +6437,7 @@ mod tests {
             executor: executor_core::tokio::TokioGlobal,
             committed: Vec::new(),
             job_registry,
-            task_id: crate::test_ids::lease("probe"),
+            launch: crate::job_registry::LaunchLease::fresh(),
             info: crate::LaunchInfo::default(),
             execution_id: "exec-test".to_string(),
             background: false,
@@ -6395,7 +6506,7 @@ mod tests {
             executor: executor_core::tokio::TokioGlobal,
             committed: Vec::new(),
             job_registry,
-            task_id: crate::test_ids::lease("policy"),
+            launch: crate::job_registry::LaunchLease::fresh(),
             info: crate::LaunchInfo::default(),
             execution_id: "exec-policy".to_string(),
             background: false,
@@ -6508,7 +6619,7 @@ mod tests {
             executor: executor_core::tokio::TokioGlobal,
             committed: Vec::new(),
             job_registry: tool.job_registry(),
-            task_id: crate::test_ids::lease("grants"),
+            launch: crate::job_registry::LaunchLease::fresh(),
             info: crate::LaunchInfo::default(),
             execution_id: "exec-grants".to_string(),
             background: false,
@@ -6918,14 +7029,14 @@ mod tests {
         })
         .await
         .expect("terminal call should succeed");
-        let task_id = started_task_id(&receiver);
+        let pid = started_pid(&receiver);
 
         // The agent's receiver is the gate: the completion it receives is
         // held, not yet taken, while the host reads the registry.
         let completed = tokio::time::timeout(Duration::from_secs(30), receiver.recv_completed())
             .await
             .expect("the job should deliver its completion");
-        assert_eq!(completed.info.task_id, task_id);
+        assert_eq!(completed.info.pid, pid);
         let held = jobs.list().await;
         assert!(
             held.iter().all(|job| job.status != JobStatus::Running),
@@ -6943,7 +7054,7 @@ mod tests {
         assert!(taken.is_empty(), "{taken:?}");
         assert!(!host_sees_owed_turn(&taken), "{taken:?}");
         assert!(
-            jobs.get_by_task_id(&task_id).await.is_none(),
+            jobs.get_by_pid(pid).await.is_none(),
             "a delivered job's id is unknown"
         );
     }
@@ -6974,15 +7085,15 @@ mod tests {
 
         let rendered = render_terminal_result(&result);
         assert!(
-            rendered.contains("Started in background as task '"),
+            rendered.contains("Started in background with PID "),
             "{rendered}"
         );
-        let task_id = started_task_id(&tool.background_receiver());
+        let pid = started_pid(&tool.background_receiver());
 
         input_tool
             .call(
                 JobInputArgs {
-                    task_id: task_id.clone(),
+                    pid,
                     input: "lexo".to_string(),
                     append_newline: true,
                 },
@@ -6991,7 +7102,7 @@ mod tests {
             .await
             .expect("terminal_input should succeed");
 
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let completed = wait_for_completed_task(&background_receiver, pid).await;
         let terminal_result = completed
             .result
             .expect("background task should complete successfully after stdin input");
@@ -7022,7 +7133,7 @@ mod tests {
             .await
             .expect("the job starts");
         let finished = jobs
-            .get(&started_task_id(&events))
+            .get(started_pid(&events))
             .await
             .expect("the shell holds the job");
         let result = finished.wait().await.expect("the job ends");
@@ -7033,7 +7144,7 @@ mod tests {
             .await
             .expect("the job starts");
         let sleeping = jobs
-            .get(&started_task_id(&events))
+            .get(started_pid(&events))
             .await
             .expect("the shell holds the job");
         let first = sleeping.read(0, 1024).await.expect("the job reads");
@@ -7041,7 +7152,7 @@ mod tests {
         assert_eq!(
             sleeping.read(cursor, 1024).await,
             Ok(crate::JobRead::Unchanged {
-                task_id: sleeping.task_id().to_owned()
+                pid: sleeping.pid()
             }),
             "a repeat read is a poll"
         );
@@ -7056,7 +7167,7 @@ mod tests {
         let refusal = read_tool
             .call(
                 crate::JobReadArgs {
-                    task_id: sleeping.task_id().to_owned(),
+                    pid: sleeping.pid(),
                     cursor,
                     max_bytes: None,
                 },
@@ -7067,7 +7178,7 @@ mod tests {
         let refusal = refusal
             .downcast_ref::<crate::Refused<crate::UnchangedRead>>()
             .expect("the refusal is typed");
-        assert_eq!(refusal.reason().task_id, sleeping.task_id());
+        assert_eq!(refusal.reason().pid, sleeping.pid());
         assert!(
             refusal.text().contains("produced no new output"),
             "{refusal}"
@@ -7131,7 +7242,7 @@ mod tests {
         };
         tool.run_background(args).await.expect("the job starts");
         let job = jobs
-            .get(&started_task_id(&events))
+            .get(started_pid(&events))
             .await
             .expect("the shell holds the job");
         let result = job.wait().await.expect("the job ends");
@@ -7170,7 +7281,7 @@ mod tests {
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
         assert!(
-            rendered.contains("Started in background as task '"),
+            rendered.contains("Started in background with PID "),
             "{rendered}"
         );
 
@@ -7195,7 +7306,7 @@ mod tests {
         assert_eq!(tool.job_registry().kill_running().await, 1);
 
         for _ in 0..100 {
-            let exists = unsafe { libc::kill(child_pid, 0) } == 0;
+            let exists = exit_code_of(&tool, &format!("/bin/kill -0 {child_pid}")).await == 0;
             if !exists {
                 return;
             }
@@ -7220,12 +7331,12 @@ mod tests {
         }
     }
 
-    /// Starts `script` as a background job and returns its task id.
+    /// Starts `script` as a background job and returns its PID.
     #[cfg(unix)]
     async fn start_background_job(
         tool: &Shell<executor_core::tokio::TokioGlobal>,
         script: &str,
-    ) -> String {
+    ) -> u32 {
         let job = tool
             .run_background(ShellArgs {
                 background: true,
@@ -7233,7 +7344,7 @@ mod tests {
             })
             .await
             .expect("terminal should start the job");
-        job.task_id().to_owned()
+        job.pid()
     }
 
     /// Python terminal arguments for `code`.
@@ -7304,22 +7415,18 @@ mod tests {
             ))
             .await
             .expect("python should start detached");
-        let task_id = job.task_id().to_owned();
-        assert_eq!(started_task_id(&receiver), task_id);
+        let pid = job.pid();
+        assert_eq!(started_pid(&receiver), pid);
 
         let jobs = tool.job_registry().list().await;
         let job = jobs
             .iter()
-            .find(|job| job.task_id == task_id)
+            .find(|job| job.pid == pid)
             .expect("the job is recorded");
         assert_eq!(job.interpreter, Interpreter::Python);
         assert!(job.script.contains("time.sleep(60)"), "{}", job.script);
 
-        let handle = tool
-            .jobs()
-            .get(&task_id)
-            .await
-            .expect("the shell holds the job");
+        let handle = tool.jobs().get(pid).await.expect("the shell holds the job");
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             let read = handle.read(0, 4096).await.expect("the job reads");
@@ -7337,8 +7444,8 @@ mod tests {
         }
         drop(handle);
 
-        assert!(tool.job_registry().kill_by_task_id(&task_id).await);
-        wait_for_completed_task(&receiver, &task_id).await;
+        assert!(tool.job_registry().kill_by_pid(pid).await);
+        wait_for_completed_task(&receiver, pid).await;
     }
 
     #[cfg(unix)]
@@ -7450,6 +7557,7 @@ mod tests {
             stdout: Sender<Vec<u8>>,
             lifetime: ExecLifetime,
         ) -> Result<ContainerExecOutcome, String> {
+            lifetime.report_pid(4242).await;
             let redirect = crate::spawn::script_reading(Pipe::Null, String::new())
                 .expect("the null stdin redirect renders");
             let null_stdin = script.contains(redirect.trim_end());
@@ -7470,7 +7578,7 @@ mod tests {
                     let name = if null_stdin {
                         Vec::new()
                     } else {
-                        if let ExecLifetime::Background { stdin_blocked } = &lifetime {
+                        if let ExecLifetime::Background { stdin_blocked, .. } = &lifetime {
                             let _ = stdin_blocked.send(StdinWatchSignal::Blocked).await;
                         }
                         stdin_rx.recv().await.unwrap_or_default()
@@ -7611,17 +7719,18 @@ mod tests {
             .await
             .expect("terminal call should succeed");
         let command = result.command().expect("a command result");
-        let CommandOutcome::Running { task_id, .. } = &command.outcome else {
+        let CommandOutcome::Running { pid, .. } = &command.outcome else {
             panic!(
                 "a command still running at the window is promoted, got {:?}",
                 command.outcome
             );
         };
+        let pid = *pid;
 
         let refusal = input_tool(tool.jobs())
             .call(
                 JobInputArgs {
-                    task_id: task_id.clone(),
+                    pid,
                     input: "lexo".to_string(),
                     append_newline: true,
                 },
@@ -7632,12 +7741,7 @@ mod tests {
         let refusal = refusal
             .downcast_ref::<crate::Refused<CallRefusal>>()
             .expect("the refusal is typed");
-        assert_eq!(
-            refusal.reason(),
-            &CallRefusal::NoStdin {
-                task_id: task_id.clone()
-            }
-        );
+        assert_eq!(refusal.reason(), &CallRefusal::NoStdin { pid });
         assert!(
             refusal.text().contains("started in the foreground"),
             "{refusal}"
@@ -7647,7 +7751,7 @@ mod tests {
             "a job without a stdin pipe raises no stdin alert"
         );
         assert!(
-            tool.job_registry().kill_by_task_id(task_id).await,
+            tool.job_registry().kill_by_pid(pid).await,
             "the promoted job still runs"
         );
     }
@@ -7798,7 +7902,9 @@ mod tests {
         );
         let provider = crate::spawn::ipc_fixture::Recording::default();
         let erased = crate::AnyIpcProvider::new(provider.clone());
-        let info = crate::LaunchInfo::new("probe", None, SandboxMode::Sandboxed);
+        let probe_lease = crate::job_registry::LaunchLease::fresh();
+        let probe_id = probe_lease.id();
+        let info = crate::LaunchInfo::new(probe_id, None, SandboxMode::Sandboxed);
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let alert_tx = ShellEvents::new().sender(AgentPath::main());
         execute_container_job(ContainerJobExecution {
@@ -7806,7 +7912,7 @@ mod tests {
             sandbox: &container_sandbox(&runtime, dir.path()),
             ipc: Some(&erased),
             committed: &[],
-            task_id: &crate::test_ids::lease("probe"),
+            launch: &probe_lease,
             info: info.clone(),
             execution_id: "exec-test",
             script: "probe",
@@ -7826,7 +7932,7 @@ mod tests {
         assert!(script.contains(r#"--commands '{"probe":"#), "{script}");
         let launches = provider.launches.lock().unwrap();
         assert_eq!(launches.len(), 1);
-        assert_eq!(launches[0].task_id.as_deref(), Some("probe"));
+        assert_eq!(launches[0].launch, Some(probe_id));
         assert_eq!(launches[0].mode, SandboxMode::Sandboxed);
     }
 
@@ -7934,12 +8040,13 @@ mod tests {
         let fifo_path = job_fifo.path().clone();
         let (startup_tx, _startup_rx) = async_channel::bounded(1);
         let alert_tx = ShellEvents::new().sender(AgentPath::main());
+        let probe_lease = crate::job_registry::LaunchLease::fresh();
         execute_container_job(ContainerJobExecution {
             executor: executor_core::tokio::TokioGlobal,
             sandbox: &container_sandbox(&runtime, dir.path()),
             ipc: None,
             committed: &[],
-            task_id: &crate::test_ids::lease("probe"),
+            launch: &probe_lease,
             info: crate::LaunchInfo::default(),
             execution_id: "exec-test",
             script: "make",
@@ -7991,13 +8098,13 @@ mod tests {
         reader: &str,
     ) {
         let background_receiver = tool.background_receiver();
-        let task_id = start_background_job(tool, reader).await;
+        let pid = start_background_job(tool, reader).await;
 
         let alerts = alerts_within(&background_receiver, Duration::from_secs(8)).await;
         assert!(
             matches!(
                 alerts.as_slice(),
-                [ShellEvent::StdinBlocked(job)] if job.task_id == task_id
+                [ShellEvent::StdinBlocked(job)] if job.pid == pid
             ),
             "a blocked reader must yield exactly one stdin alert: {alerts:?}"
         );
@@ -8005,7 +8112,7 @@ mod tests {
         input_tool(tool.jobs())
             .call(
                 JobInputArgs {
-                    task_id: task_id.clone(),
+                    pid,
                     input: "lexo".to_string(),
                     append_newline: true,
                 },
@@ -8013,7 +8120,7 @@ mod tests {
             )
             .await
             .expect("terminal_input should succeed");
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let completed = wait_for_completed_task(&background_receiver, pid).await;
         let terminal_result = completed.result.expect("the fed job should complete");
         let stdout =
             output_text(&terminal_result.stdout).expect("completed task should include stdout");
@@ -8052,11 +8159,11 @@ mod tests {
         )
         .await;
         let background_receiver = tool.background_receiver();
-        let task_id = start_background_job(&tool, "sleep 3; echo finished").await;
+        let pid = start_background_job(&tool, "sleep 3; echo finished").await;
 
         let alerts = alerts_within(&background_receiver, Duration::from_secs(4)).await;
         assert!(alerts.is_empty(), "no alert expected: {alerts:?}");
-        wait_for_completed_task(&background_receiver, &task_id).await;
+        wait_for_completed_task(&background_receiver, pid).await;
     }
 
     /// The nice value `level` steps below this test process lands at, capped
@@ -8129,10 +8236,10 @@ mod tests {
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
         assert!(
-            rendered.contains("Started in background as task '"),
+            rendered.contains("Started in background with PID "),
             "the still-running command must promote: {rendered}"
         );
-        let task_id = started_task_id(&background_receiver);
+        let pid = started_pid(&background_receiver);
 
         let child_pid = async_fs::read_to_string(&child_pid_path)
             .await
@@ -8152,10 +8259,10 @@ mod tests {
             "descendant process {child_pid} survived the timeout kill"
         );
 
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let completed = wait_for_completed_task(&background_receiver, pid).await;
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the finished job stays in the registry");
         assert!(
@@ -8217,7 +8324,7 @@ mod tests {
         wait.restore();
         let after = run().await;
         assert!(
-            after.contains("Started in background as task '"),
+            after.contains("Started in background with PID "),
             "the normal window applies again: {after}"
         );
     }
@@ -8372,15 +8479,17 @@ mod tests {
         );
 
         let child = recorded_child_pid(tool.working_dir()).await;
-        assert_process_gone(
-            child,
-            &format!("{descendant:?} descendant of a foreground command"),
-        )
-        .await;
+        if let Some(host_child) = tool.sandbox().resolve_host_pid(child.cast_unsigned()).await {
+            assert_process_gone(
+                host_child.cast_signed(),
+                &format!("{descendant:?} descendant of a foreground command"),
+            )
+            .await;
+        }
         let alerts = receiver.take_job_alerts();
         match alerts.as_slice() {
             [ShellEvent::DescendantsKilled(killed)] => {
-                assert_ne!(killed.task_id(), "");
+                assert!(killed.pid() > 0);
                 assert!(killed.call().is_none(), "the call carried no identity");
                 // The name is read after the freeze, once the child exec'd.
                 assert_eq!(
@@ -8461,7 +8570,7 @@ mod tests {
         tool: &Shell<executor_core::tokio::TokioGlobal>,
         script: &str,
         timeout: u64,
-    ) -> (String, i32) {
+    ) -> (u32, i32) {
         let job = tool
             .run_background(ShellArgs {
                 background: true,
@@ -8470,15 +8579,21 @@ mod tests {
             })
             .await
             .expect("terminal should start the background job");
-        let task_id = job.task_id().to_owned();
-        let child = recorded_child_pid(tool.working_dir()).await;
+        let pid = job.pid();
+        let child_sandbox_pid = recorded_child_pid(tool.working_dir()).await;
         // Past the shell's exit and several of the tree's checks.
         tokio::time::sleep(Duration::from_millis(1200)).await;
+        let child = tool
+            .sandbox()
+            .resolve_host_pid(child_sandbox_pid.cast_unsigned())
+            .await
+            .expect("the descendant must outlive the shell")
+            .cast_signed();
         assert!(
             process_exists(child),
             "the descendant must outlive the shell"
         );
-        (task_id, child)
+        (pid, child)
     }
 
     /// A service's args for a test, on `terminal_args`' script shape.
@@ -8496,7 +8611,7 @@ mod tests {
     }
 
     /// A service carries no bound: it outlives a cap that would kill a
-    /// bounded job, and `terminal_kill` still stops it.
+    /// bounded job, and `Jobs::kill` still stops it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_service_runs_unbounded_until_it_is_killed() {
@@ -8513,10 +8628,10 @@ mod tests {
             .run_service(service_args("a service", "sleep 60"))
             .await
             .expect("the service starts");
-        let task_id = job.task_id().to_owned();
+        let pid = job.pid();
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the service is registered");
         assert!(info.timeout.is_none(), "a service is unbounded: {info:?}");
@@ -8525,7 +8640,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the service stays in the registry");
         assert!(
@@ -8535,7 +8650,7 @@ mod tests {
         );
 
         assert!(
-            tool.job_registry().kill_by_task_id(&task_id).await,
+            tool.job_registry().kill_by_pid(pid).await,
             "a service is killable like any job"
         );
     }
@@ -8551,12 +8666,12 @@ mod tests {
         )
         .await;
 
-        let (task_id, child) =
+        let (pid, child) =
             background_job_whose_shell_exited(&tool, &descendant.script(&exec_dir(&tool), 3), 30)
                 .await;
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the job is registered");
         assert_eq!(
@@ -8568,17 +8683,17 @@ mod tests {
             tool.job_registry()
                 .format_running_jobs()
                 .await
-                .contains(&task_id),
+                .contains(&pid.to_string()),
             "the running-jobs context lists the job"
         );
 
         assert_process_gone(child, "the descendant's own exit").await;
         let receiver = tool.background_receiver();
-        let completed = wait_for_completed_task(&receiver, &task_id).await;
+        let completed = wait_for_completed_task(&receiver, pid).await;
         assert!(completed.result.is_ok(), "{completed:?}");
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the finished job stays in the registry");
         assert_eq!(
@@ -8617,21 +8732,21 @@ mod tests {
         )
         .await;
 
-        let (task_id, child) =
+        let (pid, child) =
             background_job_whose_shell_exited(&tool, &descendant.script(&exec_dir(&tool), 300), 30)
                 .await;
         assert!(
-            tool.job_registry().kill_by_task_id(&task_id).await,
+            tool.job_registry().kill_by_pid(pid).await,
             "a job with a live descendant is killable"
         );
         assert_process_gone(
             child,
-            &format!("terminal_kill of a job with a {descendant:?} descendant"),
+            &format!("kill of a job with a {descendant:?} descendant"),
         )
         .await;
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the killed job stays in the registry");
         assert!(
@@ -8667,7 +8782,7 @@ mod tests {
 
         // The timeout fires while the shell is long gone: the job is only its
         // descendant by then.
-        let (task_id, child) = background_job_whose_shell_exited(
+        let (pid, child) = background_job_whose_shell_exited(
             &tool,
             &Descendant::Setsid.script(&exec_dir(&tool), 300),
             2,
@@ -8675,10 +8790,10 @@ mod tests {
         .await;
         assert_process_gone(child, "the timeout of a job whose shell exited").await;
         let receiver = tool.background_receiver();
-        let completed = wait_for_completed_task(&receiver, &task_id).await;
+        let completed = wait_for_completed_task(&receiver, pid).await;
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the finished job stays in the registry");
         assert!(
@@ -8705,7 +8820,7 @@ mod tests {
         )
         .await;
 
-        let (_task_id, child) = background_job_whose_shell_exited(
+        let (_pid, child) = background_job_whose_shell_exited(
             &tool,
             &Descendant::Plain.script(&exec_dir(&tool), 300),
             30,
@@ -8752,15 +8867,15 @@ mod tests {
             .expect("a timeout within the cap should start the job");
         let rendered = render_terminal_result(&result);
         assert!(
-            rendered.contains("Started in background as task '"),
+            rendered.contains("Started in background with PID "),
             "{rendered}"
         );
-        let task_id = started_task_id(&background_receiver);
+        let pid = started_pid(&background_receiver);
 
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let completed = wait_for_completed_task(&background_receiver, pid).await;
         let info = tool
             .job_registry()
-            .get_by_task_id(&task_id)
+            .get_by_pid(pid)
             .await
             .expect("the finished job stays in the registry");
         assert!(
@@ -8827,8 +8942,8 @@ mod tests {
         tool.call(spinning_args(1, true), ToolContext::new())
             .await
             .expect("the job starts");
-        let task_id = started_task_id(&background_receiver);
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let pid = started_pid(&background_receiver);
+        let completed = wait_for_completed_task(&background_receiver, pid).await;
 
         let kill = completed
             .timeout_kill
@@ -8868,9 +8983,9 @@ mod tests {
         tool.call(spinning_args(30, true), ToolContext::new())
             .await
             .expect("the job starts");
-        let task_id = started_task_id(&background_receiver);
-        assert!(tool.job_registry().kill_by_task_id(&task_id).await);
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let pid = started_pid(&background_receiver);
+        assert!(tool.job_registry().kill_by_pid(pid).await);
+        let completed = wait_for_completed_task(&background_receiver, pid).await;
         assert_eq!(
             completed.info.status.kill_cause(),
             Some(crate::KillCause::User)
@@ -8946,7 +9061,7 @@ mod tests {
             })
             .await
             .expect("terminal should start the job");
-        let task_id = started_task_id(&background_receiver);
+        let pid = started_pid(&background_receiver);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let alerts = loop {
@@ -8962,7 +9077,7 @@ mod tests {
         };
         assert_eq!(alerts.len(), 1);
         assert!(
-            matches!(&alerts[0], ShellEvent::LongRunning(job) if job.task_id == task_id),
+            matches!(&alerts[0], ShellEvent::LongRunning(job) if job.pid == pid),
             "expected the long-running alert for the job: {alerts:?}"
         );
         assert!(
@@ -8971,7 +9086,7 @@ mod tests {
         );
 
         assert!(
-            tool.job_registry().kill_by_task_id(&task_id).await,
+            tool.job_registry().kill_by_pid(pid).await,
             "test cleanup should kill the job"
         );
     }
@@ -9027,15 +9142,16 @@ mod tests {
     }
 
     /// Reads the pid the sandboxed probe wrote, retrying while the sandbox
-    /// starts.
+    /// starts, and resolves it to the host OS PID.
     #[cfg(unix)]
-    async fn probe_pid(dir: &Path) -> u32 {
+    async fn probe_pid(tool: &Shell<executor_core::tokio::TokioGlobal>, dir: &Path) -> u32 {
         let path = dir.join("pid");
         for _ in 0..150 {
             if let Ok(text) = std::fs::read_to_string(&path)
-                && let Ok(pid) = text.trim().parse()
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && let Some(host_pid) = tool.sandbox().resolve_host_pid(pid).await
             {
-                return pid;
+                return host_pid;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -9063,7 +9179,7 @@ mod tests {
 
         let call = tool.call(pid_probe_args(), ToolContext::new());
         let probe = async {
-            let pid = probe_pid(dir.path()).await;
+            let pid = probe_pid(&tool, dir.path()).await;
             assert_eq!(
                 probe_nice(pid),
                 expected_lowered_nice(10),
@@ -9106,12 +9222,12 @@ mod tests {
             .expect("terminal call should succeed");
         let rendered = render_terminal_result(&result);
         assert!(
-            rendered.contains("Started in background as task '"),
+            rendered.contains("Started in background with PID "),
             "{rendered}"
         );
-        let task_id = started_task_id(&tool.background_receiver());
+        let job_pid = started_pid(&tool.background_receiver());
 
-        let pid = probe_pid(dir.path()).await;
+        let pid = probe_pid(&tool, dir.path()).await;
         assert_eq!(
             probe_nice(pid),
             expected_lowered_nice(10),
@@ -9121,7 +9237,7 @@ mod tests {
         input_tool
             .call(
                 JobInputArgs {
-                    task_id: task_id.clone(),
+                    pid: job_pid,
                     input: "exit".to_string(),
                     append_newline: true,
                 },
@@ -9130,7 +9246,7 @@ mod tests {
             .await
             .expect("terminal_input should succeed");
 
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let completed = wait_for_completed_task(&background_receiver, job_pid).await;
         let terminal_result = completed
             .result
             .expect("persistent shell should exit cleanly after input");
@@ -9158,23 +9274,23 @@ mod tests {
         let mut started = tool.background_receiver().take_started();
         assert_eq!(started.len(), 1, "expected one started-task event");
         let started = started.remove(0);
-        let task_id = started.task_id;
+        let job_pid = started.pid;
         assert_eq!(
             rendered,
             format!(
-                "Started in background as task '{task_id}'; output is being written to {} (absolute path: {}).\n",
+                "Started in background with PID {job_pid}; output is being written to {} (absolute path: {}).\n",
                 started.output_file.url, started.output_file.path
             )
         );
         assert_eq!(
             result.command().map(|command| &command.outcome),
             Some(&CommandOutcome::Running {
-                task_id: task_id.clone(),
+                pid: job_pid,
                 output: started.output_file.clone(),
             })
         );
 
-        let pid = probe_pid(dir.path()).await;
+        let pid = probe_pid(&tool, dir.path()).await;
         assert_eq!(
             probe_nice(pid),
             expected_lowered_nice(10),
@@ -9182,7 +9298,7 @@ mod tests {
         );
         release_probe(dir.path());
 
-        let completed = wait_for_completed_task(&background_receiver, &task_id).await;
+        let completed = wait_for_completed_task(&background_receiver, job_pid).await;
         let terminal_result = completed
             .result
             .expect("background job should complete successfully");
@@ -9340,13 +9456,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn container_ipc_bridge_round_trips_a_command_over_tcp() {
         use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        let workspace_dir = tempfile::tempdir().expect("temp workspace");
+        let canonical_workspace =
+            dunce::canonicalize(workspace_dir.path()).expect("canonical workspace");
         let router = heel::IpcRouter::new().register(ProbeEchoCommand);
         let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         let runtime = crate::ContainerShellRuntime::new(
             "aither-test-ipc",
             crate::HostRoute::new("host.docker.internal", loopback).expect("loopback is routable"),
             crate::AnyContainerExec::new(Arc::new(UnreachableContainerExec)),
-        );
+        )
+        .with_workspace_mount(crate::MountRoot::new(
+            canonical_workspace,
+            ContainerPath::new("/workspace").expect("valid container root"),
+        ));
         let executor = Arc::new(executor_core::AnyExecutor::new(
             executor_core::tokio::TokioGlobal,
         ));
@@ -9361,8 +9484,10 @@ mod tests {
 
         let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "pong" }))
             .expect("params should encode");
-        let request = heel::ipc::IpcRequest::encode("probe_echo", Path::new("/workspace"), &params)
-            .expect("request should encode");
+        let authed_method = format!("{}:probe_echo", bridge.token());
+        let request =
+            heel::ipc::IpcRequest::encode(&authed_method, Path::new("/workspace"), &params)
+                .expect("request should encode");
         stream
             .write_all(&request)
             .await
@@ -9392,6 +9517,94 @@ mod tests {
 
         drop(stream);
         bridge.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_ipc_rejects_bad_token_and_unmapped_working_dir() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        let workspace_dir = tempfile::tempdir().expect("temp workspace");
+        let canonical_workspace =
+            dunce::canonicalize(workspace_dir.path()).expect("canonical workspace");
+        let router = heel::IpcRouter::new().register(ProbeEchoCommand);
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        let runtime = crate::ContainerShellRuntime::new(
+            "aither-test-ipc-auth",
+            crate::HostRoute::new("host.docker.internal", loopback).expect("loopback is routable"),
+            crate::AnyContainerExec::new(Arc::new(UnreachableContainerExec)),
+        )
+        .with_workspace_mount(crate::MountRoot::new(
+            canonical_workspace,
+            ContainerPath::new("/workspace").expect("valid container root"),
+        ));
+        let executor = Arc::new(executor_core::AnyExecutor::new(
+            executor_core::tokio::TokioGlobal,
+        ));
+        let bridge = crate::spawn::container_ipc::ContainerIpc::serve(&executor, router, &runtime)
+            .expect("bridge should start on loopback");
+        let params = rmp_serde::to_vec_named(&serde_json::json!({ "marker": "spoof" })).unwrap();
+
+        let send_frame = |method: String, cwd: &'static str| {
+            let port = bridge.port();
+            let payload = params.clone();
+            async move {
+                let mut stream = async_io::Async::<std::net::TcpStream>::connect(
+                    std::net::SocketAddr::new(loopback, port),
+                )
+                .await
+                .unwrap();
+                let req = heel::ipc::IpcRequest::encode(&method, Path::new(cwd), &payload).unwrap();
+                stream.write_all(&req).await.unwrap();
+                let mut len = [0_u8; 4];
+                stream.read_exact(&mut len).await.unwrap();
+                let mut resp = vec![0_u8; u32::from_be_bytes(len) as usize];
+                stream.read_exact(&mut resp).await.unwrap();
+                resp
+            }
+        };
+
+        // Missing or wrong token is rejected.
+        let unauthed = send_frame("probe_echo".to_string(), "/workspace").await;
+        assert_eq!(unauthed.first().copied(), Some(0));
+        let wrong_token = send_frame(format!("{}:probe_echo", "0".repeat(64)), "/workspace").await;
+        assert_eq!(wrong_token.first().copied(), Some(0));
+
+        // Valid token with unmapped or escaping working_dir is rejected before handler runs.
+        let escaped = send_frame(format!("{}:probe_echo", bridge.token()), "/etc").await;
+        assert_eq!(escaped.first().copied(), Some(0));
+        let parent_escape = send_frame(
+            format!("{}:probe_echo", bridge.token()),
+            "/workspace/../etc",
+        )
+        .await;
+        assert_eq!(parent_escape.first().copied(), Some(0));
+
+        bridge.stop().await;
+    }
+
+    #[test]
+    fn builtins_and_wrapped_path_ordering_keep_managed_bin_dir_ahead_of_exports() {
+        for builtin in [
+            ".", ":", "[", "echo", "printf", "pwd", "test", "true", "wait",
+        ] {
+            assert!(
+                is_shell_builtin(builtin),
+                "{builtin} must be treated as a builtin"
+            );
+        }
+        assert!(!is_shell_builtin("ripgrep"));
+
+        let launch = crate::RemoteLaunch::new("/opt/aither/bin", "/opt/aither/bin/bash");
+        let wrapped = launch
+            .wrap_script_with_exports("export PATH='/usr/bin:/bin'", "which rg")
+            .expect("wrap_script_with_exports renders");
+        let export_pos = wrapped.find("export PATH=").expect("env export present");
+        let prepend_pos = wrapped
+            .find("PATH=/opt/aither/bin")
+            .expect("bin_dir prepend present");
+        assert!(
+            prepend_pos > export_pos,
+            "managed bin_dir must be prepended after user/env PATH exports:\n{wrapped}"
+        );
     }
 
     // ---- subagent authority -------------------------------------------------
@@ -9430,8 +9643,8 @@ mod tests {
         fn env(&self, launch: &crate::LaunchInfo) -> Vec<(String, String)> {
             vec![
                 (
-                    "PROBE_TASK".to_string(),
-                    launch.task_id.clone().unwrap_or_default(),
+                    "PROBE_LAUNCH".to_string(),
+                    launch.launch.map_or_default(|id| id.to_string()),
                 ),
                 (
                     "PROBE_CALL".to_string(),
@@ -9488,7 +9701,7 @@ mod tests {
     /// A command that reports one line of progress into the job that runs it.
     struct ProgressCommand {
         jobs: crate::Jobs,
-        task_id: String,
+        launch: crate::LaunchId,
     }
 
     #[derive(Debug, Deserialize)]
@@ -9509,10 +9722,10 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<Self::Response, heel::IpcError>> + Send
         {
             let jobs = self.jobs.clone();
-            let task_id = self.task_id.clone();
+            let launch = self.launch;
             async move {
                 let appender = jobs
-                    .output_appender(&task_id)
+                    .output_appender(launch)
                     .await
                     .expect("the job is held before its process can call");
                 assert_eq!(
@@ -9530,7 +9743,7 @@ mod tests {
         fn router(&self, launch: &crate::LaunchInfo) -> Option<heel::IpcRouter> {
             Some(heel::IpcRouter::new().register(ProgressCommand {
                 jobs: self.0.clone(),
-                task_id: launch.task_id.clone().expect("a shell names its launches"),
+                launch: launch.launch.expect("a shell names its launches"),
             }))
         }
     }
@@ -11477,27 +11690,24 @@ mod tests {
             .run_background(background_args("mark", "echo marked-command"))
             .await
             .expect("terminal call should succeed");
-        let task_id = started_task_id(&receiver);
-        let _completed = wait_for_completed_task(&receiver, &task_id).await;
+        let pid = started_pid(&receiver);
+        let _completed = wait_for_completed_task(&receiver, pid).await;
 
         let scripts = scripts.lock().unwrap().clone();
-        let script = scripts
-            .iter()
-            .find(|script| script.contains("marked-command"))
-            .expect("the command ran");
+        assert!(
+            scripts
+                .iter()
+                .any(|script| script.contains("marked-command")),
+            "{scripts:?}"
+        );
         let jobs = parent.job_registry().list().await;
         let job = jobs
             .iter()
             .find(|job| job.script == "echo marked-command")
             .expect("the job is registered");
         assert_eq!(job.place, crate::JobPlace::Container);
-        // The sandbox exports it ahead of the command, which the managed
-        // shell's command line quotes.
-        assert!(
-            script.contains(&format!("export {}=", crate::memory::JOB_MARKER_ENV))
-                && script.contains(job.task_id.as_str()),
-            "{script}"
-        );
+        assert_eq!(job.pid, pid);
+        assert!(job.pid > 0);
     }
 
     #[cfg(unix)]
@@ -11701,8 +11911,8 @@ mod tests {
 
     #[derive(Default)]
     struct Repeats {
-        /// Task id → script, for the scripts allowed and not yet ended.
-        pending: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        /// Launch id → script, for the scripts allowed and not yet ended.
+        pending: std::sync::Mutex<std::collections::HashMap<crate::LaunchId, String>>,
         last_success: std::sync::Mutex<Option<String>>,
     }
 
@@ -11723,7 +11933,7 @@ mod tests {
                     .pending
                     .lock()
                     .unwrap()
-                    .insert(script.task_id.to_string(), script.script.to_string());
+                    .insert(script.launch, script.script.to_string());
                 ScriptDecision::Pass
             };
             std::future::ready(decision)
@@ -11734,7 +11944,7 @@ mod tests {
             end: &crate::ScriptEnd<'_>,
             state: &Repeats,
         ) -> impl Future<Output = ()> + Send {
-            let script = state.pending.lock().unwrap().remove(end.task_id);
+            let script = state.pending.lock().unwrap().remove(&end.launch);
             if end.outcome == (crate::ScriptOutcome::Exited { code: 0 }) {
                 *state.last_success.lock().unwrap() = script;
             }
@@ -12254,6 +12464,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_for_monitored_line(
+        receiver: &ShellEvents,
+        lines: &mut Vec<String>,
+        expected: &str,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !lines.iter().any(|line| line == expected) {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let Some(alert) = receiver.recv_timeout(remaining).await else {
+                break;
+            };
+            if let ShellEvent::MonitorIncrement(increment) = alert {
+                lines.extend(increment.lines);
+            }
+        }
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "appended line {expected:?} is delivered, across rotation: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn monitored_file_delivers_appends_and_refuses_an_unreadable_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -12295,40 +12529,31 @@ mod tests {
             )
             .await
             .expect("monitor starts");
+        let receiver = tool.background_receiver();
+        let mut lines = Vec::new();
         async_io::Timer::after(Duration::from_millis(1500)).await;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut file, b"appended\n").unwrap();
+        drop(file);
+        wait_for_monitored_line(&receiver, &mut lines, "appended").await;
         std::fs::rename(&path, tool.working_dir().join("followed.log.1")).unwrap();
         std::fs::write(&path, "rotated\n").unwrap();
-        async_io::Timer::after(Duration::from_millis(500)).await;
+        wait_for_monitored_line(&receiver, &mut lines, "rotated").await;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut file, b"after\n").unwrap();
+        drop(file);
+        wait_for_monitored_line(&receiver, &mut lines, "after").await;
 
-        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
-        let lines: Vec<&String> = alerts
-            .iter()
-            .filter_map(|alert| match alert {
-                ShellEvent::MonitorIncrement(increment) => Some(&increment.lines),
-                _ => None,
-            })
-            .flatten()
-            .collect();
         assert!(
-            !lines.iter().any(|line| *line == "existing"),
+            !lines.iter().any(|line| line == "existing"),
             "content written before the monitor started is not delivered: {lines:?}"
         );
-        for expected in ["appended", "rotated", "after"] {
-            assert!(
-                lines.iter().any(|line| *line == expected),
-                "appended line {expected:?} is delivered, across rotation: {lines:?}"
-            );
-        }
         tool.job_registry().kill_running().await;
     }
 
@@ -12376,11 +12601,17 @@ mod tests {
             "the command after the grant writes the approved dir"
         );
 
-        let completed = wait_for_completed_task(&receiver, &task_id).await;
+        let completed = wait_for_completed_task(&receiver, task_id).await;
         let _ = completed.result;
+        #[cfg(target_os = "linux")]
         assert!(
             !late_target.exists(),
-            "a command launched before the grant keeps its launch grants"
+            "a Linux command launched before the grant keeps its launch Landlock ruleset"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            late_target.exists(),
+            "macOS persistent agent sandboxes share Seatbelt extensions across same-sandbox processes"
         );
     }
 
@@ -12563,10 +12794,133 @@ mod tests {
             0,
             "a fresh command picks up the grant"
         );
-        let _ = wait_for_completed_task(&receiver, &task_id).await;
+        let _ = wait_for_completed_task(&receiver, task_id).await;
+        #[cfg(target_os = "linux")]
         assert!(
             !shell_target.exists(),
-            "the shell launched before the grant is still sandboxed without it"
+            "the Linux shell launched before the grant keeps its launch Landlock ruleset"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            shell_target.exists(),
+            "macOS persistent agent sandboxes share Seatbelt extensions across same-sandbox processes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_flushes_unterminated_eof_line_and_refuses_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("outside.log");
+        std::fs::write(&secret, "secret\n").unwrap();
+
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let escape_link = tool.working_dir().join("escape.log");
+        std::os::unix::fs::symlink(&secret, &escape_link).unwrap();
+
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
+        let refused = monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::File {
+                        file: "escape.log".to_string(),
+                    },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "symlink escaping working_dir without a readable grant must be refused"
+        );
+
+        monitor
+            .call(
+                monitor_command("printf 'first\\ntrailing-no-newline'", 30),
+                ToolContext::new(),
+            )
+            .await
+            .expect("monitor starts");
+        let alerts = monitor_alerts(&tool.background_receiver(), Duration::from_secs(15)).await;
+        let lines: Vec<&String> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                ShellEvent::MonitorIncrement(increment) => Some(&increment.lines),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            lines.iter().any(|line| *line == "trailing-no-newline"),
+            "unterminated EOF line must be delivered: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_job_exposes_real_pid_for_native_kill_and_blocks_foreign_signals() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let shell_a = authority_terminal(dir_a.path()).await;
+        let shell_b = authority_terminal(dir_b.path()).await;
+        let receiver_a = shell_a.background_receiver();
+
+        let self_pid_file = dir_a.path().join("self.pid");
+        let pid_a = start_background_job(
+            &shell_a,
+            &format!("echo $$ > '{}'; exec sleep 120", self_pid_file.display()),
+        )
+        .await;
+
+        let mut observed_shell_pid = None;
+        for _ in 0..100 {
+            if let Ok(text) = async_fs::read_to_string(&self_pid_file).await
+                && let Ok(parsed) = text.trim().parse::<u32>()
+            {
+                observed_shell_pid = Some(parsed);
+                break;
+            }
+            async_io::Timer::after(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            observed_shell_pid,
+            Some(pid_a),
+            "background job identifier must equal the shell's real OS PID inside its sandbox"
+        );
+
+        let host_pid = std::process::id();
+        assert_ne!(
+            exit_code_of(&shell_a, &format!("/bin/kill -0 {host_pid}")).await,
+            0,
+            "sandboxed command must not signal the host process"
+        );
+        assert_ne!(
+            exit_code_of(&shell_b, &format!("/bin/kill -TERM {pid_a}")).await,
+            0,
+            "sibling agent sandbox must not signal another agent's background PID"
+        );
+
+        assert_eq!(
+            exit_code_of(&shell_a, &format!("/bin/kill -TERM {pid_a}")).await,
+            0,
+            "same agent must terminate its own background job via native kill"
+        );
+        let completed = wait_for_completed_task(&receiver_a, pid_a).await;
+        assert_eq!(completed.info.pid, pid_a);
+        assert_ne!(
+            completed
+                .result
+                .expect("terminated job completes")
+                .exit_code,
+            0
         );
     }
 }

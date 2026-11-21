@@ -2,10 +2,10 @@
 //!
 //! Applications describe which hosts sandboxed commands may reach as a
 //! serializable [`NetworkPolicyConfig`]; compiling it yields a
-//! [`CompiledNetworkPolicy`] a [`Sandbox`](crate::Sandbox) consults for every
+//! [`CompiledNetworkPolicy`] a [`Sandbox`] consults for every
 //! connection. A host the lists allow or deny is decided there; one they
 //! leave [open](NetworkVerdict::Open) goes to the sandbox's
-//! [`DomainApprover`](crate::DomainApprover).
+//! [`DomainApprover`].
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 

@@ -1,4 +1,4 @@
-//! The handle on a process a [`Sandbox`](crate::Sandbox) spawned.
+//! The handle on a process a [`Sandbox`] spawned.
 
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -100,6 +100,7 @@ impl ExitSetter {
 /// end the process; [`kill`](Self::kill) does.
 pub struct SandboxedChild {
     id: u32,
+    host_id: u32,
     stdin: Option<Sender<Vec<u8>>>,
     stdout: Option<Receiver<Vec<u8>>>,
     stderr: Option<Receiver<Vec<u8>>>,
@@ -112,12 +113,23 @@ impl std::fmt::Debug for SandboxedChild {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SandboxedChild")
             .field("id", &self.id)
+            .field("host_id", &self.host_id)
             .finish_non_exhaustive()
     }
 }
 
 impl SandboxedChild {
     pub(crate) fn new(id: u32, streams: Streams, kill: KillHandle, exit: Arc<ExitWatch>) -> Self {
+        Self::with_host_id(id, id, streams, kill, exit)
+    }
+
+    pub(crate) fn with_host_id(
+        id: u32,
+        host_id: u32,
+        streams: Streams,
+        kill: KillHandle,
+        exit: Arc<ExitWatch>,
+    ) -> Self {
         let Streams {
             stdin,
             stdout,
@@ -126,6 +138,7 @@ impl SandboxedChild {
         } = streams;
         Self {
             id,
+            host_id,
             stdin,
             stdout,
             stderr,
@@ -135,12 +148,19 @@ impl SandboxedChild {
         }
     }
 
-    /// The process id: the local process for the host and SSH backends, a
-    /// number identifying the exec for a container, which has no host
-    /// process.
+    /// Process ID inside the child's execution environment: sandbox-visible PID
+    /// on the host, in-container PID inside a container, or remote server PID
+    /// over SSH.
     #[must_use]
     pub const fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Host OS PID when running on the host (differs from [`id`](Self::id)
+    /// inside a Linux PID namespace); equals [`id`](Self::id) elsewhere.
+    #[must_use]
+    pub const fn host_id(&self) -> u32 {
+        self.host_id
     }
 
     /// The sender feeding the process's standard input, once; `None` when

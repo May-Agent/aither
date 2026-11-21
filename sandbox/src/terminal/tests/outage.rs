@@ -153,8 +153,8 @@ async fn a_background_jobs_completion_carries_the_interval() {
     run_held(&tool, true, sleep_and_wake(&controller))
         .await
         .expect("terminal call should succeed");
-    let task_id = started_task_id(&receiver);
-    let completed = wait_for_completed_task(&receiver, &task_id).await;
+    let pid = started_pid(&receiver);
+    let completed = wait_for_completed_task(&receiver, pid).await;
 
     let command = completed.result.expect("the job should complete");
     assert_eq!(command.interruptions.len(), 1);

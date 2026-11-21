@@ -646,13 +646,13 @@ pub trait ContainerMemory: Send + Sync + 'static {
     /// holds nothing.
     fn job_footprints(
         &self,
-        task_ids: &[String],
+        pids: &[u32],
     ) -> impl Future<Output = Result<Vec<u64>, FootprintError>> + Send;
 }
 
 /// Object-safe twin of [`ContainerMemory`], used only through
 /// [`AnyContainerMemory`].
-pub trait ContainerMemoryImpl: Send + Sync {
+trait ContainerMemoryImpl: Send + Sync {
     /// [`ContainerMemory::cgroup`] through a boxed future.
     fn cgroup_boxed(
         &self,
@@ -661,7 +661,7 @@ pub trait ContainerMemoryImpl: Send + Sync {
     /// [`ContainerMemory::job_footprints`] through a boxed future.
     fn job_footprints_boxed<'a>(
         &'a self,
-        task_ids: &'a [String],
+        pids: &'a [u32],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, FootprintError>> + Send + 'a>>;
 }
 
@@ -674,9 +674,9 @@ impl<T: ContainerMemory> ContainerMemoryImpl for T {
 
     fn job_footprints_boxed<'a>(
         &'a self,
-        task_ids: &'a [String],
+        pids: &'a [u32],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, FootprintError>> + Send + 'a>> {
-        Box::pin(self.job_footprints(task_ids))
+        Box::pin(self.job_footprints(pids))
     }
 }
 
@@ -697,8 +697,8 @@ impl ContainerMemory for AnyContainerMemory {
         self.0.cgroup_boxed().await
     }
 
-    async fn job_footprints(&self, task_ids: &[String]) -> Result<Vec<u64>, FootprintError> {
-        self.0.job_footprints_boxed(task_ids).await
+    async fn job_footprints(&self, pids: &[u32]) -> Result<Vec<u64>, FootprintError> {
+        self.0.job_footprints_boxed(pids).await
     }
 }
 
@@ -731,27 +731,28 @@ impl ContainerMemory for ProbedContainerMemory {
         CgroupMemory::parse(&output)
     }
 
-    async fn job_footprints(&self, task_ids: &[String]) -> Result<Vec<u64>, FootprintError> {
-        if task_ids.is_empty() {
+    async fn job_footprints(&self, pids: &[u32]) -> Result<Vec<u64>, FootprintError> {
+        if pids.is_empty() {
             return Ok(Vec::new());
         }
         let output = self
             .probe
             .read(include_str!("../templates/container_memory_jobs.sh"))
             .await?;
-        let mut by_job: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut by_job: BTreeMap<u32, u64> = BTreeMap::new();
         for line in output.lines() {
             let malformed = || FootprintError::Malformed {
                 what: "a container job's footprint",
                 content: line.to_string(),
             };
             let (id, kib) = line.split_once(' ').ok_or_else(malformed)?;
+            let pid: u32 = id.trim().parse().map_err(|_| malformed())?;
             let kib: u64 = kib.trim().parse().map_err(|_| malformed())?;
-            *by_job.entry(id).or_default() += kib * 1024;
+            *by_job.entry(pid).or_default() += kib * 1024;
         }
-        Ok(task_ids
+        Ok(pids
             .iter()
-            .map(|id| by_job.get(id.as_str()).copied().unwrap_or(0))
+            .map(|pid| by_job.get(pid).copied().unwrap_or(0))
             .collect())
     }
 }
@@ -789,11 +790,9 @@ impl ResponseWindow {
 /// One running job and the memory its process tree holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobFootprint {
-    /// The job's task ID.
-    pub task_id: String,
     /// The script the job runs.
     pub command: String,
-    /// The job's root process.
+    /// The job's root process inside its execution environment.
     pub pid: u32,
     /// The physical footprint of the job's process tree, in bytes.
     pub footprint_bytes: u64,
@@ -925,13 +924,12 @@ impl JobMemory {
             return Ok(None);
         };
         let running = self.running_at(JobPlace::Container).await;
-        let task_ids: Vec<String> = running.iter().map(|job| job.task_id.clone()).collect();
-        let footprints = container.job_footprints(&task_ids).await?;
+        let pids: Vec<u32> = running.iter().map(|job| job.pid).collect();
+        let footprints = container.job_footprints(&pids).await?;
         let mut jobs: Vec<JobFootprint> = running
             .into_iter()
             .zip(footprints)
             .map(|(job, footprint_bytes)| JobFootprint {
-                task_id: job.task_id,
                 command: job.script,
                 pid: job.pid,
                 footprint_bytes,
@@ -962,7 +960,7 @@ impl JobMemory {
     /// Fails when the host or the registry cannot be read.
     pub async fn snapshot(&self) -> Result<MemorySnapshot, FootprintError> {
         let running = self.running_at(JobPlace::Host).await;
-        let roots: Vec<u32> = running.iter().map(|job| job.pid).collect();
+        let roots: Vec<u32> = running.iter().map(|job| job.host_pid).collect();
         let (reader, registry) = (self.reader.clone(), self.registry.clone());
         let (footprints, physical_bytes, own_bytes, others) = blocking::unblock(move || {
             let footprints = reader.tree_footprints(&roots)?;
@@ -981,7 +979,6 @@ impl JobMemory {
             .into_iter()
             .zip(footprints)
             .map(|(job, footprint_bytes)| JobFootprint {
-                task_id: job.task_id,
                 command: job.script,
                 pid: job.pid,
                 footprint_bytes,
@@ -1004,7 +1001,7 @@ impl JobMemory {
     pub async fn kill_runaway(&self, job: &JobFootprint, snapshot: &MemorySnapshot) -> bool {
         self.jobs
             .kill_runaway(
-                &job.task_id,
+                job.pid,
                 job.footprint_bytes,
                 snapshot.capacity_bytes,
                 snapshot.domain,
@@ -1194,7 +1191,7 @@ mod tests {
                 jobs.register_at(
                     place,
                     pid,
-                    &crate::test_ids::lease(task),
+                    &crate::job_registry::LaunchLease::fresh(),
                     "exec",
                     task,
                     crate::Interpreter::Shell,
@@ -1217,12 +1214,8 @@ mod tests {
         async fn the_machine_counts_only_jobs_that_run_on_it() {
             let memory = memory_with_jobs().await;
             let snapshot = memory.snapshot().await.unwrap();
-            let tasks: Vec<_> = snapshot
-                .jobs
-                .iter()
-                .map(|job| job.task_id.as_str())
-                .collect();
-            assert_eq!(tasks, ["host"]);
+            let pids: Vec<_> = snapshot.jobs.iter().map(|job| job.pid).collect();
+            assert_eq!(pids, [1]);
             assert_eq!(snapshot.own_bytes, 2 * GIB);
             assert_eq!(snapshot.domain, MemoryDomain::Machine);
         }
@@ -1231,7 +1224,7 @@ mod tests {
         async fn a_container_with_a_limit_is_judged_against_it_with_its_own_jobs() {
             let (container, reader) = container_memory(
                 "4294967296\n1073741824\nsome avg10=12.00 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
-                "boxed 1048576\nboxed 524288\nother 99\n",
+                "2 1048576\n2 524288\n99 99\n",
             );
             let memory = memory_with_jobs().await.with_container(reader);
             let snapshot = memory.container_snapshot().await.unwrap().unwrap();
@@ -1241,11 +1234,11 @@ mod tests {
                 .snapshot
                 .jobs
                 .iter()
-                .map(|job| (job.task_id.as_str(), job.footprint_bytes))
+                .map(|job| (job.pid, job.footprint_bytes))
                 .collect();
             // Both processes of the job are summed; the processes of a job
             // this terminal does not know are ignored.
-            assert_eq!(jobs, [("boxed", GIB + GIB / 2)]);
+            assert_eq!(jobs, [(2, GIB + GIB / 2)]);
             assert!(snapshot.pressure.starts_with("some avg10=12.00"));
             // Read through the container's exec path.
             assert_eq!(container.scripts.lock().unwrap().len(), 2);

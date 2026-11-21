@@ -67,6 +67,9 @@ jobs:
           shared-key: test-${{ matrix.os }}-${{ inputs.cache-key }}
       - uses: ./.github/actions/install-protoc
       - uses: taiki-e/install-action@nextest
+      - name: Allow unprivileged user namespaces on Ubuntu 24.04
+        if: ${{ runner.os == 'Linux' }}
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # The fish login shell case of the sandbox's SSH tests runs only where
       # fish is installed.
       - name: Install fish

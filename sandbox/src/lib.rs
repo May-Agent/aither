@@ -10,7 +10,7 @@
 //!   directory, jobs, waiting, output handling and [`ScriptPolicy`] checks
 //!   before a script runs.
 //! - [`ShellTool`] and the job control tools are ordinary
-//!   [`Tool`](aither_core::llm::Tool)s the embedder names and describes.
+//!   [`aither_core::llm::Tool`]s the embedder names and describes.
 //!
 //! The embedder owns the commands its scripts call back into, the programs
 //! its sandboxes run with and every sentence the model reads.
@@ -99,8 +99,7 @@ pub mod test_ids;
 
 pub use bollard_exec::BollardContainerExec;
 pub use builtin::{
-    JobInputArgs, JobInputTool, JobKillArgs, JobKillTool, JobReadArgs, JobReadTool,
-    ShellToolSettings, ToolIdentity,
+    JobInputArgs, JobInputTool, JobReadArgs, JobReadTool, ShellToolSettings, ToolIdentity,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerPath, ContainerRuntimeKind, MountAccess,
@@ -162,9 +161,9 @@ pub use shell_syntax::{
 pub use spawn::{
     AnyDomainApprover, AnyIpcProvider, ApproveAllDomains, Backend, ChildExit, ContainerLaunch,
     DenyAllDomains, Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess,
-    GrantSnapshot, Grants, HostLaunch, HostRoute, HostRouteError, IpcProvider, LaunchInfo, Pipe,
-    RemoteLaunch, Sandbox, SandboxedChild, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio,
-    TreeLifetime,
+    GrantSnapshot, Grants, HostLaunch, HostRoute, HostRouteError, IpcProvider, LaunchId,
+    LaunchInfo, Pipe, RemoteLaunch, Sandbox, SandboxedChild, SpawnCommand, SpawnError, SpawnGrant,
+    SpawnSpec, Stdio, TreeLifetime,
 };
 pub use ssh::{
     AnyPrepareSsh, PrepareSsh, PreparedSsh, SshPlatform, SshPrepareError, SshProbeError, SshServer,
@@ -181,7 +180,7 @@ pub use terminal::{
     ShellBuilder, ShellRunError, ShellTool, TerminalError, TimeoutKill, open_network_audit_log,
 };
 pub use wording::{
-    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
-    JsonAsTsv, LineRange, MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines,
-    RunFailure, ShellWording, StoredBinaryPart,
+    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JsonAsTsv, LineRange,
+    MonitorStarted, OmittedLines, OutputSaved, Refused, RepeatedLines, RunFailure, RunningJob,
+    ShellWording, StoredBinaryPart,
 };

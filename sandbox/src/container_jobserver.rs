@@ -128,7 +128,7 @@ pub async fn open_container_job_fifo<E: Executor + Clone + 'static>(
                     kill_rx,
                     stdin_rx,
                     stdout_tx,
-                    crate::ExecLifetime::Foreground,
+                    crate::ExecLifetime::foreground(),
                 )
                 .await;
             let _ = outcome_tx.send(outcome).await;
