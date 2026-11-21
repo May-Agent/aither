@@ -117,7 +117,7 @@ pub use heel::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 pub use interpreter::Interpreter;
 pub use job_registry::{
     Delivery, JobDelta, JobInfo, JobInputError, JobPlace, JobRead, JobStatus, KillCause,
-    OwedCompletion, PendingCompletion, UnchangedRead,
+    LaunchLease, OwedCompletion, PendingCompletion, UnchangedRead,
 };
 pub use jobs::{
     AppendOutcome, Job, JobOutputAppender, JobWaitError, Jobs, RunOutcome, ScriptResult,
