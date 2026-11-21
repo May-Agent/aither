@@ -389,9 +389,16 @@ impl Sandbox {
                 Some(denylist) => builder.write_denylist(denylist.clone()),
                 None => builder,
             };
+            #[cfg(target_os = "macos")]
+            let initial_denied: &[PathBuf] = {
+                let _ = snapshot;
+                &[]
+            };
+            #[cfg(not(target_os = "macos"))]
+            let initial_denied: &[PathBuf] = &snapshot.read_denied;
             builder
                 .filesystem_strict(false)
-                .read_denylist(read_denylist(&snapshot.read_denied))
+                .read_denylist(read_denylist(initial_denied))
         };
         #[cfg(windows)]
         let _ = snapshot;
@@ -486,6 +493,9 @@ impl Sandbox {
                     None => None,
                 };
                 let snapshot = self.inner.grants.snapshot();
+                #[cfg(target_os = "macos")]
+                let grants = self.inner.fixed_grants.clone();
+                #[cfg(not(target_os = "macos"))]
                 let grants = self.confined_grants(&snapshot, Vec::new()).await?;
                 let mux = HostIpcMux::start(&self.inner.executor)?;
                 let gate = DomainGate {
