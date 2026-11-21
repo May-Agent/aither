@@ -17,7 +17,7 @@ arc-swap.workspace = true
 aither-core.workspace = true
 
 # Sandboxing
-heel = "0.10.1"
+heel = { git = "https://github.com/May-Agent/heel.git", branch = "main" }
 
 # Executor for tokio integration
 executor-core = { version = "0.7", features = ["tokio"] }

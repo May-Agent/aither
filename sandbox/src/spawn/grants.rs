@@ -133,9 +133,10 @@ impl Grants {
     }
 
     /// Adds `path` as a readable grant. Processes spawned after this call
-    /// read it; processes already running keep the grants they launched
-    /// with. Dedupes; a path already writable stays writable and is not
-    /// also listed readable.
+    /// read it. On Linux, commands already running keep their launch-time
+    /// Landlock ruleset and broker guard; on macOS, Seatbelt extensions attach
+    /// to the agent's shared `same-sandbox` credential. Dedupes; a path
+    /// already writable stays writable and is not also listed readable.
     pub fn add_readable(&self, path: impl Into<PathBuf>) {
         let path = path.into();
         self.update_own(|set| {

@@ -125,6 +125,30 @@ const fn process_stdio(pipe: Pipe) -> fn() -> ProcessStdio {
     }
 }
 
+fn validate_ssh_spec(has_grants: bool, has_ipc: bool, has_cwd: bool) -> Result<(), SpawnError> {
+    // A grant is a path on one machine and a router is served by this
+    // one: nothing of either reaches a server.
+    if has_grants {
+        return Err(SpawnError::Unsupported {
+            backend: "ssh",
+            what: "a grant",
+        });
+    }
+    if has_ipc {
+        return Err(SpawnError::Unsupported {
+            backend: "ssh",
+            what: "a way back to the host's commands",
+        });
+    }
+    if has_cwd {
+        return Err(SpawnError::Setup(
+            "an SSH process starts in the server's login directory: a host path names nothing there"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Sandbox {
     pub(super) async fn spawn_ssh(
         &self,
@@ -144,26 +168,7 @@ impl Sandbox {
             lifetime: _,
             info,
         } = spec;
-        // A grant is a path on one machine and a router is served by this
-        // one: nothing of either reaches a server.
-        if !grants.is_empty() {
-            return Err(SpawnError::Unsupported {
-                backend: "ssh",
-                what: "a grant",
-            });
-        }
-        if ipc.is_some() {
-            return Err(SpawnError::Unsupported {
-                backend: "ssh",
-                what: "a way back to the host's commands",
-            });
-        }
-        if cwd.is_some() {
-            return Err(SpawnError::Setup(
-                "an SSH process starts in the server's login directory: a host path names nothing there"
-                    .into(),
-            ));
-        }
+        validate_ssh_spec(!grants.is_empty(), ipc.is_some(), cwd.is_some())?;
         // A confined process runs under the server's `heel`; one that is not
         // confined runs directly.
         let heel = if self.inner.unconfined {
@@ -193,11 +198,8 @@ impl Sandbox {
             inject_env_exports(String::new(), Some(&spec_env), &info).map_err(|e| failed(&e))?;
         let remote = remote_command_with_exports(launch, heel, &extra_exports, &script)
             .map_err(|e| failed(&e))?;
-        let pidfile = shell_words::quote(&format!(
-            "/tmp/aither-spawn-{}.pgid",
-            uuid::Uuid::new_v4().simple()
-        ))
-        .into_owned();
+        let pidfile_raw = format!("/tmp/aither-spawn-{}.pgid", uuid::Uuid::new_v4().simple());
+        let pidfile = shell_words::quote(&pidfile_raw).into_owned();
         let remote = SshJobStartTemplate {
             pidfile: &pidfile,
             command: &remote,
@@ -217,28 +219,35 @@ impl Sandbox {
             std::os::unix::process::CommandExt::process_group(&mut command, 0);
             command
         };
-        // The pipes are set on the async command: converting a std command
-        // resets them, and spawning would then inherit this process's stdio.
+        // stderr is always piped so we can read and strip the remote PID marker
+        // line (`<pidfile> pid <remote_pid>`) before forwarding user stderr.
         let mut child = async_process::Command::from(command)
             .stdin(process_stdio(stdio.stdin)())
             .stdout(process_stdio(stdio.stdout)())
-            .stderr(process_stdio(stdio.stderr)())
+            .stderr(ProcessStdio::piped())
             .spawn()
             .map_err(|error| SpawnError::Start(error.to_string()))?;
-        let id = child.id();
+        let local_id = child.id();
 
         let executor = &self.inner.executor;
-        let streams = pipe_streams(executor, &mut child);
+        let (streams, pid_rx) = pipe_streams(
+            executor,
+            &mut child,
+            stdio.stderr == Pipe::Piped,
+            pidfile_raw,
+        );
+        let remote_pid = pid_rx.recv().await.unwrap_or(local_id);
 
         let watch = watch_exit(executor, child);
-        Ok(SandboxedChild::new(
-            id,
+        Ok(SandboxedChild::with_host_id(
+            remote_pid,
+            local_id,
             streams,
             KillHandle::Remote(RemoteJob {
                 client: self.inner.ssh_client.clone(),
                 server: server.clone(),
                 pidfile,
-                local: id,
+                local: local_id,
             }),
             watch,
         ))
@@ -267,9 +276,14 @@ fn watch_exit(
     watch
 }
 
-/// The channels of the local `ssh` process's standard streams that it has
-/// pipes for.
-fn pipe_streams(executor: &AnyExecutor, child: &mut async_process::Child) -> Streams {
+/// The channels of the local `ssh` process's standard streams and the one-shot
+/// receiver reporting the remote server PID emitted by `ssh_job_start.sh`.
+fn pipe_streams(
+    executor: &AnyExecutor,
+    child: &mut async_process::Child,
+    keep_stderr: bool,
+    pidfile_raw: String,
+) -> (Streams, async_channel::Receiver<u32>) {
     let mut streams = Streams::default();
     if let Some(mut stdin) = child.stdin.take() {
         let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
@@ -289,12 +303,98 @@ fn pipe_streams(executor: &AnyExecutor, child: &mut async_process::Child) -> Str
         streams.stdout = Some(rx);
         executor.spawn(pump(stdout, tx)).detach();
     }
+    let (pid_tx, pid_rx) = async_channel::bounded::<u32>(1);
     if let Some(stderr) = child.stderr.take() {
-        let (tx, rx) = async_channel::unbounded();
-        streams.stderr = Some(rx);
-        executor.spawn(pump(stderr, tx)).detach();
+        let stderr_tx = if keep_stderr {
+            let (tx, rx) = async_channel::unbounded();
+            streams.stderr = Some(rx);
+            Some(tx)
+        } else {
+            None
+        };
+        executor
+            .spawn(pump_ssh_stderr(stderr, stderr_tx, pid_tx, pidfile_raw))
+            .detach();
     }
-    streams
+    (streams, pid_rx)
+}
+
+async fn pump_ssh_stderr(
+    mut reader: impl futures_lite::AsyncRead + Unpin,
+    tx: Option<async_channel::Sender<Vec<u8>>>,
+    pid_tx: async_channel::Sender<u32>,
+    pidfile_raw: String,
+) {
+    let prefix = format!("{pidfile_raw} pid ");
+    let mut header = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut header_done = false;
+    let mut pid_tx = Some(pid_tx);
+
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => {
+                if !header_done
+                    && !header.is_empty()
+                    && let Some(tx) = &tx
+                {
+                    let _ = tx.send(std::mem::take(&mut header)).await;
+                }
+                break;
+            }
+            Ok(count) => {
+                let chunk = &buffer[..count];
+                if !header_done {
+                    header.extend_from_slice(chunk);
+                    if let Some(nl) = header.iter().position(|b| *b == b'\n') {
+                        header_done = true;
+                        let first_line = String::from_utf8_lossy(&header[..nl]);
+                        let trimmed = first_line.trim_end_matches('\r');
+                        let rest = header[nl + 1..].to_vec();
+                        if let Some(raw_pid) = trimmed.strip_prefix(&prefix)
+                            && let Ok(pid) = raw_pid.trim().parse::<u32>()
+                        {
+                            if let Some(ptx) = pid_tx.take() {
+                                let _ = ptx.try_send(pid);
+                            }
+                            header.clear();
+                            if !rest.is_empty()
+                                && let Some(tx) = &tx
+                                && tx.send(rest).await.is_err()
+                            {
+                                break;
+                            }
+                        } else {
+                            // First line was not the PID banner (e.g. ssh banner or auth error):
+                            // release pid waiter so spawn does not hang and forward everything.
+                            pid_tx.take();
+                            let whole = std::mem::take(&mut header);
+                            if let Some(tx) = &tx
+                                && tx.send(whole).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    } else if header.len() > 1024 {
+                        header_done = true;
+                        pid_tx.take();
+                        let whole = std::mem::take(&mut header);
+                        if let Some(tx) = &tx
+                            && tx.send(whole).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                } else if let Some(tx) = &tx
+                    && tx.send(chunk.to_vec()).await.is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 /// Moves a pipe to a channel of chunks that closes at its end.

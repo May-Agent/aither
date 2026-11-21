@@ -1,7 +1,8 @@
-//! The control tools of a shell's jobs: read, input and kill.
+//! The control tools of a shell's jobs: read and input.
 //!
-//! The embedder names and describes each; the texts they return are its
-//! wording's.
+//! Signals to running jobs go through ordinary `kill(1)` / `kill(2)` inside
+//! the sandbox, enforced by the kernel. The embedder names and describes each
+//! tool; the texts they return are its wording's.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::job_registry::{JobInputError, JobRead, UnchangedRead};
 use crate::jobs::Jobs;
 use crate::terminal::ShellCallError;
-use crate::wording::{AnyShellWording, CallRefusal, JobInputSent, JobKillAsked, Refused};
+use crate::wording::{AnyShellWording, CallRefusal, JobInputSent, Refused};
 
 /// What an embedder calls one of its tools and how it describes it to the
 /// model; neither has a default.
@@ -75,7 +76,7 @@ impl ToolIdentity {
     }
 }
 
-/// The identities of the shell tool and of the three job control tools.
+/// The identities of the shell tool and of the job control tools.
 #[derive(Debug, Clone)]
 pub struct ShellToolSettings {
     /// The tool that runs a script.
@@ -84,87 +85,10 @@ pub struct ShellToolSettings {
     pub read: ToolIdentity,
     /// The tool that writes to a job's stdin.
     pub input: ToolIdentity,
-    /// The tool that kills a job.
-    pub kill: ToolIdentity,
 }
 
-fn task_id<'a>(
-    argument: &'a str,
-    wording: &AnyShellWording,
-) -> Result<&'a str, Refused<CallRefusal>> {
-    let task_id = argument.trim();
-    if task_id.is_empty() {
-        return Err(Refused::call(&**wording, CallRefusal::EmptyTaskId));
-    }
-    Ok(task_id)
-}
-
-fn unknown_task(task_id: &str, wording: &AnyShellWording) -> Refused<CallRefusal> {
-    Refused::call(
-        &**wording,
-        CallRefusal::UnknownTask {
-            task_id: task_id.to_owned(),
-        },
-    )
-}
-
-/// Tool for killing a job.
-#[derive(Debug, Clone)]
-pub struct JobKillTool {
-    identity: ToolIdentity,
-    jobs: Jobs,
-    wording: AnyShellWording,
-}
-
-impl JobKillTool {
-    /// A kill tool for `jobs`, named and described by `identity`, whose
-    /// reply is `wording`'s.
-    #[must_use]
-    pub const fn new(identity: ToolIdentity, jobs: Jobs, wording: AnyShellWording) -> Self {
-        Self {
-            identity,
-            jobs,
-            wording,
-        }
-    }
-}
-
-// The arguments of the kill tool, described by its `ToolIdentity`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
-pub struct JobKillArgs {
-    // The job to kill.
-    pub task_id: String,
-}
-
-impl Tool for JobKillTool {
-    fn name(&self) -> Cow<'static, str> {
-        self.identity.name.clone()
-    }
-
-    fn description(&self) -> Cow<'static, str> {
-        self.identity.description.clone()
-    }
-
-    fn arguments_schema(&self) -> schemars::Schema {
-        self.identity.describe(schemars::schema_for!(JobKillArgs))
-    }
-
-    type Arguments = JobKillArgs;
-    type Res = ToolResult;
-    type Error = ShellCallError;
-
-    async fn call(
-        &self,
-        args: Self::Arguments,
-        _cx: ToolContext,
-    ) -> Result<Self::Res, Self::Error> {
-        let task_id = task_id(&args.task_id, &self.wording)?;
-        let killed = self.jobs.kill(task_id).await;
-        Ok(ToolResult::text(
-            self.wording.job_kill(&JobKillAsked { task_id, killed }),
-        ))
-    }
+fn unknown_job(pid: u32, wording: &AnyShellWording) -> Refused<CallRefusal> {
+    Refused::call(&**wording, CallRefusal::UnknownJob { pid })
 }
 
 /// Tool for writing to a job's stdin.
@@ -192,8 +116,8 @@ impl JobInputTool {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct JobInputArgs {
-    // The job to write to.
-    pub task_id: String,
+    // The process ID of the job to write to.
+    pub pid: u32,
     // The text written to the job's stdin.
     pub input: String,
     // Whether a trailing newline is appended before writing.
@@ -227,12 +151,12 @@ impl Tool for JobInputTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> Result<Self::Res, Self::Error> {
-        let task_id = task_id(&args.task_id, &self.wording)?;
+        let pid = args.pid;
         let job = self
             .jobs
-            .get(task_id)
+            .get(pid)
             .await
-            .ok_or_else(|| unknown_task(task_id, &self.wording))?;
+            .ok_or_else(|| unknown_job(pid, &self.wording))?;
 
         let mut bytes = args.input.into_bytes();
         if args.append_newline {
@@ -240,14 +164,14 @@ impl Tool for JobInputTool {
         }
         match job.input(bytes).await {
             Ok(()) => {}
-            Err(JobInputError::NoStdin { task_id }) => {
-                return Err(Refused::call(&*self.wording, CallRefusal::NoStdin { task_id }).into());
+            Err(JobInputError::NoStdin { pid }) => {
+                return Err(Refused::call(&*self.wording, CallRefusal::NoStdin { pid }).into());
             }
             Err(error) => return Err(error.into()),
         }
 
         Ok(ToolResult::text(
-            self.wording.job_input(&JobInputSent { task_id }),
+            self.wording.job_input(&JobInputSent { pid }),
         ))
     }
 }
@@ -285,8 +209,8 @@ impl JobReadTool {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(missing_docs, reason = "the schema's descriptions are the embedder's")]
 pub struct JobReadArgs {
-    // The job to read.
-    pub task_id: String,
+    // The process ID of the job to read.
+    pub pid: u32,
     // The offset after which output is read.
     #[serde(default)]
     pub cursor: usize,
@@ -317,7 +241,7 @@ impl Tool for JobReadTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> Result<Self::Res, Self::Error> {
-        let task_id = task_id(&args.task_id, &self.wording)?;
+        let pid = args.pid;
         let max_bytes = args
             .max_bytes
             .unwrap_or_else(|| self.output.get().read_bytes);
@@ -326,9 +250,9 @@ impl Tool for JobReadTool {
         }
         let job = self
             .jobs
-            .get(task_id)
+            .get(pid)
             .await
-            .ok_or_else(|| unknown_task(task_id, &self.wording))?;
+            .ok_or_else(|| unknown_job(pid, &self.wording))?;
         let read = job
             .read(args.cursor, max_bytes)
             .await
@@ -337,11 +261,10 @@ impl Tool for JobReadTool {
             JobRead::Delta(_) => Ok(ToolResult::text(self.wording.job_read(&read))),
             // A poll is a refusal the loop can tell from a read, worded as
             // the unchanged read.
-            JobRead::Unchanged { task_id } => {
-                Err(Refused::rendered(UnchangedRead { task_id }, |unchanged| {
-                    self.wording.job_read(&JobRead::Unchanged {
-                        task_id: unchanged.task_id.clone(),
-                    })
+            JobRead::Unchanged { pid } => {
+                Err(Refused::rendered(UnchangedRead { pid }, |unchanged| {
+                    self.wording
+                        .job_read(&JobRead::Unchanged { pid: unchanged.pid })
                 })
                 .into())
             }
@@ -357,7 +280,7 @@ mod tests {
 
     fn delta(bytes: &str, cursor: usize, total_bytes: usize, status: JobStatus) -> JobRead {
         JobRead::Delta(JobDelta {
-            task_id: "amber-forest-thunder-pearl".to_string(),
+            pid: 4242,
             bytes: bytes.as_bytes().to_vec(),
             cursor,
             total_bytes,
@@ -369,7 +292,7 @@ mod tests {
     fn a_read_without_more_buffered_states_the_next_cursor() {
         assert_eq!(
             TestWording.job_read(&delta("hello", 1005, 1005, JobStatus::Running)),
-            "hello\nTask 'amber-forest-thunder-pearl' is running; read 5 new bytes (1005 buffered in total); next cursor is 1005.\n"
+            "hello\nProcess 4242 is running; read 5 new bytes (1005 buffered in total); next cursor is 1005.\n"
         );
     }
 
@@ -385,17 +308,15 @@ mod tests {
                     delivery: Delivery::Pending,
                 }
             )),
-            "hello\nTask 'amber-forest-thunder-pearl' completed with exit code 0; read 5 new bytes (1005 buffered in total); next cursor is 5.\nMore output is buffered: call terminal_read with cursor=5.\n"
+            "hello\nProcess 4242 completed with exit code 0; read 5 new bytes (1005 buffered in total); next cursor is 5.\nMore output is buffered: call terminal_read with cursor=5.\n"
         );
     }
 
     #[test]
     fn an_unchanged_read_is_data_the_wording_words() {
-        let text = TestWording.job_read(&JobRead::Unchanged {
-            task_id: "amber-forest-thunder-pearl".to_string(),
-        });
+        let text = TestWording.job_read(&JobRead::Unchanged { pid: 4242 });
         assert!(
-            text.contains("'amber-forest-thunder-pearl' produced no new output"),
+            text.contains("Process 4242 produced no new output"),
             "{text}"
         );
     }

@@ -1,16 +1,20 @@
-//! Background job registry for tracking and managing background terminal tasks.
+//! Background job registry for tracking and managing background terminal jobs.
 //!
-//! Uses an internal command channel to avoid shared locks.
+//! Uses an internal command channel to avoid shared locks. Each job is exposed
+//! externally by its real inside-environment OS `pid: u32` while internally
+//! tracked by a monotonic [`LaunchId`] / [`LaunchLease`] so pre-spawn output
+//! appenders and OS PID reuse never confuse two distinct jobs.
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::PathBuf;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use aither_core::{IdLease, WeakIdLease};
 use async_channel::{Receiver, Sender, WeakSender};
 use futures_lite::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::LaunchId;
 use crate::interpreter::Interpreter;
 use crate::memory::MemoryDomain;
 use crate::output_policy::OutputPolicy;
@@ -29,13 +33,71 @@ const REDIRECTED_BUFFER_CAP: usize = 256 * 1024;
 /// output to disk.
 const REDIRECTED_LINE_BUFFER_CAP: usize = 512 * 1024;
 
+/// Strong handle keeping a launch's internal identity alive while its flow or
+/// registry entry still refers to it.
+#[derive(Clone, Debug)]
+pub struct LaunchLease(Arc<LaunchId>);
+
+impl LaunchLease {
+    /// Allocates a fresh launch lease.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self::new(LaunchId::next())
+    }
+
+    /// Wraps `id` in a new lease.
+    #[must_use]
+    pub fn new(id: LaunchId) -> Self {
+        Self(Arc::new(id))
+    }
+
+    /// Underlying [`LaunchId`].
+    #[must_use]
+    pub fn id(&self) -> LaunchId {
+        *self.0
+    }
+
+    /// Whether `other` is a clone of this exact lease allocation.
+    #[must_use]
+    pub fn same_lease(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Downgrades to a weak reference that does not keep the launch alive.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakLaunchLease {
+        WeakLaunchLease(Arc::downgrade(&self.0))
+    }
+}
+
+/// Weak reference to a [`LaunchLease`].
+#[derive(Clone, Debug)]
+pub struct WeakLaunchLease(Weak<LaunchId>);
+
+impl WeakLaunchLease {
+    /// Upgrades to a strong [`LaunchLease`] when the launch is still held.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<LaunchLease> {
+        self.0.upgrade().map(LaunchLease)
+    }
+
+    /// Whether this weak handle refers to `lease`.
+    #[must_use]
+    pub fn refers_to(&self, lease: &LaunchLease) -> bool {
+        Weak::ptr_eq(&self.0, &Arc::downgrade(&lease.0))
+    }
+}
+
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
 pub struct JobInfo {
-    /// Process ID.
+    /// Process ID inside the job's execution environment (model-facing).
     pub pid: u32,
-    /// Stable task identifier exposed to the model.
-    pub task_id: String,
+    /// Host OS process ID when running on the host (differs from `pid` inside a
+    /// Linux PID namespace; equals `pid` elsewhere).
+    pub(crate) host_pid: u32,
+    /// Monotonic launch identifier owning this job instance.
+    pub(crate) launch: LaunchId,
     /// Stateless execution key that owns this job.
     pub execution_key: String,
     /// The script that was executed.
@@ -68,12 +130,6 @@ impl JobInfo {
 }
 
 /// Status of a background job.
-///
-/// Every finished status carries its [`Delivery`]: the transition that
-/// finishes a job also records that its completion is owed to the agent.
-/// The registry forgets a job once its completion was taken and nothing
-/// watches it, so a [`Delivery::Taken`] job reads only while it is watched
-/// or, taken by a waiter, until its own flow settles it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
     /// Job is currently running.
@@ -104,7 +160,8 @@ pub enum JobStatus {
 /// Why a job was killed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillCause {
-    /// A request ended it: `terminal_kill`, or the shutdown of its terminal.
+    /// Host-side administrative kill (UI stop, monitor `kill_on_stop`, or
+    /// terminal shutdown).
     User,
     /// Its `timeout` bound passed.
     Timeout(TimeoutKill),
@@ -123,11 +180,6 @@ pub enum KillCause {
 }
 
 /// Where a job runs, which decides what is watched of it.
-///
-/// Only the home environment is watched: the machine the embedder runs on,
-/// and the container the agent works in when it has one. The memory and the
-/// disk of a remote execution environment are never judged and its jobs are
-/// never killed for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobPlace {
     /// A process of the machine the embedder runs on.
@@ -159,8 +211,7 @@ impl JobStatus {
         }
     }
 
-    /// Whether the job finished and its agent has yet to take the
-    /// completion: the agent still owes its session a turn for it.
+    /// Whether the job finished and its agent has yet to take the completion.
     #[must_use]
     pub const fn completion_pending(&self) -> bool {
         matches!(self.delivery(), Some(Delivery::Pending))
@@ -170,33 +221,33 @@ impl JobStatus {
 /// Why bytes were not written to a job's stdin.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JobInputError {
-    /// The registry holds no job of that name.
-    #[error("unknown task_id: {task_id}")]
-    UnknownTask {
-        /// The task named.
-        task_id: String,
+    /// The registry holds no job with that PID.
+    #[error("unknown pid: {pid}")]
+    UnknownJob {
+        /// Process ID named.
+        pid: u32,
     },
     /// The job no longer runs.
-    #[error("task {task_id} is not running; current status: {status:?}")]
+    #[error("process {pid} is not running; current status: {status:?}")]
     NotRunning {
-        /// The job.
-        task_id: String,
+        /// Process ID of the job.
+        pid: u32,
         /// How it ended.
         status: JobStatus,
     },
     /// The job's stdin is the null device, not a pipe: it was started in the
     /// foreground, and a job promoted past the foreground window keeps the
     /// stdin it started with.
-    #[error("task {task_id} reads no input: it started in the foreground, with no stdin pipe")]
+    #[error("process {pid} reads no input: it started in the foreground, with no stdin pipe")]
     NoStdin {
-        /// The job.
-        task_id: String,
+        /// Process ID of the job.
+        pid: u32,
     },
     /// The job's stdin pipe is closed.
-    #[error("terminal input channel closed for task {task_id}")]
+    #[error("terminal input channel closed for process {pid}")]
     Closed {
-        /// The job.
-        task_id: String,
+        /// Process ID of the job.
+        pid: u32,
     },
 }
 
@@ -210,43 +261,33 @@ pub enum Delivery {
 }
 
 /// A finished job's completion on its way to the agent.
-///
-/// The job reads [`Delivery::Pending`] in its registry for as long as this
-/// lives; dropping it is the agent taking the completion, which marks the
-/// job [`Delivery::Taken`] and lets the registry forget it, so its task id
-/// goes back to the allocator. The registry hands out one per job, through
-/// `JobRegistry::owe_completion`.
 #[must_use = "dropping it marks the completion taken"]
 pub struct PendingCompletion {
     tx: Sender<JobCommand>,
-    /// Keeps the word naming this job until the registry hears of the take.
-    task_id: Option<IdLease>,
+    launch: Option<LaunchLease>,
 }
 
 impl std::fmt::Debug for PendingCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingCompletion")
-            .field("task_id", &self.task_id)
+            .field("launch", &self.launch)
             .finish_non_exhaustive()
     }
 }
 
 impl PendingCompletion {
     /// Takes the completion as dropping it does, returning once the registry
-    /// recorded the take: a job it then forgets reads as unknown to every
-    /// later request.
+    /// recorded the take.
     pub async fn take(mut self) {
-        // Only `take` and `drop` empty it, each consuming the completion.
-        let Some(task_id) = self.task_id.take() else {
+        let Some(launch) = self.launch.take() else {
             return;
         };
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        // A closed registry has no reader left to tell.
         if self
             .tx
             .send(
                 JobRequest::TakeCompletion {
-                    task_id,
+                    launch,
                     reply: reply_tx,
                 }
                 .into(),
@@ -261,50 +302,55 @@ impl PendingCompletion {
 
 impl Drop for PendingCompletion {
     fn drop(&mut self) {
-        if let Some(task_id) = self.task_id.take() {
-            // A closed registry has no reader left to tell.
+        if let Some(launch) = self.launch.take() {
             let _ = self
                 .tx
-                .try_send(StateCommand::TakeCompletion { task_id }.into());
+                .try_send(StateCommand::TakeCompletion { launch }.into());
         }
     }
 }
 
-/// Keeps a job in its registry, finished or not, while something reads it
-/// by its task id; the registry forgets a finished job only once every
-/// watch of it dropped. [`JobRegistry::watch`] hands them out.
+/// Keeps a job in its registry, finished or not, while a [`Job`](crate::Job)
+/// handle holds it.
 pub struct JobWatch {
     tx: Sender<JobCommand>,
-    /// Keeps the word naming this job; the unwatch it sends keeps a clone
-    /// until the registry hears of it.
-    task_id: IdLease,
+    launch: LaunchLease,
+    pid: u32,
+}
+
+impl JobWatch {
+    pub(crate) fn launch(&self) -> LaunchId {
+        self.launch.id()
+    }
+
+    pub(crate) const fn pid(&self) -> u32 {
+        self.pid
+    }
 }
 
 impl std::fmt::Debug for JobWatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JobWatch")
-            .field("task_id", &self.task_id)
+            .field("pid", &self.pid)
+            .field("launch", &self.launch)
             .finish_non_exhaustive()
     }
 }
 
 impl Drop for JobWatch {
     fn drop(&mut self) {
-        let task_id = self.task_id.clone();
-        let _ = self.tx.try_send(StateCommand::Unwatch { task_id }.into());
+        let launch = self.launch.clone();
+        let _ = self.tx.try_send(StateCommand::Unwatch { launch }.into());
     }
 }
 
 /// What `JobRegistry::owe_completion` settled for a job.
 #[derive(Debug)]
 pub struct OwedCompletion {
-    /// The job as it ended. A job whose completion a waiter took is
-    /// forgotten as it settles when nothing watches it, so this is the one
-    /// read of it its flow is sure of.
+    /// The job as it ended.
     pub info: JobInfo,
     /// Keeps the completion pending until the agent takes it; `None` when a
-    /// waiter (`JobRegistry::wait_taking`) already took it, so nothing is
-    /// owed.
+    /// waiter (`JobRegistry::wait_taking`) already took it.
     pub pending: Option<PendingCompletion>,
 }
 
@@ -322,40 +368,36 @@ impl JobRead {
 /// Incremental read result for a background terminal buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobDelta {
-    /// Stable task identifier exposed to the model.
-    pub task_id: String,
+    /// Process ID exposed to the model.
+    pub pid: u32,
     /// Cursor the caller should pass on the next read.
     pub cursor: usize,
-    /// Total bytes currently buffered for this task.
+    /// Total bytes currently buffered for this job.
     pub total_bytes: usize,
     /// Newly read bytes from the terminal buffer.
     pub bytes: Vec<u8>,
-    /// Current task status at the time of the read.
+    /// Current job status at the time of the read.
     pub status: JobStatus,
 }
 
 /// What a read of a job's output returned.
-///
-/// A read that would return what the job's last read returned is a poll:
-/// only more output, or the job's end, can tell the reader something new, so
-/// it comes back as [`Self::Unchanged`] for the reader's wording to say so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobRead {
     /// Output past the cursor, or the same cursor with a changed status.
     Delta(JobDelta),
     /// Nothing changed since this job's last read.
     Unchanged {
-        /// The job whose output did not change.
-        task_id: String,
+        /// Process ID whose output did not change.
+        pid: u32,
     },
 }
 
 /// Why a tool refused a read of a job's output: nothing changed since the
-/// job's last read. The refusal a tool returns as `Refused<UnchangedRead>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// job's last read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnchangedRead {
-    /// The job whose output did not change.
-    pub task_id: String,
+    /// Process ID whose output did not change.
+    pub pid: u32,
 }
 
 /// Sender used by the registry to push bytes into a running process stdin.
@@ -381,15 +423,10 @@ enum KillSwitch {
 #[allow(clippy::struct_excessive_bools)]
 struct JobState {
     info: JobInfo,
-    /// Keeps the job's task id leased while the registry keeps the job.
-    task_id: IdLease,
+    launch: LaunchLease,
     terminal_buffer: Vec<u8>,
-    /// Bytes evicted from the front of `terminal_buffer` once redirected to disk.
     terminal_evicted: usize,
-    /// Complete lines only, each from one stream, in the order they
-    /// completed: what the `monitor` pump reads.
     line_buffer: Vec<u8>,
-    /// Bytes evicted from the front of `line_buffer` once redirected to disk.
     line_evicted: usize,
     stdout_partial: Vec<u8>,
     stderr_partial: Vec<u8>,
@@ -399,52 +436,36 @@ struct JobState {
     stderr_closed: bool,
     input_tx: Option<TerminalInputSender>,
     kill_switch: Option<KillSwitch>,
-    /// True while a `KillSwitch` kill is running outside the registry.
     switch_kill_in_flight: bool,
-    /// Concurrent callers waiting on the active `KillSwitch` kill.
     switch_kill_waiters: Vec<Sender<bool>>,
     process_tree: Option<JobTree>,
-    /// Why the kill in flight was asked for: the first of overlapping kills.
     kill_cause: Option<KillCause>,
-    /// How many kills of the job run outside the registry; an ending the
-    /// job's own flow reports meanwhile waits in `deferred_end`.
     kills_in_flight: usize,
     deferred_end: Option<Ending>,
-    /// Callers parked until the last kill in flight records its outcome.
     settled_waiters: Vec<SettledWaiter>,
-    /// Callers parked until the job ends.
     ended_waiters: Vec<Sender<Option<JobInfo>>>,
     output_redirect: Option<async_fs::File>,
-    /// True once initial output has been written to `info.output_path`.
     redirected_disk: bool,
     finished_at: Option<Instant>,
-    /// Whether the job's [`PendingCompletion`] was handed out.
     completion_owed: bool,
-    /// Whether a waiter took the completion before it was handed out: the
-    /// job then reads [`Delivery::Taken`] the moment it ends and owes
-    /// nothing.
     claimed: bool,
-    /// How many [`JobWatch`]es of the job live.
     watchers: usize,
 }
 
-/// A caller waiting for a job's kills in flight to record their outcome.
 #[derive(Debug)]
 enum SettledWaiter {
-    /// `get_by_task_id_settled`.
     Read(Sender<Option<JobInfo>>),
-    /// `owe_completion`.
     Owe {
         ending: Result<i32, String>,
         reply: Sender<Option<OwedCompletion>>,
     },
 }
 
-/// State mutations sent to the registry service; none expect a reply.
 enum StateCommand {
     Register {
         pid: u32,
-        task_id: IdLease,
+        host_pid: u32,
+        launch: LaunchLease,
         execution_key: String,
         script: String,
         interpreter: Interpreter,
@@ -454,139 +475,145 @@ enum StateCommand {
         place: JobPlace,
     },
     Bound {
-        task_id: IdLease,
+        launch: LaunchLease,
         timeout: Duration,
     },
-    /// The process of task `task_id` is about to start: its output can be
-    /// appended to from here on, ahead of the job's registration.
     Launching {
-        task_id: IdLease,
+        launch: LaunchLease,
     },
-    /// The launch of task `task_id` ended; a job that never registered is
-    /// forgotten and what waited for it is released.
     Abandon {
-        task_id: IdLease,
+        launch: LaunchLease,
     },
     AttachTerminalInput {
-        task_id: IdLease,
+        launch: LaunchLease,
         input_tx: TerminalInputSender,
     },
     AttachKillSwitch {
-        task_id: IdLease,
+        launch: LaunchLease,
         kill_switch: KillSwitch,
     },
     AppendTerminalOutput {
-        task_id: IdLease,
+        launch: LaunchLease,
         stream: TerminalStream,
         chunk: Vec<u8>,
     },
     CloseTerminalStream {
-        task_id: IdLease,
+        launch: LaunchLease,
         stream: TerminalStream,
     },
     Complete {
-        task_id: IdLease,
+        launch: LaunchLease,
         exit_code: i32,
         output_path: Option<PathBuf>,
     },
     Fail {
-        task_id: IdLease,
+        launch: LaunchLease,
         error: String,
         output_path: Option<PathBuf>,
     },
-    /// The agent took the completion of task `task_id`.
     TakeCompletion {
-        task_id: IdLease,
+        launch: LaunchLease,
     },
-    /// A [`JobWatch`] of task `task_id` dropped.
     Unwatch {
-        task_id: IdLease,
+        launch: LaunchLease,
     },
 }
 
-/// Registry queries and job-control requests, each answered on `reply`.
 enum JobRequest {
     List {
         reply: Sender<Vec<JobInfo>>,
     },
-    GetByTaskId {
-        task_id: String,
+    GetByPid {
+        pid: u32,
         reply: Sender<Option<JobInfo>>,
     },
-    GetByTaskIdSettled {
-        task_id: String,
+    GetByLaunch {
+        launch: LaunchId,
         reply: Sender<Option<JobInfo>>,
     },
-    /// Appends `chunk` to the stdout of task `task_id`, replying once it is
-    /// in, with whether it went in: a task not registered yet gets it when
-    /// it registers, one that no longer runs or was forgotten gets nothing.
+    GetByLaunchSettled {
+        launch: LaunchId,
+        reply: Sender<Option<JobInfo>>,
+    },
     AppendTaskStdout {
-        task_id: IdLease,
+        launch: LaunchLease,
         chunk: Vec<u8>,
         reply: Sender<bool>,
     },
-    /// The lease of the job `task_id` names, whether registered or still
-    /// launching, held weakly.
     Lease {
-        task_id: String,
-        reply: Sender<Option<WeakIdLease>>,
+        launch: LaunchId,
+        reply: Sender<Option<WeakLaunchLease>>,
     },
     OweCompletion {
-        task_id: String,
+        launch: LaunchId,
         ending: Result<i32, String>,
         reply: Sender<Option<OwedCompletion>>,
     },
-    BeginKillByTaskId {
-        task_id: String,
+    BeginKillByPid {
+        pid: u32,
+        cause: KillCause,
+        reply: Sender<Option<(LaunchId, KillPlan)>>,
+    },
+    BeginKillByLaunch {
+        launch: LaunchId,
         cause: KillCause,
         reply: Sender<KillPlan>,
     },
     BeginKillByExecutionKey {
         execution_key: String,
         cause: KillCause,
-        reply: Sender<Vec<(String, KillPlan)>>,
+        reply: Sender<Vec<(LaunchId, KillPlan)>>,
     },
     EndKill {
-        task_id: String,
+        launch: LaunchId,
         killed: bool,
         reply: Sender<bool>,
     },
     InputTerminal {
-        task_id: String,
+        launch: LaunchId,
+        pid: u32,
+        bytes: Vec<u8>,
+        reply: Sender<Result<(), JobInputError>>,
+    },
+    InputByPid {
+        pid: u32,
         bytes: Vec<u8>,
         reply: Sender<Result<(), JobInputError>>,
     },
     StartOutputRedirect {
-        task_id: String,
+        launch: LaunchId,
         output_path: PathBuf,
         reply: Sender<Result<Vec<u8>, String>>,
     },
     FlushOutputRedirect {
-        task_id: String,
+        launch: LaunchId,
         reply: Sender<Option<PathBuf>>,
     },
     TerminalOutput {
-        task_id: String,
+        launch: LaunchId,
         reply: Sender<Option<(Vec<u8>, Vec<u8>)>>,
     },
     ReadJobDelta {
-        task_id: String,
+        launch: LaunchId,
         cursor: usize,
         max_bytes: usize,
-        /// Whether this read is a model read of the merged terminal buffer,
-        /// tracked by the unchanged-read refusal; a monitor pump's reads are
-        /// not, and read the complete-line buffer instead.
+        tracked: bool,
+        reply: Sender<Result<JobRead, String>>,
+    },
+    ReadByPid {
+        pid: u32,
+        cursor: usize,
+        max_bytes: usize,
         tracked: bool,
         reply: Sender<Result<JobRead, String>>,
     },
     WaitEnded {
-        task_id: String,
-        /// Whether the waiter takes the job's completion.
+        launch: LaunchId,
         claim: bool,
         reply: Sender<Option<JobInfo>>,
     },
     TerminalStreamsClosed {
-        task_id: String,
+        launch: LaunchId,
         reply: Sender<bool>,
     },
     FormatRunning {
@@ -595,34 +622,28 @@ enum JobRequest {
     HasRunning {
         reply: Sender<bool>,
     },
-    Watch {
-        task_id: String,
+    WatchByPid {
+        pid: u32,
         reply: Sender<Option<JobWatch>>,
     },
-    /// [`PendingCompletion::take`].
+    WatchByLaunch {
+        launch: LaunchId,
+        reply: Sender<Option<JobWatch>>,
+    },
     TakeCompletion {
-        task_id: IdLease,
+        launch: LaunchLease,
         reply: Sender<()>,
     },
 }
 
-/// How the registry's caller kills a job: the kill itself runs outside the
-/// registry's state actor, which would otherwise stall every other job's
-/// output, listing and kills meanwhile.
 enum KillPlan {
-    /// The registry decided at once.
     Done(bool),
-    /// Run a backend or test kill switch outside the registry.
     Switch(KillSwitch),
-    /// Wait on a `KillSwitch` kill already in flight.
     AwaitSwitch(Receiver<bool>),
-    /// Kill the job's whole process tree.
     Tree(JobTree),
-    /// Kill the process group led by this pid.
     Group(u32),
 }
 
-/// How a job's own flow ended it while a kill of it was running.
 #[derive(Debug)]
 enum Ending {
     Complete {
@@ -635,7 +656,6 @@ enum Ending {
     },
 }
 
-/// Message delivered to the registry service.
 enum JobCommand {
     State(StateCommand),
     Request(JobRequest),
@@ -654,13 +674,9 @@ impl From<JobRequest> for JobCommand {
 }
 
 /// Registry handle for tracking background jobs.
-///
-/// Cloning keeps a sender to the same registry service.
 #[derive(Clone, Debug)]
 pub struct JobRegistry {
     tx: Sender<JobCommand>,
-    /// The tree scanner — kept for the other unixes and the tests; on Linux
-    /// the supervisor owns each tree.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     scanner: ProcessScanner,
 }
@@ -669,12 +685,8 @@ pub struct JobRegistry {
 #[derive(Debug)]
 pub struct JobRegistryService {
     rx: Receiver<JobCommand>,
-    /// What each [`PendingCompletion`] reports back on; weak, so the service
-    /// still ends with the last handle.
     tx: WeakSender<JobCommand>,
-    /// How much of a script a job listing shows.
     policy: OutputPolicy,
-    /// Embedder wording for running job summaries.
     wording: Option<AnyShellWording>,
 }
 
@@ -722,19 +734,11 @@ impl JobRegistry {
             .expect("job registry response dropped")
     }
 
-    /// Registers a new running job under `task_id`, the word its model
-    /// addresses it by.
-    ///
-    /// The registry holds the lease for as long as it keeps the job: until
-    /// the job finished, its agent took the completion
-    /// ([`Self::owe_completion`]) and nothing watches it, or until the
-    /// registry drops. The job is identified by `task_id` alone: `pid` is
-    /// data of the job, which another job may share once the operating
-    /// system reuses it.
+    /// Registers a new running job on the host under `launch` and `pid`.
     pub async fn register(
         &self,
         pid: u32,
-        task_id: &IdLease,
+        launch: &LaunchLease,
         execution_key: &str,
         script: &str,
         mode: SandboxMode,
@@ -742,7 +746,8 @@ impl JobRegistry {
     ) {
         self.register_with_tree(
             pid,
-            task_id,
+            pid,
+            launch,
             execution_key,
             script,
             Interpreter::Shell,
@@ -754,15 +759,13 @@ impl JobRegistry {
         .await;
     }
 
-    /// Registers a new running job like [`Self::register`], for a job that
-    /// runs at `place` instead of on this machine, with `script` in
-    /// `interpreter`.
+    /// Registers a new running job at `place`.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_at(
         &self,
         place: JobPlace,
         pid: u32,
-        task_id: &IdLease,
+        launch: &LaunchLease,
         execution_key: &str,
         script: &str,
         interpreter: Interpreter,
@@ -770,7 +773,8 @@ impl JobRegistry {
     ) {
         self.register_with_tree(
             pid,
-            task_id,
+            pid,
+            launch,
             execution_key,
             script,
             interpreter,
@@ -782,14 +786,14 @@ impl JobRegistry {
         .await;
     }
 
-    /// Registers a new running job whose process tree was started with
-    /// the sandbox that spawned it: the tree is part of the job from its
-    /// first moment, so a kill never finds a job without it.
+    /// Registers a new running job with both its inside-environment `pid` and
+    /// host `host_pid` plus an optional [`JobTree`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn register_with_tree(
         &self,
         pid: u32,
-        task_id: &IdLease,
+        host_pid: u32,
+        launch: &LaunchLease,
         execution_key: &str,
         script: &str,
         interpreter: Interpreter,
@@ -801,7 +805,8 @@ impl JobRegistry {
         self.send_command(StateCommand::Register {
             place,
             pid,
-            task_id: task_id.clone(),
+            host_pid,
+            launch: launch.clone(),
             execution_key: execution_key.to_string(),
             script: script.to_string(),
             interpreter,
@@ -812,31 +817,28 @@ impl JobRegistry {
         .await;
     }
 
-    /// Records that the job of task `task_id` runs under a `timeout` bound,
-    /// reported as [`JobInfo::timeout`]. Called before the job registers: it
-    /// is applied when it does.
-    pub async fn bound_by_timeout(&self, task_id: &IdLease, timeout: Duration) {
+    /// Records that `launch` runs under a `timeout` bound.
+    pub async fn bound_by_timeout(&self, launch: &LaunchLease, timeout: Duration) {
         self.send_command(StateCommand::Bound {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
             timeout,
         })
         .await;
     }
 
-    /// Attaches a stdin input channel to a running job. A job with no channel
-    /// attached reads no input: [`JobInputError::NoStdin`].
-    pub async fn attach_terminal_input(&self, task_id: &IdLease, input_tx: TerminalInputSender) {
+    /// Attaches a stdin input channel to a running job.
+    pub async fn attach_terminal_input(&self, launch: &LaunchLease, input_tx: TerminalInputSender) {
         self.send_command(StateCommand::AttachTerminalInput {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
             input_tx,
         })
         .await;
     }
 
-    /// Attaches a kill switch used by runtimes without host-visible PIDs.
-    pub async fn attach_kill_switch(&self, task_id: &IdLease, kill_tx: Sender<()>) {
+    /// Attaches a kill switch used by test fixtures or runtimes without host PIDs.
+    pub async fn attach_kill_switch(&self, launch: &LaunchLease, kill_tx: Sender<()>) {
         self.send_command(StateCommand::AttachKillSwitch {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
             kill_switch: KillSwitch::Fire(kill_tx),
         })
         .await;
@@ -846,66 +848,55 @@ impl JobRegistry {
     /// and its output drain have completed.
     pub(crate) async fn attach_backend_killer(
         &self,
-        task_id: &IdLease,
+        launch: &LaunchLease,
         kill_tx: Sender<Sender<bool>>,
     ) {
         self.send_command(StateCommand::AttachKillSwitch {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
             kill_switch: KillSwitch::Backend(kill_tx),
         })
         .await;
     }
 
-    /// The process-table scanner the registry's local jobs share, for the
-    /// sandbox that starts their trees' watch right after the spawn, while the
-    /// children's lineage can still be read.
+    /// The process-table scanner shared by local non-Linux jobs.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn scanner(&self) -> ProcessScanner {
         self.scanner.clone()
     }
 
     /// Appends stdout bytes for a running job.
-    pub async fn append_stdout(&self, task_id: &IdLease, chunk: Vec<u8>) {
-        self.append_output(task_id.clone(), TerminalStream::Stdout, chunk)
+    pub async fn append_stdout(&self, launch: &LaunchLease, chunk: Vec<u8>) {
+        self.append_output(launch.clone(), TerminalStream::Stdout, chunk)
             .await;
     }
 
     /// Appends stderr bytes for a running job.
-    pub async fn append_stderr(&self, task_id: &IdLease, chunk: Vec<u8>) {
-        self.append_output(task_id.clone(), TerminalStream::Stderr, chunk)
+    pub async fn append_stderr(&self, launch: &LaunchLease, chunk: Vec<u8>) {
+        self.append_output(launch.clone(), TerminalStream::Stderr, chunk)
             .await;
     }
 
-    /// Appends bytes to `stream` of a running job. `task_id` goes with them:
-    /// the registry drops it once they are in, so a sender holding the job's
-    /// lease only weakly keeps nothing leased once its sends are recorded.
+    /// Appends bytes to `stream` of a running job.
     pub(crate) async fn append_output(
         &self,
-        task_id: IdLease,
+        launch: LaunchLease,
         stream: TerminalStream,
         chunk: Vec<u8>,
     ) {
         self.send_command(StateCommand::AppendTerminalOutput {
-            task_id,
+            launch,
             stream,
             chunk,
         })
         .await;
     }
 
-    /// Appends stdout bytes to task `task_id`, returning once they are in its
-    /// output, and whether they went in. A task whose job is not registered
-    /// yet (its process may already be running a command) gets them as it
-    /// registers, ahead of anything the process wrote later; one the
-    /// registry already forgot, or whose job no longer runs, drops them and
-    /// answers `false`.
-    ///
-    /// `task_id` is the job's own lease, which the bytes hold until they are
-    /// in: its word cannot name a later job while they are on their way.
-    pub async fn append_task_stdout(&self, task_id: &IdLease, chunk: Vec<u8>) -> bool {
+    /// Appends stdout bytes to `launch`, parking until registration if the
+    /// launch is still starting.
+    pub async fn append_task_stdout(&self, launch: &LaunchLease, chunk: Vec<u8>) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::AppendTaskStdout {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
             chunk,
             reply: reply_tx,
         })
@@ -913,65 +904,60 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// The lease of the job `task_id` names, held weakly, while the job is
-    /// registered or its process is starting.
-    pub(crate) async fn task_lease(&self, task_id: &str) -> Option<WeakIdLease> {
+    /// Weak lease of `launch` while registered or starting.
+    pub(crate) async fn launch_lease(&self, launch: LaunchId) -> Option<WeakLaunchLease> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::Lease {
-            task_id: task_id.to_string(),
+            launch,
             reply: reply_tx,
         })
         .await;
         Self::recv_reply(reply_rx).await
     }
 
-    /// Records that the process of task `task_id` is about to start, so its
-    /// output takes appends from before its job registers.
-    pub(crate) async fn launching(&self, task_id: &IdLease) {
+    /// Records that `launch` is about to start so early appends are accepted.
+    pub(crate) async fn launching(&self, launch: &LaunchLease) {
         self.send_command(StateCommand::Launching {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
         })
         .await;
     }
 
-    /// Records that the launch of task `task_id` ended. A process that never
-    /// started leaves no job: what waited to be appended to it is released
-    /// and the task takes no more.
-    pub(crate) async fn abandon_launch(&self, task_id: &IdLease) {
+    /// Records that `launch` ended without registering.
+    pub(crate) async fn abandon_launch(&self, launch: &LaunchLease) {
         self.send_command(StateCommand::Abandon {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
         })
         .await;
     }
 
     /// Marks stdout stream closed.
-    pub async fn close_stdout(&self, task_id: &IdLease) {
-        self.close_output(task_id.clone(), TerminalStream::Stdout)
+    pub async fn close_stdout(&self, launch: &LaunchLease) {
+        self.close_output(launch.clone(), TerminalStream::Stdout)
             .await;
     }
 
     /// Marks stderr stream closed.
-    pub async fn close_stderr(&self, task_id: &IdLease) {
-        self.close_output(task_id.clone(), TerminalStream::Stderr)
+    pub async fn close_stderr(&self, launch: &LaunchLease) {
+        self.close_output(launch.clone(), TerminalStream::Stderr)
             .await;
     }
 
-    /// Marks `stream` of a job closed, `task_id` going with the close as it
-    /// does with [`Self::append_output`].
-    pub(crate) async fn close_output(&self, task_id: IdLease, stream: TerminalStream) {
-        self.send_command(StateCommand::CloseTerminalStream { task_id, stream })
+    /// Marks `stream` of `launch` closed.
+    pub(crate) async fn close_output(&self, launch: LaunchLease, stream: TerminalStream) {
+        self.send_command(StateCommand::CloseTerminalStream { launch, stream })
             .await;
     }
 
-    /// Sends bytes to a running task terminal stdin.
+    /// Sends bytes to the stdin of the job currently identified by `pid`.
     ///
     /// # Errors
-    /// Returns an error when the task does not exist, no longer runs, has no
-    /// stdin channel attached or its channel closed.
-    pub async fn terminal_input(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), JobInputError> {
+    /// Returns an error when `pid` is unknown, no longer runs, has no stdin
+    /// pipe or its channel closed.
+    pub async fn terminal_input(&self, pid: u32, bytes: Vec<u8>) -> Result<(), JobInputError> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::InputTerminal {
-            task_id: task_id.to_string(),
+        self.send_command(JobRequest::InputByPid {
+            pid,
             bytes,
             reply: reply_tx,
         })
@@ -979,18 +965,36 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// Starts continuous output redirection for a task and returns current snapshot bytes.
+    /// Sends bytes to the stdin of a specific watched `launch`.
+    pub(crate) async fn terminal_input_launch(
+        &self,
+        launch: LaunchId,
+        pid: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), JobInputError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::InputTerminal {
+            launch,
+            pid,
+            bytes,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Starts continuous output redirection for `launch` and returns current snapshot bytes.
     ///
     /// # Errors
-    /// Returns an error when the task does not exist or output cannot be redirected.
+    /// Returns an error when `launch` does not exist or output cannot be redirected.
     pub async fn start_output_redirect(
         &self,
-        task_id: &str,
+        launch: LaunchId,
         output_path: PathBuf,
     ) -> Result<Vec<u8>, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::StartOutputRedirect {
-            task_id: task_id.to_string(),
+            launch,
             output_path,
             reply: reply_tx,
         })
@@ -998,54 +1002,52 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// Flushes any active output redirect file for `task_id` and returns its
-    /// disk path when redirected.
-    pub(crate) async fn flush_output_redirect(&self, task_id: &str) -> Option<PathBuf> {
+    /// Flushes any active output redirect file for `launch` and returns its disk path.
+    pub(crate) async fn flush_output_redirect(&self, launch: LaunchId) -> Option<PathBuf> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::FlushOutputRedirect {
-            task_id: task_id.to_string(),
+            launch,
             reply: reply_tx,
         })
         .await;
         Self::recv_reply(reply_rx).await
     }
 
-    /// Returns true when both stdout/stderr streams are closed for task
-    /// `task_id`.
-    pub async fn terminal_streams_closed(&self, task_id: &str) -> bool {
+    /// Returns true when both stdout and stderr streams are closed for `launch`.
+    pub async fn terminal_streams_closed(&self, launch: LaunchId) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::TerminalStreamsClosed {
-            task_id: task_id.to_string(),
+            launch,
             reply: reply_tx,
         })
         .await;
         Self::recv_reply(reply_rx).await
     }
 
-    /// Returns collected stdout/stderr buffers for task `task_id`.
-    pub async fn terminal_output(&self, task_id: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// Returns collected stdout/stderr buffers for `launch`.
+    pub async fn terminal_output(&self, launch: LaunchId) -> Option<(Vec<u8>, Vec<u8>)> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::TerminalOutput {
-            task_id: task_id.to_string(),
+            launch,
             reply: reply_tx,
         })
         .await;
         Self::recv_reply(reply_rx).await
     }
 
-    /// Returns terminal output added since the provided cursor.
+    /// Reads terminal output added since `cursor` for the job named by `pid`.
     ///
     /// # Errors
-    /// An error when the task id is unknown.
+    /// Returns an error when `pid` is unknown or `cursor` exceeds the buffer.
     pub async fn terminal_read(
         &self,
-        task_id: &str,
+        pid: u32,
         cursor: usize,
         max_bytes: usize,
     ) -> Result<JobRead, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::ReadJobDelta {
-            task_id: task_id.to_string(),
+        self.send_command(JobRequest::ReadByPid {
+            pid,
             cursor,
             max_bytes,
             tracked: true,
@@ -1055,21 +1057,38 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// Returns terminal output added since the provided cursor, without
-    /// touching the unchanged-read tracker: the caller is the `monitor`
-    /// pump, whose own cadence is not the model polling.
+    /// Reads terminal output added since `cursor` for a specific watched `launch`.
+    pub(crate) async fn terminal_read_launch(
+        &self,
+        launch: LaunchId,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Result<JobRead, String> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::ReadJobDelta {
+            launch,
+            cursor,
+            max_bytes,
+            tracked: true,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Untracked line-buffer read for the `monitor` pump on `launch`.
     ///
     /// # Errors
-    /// Returns an error when the task id is unknown.
-    pub async fn monitor_read(
+    /// Returns an error when `launch` is unknown.
+    pub async fn monitor_read_launch(
         &self,
-        task_id: &str,
+        launch: LaunchId,
         cursor: usize,
         max_bytes: usize,
     ) -> Result<JobDelta, String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::ReadJobDelta {
-            task_id: task_id.to_string(),
+            launch,
             cursor,
             max_bytes,
             tracked: false,
@@ -1078,31 +1097,26 @@ impl JobRegistry {
         .await;
         match Self::recv_reply(reply_rx).await? {
             JobRead::Delta(delta) => Ok(delta),
-            JobRead::Unchanged { task_id } => {
-                unreachable!("an untracked read of {task_id} is never unchanged")
+            JobRead::Unchanged { pid } => {
+                unreachable!("an untracked read of pid {pid} is never unchanged")
             }
         }
     }
 
-    /// Waits until the job ends and returns how: its status, and the real
-    /// ending of a job whose kill was in flight. `None` for a task the
-    /// registry does not hold.
-    pub async fn wait_ended(&self, task_id: &str) -> Option<JobInfo> {
-        self.wait(task_id, false).await
+    /// Waits until `launch` ends and returns its final [`JobInfo`].
+    pub async fn wait_ended(&self, launch: LaunchId) -> Option<JobInfo> {
+        self.wait(launch, false).await
     }
 
-    /// Waits until the job ends, as [`Self::wait_ended`] does, and takes its
-    /// completion: nothing is owed to the agent for a job its waiter read, so
-    /// the job's [`OwedCompletion`] carries no [`PendingCompletion`]. A
-    /// completion already handed out stays with its holder.
-    pub async fn wait_taking(&self, task_id: &str) -> Option<JobInfo> {
-        self.wait(task_id, true).await
+    /// Waits until `launch` ends and claims its completion.
+    pub async fn wait_taking(&self, launch: LaunchId) -> Option<JobInfo> {
+        self.wait(launch, true).await
     }
 
-    async fn wait(&self, task_id: &str, claim: bool) -> Option<JobInfo> {
+    async fn wait(&self, launch: LaunchId, claim: bool) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::WaitEnded {
-            task_id: task_id.to_string(),
+            launch,
             claim,
             reply: reply_tx,
         })
@@ -1110,27 +1124,32 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// Marks a job as completed.
-    pub async fn complete(&self, task_id: &IdLease, exit_code: i32, output_path: Option<PathBuf>) {
+    /// Marks `launch` as completed.
+    pub async fn complete(
+        &self,
+        launch: &LaunchLease,
+        exit_code: i32,
+        output_path: Option<PathBuf>,
+    ) {
         self.send_command(StateCommand::Complete {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
             exit_code,
             output_path,
         })
         .await;
     }
 
-    /// Marks a job as failed.
-    pub async fn fail(&self, task_id: &IdLease, error: &str, output_path: Option<PathBuf>) {
+    /// Marks `launch` as failed.
+    pub async fn fail(&self, launch: &LaunchLease, error: &str, output_path: Option<PathBuf>) {
         self.send_command(StateCommand::Fail {
-            task_id: task_id.clone(),
+            launch: launch.clone(),
             error: error.to_string(),
             output_path,
         })
         .await;
     }
 
-    /// Lists all jobs.
+    /// Lists all held jobs.
     pub async fn list(&self) -> Vec<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::List { reply: reply_tx })
@@ -1138,53 +1157,48 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// Gets information about a specific job by its task ID.
-    pub async fn get_by_task_id(&self, task_id: &str) -> Option<JobInfo> {
+    /// Gets the latest held job with `pid`.
+    pub async fn get_by_pid(&self, pid: u32) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::GetByTaskId {
-            task_id: task_id.to_string(),
+        self.send_command(JobRequest::GetByPid {
+            pid,
             reply: reply_tx,
         })
         .await;
         Self::recv_reply(reply_rx).await
     }
 
-    /// Gets information about a job by its task ID once no kill of it is in
-    /// flight. A job whose process has exited from a kill's signal still reads
-    /// `Running` until the kill records its outcome; this waits for that
-    /// outcome, so the status it returns is the job's real ending.
-    pub async fn get_by_task_id_settled(&self, task_id: &str) -> Option<JobInfo> {
+    /// Gets information about a specific `launch`.
+    pub async fn get_by_launch(&self, launch: LaunchId) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::GetByTaskIdSettled {
-            task_id: task_id.to_string(),
+        self.send_command(JobRequest::GetByLaunch {
+            launch,
             reply: reply_tx,
         })
         .await;
         Self::recv_reply(reply_rx).await
     }
 
-    /// Settles how task `task_id` ended and hands out the completion it owes
-    /// its agent; its flow calls this once, after the job's process is done,
-    /// and sends the returned [`PendingCompletion`] with the completed task.
-    ///
-    /// Waits for any kill of the job in flight, as
-    /// [`Self::get_by_task_id_settled`] does. A job the registry still reads
-    /// as running ends with `ending` — `Ok(exit_code)` or `Err(error)` — so
-    /// no completion leaves a job running. `None` for a task the registry
-    /// never registered. A job whose completion a waiter took
-    /// ([`Self::wait_taking`]) is forgotten here when nothing watches it.
-    ///
-    /// # Panics
-    ///
-    /// The registry panics when the job's completion was already handed out.
+    /// Gets information about `launch` once no kill of it is in flight.
+    pub async fn get_by_launch_settled(&self, launch: LaunchId) -> Option<JobInfo> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::GetByLaunchSettled {
+            launch,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Settles how `launch` ended and hands out the completion it owes its agent.
     pub async fn owe_completion(
         &self,
-        task_id: &str,
+        launch: LaunchId,
         ending: Result<i32, String>,
     ) -> Option<OwedCompletion> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::OweCompletion {
-            task_id: task_id.to_string(),
+            launch,
             ending,
             reply: reply_tx,
         })
@@ -1192,24 +1206,21 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// Kills a running job whose `timeout` bound passed; the job reads
-    /// [`KillCause::Timeout`].
-    pub async fn kill_timed_out(&self, task_id: &str, kill: TimeoutKill) -> bool {
-        self.kill_for(task_id, KillCause::Timeout(kill)).await
+    /// Kills a running `launch` whose `timeout` bound passed.
+    pub async fn kill_timed_out(&self, launch: LaunchId, kill: TimeoutKill) -> bool {
+        self.kill_launch_for(launch, KillCause::Timeout(kill)).await
     }
 
-    /// Kills a running job whose process tree holds `footprint_bytes` of a
-    /// `domain` with `capacity_bytes`; the job reads
-    /// [`KillCause::MemoryRunaway`].
+    /// Kills a running job whose process tree exceeded memory capacity.
     pub async fn kill_runaway(
         &self,
-        task_id: &str,
+        pid: u32,
         footprint_bytes: u64,
         capacity_bytes: u64,
         domain: MemoryDomain,
     ) -> bool {
-        self.kill_for(
-            task_id,
+        self.kill_pid_for(
+            pid,
             KillCause::MemoryRunaway {
                 footprint_bytes,
                 capacity_bytes,
@@ -1219,21 +1230,40 @@ impl JobRegistry {
         .await
     }
 
-    async fn kill_for(&self, task_id: &str, cause: KillCause) -> bool {
+    async fn kill_launch_for(&self, launch: LaunchId, cause: KillCause) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::BeginKillByTaskId {
-            task_id: task_id.to_string(),
+        self.send_command(JobRequest::BeginKillByLaunch {
+            launch,
             cause,
             reply: reply_tx,
         })
         .await;
         let plan = Self::recv_reply(reply_rx).await;
-        self.finish_kill(task_id, plan).await
+        self.finish_kill(launch, plan).await
     }
 
-    /// Kills a running job by its task ID.
-    pub async fn kill_by_task_id(&self, task_id: &str) -> bool {
-        self.kill_for(task_id, KillCause::User).await
+    async fn kill_pid_for(&self, pid: u32, cause: KillCause) -> bool {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::BeginKillByPid {
+            pid,
+            cause,
+            reply: reply_tx,
+        })
+        .await;
+        let Some((launch, plan)) = Self::recv_reply(reply_rx).await else {
+            return false;
+        };
+        self.finish_kill(launch, plan).await
+    }
+
+    /// Kills a running job by its `pid` (host-side administrative kill).
+    pub async fn kill_by_pid(&self, pid: u32) -> bool {
+        self.kill_pid_for(pid, KillCause::User).await
+    }
+
+    /// Kills a running job by its `launch` (host-side administrative kill).
+    pub async fn kill_launch(&self, launch: LaunchId) -> bool {
+        self.kill_launch_for(launch, KillCause::User).await
     }
 
     /// Kills every job that is still running in this registry.
@@ -1242,7 +1272,7 @@ impl JobRegistry {
         futures::future::join_all(
             jobs.into_iter()
                 .filter(|job| job.status == JobStatus::Running)
-                .map(|job| async move { self.kill_by_task_id(&job.task_id).await }),
+                .map(|job| async move { self.kill_launch(job.launch).await }),
         )
         .await
         .into_iter()
@@ -1263,7 +1293,7 @@ impl JobRegistry {
         futures::future::join_all(
             plans
                 .into_iter()
-                .map(|(task_id, plan)| async move { self.finish_kill(&task_id, plan).await }),
+                .map(|(launch, plan)| async move { self.finish_kill(launch, plan).await }),
         )
         .await
         .into_iter()
@@ -1271,13 +1301,12 @@ impl JobRegistry {
         .count()
     }
 
-    /// Runs the kill a [`KillPlan`] describes and records its outcome.
-    async fn finish_kill(&self, task_id: &str, plan: KillPlan) -> bool {
+    async fn finish_kill(&self, launch: LaunchId, plan: KillPlan) -> bool {
         let killed = match plan {
             KillPlan::Done(killed) => return killed,
             KillPlan::Switch(KillSwitch::Fire(kill_tx)) => {
                 if kill_tx.send(()).await.is_err() {
-                    tracing::warn!(task_id, "failed to signal runtime kill switch");
+                    tracing::warn!(%launch, "failed to signal runtime kill switch");
                     false
                 } else {
                     true
@@ -1286,7 +1315,7 @@ impl JobRegistry {
             KillPlan::Switch(KillSwitch::Backend(kill_tx)) => {
                 let (done_tx, done_rx) = async_channel::bounded(1);
                 if kill_tx.send(done_tx).await.is_err() {
-                    tracing::warn!(task_id, "failed to signal backend kill switch");
+                    tracing::warn!(%launch, "failed to signal backend kill switch");
                     false
                 } else {
                     done_rx.recv().await.unwrap_or(false)
@@ -1297,25 +1326,25 @@ impl JobRegistry {
                 Ok(()) => true,
                 #[cfg(unix)]
                 Err(KillTreeError::Ended) => {
-                    tracing::debug!(task_id, "the job ended before the kill reached it");
+                    tracing::debug!(%launch, "the job ended before the kill reached it");
                     false
                 }
                 Err(error) => {
-                    tracing::warn!(task_id, error = %error, "failed to kill job");
+                    tracing::warn!(%launch, error = %error, "failed to kill job");
                     false
                 }
             },
             KillPlan::Group(group) => match crate::process_tree::kill_process_tree(group).await {
                 Ok(()) => true,
                 Err(error) => {
-                    tracing::warn!(task_id, error = %error, "failed to kill job");
+                    tracing::warn!(%launch, error = %error, "failed to kill job");
                     false
                 }
             },
         };
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.send_command(JobRequest::EndKill {
-            task_id: task_id.to_string(),
+            launch,
             killed,
             reply: reply_tx,
         })
@@ -1339,13 +1368,22 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
-    /// Keeps task `task_id` in the registry, and its word naming it, until
-    /// the returned watch drops; `None` for a task the registry does not
-    /// hold.
-    pub(crate) async fn watch(&self, task_id: &str) -> Option<JobWatch> {
+    /// Keeps the latest job with `pid` in the registry until the returned watch drops.
+    pub(crate) async fn watch(&self, pid: u32) -> Option<JobWatch> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.send_command(JobRequest::Watch {
-            task_id: task_id.to_string(),
+        self.send_command(JobRequest::WatchByPid {
+            pid,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Keeps `launch` in the registry until the returned watch drops.
+    pub(crate) async fn watch_launch(&self, launch: LaunchId) -> Option<JobWatch> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::WatchByLaunch {
+            launch,
             reply: reply_tx,
         })
         .await;
@@ -1353,66 +1391,42 @@ impl JobRegistry {
     }
 }
 
-/// Stdout appends for tasks the registry holds no job for: those whose job is
-/// not registered yet wait for it, those whose job it already forgot are
-/// dropped.
-///
-/// Both refer to their job's lease weakly. The sender of an append holds the
-/// lease until it is answered, so while one waits its word names that job
-/// alone; once the lease ends, what waited for it goes with it, and a later
-/// job leasing the same word never receives it.
 #[derive(Default)]
 struct ParkedOutput {
-    /// Appends waiting for their job to register, by its task id.
-    by_task: HashMap<String, Parked>,
-    /// Forgotten jobs whose lease something still holds, such as the job's
-    /// flow or a progress report on its way.
-    forgotten: Vec<WeakIdLease>,
-    /// `timeout` bounds of jobs not registered yet, by task id.
-    bounds: HashMap<String, (WeakIdLease, Duration)>,
-    /// Jobs whose process is starting and not registered yet, by task id.
-    launching: HashMap<String, WeakIdLease>,
+    by_launch: HashMap<LaunchId, Parked>,
+    forgotten: Vec<WeakLaunchLease>,
+    bounds: HashMap<LaunchId, (WeakLaunchLease, Duration)>,
+    launching: HashMap<LaunchId, WeakLaunchLease>,
 }
 
-/// The appends waiting for one job, in arrival order.
 struct Parked {
-    lease: WeakIdLease,
+    lease: WeakLaunchLease,
     appends: Vec<ParkedAppend>,
 }
 
-/// One parked append: its bytes and the reply that releases its sender.
 type ParkedAppend = (Vec<u8>, Sender<bool>);
 
 impl ParkedOutput {
-    /// Records that the process of task `task_id` is starting.
-    fn launching(&mut self, task_id: &IdLease) {
+    fn launching(&mut self, launch: &LaunchLease) {
         self.prune();
-        self.launching
-            .insert(task_id.to_string(), task_id.downgrade());
+        self.launching.insert(launch.id(), launch.downgrade());
     }
 
-    /// The lease of task `task_id` while its process starts.
-    fn launching_lease(&mut self, task_id: &str) -> Option<WeakIdLease> {
+    fn launching_lease(&mut self, launch: LaunchId) -> Option<WeakLaunchLease> {
         self.prune();
-        self.launching.get(task_id).cloned()
+        self.launching.get(&launch).cloned()
     }
 
-    /// Ends the launch of task `task_id` that never registered: what waited
-    /// for its job is handed back to be released, and later appends are
-    /// dropped.
-    fn abandon(&mut self, task_id: &IdLease) -> Vec<ParkedAppend> {
-        self.launching.remove(task_id.as_str());
-        let waiting = self.take(task_id);
-        self.forgot(task_id);
+    fn abandon(&mut self, launch: &LaunchLease) -> Vec<ParkedAppend> {
+        self.launching.remove(&launch.id());
+        let waiting = self.take(launch);
+        self.forgot(launch);
         waiting
     }
 
-    /// Parks an append to task `task_id`, whose job is not registered. Hands
-    /// back the reply when the registry already forgot that job, for the
-    /// sender to be released without its bytes going anywhere.
     fn park(
         &mut self,
-        task_id: &IdLease,
+        launch: &LaunchLease,
         chunk: Vec<u8>,
         reply: Sender<bool>,
     ) -> Option<Sender<bool>> {
@@ -1420,72 +1434,62 @@ impl ParkedOutput {
         if self
             .forgotten
             .iter()
-            .any(|forgotten| forgotten.refers_to(task_id))
+            .any(|forgotten| forgotten.refers_to(launch))
         {
             return Some(reply);
         }
-        let parked = self
-            .by_task
-            .entry(task_id.to_string())
-            .or_insert_with(|| Parked {
-                lease: task_id.downgrade(),
-                appends: Vec::new(),
-            });
+        let parked = self.by_launch.entry(launch.id()).or_insert_with(|| Parked {
+            lease: launch.downgrade(),
+            appends: Vec::new(),
+        });
         assert!(
-            parked.lease.refers_to(task_id),
-            "two live leases share the task id '{task_id}'"
+            parked.lease.refers_to(launch),
+            "two live leases share launch {}",
+            launch.id()
         );
         parked.appends.push((chunk, reply));
         None
     }
 
-    /// Takes the appends waiting for task `task_id`, which is registering, in
-    /// arrival order.
-    fn take(&mut self, task_id: &IdLease) -> Vec<ParkedAppend> {
+    fn take(&mut self, launch: &LaunchLease) -> Vec<ParkedAppend> {
         self.prune();
-        self.by_task
-            .remove(task_id.as_str())
+        self.by_launch
+            .remove(&launch.id())
             .map_or_default(|parked| {
                 assert!(
-                    parked.lease.refers_to(task_id),
-                    "two live leases share the task id '{task_id}'"
+                    parked.lease.refers_to(launch),
+                    "two live leases share launch {}",
+                    launch.id()
                 );
                 parked.appends
             })
     }
 
-    /// Holds the `timeout` bound of task `task_id`, whose job registers next.
-    fn bound(&mut self, task_id: &IdLease, timeout: Duration) {
+    fn bound(&mut self, launch: &LaunchLease, timeout: Duration) {
         self.prune();
         self.bounds
-            .insert(task_id.to_string(), (task_id.downgrade(), timeout));
+            .insert(launch.id(), (launch.downgrade(), timeout));
     }
 
-    /// Takes the `timeout` bound held for task `task_id`, which is registering.
-    fn take_bound(&mut self, task_id: &IdLease) -> Option<Duration> {
+    fn take_bound(&mut self, launch: &LaunchLease) -> Option<Duration> {
         self.prune();
-        self.bounds
-            .remove(task_id.as_str())
-            .map(|(lease, timeout)| {
-                assert!(
-                    lease.refers_to(task_id),
-                    "two live leases share the task id '{task_id}'"
-                );
-                timeout
-            })
+        self.bounds.remove(&launch.id()).map(|(lease, timeout)| {
+            assert!(
+                lease.refers_to(launch),
+                "two live leases share launch {}",
+                launch.id()
+            );
+            timeout
+        })
     }
 
-    /// Records that the registry forgot the job of task `task_id`, so what is
-    /// still sent to it is dropped instead of waiting for it.
-    fn forgot(&mut self, task_id: &IdLease) {
+    fn forgot(&mut self, launch: &LaunchLease) {
         self.prune();
-        self.forgotten.push(task_id.downgrade());
+        self.forgotten.push(launch.downgrade());
     }
 
-    /// Drops what refers to a lease that ended: no sender of an append to it
-    /// is left, and its word may name another job.
     fn prune(&mut self) {
-        self.by_task
+        self.by_launch
             .retain(|_, parked| parked.lease.upgrade().is_some());
         self.forgotten
             .retain(|forgotten| forgotten.upgrade().is_some());
@@ -1495,35 +1499,59 @@ impl ParkedOutput {
     }
 }
 
-/// Per-session read tracking behind the unchanged-read refusal: what each
-/// task's last `terminal_read` returned with.
 #[derive(Default)]
 struct ReadTracker {
-    /// Task id → the `(cursor, total_bytes, status)` its last read returned.
-    delta_reads: HashMap<String, (usize, usize, JobStatus)>,
+    delta_reads: HashMap<LaunchId, (usize, usize, JobStatus)>,
 }
 
-/// The jobs the registry holds, by the task id each leases: the lease keeps
-/// the word unique among the jobs that live, while a pid is the operating
-/// system's to hand out again as soon as its process ends.
-type Jobs = HashMap<String, JobState>;
+#[derive(Default)]
+struct RegistryStore {
+    jobs: HashMap<LaunchId, JobState>,
+    by_pid: HashMap<u32, Vec<LaunchId>>,
+}
+
+impl RegistryStore {
+    fn latest_launch(&self, pid: u32) -> Option<LaunchId> {
+        self.by_pid
+            .get(&pid)
+            .and_then(|launches| launches.last().copied())
+    }
+
+    fn insert(&mut self, launch: LaunchId, state: JobState) {
+        let pid = state.info.pid;
+        let replaced = self.jobs.insert(launch, state);
+        assert!(replaced.is_none(), "two live leases share launch {launch}");
+        self.by_pid.entry(pid).or_default().push(launch);
+    }
+
+    fn remove(&mut self, launch: LaunchId) -> Option<JobState> {
+        let state = self.jobs.remove(&launch)?;
+        if let Some(entries) = self.by_pid.get_mut(&state.info.pid) {
+            entries.retain(|item| *item != launch);
+            if entries.is_empty() {
+                self.by_pid.remove(&state.info.pid);
+            }
+        }
+        Some(state)
+    }
+}
 
 impl JobRegistryService {
     /// Runs the registry service loop until all senders are dropped.
     pub async fn serve(self) {
-        let mut jobs = Jobs::new();
+        let mut store = RegistryStore::default();
         let mut reads = ReadTracker::default();
         let mut parked = ParkedOutput::default();
 
         while let Ok(command) = self.rx.recv().await {
             match command {
                 JobCommand::State(command) => {
-                    handle_state_command(&mut jobs, &mut reads, &mut parked, command).await;
+                    handle_state_command(&mut store, &mut reads, &mut parked, command).await;
                 }
                 JobCommand::Request(request) => {
                     let preview = self.policy.get().job_preview_bytes;
                     handle_job_request(
-                        &mut jobs,
+                        &mut store,
                         &mut reads,
                         &mut parked,
                         &self.tx,
@@ -1539,7 +1567,7 @@ impl JobRegistryService {
 }
 
 async fn handle_state_command(
-    jobs: &mut Jobs,
+    store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
     command: StateCommand,
@@ -1547,7 +1575,8 @@ async fn handle_state_command(
     match command {
         StateCommand::Register {
             pid,
-            task_id,
+            host_pid,
+            launch,
             execution_key,
             script,
             interpreter,
@@ -1556,14 +1585,15 @@ async fn handle_state_command(
             process_tree,
             place,
         } => {
-            parked.launching.remove(task_id.as_str());
-            let waiting = parked.take(&task_id);
-            let timeout = parked.take_bound(&task_id);
-            let key = task_id.to_string();
+            let key = launch.id();
+            parked.launching.remove(&key);
+            let waiting = parked.take(&launch);
+            let timeout = parked.take_bound(&launch);
             register_job(
-                jobs,
+                store,
                 pid,
-                task_id,
+                host_pid,
+                launch,
                 execution_key,
                 script,
                 interpreter,
@@ -1572,100 +1602,96 @@ async fn handle_state_command(
                 place,
                 timeout,
             );
-            if let Some(job) = jobs.get_mut(&key) {
+            if let Some(job) = store.jobs.get_mut(&key) {
                 job.process_tree = process_tree;
             }
             for (chunk, reply) in waiting {
-                append_terminal_output(jobs, &key, TerminalStream::Stdout, chunk).await;
+                append_terminal_output(&mut store.jobs, key, TerminalStream::Stdout, chunk).await;
                 let _ = reply.send(true).await;
             }
         }
-        StateCommand::Bound { task_id, timeout } => parked.bound(&task_id, timeout),
-        StateCommand::Launching { task_id } => parked.launching(&task_id),
-        StateCommand::Abandon { task_id } => {
-            if !jobs.contains_key(task_id.as_str()) {
-                for (_, reply) in parked.abandon(&task_id) {
+        StateCommand::Bound { launch, timeout } => parked.bound(&launch, timeout),
+        StateCommand::Launching { launch } => parked.launching(&launch),
+        StateCommand::Abandon { launch } => {
+            if !store.jobs.contains_key(&launch.id()) {
+                for (_, reply) in parked.abandon(&launch) {
                     let _ = reply.send(false).await;
                 }
             }
         }
-        StateCommand::AttachTerminalInput { task_id, input_tx } => {
-            // A job that already finished takes no input: the sender drops here.
-            if let Some(job) = jobs
-                .get_mut(task_id.as_str())
+        StateCommand::AttachTerminalInput { launch, input_tx } => {
+            if let Some(job) = store
+                .jobs
+                .get_mut(&launch.id())
                 .filter(|job| matches!(job.info.status, JobStatus::Running))
             {
                 job.input_tx = Some(input_tx);
             }
         }
         StateCommand::AttachKillSwitch {
-            task_id,
+            launch,
             kill_switch,
         } => {
-            if let Some(job) = jobs.get_mut(task_id.as_str()) {
+            if let Some(job) = store.jobs.get_mut(&launch.id()) {
                 job.kill_switch = Some(kill_switch);
             }
         }
         StateCommand::AppendTerminalOutput {
-            task_id,
+            launch,
             stream,
             chunk,
         } => {
-            append_terminal_output(jobs, &task_id, stream, chunk).await;
+            append_terminal_output(&mut store.jobs, launch.id(), stream, chunk).await;
         }
-        StateCommand::CloseTerminalStream { task_id, stream } => {
-            close_terminal_stream(jobs, &task_id, stream);
+        StateCommand::CloseTerminalStream { launch, stream } => {
+            close_terminal_stream(&mut store.jobs, launch.id(), stream);
         }
         StateCommand::Complete {
-            task_id,
+            launch,
             exit_code,
             output_path,
-        } => complete_job(jobs, &task_id, exit_code, output_path).await,
+        } => complete_job(&mut store.jobs, launch.id(), exit_code, output_path).await,
         StateCommand::Fail {
-            task_id,
+            launch,
             error,
             output_path,
-        } => fail_job(jobs, &task_id, error, output_path).await,
-        StateCommand::TakeCompletion { task_id } => {
-            take_completion(jobs, reads, parked, &task_id);
+        } => fail_job(&mut store.jobs, launch.id(), error, output_path).await,
+        StateCommand::TakeCompletion { launch } => {
+            take_completion(store, reads, parked, launch.id());
         }
-        StateCommand::Unwatch { task_id } => {
-            if let Some(job) = jobs.get_mut(task_id.as_str()) {
+        StateCommand::Unwatch { launch } => {
+            let key = launch.id();
+            if let Some(job) = store.jobs.get_mut(&key) {
                 job.watchers -= 1;
-                forget_if_done(jobs, reads, parked, &task_id);
+                forget_if_done(store, reads, parked, key);
             }
         }
     }
 }
 
-/// Forgets job `task_id` once nothing can address it any more: it finished,
-/// its own flow settled its completion, its agent took it and nothing
-/// watches it. Its task id then goes back to the allocator once nothing else
-/// holds it, a later read of it answers as for any unknown task, and
-/// progress still reported to it is dropped.
 fn forget_if_done(
-    jobs: &mut Jobs,
+    store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
-    task_id: &str,
+    launch: LaunchId,
 ) {
-    let job = &jobs[task_id];
-    // A waiter's claim reads the job taken before its flow settles it; the
-    // flow still reads the job's output after that.
+    let Some(job) = store.jobs.get(&launch) else {
+        return;
+    };
     if job.completion_owed
         && job.info.status.delivery() == Some(Delivery::Taken)
         && job.watchers == 0
     {
-        let job = jobs.remove(task_id).expect("the job is registered");
-        reads.delta_reads.remove(task_id);
-        parked.forgot(&job.task_id);
-        tracing::debug!(task_id, pid = %job.info.pid, "forgot finished job");
+        let job = store.remove(launch).expect("the job is registered");
+        reads.delta_reads.remove(&launch);
+        parked.forgot(&job.launch);
+        tracing::debug!(%launch, pid = %job.info.pid, "forgot finished job");
     }
 }
 
 #[allow(clippy::too_many_lines)]
 async fn handle_job_request(
-    jobs: &mut Jobs,
+    store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
     tx: &WeakSender<JobCommand>,
@@ -1675,53 +1701,73 @@ async fn handle_job_request(
 ) {
     match request {
         JobRequest::AppendTaskStdout {
-            task_id,
+            launch,
             chunk,
             reply,
         } => {
-            if let Some(job) = jobs.get(task_id.as_str()) {
+            let key = launch.id();
+            if let Some(job) = store.jobs.get(&key) {
                 assert!(
-                    job.task_id.same_lease(&task_id),
-                    "two live leases share the task id '{task_id}'"
+                    job.launch.same_lease(&launch),
+                    "two live leases share launch {key}"
                 );
                 let running = matches!(job.info.status, JobStatus::Running);
                 if running {
-                    append_terminal_output(jobs, &task_id, TerminalStream::Stdout, chunk).await;
+                    append_terminal_output(&mut store.jobs, key, TerminalStream::Stdout, chunk)
+                        .await;
                 }
                 let _ = reply.send(running).await;
-            } else if let Some(reply) = parked.park(&task_id, chunk, reply) {
+            } else if let Some(reply) = parked.park(&launch, chunk, reply) {
                 let _ = reply.send(false).await;
             }
         }
-        JobRequest::Lease { task_id, reply } => {
-            let lease = jobs
-                .get(&task_id)
-                .map(|job| job.task_id.downgrade())
-                .or_else(|| parked.launching_lease(&task_id));
+        JobRequest::Lease { launch, reply } => {
+            let lease = store
+                .jobs
+                .get(&launch)
+                .map(|job| job.launch.downgrade())
+                .or_else(|| parked.launching_lease(launch));
             let _ = reply.send(lease).await;
         }
         JobRequest::List { reply } => {
-            let items = jobs.values().map(|state| state.info.clone()).collect();
+            let items = store
+                .jobs
+                .values()
+                .map(|state| state.info.clone())
+                .collect();
             let _ = reply.send(items).await;
         }
-        JobRequest::GetByTaskId { task_id, reply } => {
-            let item = jobs.get(&task_id).map(|state| state.info.clone());
+        JobRequest::GetByPid { pid, reply } => {
+            let item = store
+                .latest_launch(pid)
+                .and_then(|launch| store.jobs.get(&launch))
+                .map(|state| state.info.clone());
             let _ = reply.send(item).await;
         }
-        JobRequest::GetByTaskIdSettled { task_id, reply } => {
-            get_settled_by_task_id(jobs, &task_id, reply).await;
+        JobRequest::GetByLaunch { launch, reply } => {
+            let item = store.jobs.get(&launch).map(|state| state.info.clone());
+            let _ = reply.send(item).await;
+        }
+        JobRequest::GetByLaunchSettled { launch, reply } => {
+            get_settled_by_launch(&mut store.jobs, launch, reply).await;
         }
         JobRequest::OweCompletion {
-            task_id,
+            launch,
             ending,
             reply,
-        } => owe_settled_completion(jobs, reads, parked, &task_id, ending, reply, tx).await,
-        JobRequest::BeginKillByTaskId {
-            task_id,
+        } => owe_settled_completion(store, reads, parked, launch, ending, reply, tx).await,
+        JobRequest::BeginKillByPid { pid, cause, reply } => {
+            let plan = store
+                .latest_launch(pid)
+                .map(|launch| (launch, begin_kill(&mut store.jobs, launch, cause)));
+            let _ = reply.send(plan).await;
+        }
+        JobRequest::BeginKillByLaunch {
+            launch,
             cause,
             reply,
         } => {
-            let plan = begin_kill(jobs, &task_id, cause);
+            let plan = begin_kill(&mut store.jobs, launch, cause);
             let _ = reply.send(plan).await;
         }
         JobRequest::BeginKillByExecutionKey {
@@ -1729,36 +1775,44 @@ async fn handle_job_request(
             cause,
             reply,
         } => {
-            let plans = begin_kill_by_execution_key(jobs, &execution_key, cause);
+            let plans = begin_kill_by_execution_key(&mut store.jobs, &execution_key, cause);
             let _ = reply.send(plans).await;
         }
         JobRequest::EndKill {
-            task_id,
+            launch,
             killed,
             reply,
         } => {
-            let result = end_kill(jobs, &task_id, killed).await;
-            release_settled_waiters(jobs, reads, parked, &task_id, tx).await;
+            let result = end_kill(&mut store.jobs, launch, killed).await;
+            release_settled_waiters(store, reads, parked, launch, tx).await;
             let _ = reply.send(result).await;
         }
         JobRequest::InputTerminal {
-            task_id,
+            launch,
+            pid,
             bytes,
             reply,
         } => {
-            let result = input_terminal(jobs, &task_id, bytes).await;
+            let result = input_terminal(&store.jobs, launch, pid, bytes).await;
+            let _ = reply.send(result).await;
+        }
+        JobRequest::InputByPid { pid, bytes, reply } => {
+            let result = match store.latest_launch(pid) {
+                Some(launch) => input_terminal(&store.jobs, launch, pid, bytes).await,
+                None => Err(JobInputError::UnknownJob { pid }),
+            };
             let _ = reply.send(result).await;
         }
         JobRequest::StartOutputRedirect {
-            task_id,
+            launch,
             output_path,
             reply,
         } => {
-            let result = redirect_task_output(jobs, &task_id, output_path).await;
+            let result = redirect_task_output(&mut store.jobs, launch, output_path).await;
             let _ = reply.send(result).await;
         }
-        JobRequest::FlushOutputRedirect { task_id, reply } => {
-            let path = if let Some(job) = jobs.get_mut(&task_id) {
+        JobRequest::FlushOutputRedirect { launch, reply } => {
+            let path = if let Some(job) = store.jobs.get_mut(&launch) {
                 if let Some(file) = job.output_redirect.as_mut() {
                     let _ = file.flush().await;
                 }
@@ -1770,82 +1824,120 @@ async fn handle_job_request(
             };
             let _ = reply.send(path).await;
         }
-        JobRequest::TerminalOutput { task_id, reply } => {
-            send_terminal_output(jobs, &task_id, reply).await;
+        JobRequest::TerminalOutput { launch, reply } => {
+            send_terminal_output(&store.jobs, launch, reply).await;
         }
         JobRequest::ReadJobDelta {
-            task_id,
+            launch,
             cursor,
             max_bytes,
             tracked,
             reply,
         } => {
-            let result = read_terminal_delta(jobs, &task_id, cursor, max_bytes, !tracked)
+            let result = read_terminal_delta(&mut store.jobs, launch, cursor, max_bytes, !tracked)
                 .await
-                .map(|delta| tracked_delta(reads, &task_id, delta, tracked));
+                .map(|delta| tracked_delta(reads, launch, delta, tracked));
+            let _ = reply.send(result).await;
+        }
+        JobRequest::ReadByPid {
+            pid,
+            cursor,
+            max_bytes,
+            tracked,
+            reply,
+        } => {
+            let result = match store.latest_launch(pid) {
+                Some(launch) => {
+                    read_terminal_delta(&mut store.jobs, launch, cursor, max_bytes, !tracked)
+                        .await
+                        .map(|delta| tracked_delta(reads, launch, delta, tracked))
+                }
+                None => Err(format!("unknown pid: {pid}")),
+            };
             let _ = reply.send(result).await;
         }
         JobRequest::WaitEnded {
-            task_id,
+            launch,
             claim,
             reply,
         } => {
-            wait_for_end(jobs, &task_id, claim, reply).await;
+            wait_for_end(&mut store.jobs, launch, claim, reply).await;
         }
-        JobRequest::TerminalStreamsClosed { task_id, reply } => {
-            let closed = jobs
-                .get(&task_id)
+        JobRequest::TerminalStreamsClosed { launch, reply } => {
+            let closed = store
+                .jobs
+                .get(&launch)
                 .is_some_and(|job| job.stdout_closed && job.stderr_closed);
             let _ = reply.send(closed).await;
         }
         JobRequest::FormatRunning { reply } => {
             let _ = reply
-                .send(format_running_jobs(jobs, script_preview_bytes, wording))
+                .send(format_running_jobs(
+                    &store.jobs,
+                    script_preview_bytes,
+                    wording,
+                ))
                 .await;
         }
         JobRequest::HasRunning { reply } => {
-            let _ = reply.send(has_running_job(jobs)).await;
+            let _ = reply.send(has_running_job(&store.jobs)).await;
         }
-        JobRequest::TakeCompletion { task_id, reply } => {
-            take_completion(jobs, reads, parked, &task_id);
+        JobRequest::TakeCompletion { launch, reply } => {
+            take_completion(store, reads, parked, launch.id());
             let _ = reply.send(()).await;
         }
-        JobRequest::Watch { task_id, reply } => {
-            let watch = jobs.get_mut(&task_id).map(|job| {
-                job.watchers += 1;
-                JobWatch {
-                    tx: tx
-                        .upgrade()
-                        .expect("a request arrives through a live registry handle"),
-                    task_id: job.task_id.clone(),
-                }
-            });
+        JobRequest::WatchByPid { pid, reply } => {
+            let watch = store
+                .latest_launch(pid)
+                .and_then(|launch| watch_job(&mut store.jobs, launch, tx));
+            let _ = reply.send(watch).await;
+        }
+        JobRequest::WatchByLaunch { launch, reply } => {
+            let watch = watch_job(&mut store.jobs, launch, tx);
             let _ = reply.send(watch).await;
         }
     }
 }
 
+fn watch_job(
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    tx: &WeakSender<JobCommand>,
+) -> Option<JobWatch> {
+    jobs.get_mut(&launch).map(|job| {
+        job.watchers += 1;
+        JobWatch {
+            tx: tx
+                .upgrade()
+                .expect("a request arrives through a live registry handle"),
+            launch: job.launch.clone(),
+            pid: job.info.pid,
+        }
+    })
+}
+
 async fn send_terminal_output(
-    jobs: &Jobs,
-    task_id: &str,
+    jobs: &HashMap<LaunchId, JobState>,
+    launch: LaunchId,
     reply: Sender<Option<(Vec<u8>, Vec<u8>)>>,
 ) {
     let output = jobs
-        .get(task_id)
+        .get(&launch)
         .map(|job| (job.stdout_buffer.clone(), job.stderr_buffer.clone()));
     let _ = reply.send(output).await;
 }
 
-fn has_running_job(jobs: &Jobs) -> bool {
+fn has_running_job(jobs: &HashMap<LaunchId, JobState>) -> bool {
     jobs.values()
         .any(|job| matches!(job.info.status, JobStatus::Running))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn register_job(
-    jobs: &mut Jobs,
+    store: &mut RegistryStore,
     pid: u32,
-    task_id: IdLease,
+    host_pid: u32,
+    launch: LaunchLease,
     execution_key: String,
     script: String,
     interpreter: Interpreter,
@@ -1854,11 +1946,13 @@ fn register_job(
     place: JobPlace,
     timeout: Option<Duration>,
 ) {
+    let key = launch.id();
     let info = JobInfo {
         timeout,
         place,
         pid,
-        task_id: task_id.to_string(),
+        host_pid,
+        launch: key,
         execution_key,
         script,
         interpreter,
@@ -1867,20 +1961,15 @@ fn register_job(
         status: JobStatus::Running,
         output_path,
     };
-    let key = task_id.to_string();
-    let replaced = jobs.insert(key.clone(), JobState::new(info, task_id));
-    assert!(
-        replaced.is_none(),
-        "two live leases share the task id '{key}'"
-    );
-    tracing::debug!(task_id = %key, pid = %pid, "registered background job");
+    store.insert(key, JobState::new(info, launch));
+    tracing::debug!(%key, pid = %pid, host_pid = %host_pid, "registered background job");
 }
 
 impl JobState {
-    const fn new(info: JobInfo, task_id: IdLease) -> Self {
+    const fn new(info: JobInfo, launch: LaunchLease) -> Self {
         Self {
             info,
-            task_id,
+            launch,
             terminal_buffer: Vec::new(),
             terminal_evicted: 0,
             line_buffer: Vec::new(),
@@ -1963,23 +2052,18 @@ fn trim_redirected_buffers(job: &mut JobState) {
     }
 }
 
-/// How a job ended, before the registry records it.
 enum JobEnd {
     Completed { exit_code: i32 },
     Failed { error: String },
     Killed(KillCause),
 }
 
-/// Records how `job` ended: the one transition out of
-/// [`JobStatus::Running`]. The same step marks its completion
-/// [`Delivery::Pending`], so no reader ever sees the job finished with
-/// nothing owed to its agent, or [`Delivery::Taken`] when a waiter claimed
-/// it, so none sees a turn owed for a job its waiter read.
 fn finish(job: &mut JobState, end: JobEnd) {
     assert!(
         matches!(job.info.status, JobStatus::Running),
-        "job {} ended twice: it already reads {:?}",
-        job.info.task_id,
+        "job {} (pid {}) ended twice: it already reads {:?}",
+        job.info.launch,
+        job.info.pid,
         job.info.status
     );
     flush_stream_partial(job, TerminalStream::Stdout);
@@ -1999,32 +2083,28 @@ fn finish(job: &mut JobState, end: JobEnd) {
     };
     job.finished_at = Some(Instant::now());
     for waiter in std::mem::take(&mut job.ended_waiters) {
-        // A waiter that stopped waiting dropped its receiver.
         let _ = waiter.try_send(Some(job.info.clone()));
     }
     job.kill_switch = None;
-    // Dropping the last sender ends the stdin writer thread blocked on it.
     job.input_tx = None;
 }
 
-/// Marks the completion of task `task_id` taken, the agent having dropped
-/// its [`PendingCompletion`], and forgets the job when nothing watches it.
 fn take_completion(
-    jobs: &mut Jobs,
+    store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
-    task_id: &str,
+    launch: LaunchId,
 ) {
-    if let Some(job) = jobs.get_mut(task_id) {
+    if let Some(job) = store.jobs.get_mut(&launch) {
         mark_taken(job);
-        forget_if_done(jobs, reads, parked, task_id);
+        forget_if_done(store, reads, parked, launch);
     }
 }
 
 fn mark_taken(job: &mut JobState) {
-    let task_id = &job.info.task_id;
+    let pid = job.info.pid;
     let delivery = match &mut job.info.status {
-        JobStatus::Running => panic!("job {task_id}'s completion was taken while it runs"),
+        JobStatus::Running => panic!("process {pid}'s completion was taken while it runs"),
         JobStatus::Completed { delivery, .. }
         | JobStatus::Failed { delivery, .. }
         | JobStatus::Killed { delivery, .. } => delivery,
@@ -2032,24 +2112,21 @@ fn mark_taken(job: &mut JobState) {
     assert_eq!(
         *delivery,
         Delivery::Pending,
-        "job {task_id}'s completion was taken twice"
+        "process {pid}'s completion was taken twice"
     );
     *delivery = Delivery::Taken;
 }
 
-/// Hands out the completion of task `task_id`, or parks the request while a
-/// kill of it is in flight. A job a waiter claimed is then forgotten when
-/// nothing watches it.
 async fn owe_settled_completion(
-    jobs: &mut Jobs,
+    store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
-    task_id: &str,
+    launch: LaunchId,
     ending: Result<i32, String>,
     reply: Sender<Option<OwedCompletion>>,
     tx: &WeakSender<JobCommand>,
 ) {
-    let Some(job) = jobs.get_mut(task_id) else {
+    let Some(job) = store.jobs.get_mut(&launch) else {
         let _ = reply.send(None).await;
         return;
     };
@@ -2058,31 +2135,28 @@ async fn owe_settled_completion(
             .push(SettledWaiter::Owe { ending, reply });
         return;
     }
-    let owed = owe_completion(jobs, task_id, ending, tx).await;
-    forget_if_done(jobs, reads, parked, task_id);
+    let owed = owe_completion(&mut store.jobs, launch, ending, tx).await;
+    forget_if_done(store, reads, parked, launch);
     let _ = reply.send(Some(owed)).await;
 }
 
-/// Hands out the completion of job `task_id`, no kill of which is in flight;
-/// a job still running ends with `ending` first.
 async fn owe_completion(
-    jobs: &mut Jobs,
-    task_id: &str,
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
     ending: Result<i32, String>,
     tx: &WeakSender<JobCommand>,
 ) -> OwedCompletion {
-    if matches!(jobs[task_id].info.status, JobStatus::Running) {
+    if matches!(jobs[&launch].info.status, JobStatus::Running) {
         match ending {
-            Ok(exit_code) => complete_job(jobs, task_id, exit_code, None).await,
-            Err(error) => fail_job(jobs, task_id, error, None).await,
+            Ok(exit_code) => complete_job(jobs, launch, exit_code, None).await,
+            Err(error) => fail_job(jobs, launch, error, None).await,
         }
     }
-    let job = jobs.get_mut(task_id).expect("the job is registered");
+    let job = jobs.get_mut(&launch).expect("the job is registered");
     assert!(
         !job.completion_owed,
-        "job {task_id}'s completion was handed out twice"
+        "job {launch}'s completion was handed out twice"
     );
-    // A waiter that claimed the job took its completion when it ended.
     let delivery = if job.claimed {
         Delivery::Taken
     } else {
@@ -2091,13 +2165,12 @@ async fn owe_completion(
     assert_eq!(
         job.info.status.delivery(),
         Some(delivery),
-        "job {task_id} owes a completion it never recorded: {:?}",
+        "job {launch} owes a completion it never recorded: {:?}",
         job.info.status
     );
     job.completion_owed = true;
     let info = job.info.clone();
     if job.claimed {
-        // A waiter read the job: nothing is owed to the agent.
         return OwedCompletion {
             info,
             pending: None,
@@ -2109,38 +2182,37 @@ async fn owe_completion(
             tx: tx
                 .upgrade()
                 .expect("a request arrives through a live registry handle"),
-            task_id: Some(job.task_id.clone()),
+            launch: Some(job.launch.clone()),
         }),
     }
 }
 
 async fn append_terminal_output(
-    jobs: &mut Jobs,
-    task_id: &str,
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
     stream: TerminalStream,
     chunk: Vec<u8>,
 ) {
     if chunk.is_empty() {
         return;
     }
-    if let Some(job) = jobs.get_mut(task_id) {
+    if let Some(job) = jobs.get_mut(&launch) {
         job.terminal_buffer.extend_from_slice(&chunk);
         if let Some(file) = job.output_redirect.as_mut()
             && let Err(error) = file.write_all(&chunk).await
         {
-            // A redirect the model started after the job ended fails the
-            // write alone; the job keeps the ending it already recorded.
             if matches!(job.info.status, JobStatus::Running) {
                 mark_job_failed(
                     job,
                     format!(
-                        "failed to append redirected output for task {}: {error}",
-                        job.info.task_id
+                        "failed to append redirected output for pid {}: {error}",
+                        job.info.pid
                     ),
                 );
             }
             tracing::error!(
-                task_id,
+                %launch,
+                pid = %job.info.pid,
                 error = %error,
                 "failed to append redirected output"
             );
@@ -2151,8 +2223,6 @@ async fn append_terminal_output(
         };
         buffer.extend_from_slice(&chunk);
         partial.extend_from_slice(&chunk);
-        // Each stream completes its own lines; a line reaches the line
-        // buffer whole, so one stream never interrupts the other's.
         if let Some(last_newline) = partial.iter().rposition(|byte| *byte == b'\n') {
             job.line_buffer.extend(partial.drain(..=last_newline));
         }
@@ -2160,8 +2230,12 @@ async fn append_terminal_output(
     }
 }
 
-fn close_terminal_stream(jobs: &mut Jobs, task_id: &str, stream: TerminalStream) {
-    if let Some(job) = jobs.get_mut(task_id) {
+fn close_terminal_stream(
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    stream: TerminalStream,
+) {
+    if let Some(job) = jobs.get_mut(&launch) {
         flush_stream_partial(job, stream);
         match stream {
             TerminalStream::Stdout => job.stdout_closed = true,
@@ -2171,15 +2245,15 @@ fn close_terminal_stream(jobs: &mut Jobs, task_id: &str, stream: TerminalStream)
 }
 
 async fn complete_job(
-    jobs: &mut Jobs,
-    task_id: &str,
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
     exit_code: i32,
     output_path: Option<PathBuf>,
 ) {
-    if let Some(job) = jobs.get_mut(task_id) {
+    if let Some(job) = jobs.get_mut(&launch) {
         if !matches!(job.info.status, JobStatus::Running) {
             tracing::debug!(
-                task_id,
+                %launch,
                 status = ?job.info.status,
                 "ignoring complete for non-running job"
             );
@@ -2194,7 +2268,7 @@ async fn complete_job(
         }
         if let Err(error) = finalize_output_redirect(job).await {
             tracing::error!(
-                task_id,
+                %launch,
                 error = %error,
                 "failed to flush redirected output on complete"
             );
@@ -2205,15 +2279,20 @@ async fn complete_job(
         if output_path.is_some() {
             job.info.output_path = output_path;
         }
-        tracing::debug!(task_id, exit_code = %exit_code, "job completed");
+        tracing::debug!(%launch, pid = %job.info.pid, exit_code = %exit_code, "job completed");
     }
 }
 
-async fn fail_job(jobs: &mut Jobs, task_id: &str, error: String, output_path: Option<PathBuf>) {
-    if let Some(job) = jobs.get_mut(task_id) {
+async fn fail_job(
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    error: String,
+    output_path: Option<PathBuf>,
+) {
+    if let Some(job) = jobs.get_mut(&launch) {
         if !matches!(job.info.status, JobStatus::Running) {
             tracing::debug!(
-                task_id,
+                %launch,
                 status = ?job.info.status,
                 "ignoring fail for non-running job"
             );
@@ -2232,74 +2311,70 @@ async fn fail_job(jobs: &mut Jobs, task_id: &str, error: String, output_path: Op
         if output_path.is_some() {
             job.info.output_path = output_path;
         }
-        tracing::debug!(task_id, "job failed");
+        tracing::debug!(%launch, pid = %job.info.pid, "job failed");
     }
 }
 
 fn begin_kill_by_execution_key(
-    jobs: &mut Jobs,
+    jobs: &mut HashMap<LaunchId, JobState>,
     execution_key: &str,
     cause: KillCause,
-) -> Vec<(String, KillPlan)> {
-    let task_ids: Vec<String> = jobs
+) -> Vec<(LaunchId, KillPlan)> {
+    let launches: Vec<LaunchId> = jobs
         .iter()
         .filter(|(_, state)| {
             state.info.execution_key == execution_key
                 && matches!(state.info.status, JobStatus::Running)
         })
-        .map(|(task_id, _)| task_id.clone())
+        .map(|(launch, _)| *launch)
         .collect();
 
-    let mut plans = Vec::with_capacity(task_ids.len());
-    for task_id in task_ids {
-        let plan = begin_kill(jobs, &task_id, cause);
-        plans.push((task_id, plan));
+    let mut plans = Vec::with_capacity(launches.len());
+    for launch in launches {
+        let plan = begin_kill(jobs, launch, cause);
+        plans.push((launch, plan));
     }
     plans
 }
 
-async fn input_terminal(jobs: &Jobs, task_id: &str, bytes: Vec<u8>) -> Result<(), JobInputError> {
-    let Some(job) = jobs.get(task_id) else {
-        return Err(JobInputError::UnknownTask {
-            task_id: task_id.to_owned(),
-        });
+async fn input_terminal(
+    jobs: &HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    pid: u32,
+    bytes: Vec<u8>,
+) -> Result<(), JobInputError> {
+    let Some(job) = jobs.get(&launch) else {
+        return Err(JobInputError::UnknownJob { pid });
     };
+    let pid = job.info.pid;
     if !matches!(job.info.status, JobStatus::Running) {
         return Err(JobInputError::NotRunning {
-            task_id: task_id.to_owned(),
+            pid,
             status: job.info.status.clone(),
         });
     }
-    // A job with a stdin pipe has its channel attached before its start is
-    // reported, so a running job without one was started without a pipe.
     let Some(tx) = &job.input_tx else {
-        return Err(JobInputError::NoStdin {
-            task_id: task_id.to_owned(),
-        });
+        return Err(JobInputError::NoStdin { pid });
     };
-    tx.send(bytes).await.map_err(|_| JobInputError::Closed {
-        task_id: task_id.to_owned(),
-    })
+    tx.send(bytes)
+        .await
+        .map_err(|_| JobInputError::Closed { pid })
 }
 
 async fn redirect_task_output(
-    jobs: &mut Jobs,
-    task_id: &str,
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
     output_path: PathBuf,
 ) -> Result<Vec<u8>, String> {
-    let Some(job) = jobs.get_mut(task_id) else {
-        return Err(format!("unknown task_id: {task_id}"));
+    let Some(job) = jobs.get_mut(&launch) else {
+        return Err(format!("unknown launch: {launch}"));
     };
     start_output_redirect(job, output_path).await
 }
 
-/// A read returning what the last read of this task returned is a poll:
-/// nothing new arrived. Refuse it so the agent waits for the completion
-/// event instead. Untracked reads — the `monitor` pump's own cadence —
-/// neither refuse nor update the tracker.
 fn tracked_delta(
     reads: &mut ReadTracker,
-    task_id: &str,
+    launch: LaunchId,
     delta: JobDelta,
     tracked: bool,
 ) -> JobRead {
@@ -2307,27 +2382,26 @@ fn tracked_delta(
     if !tracked {
         return JobRead::Delta(delta);
     }
-    if reads.delta_reads.get(task_id) == Some(&returned) {
-        JobRead::Unchanged {
-            task_id: task_id.to_string(),
-        }
+    if reads.delta_reads.get(&launch) == Some(&returned) {
+        JobRead::Unchanged { pid: delta.pid }
     } else {
-        reads.delta_reads.insert(task_id.to_string(), returned);
+        reads.delta_reads.insert(launch, returned);
         JobRead::Delta(delta)
     }
 }
 
-/// Answers a wait for a job's end at once when it ended, or parks it until
-/// [`finish`] records the ending.
-async fn wait_for_end(jobs: &mut Jobs, task_id: &str, claim: bool, reply: Sender<Option<JobInfo>>) {
-    match jobs.get_mut(task_id) {
+async fn wait_for_end(
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    claim: bool,
+    reply: Sender<Option<JobInfo>>,
+) {
+    match jobs.get_mut(&launch) {
         Some(job) if matches!(job.info.status, JobStatus::Running) => {
             job.claimed |= claim && !job.completion_owed;
             job.ended_waiters.push(reply);
         }
         Some(job) => {
-            // Its flow has yet to settle the completion: the claim takes it
-            // now, so no reader sees a turn owed for it meanwhile.
             if claim && !job.completion_owed && !job.claimed {
                 job.claimed = true;
                 mark_taken(job);
@@ -2341,14 +2415,14 @@ async fn wait_for_end(jobs: &mut Jobs, task_id: &str, claim: bool, reply: Sender
 }
 
 async fn read_terminal_delta(
-    jobs: &mut Jobs,
-    task_id: &str,
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
     cursor: usize,
     max_bytes: usize,
     lines: bool,
 ) -> Result<JobDelta, String> {
-    let Some(job) = jobs.get_mut(task_id) else {
-        return Err(format!("unknown task_id: {task_id}"));
+    let Some(job) = jobs.get_mut(&launch) else {
+        return Err(format!("unknown launch: {launch}"));
     };
     terminal_read(job, cursor, max_bytes, lines).await
 }
@@ -2360,8 +2434,8 @@ async fn start_output_redirect(
     if let Some(existing) = job.info.output_path.as_ref() {
         if existing != &output_path {
             return Err(format!(
-                "task {} already redirects output to {}",
-                job.info.task_id,
+                "process {} already redirects output to {}",
+                job.info.pid,
                 existing.display()
             ));
         }
@@ -2385,14 +2459,14 @@ async fn start_output_redirect(
         .await
         .map_err(|error| {
             format!(
-                "failed to write initial output redirect snapshot for task {}: {error}",
-                job.info.task_id
+                "failed to write initial output redirect snapshot for pid {}: {error}",
+                job.info.pid
             )
         })?;
     file.flush().await.map_err(|error| {
         format!(
-            "failed to flush initial output redirect snapshot for task {}: {error}",
-            job.info.task_id
+            "failed to flush initial output redirect snapshot for pid {}: {error}",
+            job.info.pid
         )
     })?;
 
@@ -2413,21 +2487,23 @@ async fn finalize_output_redirect(job: &mut JobState) -> Result<(), String> {
         && let Err(error) = file.flush().await
     {
         return Err(format!(
-            "failed to flush redirected output for task {}: {error}",
-            job.info.task_id
+            "failed to flush redirected output for pid {}: {error}",
+            job.info.pid
         ));
     }
     Ok(())
 }
 
-/// Starts killing a job: decides at once what needs no process signal, and
-/// otherwise hands back what the caller must kill outside the registry.
-fn begin_kill(jobs: &mut Jobs, task_id: &str, cause: KillCause) -> KillPlan {
-    let Some(job) = jobs.get_mut(task_id) else {
+fn begin_kill(
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    cause: KillCause,
+) -> KillPlan {
+    let Some(job) = jobs.get_mut(&launch) else {
         return KillPlan::Done(false);
     };
     if !matches!(job.info.status, JobStatus::Running) {
-        tracing::warn!(task_id, "cannot kill non-running job");
+        tracing::warn!(%launch, pid = %job.info.pid, "cannot kill non-running job");
         return KillPlan::Done(false);
     }
 
@@ -2447,16 +2523,14 @@ fn begin_kill(jobs: &mut Jobs, task_id: &str, cause: KillCause) -> KillPlan {
     }
 
     job.kills_in_flight += 1;
-    let group = job.info.pid;
+    let group = job.info.host_pid;
     job.process_tree
         .as_ref()
         .map_or(KillPlan::Group(group), |tree| KillPlan::Tree(tree.clone()))
 }
 
-/// Records the outcome of a kill that ran outside the registry. A job whose
-/// own flow ended it meanwhile takes that ending only when the kill failed.
-async fn end_kill(jobs: &mut Jobs, task_id: &str, killed: bool) -> bool {
-    let Some(job) = jobs.get_mut(task_id) else {
+async fn end_kill(jobs: &mut HashMap<LaunchId, JobState>, launch: LaunchId, killed: bool) -> bool {
+    let Some(job) = jobs.get_mut(&launch) else {
         return false;
     };
     if job.switch_kill_in_flight {
@@ -2471,7 +2545,7 @@ async fn end_kill(jobs: &mut Jobs, task_id: &str, killed: bool) -> bool {
         if matches!(job.info.status, JobStatus::Running) {
             if let Err(error) = finalize_output_redirect(job).await {
                 tracing::warn!(
-                    task_id,
+                    %launch,
                     error = %error,
                     "failed to flush redirected output after kill"
                 );
@@ -2482,28 +2556,29 @@ async fn end_kill(jobs: &mut Jobs, task_id: &str, killed: bool) -> bool {
             finish(job, JobEnd::Killed(cause));
             job.stdout_closed = true;
             job.stderr_closed = true;
-            tracing::info!(task_id, ?cause, "killed job");
+            tracing::info!(%launch, pid = %job.info.pid, ?cause, "killed job");
         }
         return true;
     }
-    // While another kill of the job still runs, `complete_job` and `fail_job`
-    // defer the ending again.
     match job.deferred_end.take() {
         Some(Ending::Complete {
             exit_code,
             output_path,
-        }) => complete_job(jobs, task_id, exit_code, output_path).await,
+        }) => complete_job(jobs, launch, exit_code, output_path).await,
         Some(Ending::Fail { error, output_path }) => {
-            fail_job(jobs, task_id, error, output_path).await;
+            fail_job(jobs, launch, error, output_path).await;
         }
         None => {}
     }
     false
 }
 
-/// Answers a settled read at once, or parks it while a kill of the job runs.
-async fn get_settled_by_task_id(jobs: &mut Jobs, task_id: &str, reply: Sender<Option<JobInfo>>) {
-    match jobs.get_mut(task_id) {
+async fn get_settled_by_launch(
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    reply: Sender<Option<JobInfo>>,
+) {
+    match jobs.get_mut(&launch) {
         Some(job) if job.kills_in_flight > 0 => {
             job.settled_waiters.push(SettledWaiter::Read(reply));
         }
@@ -2516,17 +2591,14 @@ async fn get_settled_by_task_id(jobs: &mut Jobs, task_id: &str, reply: Sender<Op
     }
 }
 
-/// Answers the callers parked on a job once its last kill in flight ended,
-/// then forgets a job a waiter claimed whose completion they settled when
-/// nothing watches it.
 async fn release_settled_waiters(
-    jobs: &mut Jobs,
+    store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
-    task_id: &str,
+    launch: LaunchId,
     tx: &WeakSender<JobCommand>,
 ) {
-    let Some(job) = jobs.get_mut(task_id) else {
+    let Some(job) = store.jobs.get_mut(&launch) else {
         return;
     };
     if job.kills_in_flight > 0 {
@@ -2535,19 +2607,17 @@ async fn release_settled_waiters(
     for waiter in std::mem::take(&mut job.settled_waiters) {
         match waiter {
             SettledWaiter::Read(reply) => {
-                let _ = reply.send(Some(jobs[task_id].info.clone())).await;
+                let _ = reply.send(Some(store.jobs[&launch].info.clone())).await;
             }
             SettledWaiter::Owe { ending, reply } => {
-                let owed = owe_completion(jobs, task_id, ending, tx).await;
+                let owed = owe_completion(&mut store.jobs, launch, ending, tx).await;
                 let _ = reply.send(Some(owed)).await;
             }
         }
     }
-    forget_if_done(jobs, reads, parked, task_id);
+    forget_if_done(store, reads, parked, launch);
 }
 
-/// The start of `script`, cut at a character boundary at or below `limit`
-/// bytes.
 fn script_preview(script: &str, limit: usize) -> String {
     if script.len() <= limit {
         return script.to_string();
@@ -2557,14 +2627,15 @@ fn script_preview(script: &str, limit: usize) -> String {
 }
 
 fn format_running_jobs(
-    jobs: &Jobs,
+    jobs: &HashMap<LaunchId, JobState>,
     script_preview_bytes: usize,
     wording: Option<&dyn crate::wording::ShellWording>,
 ) -> String {
-    let running: Vec<_> = jobs
+    let mut running: Vec<_> = jobs
         .values()
         .filter(|job| matches!(job.info.status, JobStatus::Running))
         .collect();
+    running.sort_by_key(|job| job.info.pid);
 
     if running.is_empty() {
         return String::new();
@@ -2586,7 +2657,6 @@ fn format_running_jobs(
         .iter()
         .zip(&prepared)
         .map(|(job, (preview, path))| RunningJob {
-            task_id: &job.info.task_id,
             pid: job.info.pid,
             script_preview: preview,
             output_path: path.as_deref(),
@@ -2608,8 +2678,8 @@ async fn terminal_read(
         let total_bytes = job.line_evicted + job.line_buffer.len();
         if cursor > total_bytes {
             return Err(format!(
-                "cursor {cursor} exceeds terminal buffer size {total_bytes} for task {}",
-                job.info.task_id
+                "cursor {cursor} exceeds terminal buffer size {total_bytes} for pid {}",
+                job.info.pid
             ));
         }
         let effective_cursor = cursor.max(job.line_evicted);
@@ -2617,7 +2687,7 @@ async fn terminal_read(
         let start_idx = effective_cursor - job.line_evicted;
         let end_idx = end - job.line_evicted;
         return Ok(JobDelta {
-            task_id: job.info.task_id.clone(),
+            pid: job.info.pid,
             cursor: end,
             total_bytes,
             bytes: job.line_buffer[start_idx..end_idx].to_vec(),
@@ -2628,8 +2698,8 @@ async fn terminal_read(
     let total_bytes = job.terminal_evicted + job.terminal_buffer.len();
     if cursor > total_bytes {
         return Err(format!(
-            "cursor {cursor} exceeds terminal buffer size {total_bytes} for task {}",
-            job.info.task_id
+            "cursor {cursor} exceeds terminal buffer size {total_bytes} for pid {}",
+            job.info.pid
         ));
     }
     let end = total_bytes.min(cursor.saturating_add(max_bytes));
@@ -2645,9 +2715,9 @@ async fn terminal_read(
         let mut out = Vec::with_capacity(wanted.min(REDIRECTED_BUFFER_CAP));
         let mut reader = async_fs::File::open(&path).await.map_err(|error| {
             format!(
-                "failed to open redirected output {} for task {}: {error}",
+                "failed to open redirected output {} for pid {}: {error}",
                 path.display(),
-                job.info.task_id
+                job.info.pid
             )
         })?;
         reader
@@ -2655,9 +2725,9 @@ async fn terminal_read(
             .await
             .map_err(|error| {
                 format!(
-                    "failed to seek redirected output {} for task {}: {error}",
+                    "failed to seek redirected output {} for pid {}: {error}",
                     path.display(),
-                    job.info.task_id
+                    job.info.pid
                 )
             })?;
         reader
@@ -2666,9 +2736,9 @@ async fn terminal_read(
             .await
             .map_err(|error| {
                 format!(
-                    "failed to read redirected output {} for task {}: {error}",
+                    "failed to read redirected output {} for pid {}: {error}",
                     path.display(),
-                    job.info.task_id
+                    job.info.pid
                 )
             })?;
         out
@@ -2677,7 +2747,7 @@ async fn terminal_read(
     };
 
     Ok(JobDelta {
-        task_id: job.info.task_id.clone(),
+        pid: job.info.pid,
         cursor: end,
         total_bytes,
         bytes,
@@ -2688,7 +2758,6 @@ async fn terminal_read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_ids::lease;
     use executor_core::Executor;
     use executor_core::Task;
     use executor_core::tokio::TokioGlobal;
@@ -2702,80 +2771,39 @@ mod tests {
         registry
     }
 
-    /// A bound recorded before the job registers is reported once it does; a
-    /// job nothing bounded reports none.
+    fn lease() -> LaunchLease {
+        LaunchLease::fresh()
+    }
+
     #[tokio::test]
     async fn a_job_reports_the_timeout_it_runs_under() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        tokio::spawn(service.serve());
-        let bounded = crate::test_ids::lease("bounded");
-        let free = crate::test_ids::lease("free");
+        let registry = spawn_registry();
+        let bounded = lease();
+        let free = lease();
 
         registry
             .bound_by_timeout(&bounded, Duration::from_secs(600))
             .await;
         registry
-            .register(1, &bounded, "exec", "run", SandboxMode::Sandboxed, None)
+            .register(101, &bounded, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry
-            .register(2, &free, "exec", "run", SandboxMode::Sandboxed, None)
+            .register(102, &free, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
 
-        let info = registry
-            .get_by_task_id("bounded")
-            .await
-            .expect("job exists");
+        let info = registry.get_by_pid(101).await.expect("job exists");
         assert_eq!(info.timeout, Some(Duration::from_secs(600)));
         let remaining = info.remaining().expect("the job is bounded");
         assert!(remaining > Duration::from_secs(590), "{remaining:?}");
-        let info = registry.get_by_task_id("free").await.expect("job exists");
+        let info = registry.get_by_pid(102).await.expect("job exists");
         assert_eq!(info.timeout, None);
         assert_eq!(info.remaining(), None);
     }
 
-    /// A job's task id stays leased while the registry keeps the job, past
-    /// its end, and is released once the registry forgets it: when its
-    /// completion is taken and nothing watches it, or with the registry.
-    #[tokio::test]
-    async fn a_job_keeps_its_task_id_leased_until_the_registry_forgets_it() {
-        let ids = crate::test_ids::RecordingIds::default();
-        let allocator = ids.allocator();
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        let served = tokio::spawn(service.serve());
-
-        let first = allocator.lease().unwrap();
-        registry
-            .register(1, &first, "exec", "run", SandboxMode::Sandboxed, None)
-            .await;
-        let second = allocator.lease().unwrap();
-        registry
-            .register(2, &second, "exec", "run", SandboxMode::Sandboxed, None)
-            .await;
-        registry.complete(&first, 0, None).await;
-        drop((first, second));
-        assert!(registry.get_by_task_id("alfa").await.is_some());
-        assert!(ids.released().is_empty(), "the registry holds both");
-
-        drop(registry.owe_completion("alfa", Ok(0)).await.unwrap());
-        // The registry serves commands in order, so this list sees the job
-        // forgotten.
-        assert_eq!(registry.list().await.len(), 1);
-        assert_eq!(ids.released(), ["alfa"]);
-
-        drop(registry);
-        served.await.expect("the service ends with its last handle");
-        let mut released = ids.released();
-        released.sort();
-        assert_eq!(released, ["alfa", "bravo"]);
-    }
-
-    /// A job whose pid the operating system reused is a job of its own: the
-    /// finished job it shares the pid with, its completion still untaken,
-    /// keeps its output, its completion and its place in the registry.
     #[tokio::test]
     async fn a_job_sharing_a_held_jobs_pid_does_not_replace_it() {
         let registry = spawn_registry();
-        let (old, new) = (lease("old"), lease("new"));
+        let (old, new) = (lease(), lease());
         registry
             .register(4242, &old, "exec", "first", SandboxMode::Sandboxed, None)
             .await;
@@ -2787,83 +2815,70 @@ mod tests {
             .await;
         registry.append_stdout(&new, b"new output\n".to_vec()).await;
 
-        let mut jobs = registry.list().await;
-        jobs.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        assert_eq!(registry.list().await.len(), 2);
         assert_eq!(
-            jobs.iter()
-                .map(|job| (job.task_id.as_str(), job.pid))
-                .collect::<Vec<_>>(),
-            [("new", 4242), ("old", 4242)]
-        );
-        assert_eq!(
-            registry.get_by_task_id("old").await.unwrap().status,
+            registry.get_by_launch(old.id()).await.unwrap().status,
             JobStatus::Completed {
                 exit_code: 3,
                 delivery: Delivery::Pending
             }
         );
         assert_eq!(
-            registry.get_by_task_id("new").await.unwrap().status,
-            JobStatus::Running
+            registry.get_by_pid(4242).await.unwrap().status,
+            JobStatus::Running,
+            "pid lookup resolves to the active job when an earlier PID is recycled"
         );
-        let (stdout, _) = registry.terminal_output("old").await.unwrap();
+        let (stdout, _) = registry.terminal_output(old.id()).await.unwrap();
         assert_eq!(stdout, b"old output\n");
-        let (stdout, _) = registry.terminal_output("new").await.unwrap();
+        let (stdout, _) = registry.terminal_output(new.id()).await.unwrap();
         assert_eq!(stdout, b"new output\n");
         let read = registry
-            .terminal_read("old", 0, 1024)
+            .terminal_read(4242, 0, 1024)
             .await
             .unwrap()
             .into_delta()
             .unwrap();
-        assert_eq!(read.bytes, b"old output\n");
+        assert_eq!(read.bytes, b"new output\n");
 
         let owed = registry
-            .owe_completion("old", Ok(3))
+            .owe_completion(old.id(), Ok(3))
             .await
             .expect("the first job is still registered");
-        assert!(owed.pending.is_some(), "its completion is still takeable");
+        assert!(owed.pending.is_some());
         drop(owed);
-        assert!(registry.get_by_task_id("old").await.is_none());
+        assert!(registry.get_by_launch(old.id()).await.is_none());
         assert_eq!(
-            registry.get_by_task_id("new").await.unwrap().status,
+            registry.get_by_pid(4242).await.unwrap().status,
             JobStatus::Running,
             "the second job is untouched"
         );
     }
 
-    /// A waiter that takes a job's completion leaves nothing owed from the
-    /// moment the job ended, though the job's flow settles it later: a job
-    /// that ended before the wait and one that ends during it both read
-    /// taken, and the job stays readable until its flow settled and its
-    /// watch dropped.
     #[tokio::test]
     async fn a_claiming_wait_reads_the_job_taken_before_its_flow_settles() {
         let registry = spawn_registry();
-        let (ended, ending) = (lease("ended"), lease("ending"));
+        let (ended, ending) = (lease(), lease());
         registry
             .register(1, &ended, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry
             .register(2, &ending, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
-        let ended_watch = registry.watch("ended").await.expect("ended is held");
-        let ending_watch = registry.watch("ending").await.expect("ending is held");
+        let ended_watch = registry.watch(1).await.expect("ended is held");
+        let ending_watch = registry.watch(2).await.expect("ending is held");
 
         registry.complete(&ended, 0, None).await;
         let taken = JobStatus::Completed {
             exit_code: 0,
             delivery: Delivery::Taken,
         };
-        assert_eq!(registry.wait_taking("ended").await.unwrap().status, taken);
         assert_eq!(
-            registry.get_by_task_id("ended").await.unwrap().status,
+            registry.wait_taking(ended.id()).await.unwrap().status,
             taken
         );
+        assert_eq!(registry.get_by_pid(1).await.unwrap().status, taken);
 
-        // The first poll queues the wait ahead of the ending, and the
-        // registry serves its commands in order.
-        let mut waiting = std::pin::pin!(registry.wait_taking("ending"));
+        let mut waiting = std::pin::pin!(registry.wait_taking(ending.id()));
         assert!(
             futures_lite::future::poll_once(waiting.as_mut())
                 .await
@@ -2871,134 +2886,73 @@ mod tests {
         );
         registry.complete(&ending, 0, None).await;
         assert_eq!(waiting.await.unwrap().status, taken);
-        assert_eq!(
-            registry.get_by_task_id("ending").await.unwrap().status,
-            taken
-        );
+        assert_eq!(registry.get_by_pid(2).await.unwrap().status, taken);
         assert!(
             !registry
                 .list()
                 .await
                 .iter()
-                .any(|job| job.status.completion_pending()),
-            "no turn is owed for a job its waiter read"
+                .any(|job| job.status.completion_pending())
         );
 
-        // The watch dropping before the flow settles leaves the job readable
-        // to the flow.
         drop(ended_watch);
-        assert!(registry.terminal_output("ended").await.is_some());
-        for task_id in ["ended", "ending"] {
-            let owed = registry.owe_completion(task_id, Ok(0)).await.unwrap();
-            assert!(owed.pending.is_none(), "{task_id} owes nothing");
+        assert!(registry.terminal_output(ended.id()).await.is_some());
+        for id in [ended.id(), ending.id()] {
+            let owed = registry.owe_completion(id, Ok(0)).await.unwrap();
+            assert!(owed.pending.is_none());
         }
         drop(ending_watch);
-        assert!(registry.get_by_task_id("ending").await.is_none());
+        assert!(registry.get_by_pid(2).await.is_none());
     }
 
-    /// A job its waiter claimed, whose watch dropped before its flow settled
-    /// it, is forgotten as the flow settles it: the flow still reads it as it
-    /// ended, and its id goes back to the allocator.
     #[tokio::test]
-    async fn a_claimed_job_unwatched_before_its_flow_settles_is_forgotten_as_it_settles() {
-        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
+    async fn a_taken_completion_forgets_the_job_and_clears_read_history_on_pid_reuse() {
         let registry = spawn_registry();
-        let task_id = ids.lease().expect("river is free");
+        let first = lease();
         registry
-            .register(1, &task_id, "exec", "run", SandboxMode::Sandboxed, None)
+            .register(51, &first, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
-        let watch = registry.watch("river").await.expect("river is held");
-
-        let mut waiting = std::pin::pin!(registry.wait_taking("river"));
-        assert!(
-            futures_lite::future::poll_once(waiting.as_mut())
-                .await
-                .is_none()
-        );
-        registry.complete(&task_id, 0, None).await;
-        let taken = JobStatus::Completed {
-            exit_code: 0,
-            delivery: Delivery::Taken,
-        };
-        assert_eq!(waiting.await.unwrap().status, taken);
-        drop(watch);
-        assert!(
-            registry.terminal_output("river").await.is_some(),
-            "the flow still reads the job it has yet to settle"
-        );
-
-        let owed = registry.owe_completion("river", Ok(0)).await.unwrap();
-        assert!(owed.pending.is_none(), "the waiter took the completion");
-        assert_eq!(owed.info.status, taken);
-        drop(task_id);
-        assert!(registry.list().await.is_empty(), "the job is forgotten");
-        assert_eq!(&*ids.lease().expect("river is free again"), "river");
-    }
-
-    /// Once its completion is taken and nothing watches it, a finished job
-    /// leaves the registry: its id goes back to the allocator, every read of
-    /// it answers as for an unknown task, and a job that leases the word
-    /// again starts with no read history.
-    #[tokio::test]
-    async fn a_taken_completion_forgets_the_job_and_releases_its_id() {
-        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
-        let registry = spawn_registry();
-        let river = ids.lease().unwrap();
+        registry.append_stdout(&first, b"done\n".to_vec()).await;
+        registry.complete(&first, 0, None).await;
         registry
-            .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
-            .await;
-        registry.append_stdout(&river, b"done\n".to_vec()).await;
-        registry.complete(&river, 0, None).await;
-        drop(river);
-        registry
-            .terminal_read("river", 0, 1024)
+            .terminal_read(51, 0, 1024)
             .await
             .expect("a finished job reads until delivered");
-        assert!(ids.lease().is_err(), "the registry holds river");
 
-        // A watch keeps the job past the take, reading it taken.
-        let watch = registry.watch("river").await.expect("river is held");
-        let owed = registry.owe_completion("river", Ok(0)).await.unwrap();
+        let watch = registry.watch(51).await.expect("job is held");
+        let owed = registry.owe_completion(first.id(), Ok(0)).await.unwrap();
         drop(owed);
         assert_eq!(
-            registry.get_by_task_id("river").await.unwrap().status,
+            registry.get_by_pid(51).await.unwrap().status,
             JobStatus::Completed {
                 exit_code: 0,
                 delivery: Delivery::Taken
             }
         );
-        assert!(ids.lease().is_err(), "the watch holds river");
 
         drop(watch);
-        assert!(registry.list().await.is_empty(), "the job is forgotten");
-        assert!(registry.get_by_task_id("river").await.is_none());
-        assert!(registry.terminal_read("river", 0, 1024).await.is_err());
-        assert!(!registry.kill_by_task_id("river").await);
-        assert!(
-            registry
-                .terminal_input("river", b"x".to_vec())
-                .await
-                .is_err()
-        );
+        assert!(registry.list().await.is_empty());
+        assert!(registry.get_by_pid(51).await.is_none());
+        assert!(registry.terminal_read(51, 0, 1024).await.is_err());
+        assert!(!registry.kill_by_pid(51).await);
+        assert!(registry.terminal_input(51, b"x".to_vec()).await.is_err());
 
-        // The word names a new job, whose first read is not refused as a
-        // repeat of the old job's last one.
-        let again = ids.lease().expect("river went back to the allocator");
+        let again = lease();
         registry
-            .register(2, &again, "exec", "run", SandboxMode::Sandboxed, None)
+            .register(51, &again, "exec", "run", SandboxMode::Sandboxed, None)
             .await;
         registry.append_stdout(&again, b"done\n".to_vec()).await;
         registry.complete(&again, 0, None).await;
         registry
-            .terminal_read("river", 0, 1024)
+            .terminal_read(51, 0, 1024)
             .await
-            .expect("a new job under a reused word reads afresh");
+            .expect("a new job under a reused PID reads afresh");
     }
 
     #[tokio::test]
     async fn task_output_appended_before_registration_lands_first_and_in_order() {
         let registry = spawn_registry();
-        let early = lease("early");
+        let early = lease();
         let appends = {
             let registry = registry.clone();
             let early = early.clone();
@@ -3007,11 +2961,8 @@ mod tests {
                 registry.append_task_stdout(&early, b"two\n".to_vec()).await;
             })
         };
-        // The appends are parked: the job does not exist, and their sender
-        // is still waiting for it.
         tokio::task::yield_now().await;
         assert!(!appends.is_finished());
-        assert!(registry.get_by_task_id("early").await.is_none());
 
         registry
             .register(9, &early, "exec-e", "run", SandboxMode::Sandboxed, None)
@@ -3019,116 +2970,34 @@ mod tests {
         appends.await.expect("appends are released by registration");
         registry.append_stdout(&early, b"three\n".to_vec()).await;
 
-        let (stdout, _) = registry.terminal_output("early").await.expect("job exists");
+        let (stdout, _) = registry
+            .terminal_output(early.id())
+            .await
+            .expect("job exists");
         assert_eq!(stdout, b"one\ntwo\nthree\n");
-    }
-
-    /// Parked progress refers to its job's lease weakly: it never keeps the
-    /// word leased, and once the lease ends it goes with it, so a later job
-    /// leasing the same word starts with none of it.
-    #[tokio::test]
-    async fn parked_output_never_reaches_a_later_job_under_the_same_word() {
-        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
-        let registry = spawn_registry();
-        let first = ids.lease().unwrap();
-        let reporter = {
-            let registry = registry.clone();
-            let first = first.clone();
-            tokio::spawn(async move {
-                registry
-                    .append_task_stdout(&first, b"stale\n".to_vec())
-                    .await;
-            })
-        };
-        tokio::task::yield_now().await;
-        assert!(!reporter.is_finished(), "the report is parked");
-        drop(first);
-        assert!(ids.lease().is_err(), "the waiting reporter holds river");
-
-        // The first job never registers; its reporter goes away.
-        reporter.abort();
-        assert!(reporter.await.unwrap_err().is_cancelled());
-        let second = ids.lease().expect("parked output holds no lease");
-        registry
-            .register(2, &second, "exec", "run", SandboxMode::Sandboxed, None)
-            .await;
-        registry
-            .append_task_stdout(&second, b"fresh\n".to_vec())
-            .await;
-
-        let (stdout, _) = registry.terminal_output("river").await.expect("job exists");
-        assert_eq!(stdout, b"fresh\n");
-    }
-
-    /// Progress a command reports after its job was forgotten is dropped:
-    /// its sender is released at once, and the word goes back to the
-    /// allocator when the command lets go of it.
-    #[tokio::test]
-    async fn output_for_a_forgotten_job_is_dropped() {
-        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
-        let registry = spawn_registry();
-        let river = ids.lease().unwrap();
-        registry
-            .register(1, &river, "exec", "run", SandboxMode::Sandboxed, None)
-            .await;
-        registry.complete(&river, 0, None).await;
-        drop(registry.owe_completion("river", Ok(0)).await.unwrap());
-        assert!(registry.list().await.is_empty(), "the job is forgotten");
-
-        // Answered at once, not parked for a registration that never comes.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            registry.append_task_stdout(&river, b"late\n".to_vec()),
-        )
-        .await
-        .expect("a report to a forgotten job is answered");
-        assert!(registry.get_by_task_id("river").await.is_none());
-        drop(river);
-        let again = ids.lease().expect("nothing kept river");
-        registry
-            .register(2, &again, "exec", "run", SandboxMode::Sandboxed, None)
-            .await;
-        let (stdout, _) = registry.terminal_output("river").await.expect("job exists");
-        assert!(stdout.is_empty(), "the late report reached no job");
     }
 
     #[tokio::test]
     async fn unchanged_terminal_read_is_refused_then_succeeds_after_new_output() {
         let registry = spawn_registry();
+        let alpha = lease();
         registry
-            .register(
-                7,
-                &lease("alpha"),
-                "exec-a",
-                "run",
-                SandboxMode::Sandboxed,
-                None,
-            )
+            .register(7, &alpha, "exec-a", "run", SandboxMode::Sandboxed, None)
             .await;
-        registry
-            .append_stdout(&lease("alpha"), b"one".to_vec())
-            .await;
+        registry.append_stdout(&alpha, b"one".to_vec()).await;
 
         let first = registry
-            .terminal_read("alpha", 0, 1024)
+            .terminal_read(7, 0, 1024)
             .await
             .expect("first read succeeds")
             .into_delta()
             .expect("the first read is a delta");
-        let second = registry.terminal_read("alpha", first.cursor, 1024).await;
-        assert!(
-            matches!(
-                &second,
-                Ok(JobRead::Unchanged { task_id }) if task_id == "alpha"
-            ),
-            "an unchanged repeat read is reported as a poll: {second:?}"
-        );
+        let second = registry.terminal_read(7, first.cursor, 1024).await;
+        assert!(matches!(&second, Ok(JobRead::Unchanged { pid: 7 })));
 
-        registry
-            .append_stdout(&lease("alpha"), b"two".to_vec())
-            .await;
+        registry.append_stdout(&alpha, b"two".to_vec()).await;
         let third = registry
-            .terminal_read("alpha", first.cursor, 1024)
+            .terminal_read(7, first.cursor, 1024)
             .await
             .expect("read succeeds once output changed")
             .into_delta()
@@ -3137,681 +3006,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_job_registry_lifecycle() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        registry
-            .register(
-                12345,
-                &lease("amber"),
-                "exec-test",
-                "sleep 10",
-                SandboxMode::Sandboxed,
-                Some(PathBuf::from("outputs/12345.txt")),
-            )
-            .await;
-
-        let jobs = registry.list().await;
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].pid, 12345);
-        assert_eq!(jobs[0].task_id, "amber");
-        assert_eq!(jobs[0].execution_key, "exec-test");
-        assert!(matches!(jobs[0].status, JobStatus::Running));
-
-        registry.complete(&lease("amber"), 0, None).await;
-        let job = registry.get_by_task_id("amber").await.unwrap();
-        assert_eq!(
-            job.status,
-            JobStatus::Completed {
-                exit_code: 0,
-                delivery: Delivery::Pending
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn test_format_running_jobs() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        registry
-            .register(
-                1,
-                &lease("alpha"),
-                "exec-a",
-                "echo hello",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        registry
-            .register(
-                2,
-                &lease("beta"),
-                "exec-b",
-                "sleep 5",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        registry.complete(&lease("beta"), 0, None).await;
-
-        let running = registry.format_running_jobs().await;
-        assert!(running.contains("task alpha"));
-        assert!(!running.contains("task beta"));
-    }
-
-    #[tokio::test]
-    async fn test_output_redirect_streams_full_output() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        let temp = tempdir().unwrap();
-        let redirect_path = temp.path().join("stream.log");
-
-        registry
-            .register(
-                101,
-                &lease("stream"),
-                "exec-stream",
-                "printf one",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-
-        registry
-            .append_stdout(&lease("stream"), b"line1\nline2\n".to_vec())
-            .await;
-        let snapshot = registry
-            .start_output_redirect("stream", redirect_path.clone())
-            .await
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&snapshot), "line1\nline2\n");
-
-        registry
-            .append_stderr(&lease("stream"), b"line3\n".to_vec())
-            .await;
-        registry.complete(&lease("stream"), 0, None).await;
-        let job = registry.get_by_task_id("stream").await.unwrap();
-        assert!(matches!(
-            job.status,
-            JobStatus::Completed { exit_code: 0, .. }
-        ));
-
-        let redirected = async_fs::read(&redirect_path).await.unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&redirected),
-            "line1\nline2\nline3\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_read_terminal_delta_reads_incrementally() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        registry
-            .register(
-                202,
-                &lease("delta"),
-                "exec-delta",
-                "tail -f log",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        registry
-            .append_stdout(&lease("delta"), b"hello ".to_vec())
-            .await;
-        registry
-            .append_stderr(&lease("delta"), b"world".to_vec())
-            .await;
-
-        let first = registry
-            .terminal_read("delta", 0, 6)
-            .await
-            .unwrap()
-            .into_delta()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&first.bytes), "hello ");
-        assert_eq!(first.cursor, 6);
-        assert_eq!(first.total_bytes, 11);
-        assert!(matches!(first.status, JobStatus::Running));
-
-        let second = registry
-            .terminal_read("delta", first.cursor, 32)
-            .await
-            .unwrap()
-            .into_delta()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&second.bytes), "world");
-        assert_eq!(second.cursor, 11);
-        assert_eq!(second.total_bytes, 11);
-    }
-
-    /// The rotation case: tail writes `tail: ` on stderr, the new file's line
-    /// arrives on stdout, then the rest of the notice on stderr. The monitor
-    /// reads whole lines, while the merged terminal buffer stays in arrival
-    /// order.
-    #[tokio::test]
-    async fn monitor_reads_whole_lines_when_partial_writes_interleave() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-        registry
-            .register(
-                203,
-                &lease("lines"),
-                "exec-lines",
-                "tail -F f",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        let lines = lease("lines");
-        registry.append_stderr(&lines, b"tail: ".to_vec()).await;
-        registry.append_stdout(&lines, b"rotated\n".to_vec()).await;
-        registry
-            .append_stderr(&lines, b"'f' has been replaced\n".to_vec())
-            .await;
-        registry.append_stdout(&lines, b"unfinished".to_vec()).await;
-
-        let lines = registry.monitor_read("lines", 0, usize::MAX).await.unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&lines.bytes),
-            "rotated\ntail: 'f' has been replaced\n"
-        );
-        let merged = registry
-            .terminal_read("lines", 0, usize::MAX)
-            .await
-            .unwrap()
-            .into_delta()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&merged.bytes),
-            "tail: rotated\n'f' has been replaced\nunfinished"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_kill_by_execution_key_no_match() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        registry
-            .register(
-                1,
-                &lease("alpha"),
-                "exec-a",
-                "echo hello",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        registry.complete(&lease("alpha"), 0, None).await;
-
-        let killed = registry.kill_by_execution_key("exec-b").await;
-        assert_eq!(killed, 0);
-    }
-
-    #[tokio::test]
-    async fn test_kill_switch_path_marks_job_killed() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        registry
-            .register(
-                555,
-                &lease("switch"),
-                "exec-kill-switch",
-                "sleep 10",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
-        registry.attach_kill_switch(&lease("switch"), kill_tx).await;
-
-        assert!(registry.kill_by_task_id("switch").await);
-        assert!(kill_rx.recv().await.is_ok());
-        let job = registry
-            .get_by_task_id("switch")
-            .await
-            .expect("job should exist");
-        assert!(matches!(job.status, JobStatus::Killed { .. }));
-    }
-
-    #[tokio::test]
-    async fn a_finished_job_releases_its_input_sender_and_refuses_input() {
-        let registry = spawn_registry();
-        registry
-            .register(
-                557,
-                &lease("input"),
-                "exec-input",
-                "cat",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
-        registry
-            .attach_terminal_input(&lease("input"), input_tx)
-            .await;
-        registry
-            .terminal_input("input", b"x".to_vec())
-            .await
-            .expect("a running job takes input");
-        assert_eq!(input_rx.recv().await.expect("input arrives"), b"x");
-
-        registry.complete(&lease("input"), 0, None).await;
-
-        // The registry handles commands in order, so this reply follows the
-        // completion.
-        let error = registry
-            .terminal_input("input", b"y".to_vec())
-            .await
-            .expect_err("a finished job refuses input");
-        assert!(matches!(error, JobInputError::NotRunning { .. }), "{error}");
-        assert!(input_rx.is_closed(), "the registry must drop its sender");
-    }
-
-    #[tokio::test]
-    async fn test_complete_does_not_override_killed_status() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        registry
-            .register(
-                556,
-                &lease("finished"),
-                "exec-killed-complete",
-                "sleep 10",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        let (kill_tx, _kill_rx) = async_channel::bounded::<()>(1);
-        registry
-            .attach_kill_switch(&lease("finished"), kill_tx)
-            .await;
-        assert!(registry.kill_by_task_id("finished").await);
-
-        registry.complete(&lease("finished"), 0, None).await;
-        let job = registry
-            .get_by_task_id("finished")
-            .await
-            .expect("job should exist");
-        assert!(matches!(job.status, JobStatus::Killed { .. }));
-    }
-
-    /// A script longer than the preview, with a multibyte character across
-    /// the cut, is listed instead of panicking inside the registry.
-    #[tokio::test]
     async fn test_format_running_jobs_cuts_a_multibyte_script_at_a_boundary() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-
-        // Three bytes per character: byte 50 lies inside the 17th.
+        let registry = spawn_registry();
         let script = "日".repeat(30);
         let preview_bytes = crate::output_policy::fixture::LIMITS.job_preview_bytes;
         assert!(!script.is_char_boundary(preview_bytes));
+        let cjk = lease();
         registry
-            .register(
-                1,
-                &lease("cjk"),
-                "exec-cjk",
-                &script,
-                SandboxMode::Sandboxed,
-                None,
-            )
+            .register(42, &cjk, "exec-cjk", &script, SandboxMode::Sandboxed, None)
             .await;
 
         let running = registry.format_running_jobs().await;
+        assert!(running.contains("pid 42"), "{running}");
         assert!(
             running.contains(&format!("`{}...`", "日".repeat(16))),
             "{running}"
         );
-        assert_eq!(script_preview("short", 50), "short");
-        assert_eq!(script_preview(&"x".repeat(50), 50), "x".repeat(50));
-        assert_eq!(
-            script_preview(&"x".repeat(51), 50),
-            format!("{}...", "x".repeat(50))
-        );
-        assert_eq!(script_preview("abcdef", 3), "abc...");
-    }
-
-    fn running_job(pid: u32) -> Jobs {
-        let mut jobs = Jobs::new();
-        register_job(
-            &mut jobs,
-            pid,
-            lease("task"),
-            "exec".to_string(),
-            "true".to_string(),
-            Interpreter::Shell,
-            SandboxMode::Sandboxed,
-            None,
-            JobPlace::Host,
-            None,
-        );
-        jobs
-    }
-
-    /// Two kills of one job overlap: the first to end must not release an
-    /// ending the job's own flow reported while the second still runs.
-    #[tokio::test]
-    async fn overlapping_kills_hold_the_deferred_ending_until_the_last_ends() {
-        let mut jobs = running_job(7);
-        let user = KillCause::User;
-        assert!(matches!(
-            begin_kill(&mut jobs, "task", user),
-            KillPlan::Group(7)
-        ));
-        assert!(matches!(
-            begin_kill(&mut jobs, "task", user),
-            KillPlan::Group(7)
-        ));
-        complete_job(&mut jobs, "task", 0, None).await;
-        assert_eq!(
-            jobs["task"].info.status,
-            JobStatus::Running,
-            "the ending waits"
-        );
-
-        assert!(!end_kill(&mut jobs, "task", false).await);
-        assert_eq!(
-            jobs["task"].info.status,
-            JobStatus::Running,
-            "the other kill still runs"
-        );
-        assert!(!end_kill(&mut jobs, "task", false).await);
-        assert_eq!(
-            jobs["task"].info.status,
-            JobStatus::Completed {
-                exit_code: 0,
-                delivery: Delivery::Pending
-            },
-            "the last kill to fail releases the ending"
-        );
-    }
-
-    /// A kill that succeeds wins over an ending reported while it ran.
-    #[tokio::test]
-    async fn a_successful_kill_wins_over_a_deferred_ending() {
-        let mut jobs = running_job(8);
-        assert!(matches!(
-            begin_kill(&mut jobs, "task", KillCause::User),
-            KillPlan::Group(8)
-        ));
-        complete_job(&mut jobs, "task", 0, None).await;
-        assert!(end_kill(&mut jobs, "task", true).await);
-        assert_eq!(
-            jobs["task"].info.status,
-            JobStatus::Killed {
-                cause: KillCause::User,
-                delivery: Delivery::Pending
-            }
-        );
-    }
-
-    /// A job whose process exited from a kill's signal reads as running until
-    /// the kill records its outcome; the settled read waits for it.
-    #[tokio::test]
-    async fn the_settled_read_waits_for_a_kill_in_flight() {
-        let (registry, service) = job_registry_channel(crate::output_policy::fixture::policy());
-        TokioGlobal
-            .spawn(async move { service.serve().await })
-            .detach();
-        registry
-            .register(
-                557,
-                &lease("settled"),
-                "exec-settled",
-                "sleep 10",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        registry
-            .send_command(JobRequest::BeginKillByTaskId {
-                task_id: "settled".to_string(),
-                cause: KillCause::User,
-                reply: reply_tx,
-            })
-            .await;
-        let plan = JobRegistry::recv_reply(reply_rx).await;
-        assert!(matches!(plan, KillPlan::Group(557)));
-        // The killed process exits and its flow reports completion while the
-        // kill has not returned.
-        registry.complete(&lease("settled"), 137, None).await;
-        let running = registry.get_by_task_id("settled").await;
-        assert!(matches!(
-            running.expect("job should exist").status,
-            JobStatus::Running
-        ));
-
-        let waiting = {
-            let registry = registry.clone();
-            tokio::spawn(async move { registry.get_by_task_id_settled("settled").await })
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!waiting.is_finished(), "the kill is still in flight");
-
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        registry
-            .send_command(JobRequest::EndKill {
-                task_id: "settled".to_string(),
-                killed: true,
-                reply: reply_tx,
-            })
-            .await;
-        assert!(JobRegistry::recv_reply(reply_rx).await);
-        let job = waiting.await.unwrap().expect("job should exist");
-        assert!(matches!(job.status, JobStatus::Killed { .. }));
-    }
-
-    /// What a host reading the registry can tell: whether the session still
-    /// owes its agent a turn.
-    fn host_sees_owed_turn(jobs: &[JobInfo]) -> bool {
-        jobs.iter()
-            .any(|job| job.status == JobStatus::Running || job.status.completion_pending())
-    }
-
-    #[tokio::test]
-    async fn a_job_reads_its_completion_pending_from_the_transition_that_finishes_it() {
-        let registry = spawn_registry();
-        registry
-            .register(
-                9,
-                &lease("owed"),
-                "exec",
-                "run",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        // The registry serves its commands in order, so this list sees the
-        // state the finishing transition left, before anything else runs.
-        registry.complete(&lease("owed"), 0, None).await;
-        let jobs = registry.list().await;
-        assert!(
-            host_sees_owed_turn(&jobs),
-            "a finished job whose completion was never delivered reads as done: {jobs:?}"
-        );
-
-        // The job's flow hands the completion out; the agent holds it.
-        let owed = registry
-            .owe_completion("owed", Ok(0))
-            .await
-            .expect("the job is registered");
-        assert_eq!(owed.info.status.kill_cause(), None);
-        let jobs = registry.list().await;
-        assert!(host_sees_owed_turn(&jobs), "{jobs:?}");
-
-        // The agent takes it, and the registry forgets the job.
-        drop(owed);
-        let jobs = registry.list().await;
-        assert!(jobs.is_empty(), "{jobs:?}");
-        assert!(!host_sees_owed_turn(&jobs));
-    }
-
-    #[tokio::test]
-    async fn a_completion_owed_by_a_job_still_running_ends_it_pending() {
-        let registry = spawn_registry();
-        registry
-            .register(
-                10,
-                &lease("lost"),
-                "exec",
-                "run",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        // The flow failed without the registry recording how.
-        let owed = registry
-            .owe_completion("lost", Err("output could not be saved".to_string()))
-            .await
-            .expect("the job is registered");
-        assert_eq!(owed.info.status.kill_cause(), None);
-        let job = registry
-            .get_by_task_id("lost")
-            .await
-            .expect("job should exist");
-        assert_eq!(
-            job.status,
-            JobStatus::Failed {
-                error: "output could not be saved".to_string(),
-                delivery: Delivery::Pending
-            }
-        );
-        assert!(
-            registry
-                .owe_completion("task-never-registered", Ok(0))
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_completion_owed_during_a_kill_waits_for_its_outcome() {
-        let registry = spawn_registry();
-        registry
-            .register(
-                11,
-                &lease("kill"),
-                "exec",
-                "run",
-                SandboxMode::Sandboxed,
-                None,
-            )
-            .await;
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        registry
-            .send_command(JobRequest::BeginKillByTaskId {
-                task_id: "kill".to_string(),
-                cause: KillCause::User,
-                reply: reply_tx,
-            })
-            .await;
-        assert!(matches!(
-            JobRegistry::recv_reply(reply_rx).await,
-            KillPlan::Group(11)
-        ));
-        let (reply_tx, owed) = async_channel::bounded(1);
-        registry
-            .send_command(JobRequest::OweCompletion {
-                task_id: "kill".to_string(),
-                ending: Ok(137),
-                reply: reply_tx,
-            })
-            .await;
-        // Served after the request above: the owed completion is parked.
-        assert_eq!(
-            registry
-                .get_by_task_id("kill")
-                .await
-                .expect("job should exist")
-                .status,
-            JobStatus::Running
-        );
-        assert!(owed.is_empty(), "the kill is still in flight");
-
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        registry
-            .send_command(JobRequest::EndKill {
-                task_id: "kill".to_string(),
-                killed: true,
-                reply: reply_tx,
-            })
-            .await;
-        assert!(JobRegistry::recv_reply(reply_rx).await);
-        let owed = JobRegistry::recv_reply(owed)
-            .await
-            .expect("the job is registered");
-        assert_eq!(owed.info.status.kill_cause(), Some(KillCause::User));
-        assert_eq!(
-            registry
-                .get_by_task_id("kill")
-                .await
-                .expect("job should exist")
-                .status,
-            JobStatus::Killed {
-                cause: KillCause::User,
-                delivery: Delivery::Pending
-            }
-        );
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "handed out twice")]
-    async fn a_completion_is_handed_out_once() {
-        let (tx, _rx) = async_channel::unbounded();
-        let weak = tx.downgrade();
-        let mut jobs = Jobs::new();
-        register_job(
-            &mut jobs,
-            12,
-            lease("twice"),
-            "exec".to_string(),
-            "run".to_string(),
-            Interpreter::Shell,
-            SandboxMode::Sandboxed,
-            None,
-            JobPlace::Host,
-            None,
-        );
-        let _first = owe_completion(&mut jobs, "twice", Ok(0), &weak).await;
-        let _second = owe_completion(&mut jobs, "twice", Ok(0), &weak).await;
     }
 
     #[tokio::test]
     async fn two_phase_backend_kill_waits_for_drain_and_preserves_unterminated_eof_line() {
         let registry = spawn_registry();
-        let id = lease("containerjob");
+        let id = lease();
         registry
-            .register(0, &id, "exec", "echo partial", SandboxMode::Sandboxed, None)
+            .register(
+                700,
+                &id,
+                "exec",
+                "echo partial",
+                SandboxMode::Sandboxed,
+                None,
+            )
             .await;
 
         let (kill_tx, kill_rx) = async_channel::bounded::<Sender<bool>>(1);
@@ -3833,54 +3058,43 @@ mod tests {
         });
 
         let reg_kill = registry.clone();
-        let kill_task = tokio::spawn(async move { reg_kill.kill_by_task_id("containerjob").await });
+        let kill_task = tokio::spawn(async move { reg_kill.kill_by_pid(700).await });
 
         kill_entered_rx.recv().await.unwrap();
         assert_eq!(
-            registry
-                .get_by_task_id("containerjob")
-                .await
-                .unwrap()
-                .status,
-            JobStatus::Running,
-            "job stays Running while backend killer and stream drain are in flight"
+            registry.get_by_pid(700).await.unwrap().status,
+            JobStatus::Running
         );
 
         release_kill_tx.send(()).await.unwrap();
         assert!(kill_task.await.unwrap());
         killer_task.await.unwrap();
 
-        let settled = registry.get_by_task_id("containerjob").await.unwrap();
+        let settled = registry.get_by_pid(700).await.unwrap();
         assert!(matches!(settled.status, JobStatus::Killed { .. }));
 
-        let (stdout, _stderr) = registry
-            .terminal_output("containerjob")
-            .await
-            .expect("terminal output preserved");
+        let (stdout, _stderr) = registry.terminal_output(id.id()).await.unwrap();
         assert_eq!(stdout, b"final-unterminated");
 
         let delta = registry
-            .monitor_read("containerjob", 0, 1024)
+            .monitor_read_launch(id.id(), 0, 1024)
             .await
-            .expect("monitor read succeeds");
-        assert_eq!(
-            delta.bytes, b"final-unterminated\n",
-            "unterminated EOF line must remain readable after kill"
-        );
+            .unwrap();
+        assert_eq!(delta.bytes, b"final-unterminated\n");
     }
 
     #[tokio::test]
     async fn redirected_job_bounds_in_memory_buffers_and_serves_evicted_bytes_from_disk() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let redirect_path = dir.path().join("redirected.log");
         let registry = spawn_registry();
-        let id = lease("bigjob");
+        let id = lease();
         registry
-            .register(0, &id, "exec", "yes line", SandboxMode::Sandboxed, None)
+            .register(800, &id, "exec", "yes line", SandboxMode::Sandboxed, None)
             .await;
 
         registry
-            .start_output_redirect("bigjob", redirect_path.clone())
+            .start_output_redirect(id.id(), redirect_path.clone())
             .await
             .unwrap();
 
@@ -3890,29 +3104,14 @@ mod tests {
             registry.append_stdout(&id, chunk.as_bytes().to_vec()).await;
             total += chunk.len();
         }
-        assert!(total > REDIRECTED_BUFFER_CAP * 3);
 
-        let (stdout_in_mem, _) = registry.terminal_output("bigjob").await.unwrap();
-        assert!(
-            stdout_in_mem.len() <= REDIRECTED_BUFFER_CAP,
-            "stdout_buffer must stay bounded after redirect: {}",
-            stdout_in_mem.len()
-        );
-
-        let first_slice = registry
-            .terminal_read("bigjob", 0, 64)
+        let delta = registry
+            .terminal_read(800, 0, 4096)
             .await
             .unwrap()
             .into_delta()
-            .expect("first slice is a delta");
-        assert_eq!(first_slice.bytes.len(), 64);
-        assert_eq!(&first_slice.bytes, &chunk.as_bytes()[..64]);
-        assert_eq!(first_slice.total_bytes, total);
-
-        registry.complete(&id, 0, Some(redirect_path.clone())).await;
-        assert_eq!(
-            usize::try_from(std::fs::metadata(&redirect_path).unwrap().len()).unwrap(),
-            total
-        );
+            .unwrap();
+        assert_eq!(delta.total_bytes, total);
+        assert_eq!(delta.bytes, &chunk.as_bytes()[..4096]);
     }
 }

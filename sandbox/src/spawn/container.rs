@@ -119,7 +119,7 @@ impl Sandbox {
         launch.shell_command(&script).map_err(|e| failed(&e))
     }
 
-    pub(super) fn spawn_container(
+    pub(super) async fn spawn_container(
         &self,
         runtime: &ContainerShellRuntime,
         launch: &ContainerLaunch,
@@ -151,14 +151,11 @@ impl Sandbox {
         let (stdin_tx, stdin_rx) = async_channel::unbounded::<Vec<u8>>();
         let (stdout_tx, stdout_rx) = async_channel::bounded::<Vec<u8>>(OUTPUT_BACKLOG);
         let (stderr_tx, stderr_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (pid_tx, pid_rx) = async_channel::bounded::<u32>(1);
         let mut streams = Streams::default();
-        // The exec's attached stream closes with a dropped sender; the script
-        // of an unpiped stdin reads the null device instead.
         if stdio.stdin == Pipe::Piped {
             streams.stdin = Some(stdin_tx);
         }
-        // The exec is killed once its stdout has no receiver, so an unpiped
-        // stream is read and dropped.
         match stdio.stdout {
             Pipe::Piped => streams.stdout = Some(stdout_rx),
             Pipe::Null => self
@@ -170,10 +167,8 @@ impl Sandbox {
         if stdio.stderr == Pipe::Piped {
             streams.stderr = Some(stderr_rx);
         }
-        // A background exec lasts until its last process ends and watches its
-        // stdin; a foreground one kills what its top-level shell leaves.
         let exec_lifetime = match lifetime {
-            TreeLifetime::Foreground => ExecLifetime::Foreground,
+            TreeLifetime::Foreground => ExecLifetime::Foreground { pid: Some(pid_tx) },
             TreeLifetime::Background => {
                 let (signal_tx, signal_rx) = async_channel::unbounded();
                 if stdio.stdin == Pipe::Piped {
@@ -181,12 +176,11 @@ impl Sandbox {
                 }
                 ExecLifetime::Background {
                     stdin_blocked: signal_tx,
+                    pid: Some(pid_tx),
                 }
             }
         };
 
-        // Dropping the kill sender would kill the exec, so the task that waits
-        // for it holds one until it ends.
         let kill = kill_tx.clone();
         let exec = runtime.exec();
         let container_id = runtime.container_id().to_string();
@@ -215,8 +209,9 @@ impl Sandbox {
             })
             .detach();
 
+        let pid = pid_rx.recv().await.unwrap_or_else(|_| exec_id());
         Ok(SandboxedChild::new(
-            exec_id(),
+            pid,
             streams,
             KillHandle::Switch(kill_tx),
             watch,

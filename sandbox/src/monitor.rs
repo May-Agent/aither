@@ -3,9 +3,9 @@
 //!
 //! Following a running command or a growing log used to mean polling: sleep,
 //! read, sleep, read. `monitor` runs the source as an ordinary background
-//! job — same sandbox, same PID-only kills, `terminal_kill` reaches it — and
-//! a pump raises its new output as [`ShellEvent::MonitorIncrement`] facts,
-//! which the embedder merges into its agent's next turn boundary.
+//! job — same sandbox, same native `kill <pid>` reachability — and a pump
+//! raises its new output as [`ShellEvent::MonitorIncrement`] facts, which the
+//! embedder merges into its agent's next turn boundary.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -92,7 +92,7 @@ pub enum MonitorSource {
 #[non_exhaustive]
 pub struct MonitorIncrement {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) lines: Vec<String>,
 }
 
@@ -103,10 +103,10 @@ impl MonitorIncrement {
         &self.agent
     }
 
-    /// Task id of the watched job.
+    /// Process ID of the watched job.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// The new lines (filtered when the monitor has a `filter`).
@@ -121,7 +121,7 @@ impl MonitorIncrement {
 #[non_exhaustive]
 pub struct MonitorStalled {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) stall_secs: u64,
 }
 
@@ -132,10 +132,10 @@ impl MonitorStalled {
         &self.agent
     }
 
-    /// Task id of the watched job.
+    /// Process ID of the watched job.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// How long it has produced nothing.
@@ -150,7 +150,7 @@ impl MonitorStalled {
 #[non_exhaustive]
 pub struct MonitorEnded {
     pub(crate) agent: AgentPath,
-    pub(crate) task_id: String,
+    pub(crate) pid: u32,
     pub(crate) end: MonitorEnd,
 }
 
@@ -161,10 +161,10 @@ impl MonitorEnded {
         &self.agent
     }
 
-    /// Task id of the watched job.
+    /// Process ID of the watched job.
     #[must_use]
-    pub fn task_id(&self) -> &str {
-        &self.task_id
+    pub const fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// What ended it.
@@ -189,7 +189,7 @@ pub enum MonitorEnd {
     },
     /// The monitor's `timeout_secs` passed.
     TimedOut,
-    /// The watched job was killed (`terminal_kill` or the watchdog).
+    /// The watched job was killed (by a signal or a watchdog).
     Killed,
     /// The watched job failed.
     Failed {
@@ -231,9 +231,10 @@ pub enum MonitorRefusal {
 
 /// Everything a running monitor needs to know to watch and report.
 struct Watch {
-    task_id: String,
-    /// Keeps the job, and its word, until the pump reports its end, so a
-    /// completion the agent took first still leaves the pump its status.
+    pid: u32,
+    launch: crate::LaunchId,
+    /// Keeps the job until the pump reports its end, so a completion the agent
+    /// took first still leaves the pump its status.
     _job: crate::Job,
     registry: JobRegistry,
     alerts: EventSender,
@@ -404,10 +405,9 @@ where
         let notices = self.terminal.wording();
         let interval_secs = self.interval_secs(&args);
         match self.start(args).await {
-            Ok(task_id) => Ok(ToolResult::text(notices.monitor_started(&MonitorStarted {
-                task_id: &task_id,
-                interval_secs,
-            }))),
+            Ok(pid) => Ok(ToolResult::text(
+                notices.monitor_started(&MonitorStarted { pid, interval_secs }),
+            )),
             Err(refusal) => {
                 Err(Refused::rendered(refusal, |refusal| notices.monitor_refusal(refusal)).into())
             }
@@ -416,8 +416,8 @@ where
 }
 
 impl<E: Executor + Clone + 'static> MonitorTool<E> {
-    /// Starts the watched job and its pump; returns the job's task id.
-    async fn start(&self, args: MonitorArgs) -> Result<String, MonitorRefusal> {
+    /// Starts the watched job and its pump; returns the job's PID.
+    async fn start(&self, args: MonitorArgs) -> Result<u32, MonitorRefusal> {
         // The pump owns the deadline and the job's own bound stays a margin
         // past it, so a monitor is accepted only when the shell accepts that
         // bound too.
@@ -472,10 +472,12 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
             .map_err(|error| MonitorRefusal::StartFailed {
                 reason: error.to_string(),
             })?;
-        let task_id = job.task_id().to_owned();
+        let pid = job.pid();
+        let launch = job.launch();
         let watch = Watch {
             _job: job,
-            task_id: task_id.clone(),
+            pid,
+            launch,
             registry: self.terminal.job_registry(),
             alerts: self.terminal.event_sender(),
             interval: Duration::from_secs(interval_secs),
@@ -489,7 +491,7 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
             .executor()
             .spawn(async move { watch_task(watch).await })
             .detach();
-        Ok(task_id)
+        Ok(pid)
     }
 }
 
@@ -512,7 +514,8 @@ async fn send(alerts: &EventSender, alert: ShellEvent) {
 #[allow(clippy::too_many_lines)]
 async fn watch_task(watch: Watch) {
     let Watch {
-        task_id,
+        pid,
+        launch,
         _job,
         registry,
         alerts,
@@ -534,7 +537,10 @@ async fn watch_task(watch: Watch) {
         )
         .await;
         let now = Instant::now();
-        let mut end = match registry.monitor_read(&task_id, cursor, usize::MAX).await {
+        let mut end = match registry
+            .monitor_read_launch(launch, cursor, usize::MAX)
+            .await
+        {
             Ok(delta) => {
                 cursor = delta.cursor;
                 remainder.extend_from_slice(&delta.bytes);
@@ -569,7 +575,7 @@ async fn watch_task(watch: Watch) {
                         &alerts,
                         ShellEvent::MonitorIncrement(MonitorIncrement {
                             agent: alerts.agent().clone(),
-                            task_id: task_id.clone(),
+                            pid,
                             lines,
                         }),
                     )
@@ -580,7 +586,7 @@ async fn watch_task(watch: Watch) {
                 }
                 if let Some(line) = stop {
                     if kill_on_stop {
-                        registry.kill_by_task_id(&task_id).await;
+                        registry.kill_launch(launch).await;
                     }
                     Some(MonitorEnd::StopMatched { line })
                 } else {
@@ -597,7 +603,7 @@ async fn watch_task(watch: Watch) {
             Err(_) => Some(MonitorEnd::Lost),
         };
         if end.is_none() && now >= deadline {
-            registry.kill_by_task_id(&task_id).await;
+            registry.kill_launch(launch).await;
             end = Some(MonitorEnd::TimedOut);
         }
         if let Some(end) = end {
@@ -605,7 +611,7 @@ async fn watch_task(watch: Watch) {
                 &alerts,
                 ShellEvent::MonitorEnded(MonitorEnded {
                     agent: alerts.agent().clone(),
-                    task_id,
+                    pid,
                     end,
                 }),
             )
@@ -618,7 +624,7 @@ async fn watch_task(watch: Watch) {
                 &alerts,
                 ShellEvent::MonitorStalled(MonitorStalled {
                     agent: alerts.agent().clone(),
-                    task_id: task_id.clone(),
+                    pid,
                     stall_secs: stall.map_or(0, |s| s.as_secs()),
                 }),
             )

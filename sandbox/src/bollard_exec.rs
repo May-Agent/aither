@@ -331,16 +331,15 @@ type ExecInput = Pin<Box<dyn tokio::io::AsyncWrite + Send>>;
 /// leaves running.
 const fn lifetime_argument(lifetime: &ExecLifetime) -> &'static str {
     match lifetime {
-        ExecLifetime::Foreground => "foreground",
+        ExecLifetime::Foreground { .. } => "foreground",
         ExecLifetime::Background { .. } => "background",
     }
 }
 
-/// Takes the lines the exec wrapper wrote about the processes it killed out of
-/// the exec's stderr. Each starts with `pid_file`, a path nothing else knows:
-/// `<pid_file> killed <pid> <name>` names one process, `<pid_file> error
-/// <message>` reports a kill that failed.
+/// Takes the lines the exec wrapper wrote about its PID and the processes it
+/// killed out of the exec's stderr.
 fn split_killed(stderr: &[u8], pid_file: &str) -> Result<(Vec<u8>, Vec<JobProcess>), String> {
+    let pid_prefix = format!("{pid_file} pid ");
     let killed_prefix = format!("{pid_file} killed ");
     let error_prefix = format!("{pid_file} error ");
     let mut kept = Vec::with_capacity(stderr.len());
@@ -348,6 +347,9 @@ fn split_killed(stderr: &[u8], pid_file: &str) -> Result<(Vec<u8>, Vec<JobProces
     for line in stderr.split_inclusive(|byte| *byte == b'\n') {
         let text = String::from_utf8_lossy(line);
         let text = text.trim_end_matches('\n');
+        if text.starts_with(&pid_prefix) {
+            continue;
+        }
         if let Some(process) = text.strip_prefix(&killed_prefix) {
             let (pid, name) = process
                 .split_once(' ')
@@ -520,9 +522,11 @@ async fn exec_inner(
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let stdin_blocked = match lifetime {
-        ExecLifetime::Foreground => None,
-        ExecLifetime::Background { stdin_blocked } => Some(stdin_blocked),
+    let mut pid_probe_buf = Vec::new();
+    let pid_prefix = format!("{pid_file} pid ");
+    let (stdin_blocked, mut pid_tx) = match lifetime {
+        ExecLifetime::Foreground { pid } => (None, pid),
+        ExecLifetime::Background { stdin_blocked, pid } => (Some(stdin_blocked), pid),
     };
     let mut watch = stdin_blocked.map(|signal| StdinWatch {
         signal,
@@ -552,8 +556,6 @@ async fn exec_inner(
                         if stdin_open {
                             let _ = shutdown_container_stdin(&mut input).await;
                         }
-                        // A job the kill could not stop is still running,
-                        // so it must not be reported killed.
                         kill_exec_inside_container(&client, &container_id, &exec_id, &pid_file)
                             .await
                             .map_err(|error| format!("failed to kill container exec: {error}"))?;
@@ -561,6 +563,21 @@ async fn exec_inner(
                     }
                 }
                 (_, output) => {
+                    if pid_tx.is_some()
+                        && let LogOutput::StdErr { ref message } = output
+                    {
+                        pid_probe_buf.extend_from_slice(message);
+                        if let Some(nl) = pid_probe_buf.iter().position(|b| *b == b'\n') {
+                            let line = String::from_utf8_lossy(&pid_probe_buf[..nl]);
+                            if let Some(raw_pid) =
+                                line.trim_end_matches('\r').strip_prefix(&pid_prefix)
+                                && let Ok(pid) = raw_pid.trim().parse::<u32>()
+                                && let Some(tx) = pid_tx.take()
+                            {
+                                let _ = tx.try_send(pid);
+                            }
+                        }
+                    }
                     append_log_output(output, &mut stdout, &mut stderr, stdout_sink.is_some());
                 }
             },
@@ -836,7 +853,12 @@ mod tests {
         }
         let run = run_wrapper_as(&pid_file, "exit 4", "foreground", dir.path());
         assert_eq!(run.status.code(), Some(4));
-        assert!(run.stderr.is_empty(), "nothing left, nothing reported");
+        let (kept, killed) =
+            super::split_killed(&run.stderr, &pid_file.display().to_string()).unwrap();
+        assert!(
+            kept.is_empty() && killed.is_empty(),
+            "nothing left, nothing reported"
+        );
     }
 
     /// A background wrapper stays until what its script left running exits,
@@ -858,8 +880,10 @@ mod tests {
             started.elapsed() >= std::time::Duration::from_secs(2),
             "the wrapper must outlive the leftover process"
         );
+        let (kept, killed) =
+            super::split_killed(&run.stderr, &pid_file.display().to_string()).unwrap();
         assert!(
-            run.stderr.is_empty(),
+            kept.is_empty() && killed.is_empty(),
             "{}",
             String::from_utf8_lossy(&run.stderr)
         );
@@ -962,7 +986,12 @@ mod tests {
             "the wrapper ended before {survivors:?}: {stderr}"
         );
         assert!(run.status.success(), "{stderr}");
-        assert!(run.stderr.is_empty(), "{stderr}");
+        let (kept, killed) = super::split_killed(
+            &run.stderr,
+            &dir.path().join("exec.pid").display().to_string(),
+        )
+        .unwrap();
+        assert!(kept.is_empty() && killed.is_empty(), "{stderr}");
     }
 
     /// A process that dropped the marker from its environment, or runs with
@@ -990,7 +1019,9 @@ mod tests {
         assert_eq!(survivors.len(), 2, "both processes ran: {pids:?}");
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert!(run.status.success(), "{stderr}");
-        assert!(run.stderr.is_empty(), "{stderr}");
+        let (kept, killed) =
+            super::split_killed(&run.stderr, &pid_file.display().to_string()).unwrap();
+        assert!(kept.is_empty() && killed.is_empty(), "{stderr}");
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "the wrapper waited for processes outside the job"

@@ -10,16 +10,16 @@ use crate::job_registry::{JobRead, JobStatus};
 use crate::monitor::MonitorRefusal;
 use crate::terminal::{TerminalError, TimeoutKill};
 use crate::wording::{
-    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JobKillAsked,
-    JsonAsTsv, MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, RunFailure, RunningJob,
-    ShellWording, StoredBinaryPart,
+    AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JsonAsTsv,
+    MonitorStarted, OmittedLines, OutputSaved, RepeatedLines, RunFailure, RunningJob, ShellWording,
+    StoredBinaryPart,
 };
 use aither_core::llm::CommandStream;
 
 #[derive(Template)]
 #[template(path = "test_wording/unchanged_task_read.txt")]
-struct UnchangedTaskReadText<'a> {
-    task_id: &'a str,
+struct UnchangedTaskReadText {
+    pid: u32,
 }
 
 #[derive(Template)]
@@ -28,7 +28,7 @@ struct JobReadText<'a> {
     delta: &'a str,
     has_more: bool,
     cursor: usize,
-    task_id: &'a str,
+    pid: u32,
     status_text: &'a str,
     bytes_read: usize,
     total_bytes: usize,
@@ -36,15 +36,8 @@ struct JobReadText<'a> {
 
 #[derive(Template)]
 #[template(path = "test_wording/job_input.txt", escape = "none")]
-struct JobInputText<'a> {
-    task_id: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "test_wording/job_kill.txt", escape = "none")]
-struct JobKillText<'a> {
-    task_id: &'a str,
-    killed: bool,
+struct JobInputText {
+    pid: u32,
 }
 
 fn job_status_text(status: &JobStatus) -> String {
@@ -97,8 +90,8 @@ struct MonitorRefused<'a> {
 
 #[derive(Template)]
 #[template(path = "test_wording/monitor_started.txt", escape = "none")]
-struct MonitorStartedText<'a> {
-    task_id: &'a str,
+struct MonitorStartedText {
+    pid: u32,
     interval_secs: u64,
 }
 
@@ -199,7 +192,7 @@ pub fn argument_descriptions()
         ("raw", "Whether the output is returned verbatim."),
         ("timeout", "The maximum runtime in seconds."),
         ("background", "Whether the command is detached at once."),
-        ("task_id", "The job."),
+        ("pid", "Process ID of the job."),
         ("cursor", "The offset after which output is read."),
         ("max_bytes", "The most bytes returned."),
         ("input", "The text written to stdin."),
@@ -232,7 +225,6 @@ pub fn job_tools() -> crate::ShellToolSettings {
         shell: identity("terminal", "Run a script."),
         read: identity("terminal_read", "Read a job's output."),
         input: identity("terminal_input", "Write to a job's stdin."),
-        kill: identity("terminal_kill", "Kill a job."),
     }
 }
 
@@ -251,7 +243,7 @@ impl TestWording {
 impl ShellWording for TestWording {
     fn job_read(&self, read: &JobRead) -> String {
         match read {
-            JobRead::Unchanged { task_id } => rendered(&UnchangedTaskReadText { task_id }),
+            JobRead::Unchanged { pid } => rendered(&UnchangedTaskReadText { pid: *pid }),
             JobRead::Delta(delta) => {
                 let output = CommandStream::Inline {
                     text: String::from_utf8_lossy(&delta.bytes).into_owned(),
@@ -261,7 +253,7 @@ impl ShellWording for TestWording {
                     delta: &output,
                     has_more: delta.cursor < delta.total_bytes,
                     cursor: delta.cursor,
-                    task_id: &delta.task_id,
+                    pid: delta.pid,
                     status_text: &job_status_text(&delta.status),
                     bytes_read: delta.bytes.len(),
                     total_bytes: delta.total_bytes,
@@ -270,17 +262,8 @@ impl ShellWording for TestWording {
         }
     }
 
-    fn job_input(&self, sent: &JobInputSent<'_>) -> String {
-        rendered(&JobInputText {
-            task_id: sent.task_id,
-        })
-    }
-
-    fn job_kill(&self, kill: &JobKillAsked<'_>) -> String {
-        rendered(&JobKillText {
-            task_id: kill.task_id,
-            killed: kill.killed,
-        })
+    fn job_input(&self, sent: &JobInputSent) -> String {
+        rendered(&JobInputText { pid: sent.pid })
     }
 
     fn call_refused(&self, refusal: &CallRefusal) -> String {
@@ -312,9 +295,9 @@ impl ShellWording for TestWording {
         })
     }
 
-    fn monitor_started(&self, started: &MonitorStarted<'_>) -> String {
+    fn monitor_started(&self, started: &MonitorStarted) -> String {
         rendered(&MonitorStartedText {
-            task_id: started.task_id,
+            pid: started.pid,
             interval_secs: started.interval_secs,
         })
     }
