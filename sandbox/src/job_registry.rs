@@ -93,11 +93,6 @@ impl WeakLaunchLease {
 pub struct JobInfo {
     /// Process ID inside the job's execution environment (model-facing).
     pub pid: u32,
-    /// Host OS process ID when running on the host (differs from `pid` inside a
-    /// Linux PID namespace; equals `pid` elsewhere).
-    pub(crate) host_pid: u32,
-    /// Monotonic launch identifier owning this job instance.
-    pub(crate) launch: LaunchId,
     /// Stateless execution key that owns this job.
     pub execution_key: String,
     /// The script that was executed.
@@ -423,6 +418,7 @@ enum KillSwitch {
 #[allow(clippy::struct_excessive_bools)]
 struct JobState {
     info: JobInfo,
+    host_pid: u32,
     launch: LaunchLease,
     terminal_buffer: Vec<u8>,
     terminal_evicted: usize,
@@ -523,6 +519,9 @@ enum JobRequest {
     List {
         reply: Sender<Vec<JobInfo>>,
     },
+    ListHostRunning {
+        reply: Sender<Vec<(JobInfo, u32)>>,
+    },
     GetByPid {
         pid: u32,
         reply: Sender<Option<JobInfo>>,
@@ -561,6 +560,10 @@ enum JobRequest {
     },
     BeginKillByExecutionKey {
         execution_key: String,
+        cause: KillCause,
+        reply: Sender<Vec<(LaunchId, KillPlan)>>,
+    },
+    BeginKillAllRunning {
         cause: KillCause,
         reply: Sender<Vec<(LaunchId, KillPlan)>>,
     },
@@ -1168,6 +1171,14 @@ impl JobRegistry {
         Self::recv_reply(reply_rx).await
     }
 
+    /// Lists running host jobs alongside their host OS PIDs.
+    pub(crate) async fn list_host_running(&self) -> Vec<(JobInfo, u32)> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::ListHostRunning { reply: reply_tx })
+            .await;
+        Self::recv_reply(reply_rx).await
+    }
+
     /// Gets information about a specific `launch`.
     pub async fn get_by_launch(&self, launch: LaunchId) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
@@ -1268,11 +1279,17 @@ impl JobRegistry {
 
     /// Kills every job that is still running in this registry.
     pub async fn kill_running(&self) -> usize {
-        let jobs = self.list().await;
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::BeginKillAllRunning {
+            cause: KillCause::User,
+            reply: reply_tx,
+        })
+        .await;
+        let plans = Self::recv_reply(reply_rx).await;
         futures::future::join_all(
-            jobs.into_iter()
-                .filter(|job| job.status == JobStatus::Running)
-                .map(|job| async move { self.kill_launch(job.launch).await }),
+            plans
+                .into_iter()
+                .map(|(launch, plan)| async move { self.finish_kill(launch, plan).await }),
         )
         .await
         .into_iter()
@@ -1737,6 +1754,18 @@ async fn handle_job_request(
                 .collect();
             let _ = reply.send(items).await;
         }
+        JobRequest::ListHostRunning { reply } => {
+            let items = store
+                .jobs
+                .values()
+                .filter(|state| {
+                    state.info.place == JobPlace::Host
+                        && matches!(state.info.status, JobStatus::Running)
+                })
+                .map(|state| (state.info.clone(), state.host_pid))
+                .collect();
+            let _ = reply.send(items).await;
+        }
         JobRequest::GetByPid { pid, reply } => {
             let item = store
                 .latest_launch(pid)
@@ -1776,6 +1805,19 @@ async fn handle_job_request(
             reply,
         } => {
             let plans = begin_kill_by_execution_key(&mut store.jobs, &execution_key, cause);
+            let _ = reply.send(plans).await;
+        }
+        JobRequest::BeginKillAllRunning { cause, reply } => {
+            let keys: Vec<LaunchId> = store
+                .jobs
+                .iter()
+                .filter(|(_, job)| matches!(job.info.status, JobStatus::Running))
+                .map(|(launch, _)| *launch)
+                .collect();
+            let plans = keys
+                .into_iter()
+                .map(|launch| (launch, begin_kill(&mut store.jobs, launch, cause)))
+                .collect();
             let _ = reply.send(plans).await;
         }
         JobRequest::EndKill {
@@ -1951,8 +1993,6 @@ fn register_job(
         timeout,
         place,
         pid,
-        host_pid,
-        launch: key,
         execution_key,
         script,
         interpreter,
@@ -1961,14 +2001,15 @@ fn register_job(
         status: JobStatus::Running,
         output_path,
     };
-    store.insert(key, JobState::new(info, launch));
+    store.insert(key, JobState::new(info, host_pid, launch));
     tracing::debug!(%key, pid = %pid, host_pid = %host_pid, "registered background job");
 }
 
 impl JobState {
-    const fn new(info: JobInfo, launch: LaunchLease) -> Self {
+    const fn new(info: JobInfo, host_pid: u32, launch: LaunchLease) -> Self {
         Self {
             info,
+            host_pid,
             launch,
             terminal_buffer: Vec::new(),
             terminal_evicted: 0,
@@ -2062,7 +2103,7 @@ fn finish(job: &mut JobState, end: JobEnd) {
     assert!(
         matches!(job.info.status, JobStatus::Running),
         "job {} (pid {}) ended twice: it already reads {:?}",
-        job.info.launch,
+        job.launch.id(),
         job.info.pid,
         job.info.status
     );
@@ -2523,7 +2564,7 @@ fn begin_kill(
     }
 
     job.kills_in_flight += 1;
-    let group = job.info.host_pid;
+    let group = job.host_pid;
     job.process_tree
         .as_ref()
         .map_or(KillPlan::Group(group), |tree| KillPlan::Tree(tree.clone()))
