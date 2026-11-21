@@ -359,7 +359,7 @@ impl<E: Executor + Clone + 'static> ContainerGit<E> {
                         kill_rx,
                         stdin_rx,
                         stdout,
-                        crate::ExecLifetime::Foreground,
+                        crate::ExecLifetime::foreground(),
                     )
                     .await;
                 let _ = done_tx.send(outcome).await;

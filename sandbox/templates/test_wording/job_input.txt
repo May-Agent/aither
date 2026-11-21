@@ -1,1 +1,2 @@
-Input written to background task '{{ task_id }}' stdin.
+Input written to background process {{ pid }} stdin.
+

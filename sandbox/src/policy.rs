@@ -109,9 +109,9 @@ impl ScriptDir {
 /// [`TreatOutput`](crate::TreatOutput) see it.
 #[derive(Debug, Clone, Copy)]
 pub struct ScriptCheck<'a> {
-    /// The id the script's task gets when it runs; the [`ScriptEnd`] that
-    /// reports how it ended carries the same id.
-    pub task_id: &'a str,
+    /// Identifier of this launch; the [`ScriptEnd`] that reports how it ended
+    /// carries the same [`LaunchId`](crate::LaunchId).
+    pub launch: crate::LaunchId,
     /// The script as written.
     pub script: &'a str,
     /// The language it is written in.
@@ -172,8 +172,8 @@ pub enum Carry {
 /// The end of a script a [`ScriptPolicy`] was asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScriptEnd<'a> {
-    /// The task id the [`ScriptCheck`] carried.
-    pub task_id: &'a str,
+    /// The [`LaunchId`](crate::LaunchId) the [`ScriptCheck`] carried.
+    pub launch: crate::LaunchId,
     /// How it ended.
     pub outcome: ScriptOutcome,
     /// The directory the terminal's next foreground script starts in now
@@ -410,7 +410,7 @@ impl ScriptPolicies {
     /// terminal's next foreground script starts.
     pub async fn ended(
         &self,
-        task_id: &str,
+        launch: crate::LaunchId,
         outcome: ScriptOutcome,
         end: &ScriptDir,
         carry: Carry,
@@ -419,7 +419,7 @@ impl ScriptPolicies {
             return;
         }
         let end = ScriptEnd {
-            task_id,
+            launch,
             outcome,
             end,
             carry,
@@ -488,11 +488,11 @@ mod tests {
         ScriptDecision::Ask(ApprovalRequest::new(ApprovalKind::new("test"), subject))
     }
 
-    fn check(task_id: &str) -> ScriptCheck<'_> {
+    fn check(launch: u64) -> ScriptCheck<'static> {
         static START: std::sync::LazyLock<ScriptDir> =
             std::sync::LazyLock::new(|| ScriptDir::Host(PathBuf::from("/")));
         ScriptCheck {
-            task_id,
+            launch: crate::LaunchId::from_raw(launch),
             script: "true",
             interpreter: Interpreter::Shell,
             shell: None,
@@ -518,14 +518,14 @@ mod tests {
         let main = ScriptPolicies::new(vec![AnyScriptPolicy::new(Quota { allowed: 1 })]);
         let view = main.clone();
         let subagent = main.for_agent();
-        assert_eq!(main.check(&check("a")).await, ScriptDecision::Allow);
-        assert_eq!(main.check(&check("b")).await, refuse("over quota"));
+        assert_eq!(main.check(&check(1)).await, ScriptDecision::Allow);
+        assert_eq!(main.check(&check(2)).await, refuse("over quota"));
         assert!(
-            matches!(view.check(&check("c")).await, ScriptDecision::Refuse(_)),
+            matches!(view.check(&check(3)).await, ScriptDecision::Refuse(_)),
             "a view of the main agent's registry shares its state"
         );
         assert_eq!(
-            subagent.check(&check("d")).await,
+            subagent.check(&check(4)).await,
             ScriptDecision::Allow,
             "the subagent's state is its own"
         );
@@ -547,12 +547,12 @@ mod tests {
         {
             for pair in [[weak, strong], [strong, weak]] {
                 let policies = policies(pair.into_iter().cloned());
-                assert_eq!(&policies.check(&check("a")).await, strong);
+                assert_eq!(&policies.check(&check(1)).await, strong);
             }
         }
         assert_eq!(
             policies([ScriptDecision::Allow, ScriptDecision::Pass])
-                .check(&check("b"))
+                .check(&check(2))
                 .await,
             ScriptDecision::Allow
         );
@@ -567,15 +567,15 @@ mod tests {
             refuse("first refusal"),
             refuse("second refusal"),
         ]);
-        assert_eq!(policies.check(&check("a")).await, refuse("first refusal"));
+        assert_eq!(policies.check(&check(1)).await, refuse("first refusal"));
         let asking = super::ScriptPolicies::new(vec![
             AnyScriptPolicy::new(Always(ask("first question"))),
             AnyScriptPolicy::new(Always(ask("second question"))),
         ]);
-        assert_eq!(asking.check(&check("b")).await, ask("first question"));
+        assert_eq!(asking.check(&check(2)).await, ask("first question"));
         assert!(ScriptPolicies::default().is_empty());
         assert_eq!(
-            ScriptPolicies::default().check(&check("c")).await,
+            ScriptPolicies::default().check(&check(3)).await,
             ScriptDecision::Pass
         );
     }

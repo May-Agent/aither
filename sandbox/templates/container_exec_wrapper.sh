@@ -1,9 +1,7 @@
 # Records this shell's own in-container pid in the file $1 for the stdin
 # probe and the kill path (Docker reports exec pids in the host's namespace),
-# then runs the script $2 in a child shell, which sees none of the wrapper's
-# arguments or variables but the job marker AITHER_JOB, the file's path. The
-# file is removed when this shell exits. The wrapper never redirects its
-# stdin, so its fd 0 stays the job's stdin pipe.
+# announces "<file> pid $$" on stderr so the host registers the real
+# in-container PID, and exports AITHER_CONTAINER_JOB=$$ for cgroup/RSS probes.
 #
 # A job's processes live exactly as long as the job. When the script's shell
 # has exited, $3 says what becomes of the processes it left running, found
@@ -15,17 +13,30 @@
 #   background  the wrapper stays until none is left, so the exec ends with its
 #               last process; a helper that fails ends the wait with the same
 #               error line.
-# The text $1 on one line, built without any tool the job script may be
-# missing.
 oneline() {
   printf '%s' "$1" | while IFS= read -r oneline_part || [ -n "$oneline_part" ]; do
     printf '%s ' "$oneline_part"
   done
 }
-echo $$ > "$1" || { echo "cannot record the exec's pid in $1" >&2; exit 125; }
+wrapper_pid=$$
+echo "$wrapper_pid" > "$1" || { echo "cannot record the exec's pid in $1" >&2; exit 125; }
+printf '%s pid %s\n' "$1" "$wrapper_pid" >&2
 trap 'rm -f "$1"' EXIT
-AITHER_JOB=$1 sh -c "$2"
+exec 9<&0
+AITHER_JOB=$1 AITHER_CONTAINER_JOB=$wrapper_pid sh -c 'exec 0<&9 9<&-; exec sh -c "$1"' sh "$2" &
+child_pid=$!
+exec 9<&-
+forward_signal() {
+  sig=$1
+  kill "-$sig" "$child_pid" 2>/dev/null || true
+  sh -c "$4" sh reap "$1" >/dev/null 2>&1 || true
+}
+trap 'forward_signal TERM; exit 143' TERM
+trap 'forward_signal INT; exit 130' INT
+trap 'forward_signal HUP; exit 129' HUP
+wait "$child_pid"
 status=$?
+trap - TERM INT HUP
 case $3 in
   foreground)
     if killed=$(sh -c "$4" sh reap "$1" 2>&1); then
@@ -47,6 +58,4 @@ case $3 in
     done
     ;;
 esac
-# Not the last command, so the shell cannot replace itself with the child
-# and skip its trap; the status is the script's.
 exit "$status"

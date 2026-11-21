@@ -59,17 +59,17 @@ pub enum CommandOutcome {
         /// Process exit code.
         code: i32,
     },
-    /// A background task; its output is being written to `output`.
+    /// A background process; its output is being written to `output`.
     Running {
-        /// Identifier of the background task.
-        task_id: String,
+        /// Process identifier of the background job.
+        pid: u32,
         /// File the background output is written to.
         output: StoredFile,
     },
     /// The foreground run was killed at its time bound.
     Killed {
-        /// Identifier of the killed run.
-        task_id: String,
+        /// Process identifier of the killed run.
+        pid: u32,
         /// Model-facing reason the run was killed.
         notice: String,
     },
@@ -503,11 +503,11 @@ mod tests {
                 },
                 None,
                 CommandOutcome::Running {
-                    task_id: "t1".to_string(),
+                    pid: 4242,
                     output: file(),
                 },
             ),
-            "Started in background as task 't1'; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt).\n"
+            "Started in background with PID 4242; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt).\n"
         );
         assert_eq!(
             result(
@@ -516,11 +516,11 @@ mod tests {
                 },
                 None,
                 CommandOutcome::Killed {
-                    task_id: "t2".to_string(),
+                    pid: 4243,
                     notice: "Killed at the time bound.".to_string(),
                 },
             ),
-            "partial\nKilled at the time bound.\nTask ID: 't2'.\n"
+            "partial\nKilled at the time bound.\nPID: 4243.\n"
         );
     }
 

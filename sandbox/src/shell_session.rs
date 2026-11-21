@@ -15,7 +15,11 @@ pub enum ExecLifetime {
     /// None: they are killed with the shell and reported in
     /// [`ContainerExecOutcome::Completed`]'s `killed`. Its stdin is not
     /// watched.
-    Foreground,
+    Foreground {
+        /// Optional one-shot channel receiving the job's in-container PID as
+        /// soon as the exec wrapper starts.
+        pid: Option<Sender<u32>>,
+    },
     /// All of them: the execution ends with its last process. Its stdin is
     /// watched: implementations send one [`StdinWatchSignal::Blocked`] each
     /// time a process of the command's tree starts waiting to read the stdin
@@ -25,7 +29,37 @@ pub enum ExecLifetime {
     Background {
         /// Where the stdin watch reports.
         stdin_blocked: Sender<StdinWatchSignal>,
+        /// Optional one-shot channel receiving the job's in-container PID as
+        /// soon as the exec wrapper starts.
+        pid: Option<Sender<u32>>,
     },
+}
+
+impl ExecLifetime {
+    /// Foreground lifetime that does not need the in-container PID reported.
+    #[must_use]
+    pub const fn foreground() -> Self {
+        Self::Foreground { pid: None }
+    }
+
+    /// Sends `reported` once when the caller supplied a PID channel.
+    pub async fn report_pid(&self, reported: u32) {
+        let tx = match self {
+            Self::Foreground { pid } | Self::Background { pid, .. } => pid.as_ref(),
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(reported).await;
+        }
+    }
+
+    /// Background lifetime watching `stdin_blocked` without a PID channel.
+    #[must_use]
+    pub const fn background(stdin_blocked: Sender<StdinWatchSignal>) -> Self {
+        Self::Background {
+            stdin_blocked,
+            pid: None,
+        }
+    }
 }
 
 /// Outcome of a container execution request.
@@ -428,7 +462,7 @@ impl ContainerProbe {
                 "/",
                 kill_rx,
                 stdin_rx,
-                ExecLifetime::Foreground,
+                ExecLifetime::foreground(),
             )
             .await
             .map_err(ContainerProbeError::Exec)?;

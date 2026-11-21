@@ -1949,7 +1949,7 @@ mod tests {
                 },
                 stderr: None,
                 outcome: CommandOutcome::Running {
-                    task_id: "t1".to_string(),
+                    pid: 4242,
                     output: file(),
                 },
                 interruptions: Vec::new(),

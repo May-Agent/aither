@@ -1,2 +1,2 @@
-{% for job in jobs %}  - task {{ job.task_id }} (pid {{ job.pid }}): `{{ job.script_preview }}` -> {% match job.output_path %}{% when Some with (path) %}{{ path }}{% when None %}(no output){% endmatch %}
+{% for job in jobs %}  - pid {{ job.pid }}: `{{ job.script_preview }}` -> {% match job.output_path %}{% when Some with (path) %}{{ path }}{% when None %}(no output){% endmatch %}
 {% endfor %}

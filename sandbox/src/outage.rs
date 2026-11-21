@@ -13,6 +13,8 @@ pub use enabled::Outages;
 mod disabled {
     use aither_core::llm::Interruption;
 
+    use crate::LaunchId;
+
     /// Without the `connectivity` feature nothing is recorded.
     #[derive(Clone)]
     pub struct Outages;
@@ -23,10 +25,10 @@ mod disabled {
         }
 
         #[allow(clippy::unused_self)]
-        pub const fn begin(&self, _task_id: &str) {}
+        pub const fn begin(&self, _launch: LaunchId) {}
 
         #[allow(clippy::unused_self)]
-        pub fn end(&self, _task_id: &str) -> std::future::Ready<Vec<Interruption>> {
+        pub fn end(&self, _launch: LaunchId) -> std::future::Ready<Vec<Interruption>> {
             std::future::ready(Vec::new())
         }
     }
@@ -44,13 +46,15 @@ mod enabled {
     use futures_lite::{StreamExt, future};
     use jiff::{Timestamp, tz::TimeZone};
 
+    use crate::LaunchId;
+
     enum Request {
         Begin {
-            task_id: String,
+            launch: LaunchId,
             at: Timestamp,
         },
         End {
-            task_id: String,
+            launch: LaunchId,
             at: Timestamp,
             reply: Sender<Vec<Interruption>>,
         },
@@ -81,10 +85,10 @@ mod enabled {
         }
 
         /// Starts recording for a command that is starting now.
-        pub fn begin(&self, task_id: &str) {
+        pub fn begin(&self, launch: LaunchId) {
             if let Some(requests) = &self.requests {
                 let _ = requests.try_send(Request::Begin {
-                    task_id: task_id.to_string(),
+                    launch,
                     at: Timestamp::now(),
                 });
             }
@@ -92,13 +96,13 @@ mod enabled {
 
         /// Stops recording for a command that ended now and returns the
         /// intervals it overlapped, oldest first.
-        pub async fn end(&self, task_id: &str) -> Vec<Interruption> {
+        pub async fn end(&self, launch: LaunchId) -> Vec<Interruption> {
             let Some(requests) = &self.requests else {
                 return Vec::new();
             };
             let (reply, answer) = async_channel::bounded(1);
             let request = Request::End {
-                task_id: task_id.to_string(),
+                launch,
                 at: Timestamp::now(),
                 reply,
             };
@@ -133,7 +137,7 @@ mod enabled {
     struct Recorder {
         sleeping_since: Option<Timestamp>,
         offline_since: Option<Timestamp>,
-        running: HashMap<String, Running>,
+        running: HashMap<LaunchId, Running>,
     }
 
     impl Recorder {
@@ -189,17 +193,17 @@ mod enabled {
 
         async fn handle(&mut self, request: Request) {
             match request {
-                Request::Begin { task_id, at } => {
+                Request::Begin { launch, at } => {
                     self.running.insert(
-                        task_id,
+                        launch,
                         Running {
                             started: at,
                             spans: Vec::new(),
                         },
                     );
                 }
-                Request::End { task_id, at, reply } => {
-                    let interruptions = self.finish(&task_id, at);
+                Request::End { launch, at, reply } => {
+                    let interruptions = self.finish(launch, at);
                     let _ = reply.send(interruptions).await;
                 }
             }
@@ -234,8 +238,8 @@ mod enabled {
 
         /// Closes the intervals still open at `at` and hands over the
         /// command's record.
-        fn finish(&mut self, task_id: &str, at: Timestamp) -> Vec<Interruption> {
-            let Some(mut running) = self.running.remove(task_id) else {
+        fn finish(&mut self, launch: LaunchId, at: Timestamp) -> Vec<Interruption> {
+            let Some(mut running) = self.running.remove(&launch) else {
                 return Vec::new();
             };
             if let Some(since) = self.sleeping_since {

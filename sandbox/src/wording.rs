@@ -16,11 +16,11 @@ use crate::job_registry::JobRead;
 use crate::monitor::MonitorRefusal;
 use crate::terminal::{TerminalError, TimeoutKill};
 
-/// A `monitor` call that started watching a task.
+/// A `monitor` call that started watching a background process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MonitorStarted<'a> {
-    /// The task the monitor watches.
-    pub task_id: &'a str,
+pub struct MonitorStarted {
+    /// Process ID of the job the monitor watches.
+    pub pid: u32,
     /// How often its new output is delivered, in seconds.
     pub interval_secs: u64,
 }
@@ -41,12 +41,10 @@ pub enum CallRefusal {
         /// The longest timeout the shell accepts.
         cap: std::time::Duration,
     },
-    /// A job control call names no task.
-    EmptyTaskId,
-    /// A job control call names a task the shell does not hold.
-    UnknownTask {
-        /// The task named.
-        task_id: String,
+    /// A job control call names a PID the shell does not hold.
+    UnknownJob {
+        /// Process ID named.
+        pid: u32,
     },
     /// A read asks for zero bytes.
     ZeroMaxBytes,
@@ -55,8 +53,8 @@ pub enum CallRefusal {
     /// the foreground window keeps the stdin it started with. Only a job
     /// started with `background` has a stdin pipe.
     NoStdin {
-        /// The task named.
-        task_id: String,
+        /// Process ID named.
+        pid: u32,
     },
 }
 
@@ -82,19 +80,9 @@ impl<'a> CommandKilled<'a> {
 
 /// Bytes written to a job's stdin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JobInputSent<'a> {
-    /// The job written to.
-    pub task_id: &'a str,
-}
-
-/// A kill of a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JobKillAsked<'a> {
-    /// The job asked to die.
-    pub task_id: &'a str,
-    /// Whether a running job was found and killed; `false` for an unknown
-    /// one or one that already stopped.
-    pub killed: bool,
+pub struct JobInputSent {
+    /// Process ID of the job written to.
+    pub pid: u32,
 }
 
 /// An output too large for the window, replaced by a preview and the file
@@ -176,8 +164,6 @@ pub struct RepeatedLines {
 /// One running job as [`ShellWording::running_jobs`] describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunningJob<'a> {
-    /// Model-facing task identifier.
-    pub task_id: &'a str,
     /// Process identifier at the job's execution place.
     pub pid: u32,
     /// Truncated preview of the job's script.
@@ -236,10 +222,7 @@ pub trait ShellWording: Send + Sync + 'static {
     fn job_read(&self, read: &JobRead) -> String;
 
     /// A job's stdin was written.
-    fn job_input(&self, sent: &JobInputSent<'_>) -> String;
-
-    /// A kill of a job was asked for.
-    fn job_kill(&self, kill: &JobKillAsked<'_>) -> String;
+    fn job_input(&self, sent: &JobInputSent) -> String;
 
     /// A call of a tool of the shell refused before it ran.
     fn call_refused(&self, refusal: &CallRefusal) -> String;
@@ -251,7 +234,7 @@ pub trait ShellWording: Send + Sync + 'static {
     fn monitor_refusal(&self, refusal: &MonitorRefusal) -> String;
 
     /// The result of a `monitor` call that started watching.
-    fn monitor_started(&self, started: &MonitorStarted<'_>) -> String;
+    fn monitor_started(&self, started: &MonitorStarted) -> String;
 
     /// Why a command was killed, appended to its result.
     fn command_killed(&self, killed: &CommandKilled<'_>) -> String;
