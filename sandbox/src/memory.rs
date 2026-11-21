@@ -959,8 +959,8 @@ impl JobMemory {
     ///
     /// Fails when the host or the registry cannot be read.
     pub async fn snapshot(&self) -> Result<MemorySnapshot, FootprintError> {
-        let running = self.running_at(JobPlace::Host).await;
-        let roots: Vec<u32> = running.iter().map(|job| job.host_pid).collect();
+        let running = self.jobs.list_host_running().await;
+        let roots: Vec<u32> = running.iter().map(|(_, host_pid)| *host_pid).collect();
         let (reader, registry) = (self.reader.clone(), self.registry.clone());
         let (footprints, physical_bytes, own_bytes, others) = blocking::unblock(move || {
             let footprints = reader.tree_footprints(&roots)?;
@@ -978,7 +978,7 @@ impl JobMemory {
         let mut jobs: Vec<JobFootprint> = running
             .into_iter()
             .zip(footprints)
-            .map(|(job, footprint_bytes)| JobFootprint {
+            .map(|((job, _), footprint_bytes)| JobFootprint {
                 command: job.script,
                 pid: job.pid,
                 footprint_bytes,
