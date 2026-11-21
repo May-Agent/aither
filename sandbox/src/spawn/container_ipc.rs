@@ -349,6 +349,134 @@ async fn connection(
 mod tests {
     use super::*;
 
+    /// A container executor for a runtime whose container never runs.
+    struct UnreachableExec;
+
+    impl crate::ContainerExec for UnreachableExec {
+        fn exec(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _lifetime: crate::ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("the test never execs".to_string()))
+        }
+
+        fn exec_streamed(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdout: Sender<Vec<u8>>,
+            _lifetime: crate::ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<crate::ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("the test never execs".to_string()))
+        }
+    }
+
+    /// An IPC command that answers with its marker and the working directory
+    /// it was handed, so a request that reached the live handler through the
+    /// mapped mount is unmistakable.
+    struct ProbeEchoCommand;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ProbeEchoArgs {
+        marker: String,
+    }
+
+    impl heel::IpcCommand for ProbeEchoCommand {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "probe_echo".into()
+        }
+
+        type Args = ProbeEchoArgs;
+        type Response = String;
+
+        fn handle(
+            &self,
+            args: Self::Args,
+            context: heel::IpcContext,
+        ) -> impl std::future::Future<Output = Result<Self::Response, heel::IpcError>> + Send
+        {
+            std::future::ready(Ok(format!(
+                "marker: {} in {}",
+                args.marker,
+                context.working_dir().display()
+            )))
+        }
+    }
+
+    /// A command shim the rendered prelude writes must reach the live
+    /// router: the `heel-shim` helper knows itself by its executable name's
+    /// file stem, so the token wrapper renames the binary only to a name
+    /// that keeps it. Renaming it `heel-shim-bin` made the helper read a
+    /// `heel-shim-bin.json` beside it instead of parsing its command line,
+    /// and every IPC command answered `I/O error: No such file or directory`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_prelude_shims_reach_the_router_through_the_real_heel_shim() {
+        let work_dir = tempfile::tempdir().expect("a workspace");
+        // The directory a shim reports is what `getcwd` answers: the
+        // resolved spelling, so the test's mount and working directory are
+        // canonical like everything `resolve_host_working_dir` compares.
+        let work = dunce::canonicalize(work_dir.path()).expect("the workspace resolves");
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        let runtime = crate::ContainerShellRuntime::new(
+            "aither-test-ipc-shim",
+            crate::HostRoute::new("127.0.0.1", loopback).expect("loopback is routable"),
+            crate::AnyContainerExec::new(Arc::new(UnreachableExec)),
+        )
+        .with_workspace_mount(crate::MountRoot::new(
+            work.clone(),
+            ContainerPath::new(work.to_str().expect("the workspace is UTF-8"))
+                .expect("the workspace is absolute"),
+        ));
+        let router = heel::IpcRouter::new().register(ProbeEchoCommand);
+        let executor = Arc::new(AnyExecutor::new(executor_core::tokio::TokioGlobal));
+        let bridge = ContainerIpc::serve(&executor, router, &runtime).expect("the bridge serves");
+
+        // The prelude is what an exec's shell runs before the script, so
+        // running it under `sh` with a real `heel` exercises the shims it
+        // writes exactly as a container does.
+        let heel = crate::test_heel::binary().await.expect("a test heel");
+        let heel_dir = heel
+            .as_path()
+            .parent()
+            .expect("the heel binary has a directory")
+            .to_path_buf();
+        let path = std::env::join_paths(std::iter::once(heel_dir).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .expect("the PATH joins");
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "{}\nprobe_echo --marker reached",
+                bridge.setup.script
+            ))
+            .current_dir(&work)
+            .env("PATH", path)
+            .output()
+            .expect("the prelude script runs");
+        bridge.stop().await;
+        assert!(
+            output.status.success(),
+            "the shim should reach the router: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("marker: reached in {}\n", work.display())
+        );
+    }
+
     /// A symlink inside the workspace whose target does not exist still
     /// reads as absent, but a later command would write through it outside
     /// the mount: it is rejected.

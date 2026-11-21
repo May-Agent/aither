@@ -5,12 +5,15 @@ cleanup(){ local __aither_ipc_status=$?; wait >/dev/null 2>&1 || true; rm -rf "$
 trap cleanup EXIT;
 "$AITHER_IPC_BIN" shims --dir "$AITHER_IPC_DIR" --commands {{ escaped_commands }} || exit $?;
 if [ -f "$AITHER_IPC_DIR/heel-shim" ]; then
-mv "$AITHER_IPC_DIR/heel-shim" "$AITHER_IPC_DIR/heel-shim-bin" || exit $?;
+# `heel-shim` knows itself by executable name and reads "<name>.json" beside
+# any other one: the real binary is renamed so this script can take its place,
+# and the name it moves to must keep the "heel-shim" file stem.
+mv "$AITHER_IPC_DIR/heel-shim" "$AITHER_IPC_DIR/heel-shim.bin" || exit $?;
 cat <<'__AITHER_IPC_SHIM__' > "$AITHER_IPC_DIR/heel-shim" || exit $?;
 #!/bin/sh
 __aither_cmd="$1"
 shift
-exec "${0%/*}/heel-shim-bin" "{{ ipc_token }}:$__aither_cmd" "$@"
+exec "${0%/*}/heel-shim.bin" "{{ ipc_token }}:$__aither_cmd" "$@"
 __AITHER_IPC_SHIM__
 chmod 0700 "$AITHER_IPC_DIR/heel-shim" || exit $?;
 fi;
