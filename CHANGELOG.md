@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/v0.31.0...v0.32.0) - 2026-11-21
+
+### Added
+
+- *(acp)* [**breaking**] redesign as a dual-stack v1/v2 API
+
+### Fixed
+
+- *(sandbox)* fail closed on canonicalize errors and dangling symlinks in container IPC working dir
+- *(mcp,acp,rag)* drain oversized frames, own embed batch inputs, restore docs
+- *(sandbox,tools,cli)* complete approval gating and job lifecycle hardening
+- *(acp,mem0)* harden acp rpc and prompt rendering
+- *(core,derive)* fix schema/macro correctness, feature gates, token counting, and command rendering
+
+### Other
+
+- Pass only fixed_grants to macOS SandboxConfig::grants
+- Merge remote-tracking branch 'origin/main' into feat/816-pid-jobs
+- Expose real PIDs for jobs and enforce signal isolation in heel
+- Replace anyhow with typed errors across the workspace
+- Merge remote-tracking branch 'origin/main' into fix/793-sandbox-tools
+- Merge remote-tracking branch 'origin/main' into fix/788-core-derive
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/v0.30.0...v0.31.0) - 2026-11-13
 
 ### Added

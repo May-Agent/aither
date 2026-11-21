@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/cloud-v0.31.0...cloud-v0.32.0) - 2026-11-21
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+- Make CodexCredentials::refresh_token an Option<String>
+- Harden cloud and local provider streaming, auth, and error handling
+
 ## [0.25.0](https://github.com/May-Agent/aither/compare/cloud-v0.24.0...cloud-v0.25.0) - 2026-11-08
 
 ### Added

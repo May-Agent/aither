@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/websearch-v0.31.0...websearch-v0.32.0) - 2026-11-21
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/websearch-v0.30.0...websearch-v0.31.0) - 2026-11-13
 
 ### Added
