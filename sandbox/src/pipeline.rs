@@ -14,10 +14,13 @@ use std::time::{Duration, Instant};
 use askama::Template;
 use brush_parser::ast::{
     AndOr, AndOrList, Command, CommandPrefixOrSuffixItem, CompoundList, IoRedirect, Pipeline,
-    SeparatorOperator, SimpleCommand,
+    SeparatorOperator, SimpleCommand, SourceLocation,
 };
 use brush_parser::word::{WordPiece, WordPieceWithSource};
-use brush_parser::{Parser, ParserOptions, SourceInfo};
+use brush_parser::{
+    ParserOptions, SourceInfo, Token, TokenLocation, TokenizerOptions, parse_tokens,
+    tokenize_str_with_options,
+};
 use serde::Serialize;
 
 use crate::job_registry::JobStatus;
@@ -328,194 +331,380 @@ pub fn instrument_script(
     planner: &AnyPlanPipelines,
     check: &ScriptCheck<'_>,
 ) -> Result<Option<InstrumentedScript>, TerminalError> {
-    let Ok(program) = Parser::new(
-        check.script.as_bytes(),
-        &ParserOptions::default(),
-        &SourceInfo::default(),
-    )
-    .parse_program() else {
+    let Ok(tokens) = tokenize_str_with_options(check.script, &TokenizerOptions::default()) else {
+        return Ok(None);
+    };
+    let Ok(program) = parse_tokens(&tokens, &ParserOptions::default(), &SourceInfo::default())
+    else {
         return Ok(None);
     };
 
-    let mut sidecar_pipelines = Vec::new();
-    let mut stage_commands = Vec::new();
-    let mut rendered_lists = Vec::new();
-    let mut any_tapped = false;
+    let char_to_byte: Vec<usize> = check
+        .script
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(check.script.len()))
+        .collect();
+
+    let mut collector = SpliceCollector {
+        planner,
+        check,
+        tokens: &tokens,
+        char_to_byte: &char_to_byte,
+        sidecar_pipelines: Vec::new(),
+        stage_commands: Vec::new(),
+        splices: Vec::new(),
+    };
 
     for list in &program.complete_commands {
-        let rendered = rewrite_compound_list(
-            list,
-            planner,
-            check,
-            &mut sidecar_pipelines,
-            &mut stage_commands,
-            &mut any_tapped,
-        );
-        if !rendered.is_empty() {
-            rendered_lists.push(rendered);
-        }
+        collector.collect_compound_list(list);
     }
 
-    if !any_tapped {
+    if collector.splices.is_empty() {
         return Ok(None);
     }
+
+    let mut rewritten_script = String::with_capacity(check.script.len() + 128);
+    let mut cursor = 0usize;
+    for (start, end, replacement) in collector.splices {
+        if start < cursor || end > check.script.len() || start > end {
+            return Ok(None);
+        }
+        rewritten_script.push_str(check.script.get(cursor..start).ok_or_else(|| {
+            TerminalError::Execution("invalid UTF-8 boundary before pipeline span".to_owned())
+        })?);
+        rewritten_script.push_str(&replacement);
+        cursor = end;
+    }
+    rewritten_script.push_str(check.script.get(cursor..).ok_or_else(|| {
+        TerminalError::Execution("invalid UTF-8 boundary after pipeline span".to_owned())
+    })?);
 
     let mut magic = [0_u8; 8];
     getrandom::fill(&mut magic)
         .map_err(|error| TerminalError::Execution(format!("cannot generate tap token: {error}")))?;
-    let spec_json = serde_json::to_string(&sidecar_pipelines).map_err(|error| {
+    let spec_json = serde_json::to_string(&collector.sidecar_pipelines).map_err(|error| {
         TerminalError::Execution(format!("cannot serialize pipeline spec: {error}"))
     })?;
 
     Ok(Some(InstrumentedScript {
         magic,
-        rewritten_script: rendered_lists.join("\n"),
+        rewritten_script,
         spec_json,
-        stage_commands,
+        stage_commands: collector.stage_commands,
     }))
 }
 
-fn rewrite_compound_list(
-    list: &CompoundList,
-    planner: &AnyPlanPipelines,
-    check: &ScriptCheck<'_>,
-    sidecar_pipelines: &mut Vec<SidecarPipelineSpec>,
-    stage_commands: &mut Vec<String>,
-    any_tapped: &mut bool,
-) -> String {
-    let mut out = String::new();
-    for (idx, item) in list.0.iter().enumerate() {
-        if idx > 0 {
-            out.push(' ');
-        }
-        if matches!(item.1, SeparatorOperator::Async) {
-            out.push_str(&item.0.to_string());
-            out.push_str(" &");
-        } else {
-            out.push_str(&rewrite_and_or(
-                &item.0,
-                planner,
-                check,
-                sidecar_pipelines,
-                stage_commands,
-                any_tapped,
-            ));
-            out.push(';');
-        }
+const fn token_location(token: &Token) -> &TokenLocation {
+    match token {
+        Token::Operator(_, loc) | Token::Word(_, loc) => loc,
     }
-    out
 }
 
-fn rewrite_and_or(
-    list: &AndOrList,
-    planner: &AnyPlanPipelines,
-    check: &ScriptCheck<'_>,
-    sidecar_pipelines: &mut Vec<SidecarPipelineSpec>,
-    stage_commands: &mut Vec<String>,
-    any_tapped: &mut bool,
-) -> String {
-    let mut out = rewrite_pipeline(
-        &list.first,
-        planner,
-        check,
-        sidecar_pipelines,
-        stage_commands,
-        any_tapped,
-    );
-    for next in &list.additional {
-        match next {
-            AndOr::And(pipeline) => {
-                out.push_str(" && ");
-                out.push_str(&rewrite_pipeline(
-                    pipeline,
-                    planner,
-                    check,
-                    sidecar_pipelines,
-                    stage_commands,
-                    any_tapped,
-                ));
-            }
-            AndOr::Or(pipeline) => {
-                out.push_str(" || ");
-                out.push_str(&rewrite_pipeline(
-                    pipeline,
-                    planner,
-                    check,
-                    sidecar_pipelines,
-                    stage_commands,
-                    any_tapped,
-                ));
-            }
-        }
-    }
-    out
+fn span_byte_range(char_to_byte: &[usize], loc: &TokenLocation) -> Option<(usize, usize)> {
+    let start = *char_to_byte.get(loc.start.index)?;
+    let end = *char_to_byte.get(loc.end.index)?;
+    (start <= end).then_some((start, end))
 }
 
-fn rewrite_pipeline(
-    pipeline: &Pipeline,
-    planner: &AnyPlanPipelines,
-    check: &ScriptCheck<'_>,
-    sidecar_pipelines: &mut Vec<SidecarPipelineSpec>,
-    stage_commands: &mut Vec<String>,
-    any_tapped: &mut bool,
-) -> String {
-    if pipeline.bang
-        || pipeline.timed.is_some()
-        || pipeline.seq.len() < 2
-        || pipeline.seq.iter().any(command_has_heredoc)
-    {
-        return pipeline.to_string();
+fn command_anchor_char(command: &Command) -> Option<usize> {
+    if let Some(loc) = command.location() {
+        return Some(loc.start.index);
     }
-
-    let syntax: Vec<StageSyntax> = pipeline
-        .seq
-        .iter()
-        .enumerate()
-        .map(|(step, cmd)| stage_syntax(step, cmd))
-        .collect();
-
-    let Some(directives) = planner.plan_pipeline(check, &syntax) else {
-        return pipeline.to_string();
+    let Command::Simple(simple) = command else {
+        return None;
     };
-    if directives.len() != pipeline.seq.len() || sidecar_pipelines.len() >= 32 {
-        return pipeline.to_string();
-    }
-
-    let p_idx = sidecar_pipelines.len();
-    let mut stage_specs = Vec::with_capacity(directives.len());
-    let mut wrapped_stages = Vec::with_capacity(directives.len());
-
-    for (k_idx, (cmd, directive)) in pipeline.seq.iter().zip(directives).enumerate() {
-        if stage_commands.len() >= usize::from(u8::MAX) {
-            return pipeline.to_string();
-        }
-        let injection = directive.injected_color.filter(|inj| !inj.is_empty());
-        let env_src = injection
-            .as_ref()
-            .map_or_else(String::new, |inj| render_stage_env(&inj.env));
-        let cmd_src = match (&injection, cmd) {
-            (Some(inj), Command::Simple(simple)) if !inj.flags.is_empty() => {
-                render_simple_with_flags(simple, &inj.flags)
+    simple
+        .prefix
+        .iter()
+        .flat_map(|p| &p.0)
+        .chain(simple.suffix.iter().flat_map(|s| &s.0))
+        .find_map(|item| match item {
+            CommandPrefixOrSuffixItem::Word(w) => w.location().map(|l| l.start.index),
+            CommandPrefixOrSuffixItem::AssignmentWord(a, _) => Some(a.loc.start.index),
+            CommandPrefixOrSuffixItem::ProcessSubstitution(_, sub) => {
+                sub.location().map(|l| l.start.index)
             }
-            _ => cmd.to_string(),
-        };
-        stage_specs.push(SidecarStageSpec {
-            injected: injection.is_some(),
-            line_slicer: directive.line_slicer,
-        });
-        stage_commands.push(directive.command);
-        wrapped_stages.push(format!(
-            "__aither_stage {p_idx} {k_idx} {} {}",
-            shell_escape(&env_src),
-            shell_escape(&cmd_src),
-        ));
+            CommandPrefixOrSuffixItem::IoRedirect(_) => None,
+        })
+}
+
+fn collect_nested_char_spans(command: &Command, out: &mut Vec<(usize, usize)>) {
+    match command {
+        Command::Simple(simple) => {
+            for item in simple
+                .prefix
+                .iter()
+                .flat_map(|p| &p.0)
+                .chain(simple.suffix.iter().flat_map(|s| &s.0))
+            {
+                if let CommandPrefixOrSuffixItem::ProcessSubstitution(_, sub) = item
+                    && let Some(loc) = sub.location()
+                {
+                    out.push((loc.start.index, loc.end.index));
+                }
+            }
+        }
+        Command::Compound(compound, _) => {
+            if let Some(loc) = compound.location() {
+                out.push((loc.start.index, loc.end.index));
+            }
+        }
+        Command::Function(func) => {
+            if let Some(loc) = func.location() {
+                out.push((loc.start.index, loc.end.index));
+            }
+        }
+        Command::ExtendedTest(expr) => {
+            if let Some(loc) = expr.location() {
+                out.push((loc.start.index, loc.end.index));
+            }
+        }
+    }
+}
+
+fn is_pipeline_boundary_op(op: &str) -> bool {
+    matches!(op, "\n" | ";" | "&" | "&&" | "||" | "(" | ")")
+}
+
+struct PipelineByteSpans {
+    span: (usize, usize),
+    stages: Vec<(usize, usize)>,
+}
+
+/// Resolves the exact `(start_byte, end_byte)` of `pipeline` and of each stage
+/// in `pipeline.seq` directly from `tokens`, including trailing I/O redirects
+/// (`> file`, `2>&1`) whose AST nodes omit `SourceLocation` in `brush-parser`.
+fn resolve_pipeline_byte_spans(
+    pipeline: &Pipeline,
+    tokens: &[Token],
+    char_to_byte: &[usize],
+) -> Option<PipelineByteSpans> {
+    let first_anchor = command_anchor_char(pipeline.seq.first()?)?;
+    let last_anchor = command_anchor_char(pipeline.seq.last()?)?;
+    let mut nested = Vec::new();
+    for cmd in &pipeline.seq {
+        collect_nested_char_spans(cmd, &mut nested);
+    }
+    let inside_nested = |loc: &TokenLocation| {
+        nested
+            .iter()
+            .any(|&(ns, ne)| loc.start.index >= ns && loc.end.index <= ne)
+    };
+
+    let first_tok_idx = tokens.iter().position(|tok| {
+        let loc = token_location(tok);
+        loc.start.index <= first_anchor && first_anchor < loc.end.index.max(loc.start.index + 1)
+    })?;
+    let last_tok_idx = tokens.iter().rposition(|tok| {
+        let loc = token_location(tok);
+        loc.start.index <= last_anchor && last_anchor < loc.end.index.max(loc.start.index + 1)
+    })?;
+    if first_tok_idx > last_tok_idx {
+        return None;
     }
 
-    sidecar_pipelines.push(SidecarPipelineSpec {
-        stages: stage_specs,
-    });
-    *any_tapped = true;
-    wrapped_stages.join(" | ")
+    let mut start_idx = first_tok_idx;
+    while start_idx > 0 {
+        let prev = &tokens[start_idx - 1];
+        let loc = token_location(prev);
+        if !inside_nested(loc)
+            && let Token::Operator(op, _) = prev
+            && is_pipeline_boundary_op(op)
+        {
+            break;
+        }
+        start_idx -= 1;
+    }
+
+    let mut end_idx = last_tok_idx;
+    while end_idx + 1 < tokens.len() {
+        let next = &tokens[end_idx + 1];
+        let loc = token_location(next);
+        if !inside_nested(loc)
+            && let Token::Operator(op, _) = next
+            && is_pipeline_boundary_op(op)
+        {
+            break;
+        }
+        end_idx += 1;
+    }
+
+    let mut stage_token_ranges = Vec::with_capacity(pipeline.seq.len());
+    let mut cur_stage_start = start_idx;
+    let mut idx = start_idx;
+    while idx <= end_idx {
+        let tok = &tokens[idx];
+        let loc = token_location(tok);
+        if !inside_nested(loc)
+            && let Token::Operator(op, _) = tok
+        {
+            if op == "|&" {
+                return None;
+            }
+            if op == "|" {
+                if cur_stage_start >= idx {
+                    return None;
+                }
+                stage_token_ranges.push((cur_stage_start, idx - 1));
+                cur_stage_start = idx + 1;
+            }
+        }
+        idx += 1;
+    }
+    if cur_stage_start > end_idx {
+        return None;
+    }
+    stage_token_ranges.push((cur_stage_start, end_idx));
+    if stage_token_ranges.len() != pipeline.seq.len() {
+        return None;
+    }
+
+    let mut stage_bytes = Vec::with_capacity(stage_token_ranges.len());
+    for (s_tok, e_tok) in stage_token_ranges {
+        let (s_byte, _) = span_byte_range(char_to_byte, token_location(&tokens[s_tok]))?;
+        let (_, e_byte) = span_byte_range(char_to_byte, token_location(&tokens[e_tok]))?;
+        if s_byte > e_byte {
+            return None;
+        }
+        stage_bytes.push((s_byte, e_byte));
+    }
+    let pipe_span = (stage_bytes.first()?.0, stage_bytes.last()?.1);
+    Some(PipelineByteSpans {
+        span: pipe_span,
+        stages: stage_bytes,
+    })
+}
+
+struct SpliceCollector<'a, 's> {
+    planner: &'a AnyPlanPipelines,
+    check: &'a ScriptCheck<'s>,
+    tokens: &'a [Token],
+    char_to_byte: &'a [usize],
+    sidecar_pipelines: Vec<SidecarPipelineSpec>,
+    stage_commands: Vec<String>,
+    splices: Vec<(usize, usize, String)>,
+}
+
+impl SpliceCollector<'_, '_> {
+    fn collect_compound_list(&mut self, list: &CompoundList) {
+        for item in &list.0 {
+            if !matches!(item.1, SeparatorOperator::Async) {
+                self.collect_and_or(&item.0);
+            }
+        }
+    }
+
+    fn collect_and_or(&mut self, list: &AndOrList) {
+        if let Some(splice) = self.plan_pipeline_splice(&list.first) {
+            self.splices.push(splice);
+        }
+        for next in &list.additional {
+            let (AndOr::And(pipeline) | AndOr::Or(pipeline)) = next;
+            if let Some(splice) = self.plan_pipeline_splice(pipeline) {
+                self.splices.push(splice);
+            }
+        }
+    }
+
+    fn plan_pipeline_splice(&mut self, pipeline: &Pipeline) -> Option<(usize, usize, String)> {
+        if pipeline.bang
+            || pipeline.timed.is_some()
+            || pipeline.seq.len() < 2
+            || pipeline.seq.iter().any(command_has_heredoc)
+        {
+            return None;
+        }
+
+        let PipelineByteSpans {
+            span: (pipe_start, pipe_end),
+            stages: stage_bytes,
+        } = resolve_pipeline_byte_spans(pipeline, self.tokens, self.char_to_byte)?;
+
+        let mut syntax = Vec::with_capacity(pipeline.seq.len());
+        for (step, (cmd, &(s_byte, e_byte))) in pipeline.seq.iter().zip(&stage_bytes).enumerate() {
+            let raw_stage = self.check.script.get(s_byte..e_byte)?;
+            syntax.push(stage_syntax(step, cmd, raw_stage));
+        }
+
+        let directives = self.planner.plan_pipeline(self.check, &syntax)?;
+        if directives.len() != pipeline.seq.len() || self.sidecar_pipelines.len() >= 32 {
+            return None;
+        }
+        if self.stage_commands.len().saturating_add(directives.len()) > usize::from(u8::MAX) {
+            return None;
+        }
+
+        let p_idx = self.sidecar_pipelines.len();
+        let mut stage_specs = Vec::with_capacity(directives.len());
+        let mut wrapped_stages = Vec::with_capacity(directives.len());
+
+        for (k_idx, ((cmd, &(s_byte, e_byte)), directive)) in pipeline
+            .seq
+            .iter()
+            .zip(&stage_bytes)
+            .zip(directives)
+            .enumerate()
+        {
+            let injection = directive.injected_color.filter(|inj| !inj.is_empty());
+            let env_src = injection
+                .as_ref()
+                .map_or_else(String::new, |inj| render_stage_env(&inj.env));
+            let raw_cmd = self.check.script.get(s_byte..e_byte)?;
+            let cmd_src = match (&injection, cmd) {
+                (Some(inj), Command::Simple(simple)) if !inj.flags.is_empty() => {
+                    splice_simple_flags(
+                        self.check.script,
+                        self.char_to_byte,
+                        (s_byte, e_byte),
+                        simple,
+                        &inj.flags,
+                    )
+                    .unwrap_or_else(|| render_simple_with_flags(simple, &inj.flags))
+                }
+                _ => raw_cmd.to_owned(),
+            };
+            stage_specs.push(SidecarStageSpec {
+                injected: injection.is_some(),
+                line_slicer: directive.line_slicer,
+            });
+            self.stage_commands.push(directive.command);
+            wrapped_stages.push(format!(
+                "__aither_stage {p_idx} {k_idx} {} {}",
+                shell_escape(&env_src),
+                shell_escape(&cmd_src),
+            ));
+        }
+
+        self.sidecar_pipelines.push(SidecarPipelineSpec {
+            stages: stage_specs,
+        });
+        Some((pipe_start, pipe_end, wrapped_stages.join(" | ")))
+    }
+}
+
+fn splice_simple_flags(
+    script: &str,
+    char_to_byte: &[usize],
+    (cmd_start, cmd_end): (usize, usize),
+    simple: &SimpleCommand,
+    flags: &[String],
+) -> Option<String> {
+    let prog_loc = simple.word_or_name.as_ref()?.location()?;
+    let (_, prog_end) = span_byte_range(char_to_byte, &prog_loc)?;
+    if prog_end < cmd_start || prog_end > cmd_end {
+        return None;
+    }
+    let head = script.get(cmd_start..prog_end)?;
+    let tail = script.get(prog_end..cmd_end)?;
+    let mut out = String::with_capacity((cmd_end - cmd_start) + 32);
+    out.push_str(head);
+    for flag in flags {
+        out.push(' ');
+        out.push_str(&shell_escape(flag));
+    }
+    out.push_str(tail);
+    Some(out)
 }
 
 fn render_stage_env(env: &[(String, String)]) -> String {
@@ -582,8 +771,8 @@ fn command_has_heredoc(command: &Command) -> bool {
     }
 }
 
-fn stage_syntax(step: usize, command: &Command) -> StageSyntax {
-    let source = command.to_string();
+fn stage_syntax(step: usize, command: &Command, raw_source: &str) -> StageSyntax {
+    let source = raw_source.to_owned();
     let Command::Simple(simple) = command else {
         return StageSyntax {
             step,
@@ -1344,6 +1533,49 @@ mod tests {
                 expired_refusal.reason(),
                 &CallRefusal::ExpiredJob { pid: pid2 }
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn preserves_heredocs_ansi_c_quotes_cjk_and_async_commands_around_pipelines() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().canonicalize().expect("canonicalize");
+            let shell = build_shell(&dir, test_budgets::limits()).await;
+            let script = "\
+set -eu
+cat <<'PATCH' > patch.txt
+*** Begin Patch
++你好 こんにちは 안녕하세요
+*** End Patch
+PATCH
+printf 'bg-ok\\n' > bg.txt &
+bg_pid=$!
+wait \"$bg_pid\"
+line=$'first\\nsecond'
+line=${line%%$'\\n'*}
+printf '%s\\n' \"$line\" | tr 'a-z' 'A-Z' > piped.txt
+cat <<'PATCH' >> patch.txt
+*** Second
+PATCH
+(cd . && cat piped.txt) | cat
+cat patch.txt
+";
+            let res = shell
+                .call(shell_args(script, false, false), ToolContext::new())
+                .await
+                .expect("mixed heredoc and pipeline script succeeds");
+            let cmd = res.command().expect("command result");
+            assert_eq!(
+                cmd.outcome,
+                aither_core::llm::CommandOutcome::Exited { code: 0 },
+                "{cmd:?}"
+            );
+            let text = match &cmd.stdout {
+                CommandStream::Inline { text } => text.as_str(),
+                other => panic!("expected inline stdout, got {other:?}"),
+            };
+            assert!(text.contains("FIRST"), "{text}");
+            assert!(text.contains("你好 こんにちは 안녕하세요"), "{text}");
+            assert!(text.contains("*** Second"), "{text}");
         }
     }
 }
