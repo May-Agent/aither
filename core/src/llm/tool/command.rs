@@ -129,6 +129,14 @@ pub struct CommandResult {
     pub stderr: Option<CommandStream>,
     /// How the run ended.
     pub outcome: CommandOutcome,
+    /// Process identifier whose upstream pipeline stage outputs remain
+    /// inspectable after a foreground run completed, when at least one
+    /// non-final stage met the retention threshold.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub retained_pid: Option<u32>,
     /// Spans of the run during which the machine was asleep or offline.
     #[cfg_attr(
         feature = "serde",
@@ -182,6 +190,14 @@ pub trait CommandWording: Send + Sync {
             .expect("command outcome template must render")
     }
 
+    /// Renders the minimal PID trailer appended when a completed foreground
+    /// pipeline retained upstream stage output (`PID: <pid>.\n` by default).
+    fn retained_pid(&self, pid: u32) -> String {
+        RetainedPidTemplate { pid }
+            .render()
+            .expect("retained pid template must render")
+    }
+
     /// Renders `interruptions` appended after the outcome.
     fn interruptions(&self, interruptions: &[Interruption]) -> String {
         render_interruptions(interruptions)
@@ -224,12 +240,19 @@ struct CommandOutcomeTemplate<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "retained_pid.txt", escape = "none")]
+struct RetainedPidTemplate {
+    pid: u32,
+}
+
+#[derive(Template)]
 #[template(path = "command_result.txt", escape = "none")]
 struct CommandResultTemplate<'a> {
     empty: &'a str,
     stdout: &'a str,
     stderr: Option<&'a str>,
     outcome: &'a str,
+    retained_pid: &'a str,
     interruptions: &'a str,
 }
 
@@ -317,12 +340,17 @@ impl CommandResult {
             String::new()
         };
         let outcome = wording.outcome(&self.outcome);
+        let retained_pid = match (&self.outcome, self.retained_pid) {
+            (CommandOutcome::Exited { .. }, Some(pid)) => wording.retained_pid(pid),
+            _ => String::new(),
+        };
         let interruptions = wording.interruptions(&self.interruptions);
         CommandResultTemplate {
             empty: &empty,
             stdout: &stdout,
             stderr: stderr.as_deref(),
             outcome: &outcome,
+            retained_pid: &retained_pid,
             interruptions: &interruptions,
         }
         .render()
@@ -353,6 +381,7 @@ mod tests {
             stdout,
             stderr,
             outcome,
+            retained_pid: None,
             interruptions: Vec::new(),
         }
         .render_for_model()
@@ -440,6 +469,7 @@ mod tests {
             },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 7 },
+            retained_pid: None,
             interruptions: Vec::new(),
         };
         assert_eq!(
@@ -457,6 +487,7 @@ mod tests {
             },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 0 },
+            retained_pid: None,
             interruptions: Vec::new(),
         };
         let value = serde_json::to_value(&command).expect("serializes");
@@ -464,6 +495,10 @@ mod tests {
         assert!(
             !obj.contains_key("stderr"),
             "None stderr must be omitted: {value}"
+        );
+        assert!(
+            !obj.contains_key("retained_pid"),
+            "None retained_pid must be omitted: {value}"
         );
         assert!(
             !obj.contains_key("interruptions"),
@@ -480,6 +515,7 @@ mod tests {
                 text: "warn\n".to_string(),
             }),
             outcome: CommandOutcome::Exited { code: 1 },
+            retained_pid: Some(48210),
             interruptions: alloc::vec![Interruption {
                 cause: InterruptionCause::Offline,
                 from: "10:00:00".to_string(),
@@ -489,6 +525,7 @@ mod tests {
         let value = serde_json::to_value(&with_fields).expect("serializes");
         let obj = value.as_object().expect("object");
         assert!(obj.contains_key("stderr"));
+        assert_eq!(obj.get("retained_pid"), Some(&serde_json::json!(48210)));
         assert!(obj.contains_key("interruptions"));
         let decoded: CommandResult = serde_json::from_value(value).expect("deserializes");
         assert_eq!(decoded, with_fields);
@@ -532,6 +569,7 @@ mod tests {
             },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 1 },
+            retained_pid: None,
             interruptions: alloc::vec![
                 Interruption {
                     cause: InterruptionCause::Asleep,
@@ -548,6 +586,40 @@ mod tests {
         assert_eq!(
             command.render_for_model(),
             "out\nExit code: 1.\nThe machine was asleep from 14:02:11 to 14:31:40 while this ran.\nThe network was offline from 14:31:40 to 14:32:05 while this ran.\n"
+        );
+    }
+
+    #[test]
+    fn retained_pid_renders_only_for_completed_foreground_runs() {
+        let exited = CommandResult {
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 1 },
+            retained_pid: Some(48210),
+            interruptions: Vec::new(),
+        };
+        assert_eq!(
+            exited.render_for_model(),
+            "(no output)\nExit code: 1.\nPID: 48210.\n"
+        );
+
+        let running = CommandResult {
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Running {
+                pid: 48210,
+                output: file(),
+            },
+            retained_pid: Some(48210),
+            interruptions: Vec::new(),
+        };
+        assert_eq!(
+            running.render_for_model(),
+            "Started in background with PID 48210; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt).\n"
         );
     }
 }

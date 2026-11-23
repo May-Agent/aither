@@ -55,6 +55,16 @@ pub fn folded_code_content(
     Some(wording.folded_code(folded.trim_end_matches('\n')))
 }
 
+/// Renders terminal escape sequences and `\r` overwrites on raw UTF-8/lossy
+/// bytes, returning cleaned plain-text UTF-8 bytes.
+#[must_use]
+pub fn render_terminal_bytes(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    render::render_terminal(&String::from_utf8_lossy(bytes)).into_bytes()
+}
+
 /// Cleans foreground terminal text for the model under `treatment`.
 ///
 /// Returns `None` when no stage changed the text, so the caller can keep the

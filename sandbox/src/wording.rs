@@ -46,6 +46,21 @@ pub enum CallRefusal {
         /// Process ID named.
         pid: u32,
     },
+    /// A read names a PID whose retained pipeline stage outputs expired and
+    /// were deleted.
+    ExpiredJob {
+        /// Process ID named.
+        pid: u32,
+    },
+    /// A stage read names a step index that is not retained on `pid`.
+    InvalidPipelineStep {
+        /// Process ID named.
+        pid: u32,
+        /// Requested `0`-based pipeline stage index.
+        step: usize,
+        /// Retained `0`-based stage indices available on `pid`.
+        kept_steps: Vec<usize>,
+    },
     /// A read asks for zero bytes.
     ZeroMaxBytes,
     /// An input names a job that reads no input: it was started in the

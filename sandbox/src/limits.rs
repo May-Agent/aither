@@ -55,6 +55,13 @@ pub struct ShellLimits {
     pub subagent_import: ImportBudget,
     /// How long the agent has to act on a final memory warning.
     pub response_window: ResponseWindow,
+    /// Minimum own active duration a pipeline stage must reach to retain its
+    /// output after exit (and after which a foreground pipeline surfaces live
+    /// stage progress).
+    pub pipeline_record_after: LiveDuration,
+    /// How long retained pipeline stage outputs remain readable after a
+    /// command finishes before intermediate buffers are deleted.
+    pub pipeline_retention: LiveDuration,
 }
 
 #[cfg(any(test, feature = "test-budgets"))]
@@ -71,6 +78,8 @@ pub mod fixture {
             long_job_alert: LiveDuration::new(Duration::from_mins(40)),
             subagent_import: ImportBudget::new(1024 * 1024 * 1024),
             response_window: ResponseWindow::new(Duration::from_secs(120)),
+            pipeline_record_after: LiveDuration::new(Duration::from_secs(3)),
+            pipeline_retention: LiveDuration::new(Duration::from_mins(15)),
         }
     }
 }
