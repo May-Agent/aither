@@ -479,6 +479,11 @@ struct TerminalLimits {
     /// How long the agent has to act on a final memory warning; adjustable
     /// at runtime and shared with every terminal derived from this one.
     response_window: ResponseWindow,
+    /// Minimum own active duration a pipeline stage must reach to retain its
+    /// output after exit.
+    pipeline_record_after: LiveDuration,
+    /// How long retained pipeline stage outputs remain readable after exit.
+    pipeline_retention: LiveDuration,
     /// Reads what the terminal's jobs hold of the machine's memory.
     footprints: AnyFootprintReader,
     /// Shares the total the agent's jobs hold with the machine's other
@@ -490,6 +495,8 @@ impl TerminalLimits {
     fn new(limits: ShellLimits) -> Self {
         Self {
             response_window: limits.response_window,
+            pipeline_record_after: limits.pipeline_record_after,
+            pipeline_retention: limits.pipeline_retention,
             footprints: AnyFootprintReader::new(SystemFootprints),
             footprint_registry: None,
             foreground_wait: limits.foreground_wait,
@@ -886,6 +893,8 @@ pub struct Shell<E> {
     /// shell derived from this one; without it every output is command
     /// output.
     treat_output: Option<crate::output_treatment::AnyTreatOutput>,
+    /// Chooses which multi-stage shell pipelines are tapped per stage.
+    plan_pipelines: Option<crate::pipeline::AnyPlanPipelines>,
     /// The commands the embedder serves to this shell's scripts, shared with
     /// every subagent shell derived from this one.
     ipc: Option<crate::AnyIpcProvider>,
@@ -929,6 +938,7 @@ impl<E: Clone> Clone for Shell<E> {
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.clone(),
             treat_output: self.treat_output.clone(),
+            plan_pipelines: self.plan_pipelines.clone(),
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: self.launches.clone(),
@@ -1048,10 +1058,16 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         .await?;
 
         // Start job registry service
+        let limits = TerminalLimits::new(parts.limits);
         let (job_registry, job_registry_service) =
             job_registry_channel(output_store.policy().clone());
-        let job_registry_service =
-            job_registry_service.with_wording(output_store.wording().clone());
+        let job_registry_service = job_registry_service
+            .with_wording(output_store.wording().clone())
+            .with_pipeline_settings(
+                limits.pipeline_record_after.clone(),
+                limits.pipeline_retention.clone(),
+                output_store.dir().join(".stages"),
+            );
         executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1076,7 +1092,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             events_rx,
             job_tools: parts.tools,
             interpreters: parts.interpreters.into(),
-            limits: TerminalLimits::new(parts.limits),
+            limits,
             running_tasks,
             sandbox,
             subagent: None,
@@ -1087,6 +1103,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             subagent_spaces: None,
             policies: ScriptPolicies::new(parts.policies),
             treat_output: parts.treat_output,
+            plan_pipelines: parts.plan_pipelines,
             ipc: parts.ipc,
             committed: Arc::new(Mutex::new(Vec::new())),
             launches: Arc::default(),
@@ -1140,6 +1157,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 policies: Vec::new(),
                 ipc: None,
                 treat_output: None,
+                plan_pipelines: None,
                 host_shell,
             },
         )
@@ -1587,8 +1605,13 @@ where
         let running_tasks = Arc::new(AtomicUsize::new(0));
         let (job_registry, job_registry_service) =
             job_registry_channel(self.output_store.policy().clone());
-        let job_registry_service =
-            job_registry_service.with_wording(self.output_store.wording().clone());
+        let job_registry_service = job_registry_service
+            .with_wording(self.output_store.wording().clone())
+            .with_pipeline_settings(
+                self.limits.pipeline_record_after.clone(),
+                self.limits.pipeline_retention.clone(),
+                space.join(".stages"),
+            );
         self.executor
             .spawn(async move { job_registry_service.serve().await })
             .detach();
@@ -1668,6 +1691,7 @@ where
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.for_agent(),
             treat_output: self.treat_output.clone(),
+            plan_pipelines: self.plan_pipelines.clone(),
             ipc: self.ipc.clone(),
             committed: self.committed.clone(),
             launches: Arc::default(),
@@ -1863,6 +1887,7 @@ where
             launch,
             execution_id,
             script,
+            instrumented,
             interpreter,
             expect,
             resolution,
@@ -1921,6 +1946,7 @@ where
                 carry,
                 carried_dir: self.carried_dir.clone(),
                 script,
+                instrumented,
                 interpreter,
                 mode,
                 backend,
@@ -2092,6 +2118,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
             script: arguments.script,
+            instrumented: prepared.instrumented,
             interpreter: arguments.interpreter,
             expect: OutputFormat::Auto,
             resolution: arguments.resolution,
@@ -2125,9 +2152,16 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                     .await;
                 let pid = settled.as_ref().map_or(0, |job| job.pid);
                 let killed = settled.and_then(|job| job.status.kill_cause());
-                let command = result
+                let retained = self
+                    .job_registry
+                    .has_retained_non_final_stage(prepared.launch.id())
+                    .await;
+                let mut command = result
                     .into_script_result(killed)
                     .into_command_result(pid, &self.output_store);
+                if retained && pid > 0 {
+                    command.retained_pid = Some(pid);
+                }
                 spawned.took_result().await;
                 Ok(Execution::Finished(command))
             }
@@ -2182,6 +2216,7 @@ impl Detached {
         CommandResult {
             stdout,
             stderr: None,
+            retained_pid: None,
             interruptions: Vec::new(),
             outcome: CommandOutcome::Running {
                 pid,
@@ -2533,6 +2568,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
             script: arguments.script,
+            instrumented: prepared.instrumented,
             interpreter: arguments.interpreter,
             expect: OutputFormat::Auto,
             resolution: arguments.resolution,
@@ -2656,15 +2692,12 @@ where
                 &own,
             ),
         };
-        let checked = self
-            .check_script(launch_id, &admission, &start)
-            .await
-            .map_err(ShellRunError::Refused);
-        let (clearance, treatment) = match checked {
+        let checked = self.check_script(launch_id, &admission, &start).await;
+        let (clearance, treatment, instrumented) = match checked {
             Ok(checked) => checked,
-            Err(refusal) => {
+            Err(error) => {
                 self.end_unrun(launch_id).await;
-                return Err(refusal);
+                return Err(error);
             }
         };
         let admitted = self
@@ -2681,6 +2714,7 @@ where
             outputs: self.output_store.clone(),
             max_lines,
             treatment,
+            instrumented,
             carried_start,
         })
     }
@@ -2704,10 +2738,17 @@ where
         launch: crate::LaunchId,
         admission: &Admission<'_>,
         start: &ScriptDir,
-    ) -> Result<(Clearance, OutputTreatment), ScriptRefusal> {
+    ) -> Result<
+        (
+            Clearance,
+            OutputTreatment,
+            Option<crate::pipeline::InstrumentedScript>,
+        ),
+        ShellRunError,
+    > {
         let policies = &self.policies;
-        if policies.is_empty() && self.treat_output.is_none() {
-            return Ok((Clearance::Pass, OutputTreatment::default()));
+        if policies.is_empty() && self.treat_output.is_none() && self.plan_pipelines.is_none() {
+            return Ok((Clearance::Pass, OutputTreatment::default(), None));
         }
         let shell = (admission.interpreter == Interpreter::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
@@ -2730,9 +2771,15 @@ where
             ScriptDecision::Pass => Clearance::Pass,
             ScriptDecision::Allow => Clearance::Allow,
             ScriptDecision::Ask(request) => Clearance::Ask(request),
-            ScriptDecision::Refuse(refusal) => return Err(refusal),
+            ScriptDecision::Refuse(refusal) => return Err(ShellRunError::Refused(refusal)),
         };
-        Ok((clearance, treatment))
+        let instrumented = match (&self.plan_pipelines, admission.interpreter) {
+            (Some(planner), Interpreter::Shell) => {
+                crate::pipeline::instrument_script(planner, &check)?
+            }
+            _ => None,
+        };
+        Ok((clearance, treatment, instrumented))
     }
 
     /// The rest of admission once the policies did not refuse the script.
@@ -2878,6 +2925,7 @@ where
             launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
             script: run.source,
+            instrumented: prepared.instrumented,
             interpreter: Interpreter::Shell,
             expect: OutputFormat::Text,
             resolution: MediaResolution::Auto,
@@ -3033,6 +3081,7 @@ struct ExecutionPreparation {
     outputs: OutputStore,
     max_lines: usize,
     treatment: OutputTreatment,
+    instrumented: Option<crate::pipeline::InstrumentedScript>,
     carried_start: Option<PathBuf>,
 }
 
@@ -3202,6 +3251,7 @@ struct StandaloneExecution<E> {
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
+    instrumented: Option<crate::pipeline::InstrumentedScript>,
     interpreter: Interpreter,
     mode: SandboxMode,
     backend: ExecutionBackend,
@@ -3227,6 +3277,7 @@ struct StandaloneStart<'a, E> {
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
+    instrumented: Option<&'a crate::pipeline::InstrumentedScript>,
     interpreter: Interpreter,
     mode: SandboxMode,
     backend: &'a ExecutionBackend,
@@ -3247,6 +3298,7 @@ struct LocalBackgroundExecution<'a, E> {
     execution_id: &'a str,
     carry: Option<&'a CwdCarry>,
     script: &'a str,
+    instrumented: Option<&'a crate::pipeline::InstrumentedScript>,
     interpreter: Interpreter,
     mode: SandboxMode,
     job_registry: &'a JobRegistry,
@@ -3265,6 +3317,7 @@ struct ContainerJobExecution<'a, E> {
     info: crate::LaunchInfo,
     execution_id: &'a str,
     script: &'a str,
+    instrumented: Option<&'a crate::pipeline::InstrumentedScript>,
     interpreter: Interpreter,
     mode: SandboxMode,
     container_runtime: &'a ContainerShellRuntime,
@@ -3284,6 +3337,7 @@ struct SshBackgroundExecution<'a, E> {
     info: crate::LaunchInfo,
     execution_id: &'a str,
     script: &'a str,
+    instrumented: Option<&'a crate::pipeline::InstrumentedScript>,
     interpreter: Interpreter,
     mode: SandboxMode,
     client: &'a SshClient,
@@ -3342,6 +3396,7 @@ struct TerminalSpawnRequest {
     launch: crate::job_registry::LaunchLease,
     execution_id: String,
     script: String,
+    instrumented: Option<crate::pipeline::InstrumentedScript>,
     interpreter: Interpreter,
     expect: OutputFormat,
     resolution: MediaResolution,
@@ -3394,6 +3449,7 @@ struct SpawnedTerminalTask<E> {
     carry: Option<CwdCarry>,
     carried_dir: Option<CarriedDir>,
     script: String,
+    instrumented: Option<crate::pipeline::InstrumentedScript>,
     interpreter: Interpreter,
     mode: SandboxMode,
     backend: ExecutionBackend,
@@ -3434,6 +3490,7 @@ where
         carry,
         carried_dir,
         script,
+        instrumented,
         interpreter,
         mode,
         backend,
@@ -3455,6 +3512,11 @@ where
     let launch_id = launch.id();
     if let Some(timeout) = timeout {
         job_registry.bound_by_timeout(&launch, timeout).await;
+    }
+    if let Some(inst) = &instrumented {
+        job_registry
+            .init_pipeline(&launch, inst.stage_commands().to_vec(), background)
+            .await;
     }
     job_registry.launching(&launch).await;
     let status_registry = job_registry.clone();
@@ -3478,6 +3540,7 @@ where
         carry,
         carried_dir,
         script: script.clone(),
+        instrumented,
         interpreter,
         mode,
         backend,
@@ -3591,6 +3654,7 @@ where
         carry,
         carried_dir,
         script,
+        instrumented,
         interpreter,
         mode,
         backend,
@@ -3622,6 +3686,7 @@ where
         execution_id: &execution_id,
         carry: carry.as_ref(),
         script: &script,
+        instrumented: instrumented.as_ref(),
         interpreter,
         mode,
         backend: &backend,
@@ -3721,6 +3786,7 @@ where
                 info: request.info,
                 execution_id: request.execution_id,
                 script: request.script,
+                instrumented: request.instrumented,
                 interpreter: request.interpreter,
                 mode: request.mode,
                 container_runtime: runtime,
@@ -3747,6 +3813,7 @@ where
                 info: request.info,
                 execution_id: request.execution_id,
                 script: request.script,
+                instrumented: request.instrumented,
                 interpreter: request.interpreter,
                 mode: request.mode,
                 client,
@@ -3775,6 +3842,7 @@ where
         execution_id: request.execution_id,
         carry: request.carry,
         script: request.script,
+        instrumented: request.instrumented,
         interpreter: request.interpreter,
         mode: request.mode,
         job_registry: request.job_registry,
@@ -4095,12 +4163,19 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
         SandboxMode::Unsandboxed => context.sandbox.clone().unconfined(),
     };
 
-    let launch_script = launch_script(context.interpreter, context.script, context.launch.id())?;
-    let launch = build_terminal_launch(
-        context.shell,
-        &launch_script,
-        context.carry.and_then(|carry| carry.report.as_deref()),
-    )?;
+    let report_path = context.carry.and_then(|carry| carry.report.as_deref());
+    let (launch, mux_magic) = if let Some(inst) = context.instrumented {
+        let wrapped = inst.render(report_path)?;
+        let (program, args) = shell_launch(context.shell, &wrapped);
+        (TerminalLaunch::Shell { program, args }, Some(inst.magic()))
+    } else {
+        let launch_script =
+            launch_script(context.interpreter, context.script, context.launch.id())?;
+        (
+            build_terminal_launch(context.shell, &launch_script, report_path)?,
+            None,
+        )
+    };
     let (program, args) = match launch {
         TerminalLaunch::Direct { program, args } | TerminalLaunch::Shell { program, args } => {
             (program, args)
@@ -4154,6 +4229,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
             tree,
             lifetime,
             startup: context.background_startup,
+            mux_magic,
         },
         "missing stdout pipe for local process",
         "missing stderr pipe for local process",
@@ -4360,6 +4436,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
         tree,
         lifetime,
         startup,
+        mux_magic,
     } = job;
     let stdin_watch =
         attach_local_stdin_watch(&mut child, &executor, job_registry, launch, pid, &lifetime)
@@ -4382,6 +4459,7 @@ async fn collect_local_process_output<E: Executor + Clone + 'static>(
             job_registry.clone(),
             launch.downgrade(),
             chunk_rx,
+            mux_magic,
             None,
         ))
         .detach();
@@ -4458,6 +4536,7 @@ struct LocalJob<'a> {
     tree: JobTree,
     lifetime: JobLifetime,
     startup: &'a BackgroundStartup,
+    mux_magic: Option<[u8; 8]>,
 }
 
 /// The teardown budget a job's supervisor gives its kills: the time to
@@ -4667,13 +4746,21 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
     let sandbox = context.sandbox.clone();
 
     let carry = context.carry;
+    let (inner_script, mux_magic) = if let Some(inst) = context.instrumented {
+        (inst.render(None)?, Some(inst.magic()))
+    } else {
+        (
+            launch_script(context.interpreter, context.script, context.launch.id())?.into_owned(),
+            None,
+        )
+    };
     let script = container_job_script(
         context.committed,
         runtime.workspace_mount(),
         carry
             .and_then(|carry| carry.container.as_ref())
             .and_then(|container| container.report.as_ref()),
-        &launch_script(context.interpreter, context.script, context.launch.id())?,
+        &inner_script,
     )?;
     let mut spec = context.lifetime.applied_to(
         SpawnSpec::script(script)
@@ -4701,6 +4788,7 @@ async fn spawn_container_job<E: Executor + Clone + 'static>(
             interpreter: context.interpreter,
             mode: context.mode,
             lifetime: context.lifetime.clone(),
+            mux_magic,
         },
     )
     .await
@@ -4764,7 +4852,14 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
         SandboxMode::Sandboxed => sandbox,
         SandboxMode::Unsandboxed => sandbox.unconfined(),
     };
-    let script = launch_script(context.interpreter, context.script, context.launch.id())?;
+    let (script, mux_magic) = if let Some(inst) = context.instrumented {
+        (Cow::Owned(inst.render(None)?), Some(inst.magic()))
+    } else {
+        (
+            launch_script(context.interpreter, context.script, context.launch.id())?,
+            None,
+        )
+    };
     let child = sandbox
         .spawn(
             context
@@ -4785,6 +4880,7 @@ async fn execute_ssh_background<E: Executor + Clone + 'static>(
             interpreter: context.interpreter,
             mode: context.mode,
             lifetime: context.lifetime,
+            mux_magic,
         },
     )
     .await
@@ -4801,6 +4897,7 @@ struct SpawnedJob<'a, E> {
     interpreter: Interpreter,
     mode: SandboxMode,
     lifetime: JobLifetime,
+    mux_magic: Option<[u8; 8]>,
 }
 
 async fn attach_backend_killer<E: Executor + Clone + 'static>(
@@ -4880,6 +4977,7 @@ async fn run_spawned_job<E: Executor + Clone + 'static>(
             job.job_registry.clone(),
             job.launch.downgrade(),
             chunk_rx,
+            job.mux_magic,
             Some(drained_tx),
         ))
         .detach();
@@ -5213,17 +5311,25 @@ async fn drain_terminal_chunks(
     job_registry: JobRegistry,
     launch: crate::job_registry::WeakLaunchLease,
     rx: async_channel::Receiver<TerminalChunk>,
+    mux_magic: Option<[u8; 8]>,
     _drained: Option<Sender<()>>,
 ) {
+    let mut mux = mux_magic.map(crate::pipeline::MuxDecoder::new);
     while let Ok(chunk) = rx.recv().await {
         let Some(launch) = launch.upgrade() else {
             return;
         };
         match chunk {
             TerminalChunk::Stdout(bytes) => {
-                job_registry
-                    .append_output(launch, TerminalStream::Stdout, bytes)
-                    .await;
+                if let Some(decoder) = mux.as_mut() {
+                    for event in decoder.push(&bytes) {
+                        apply_mux_event(&job_registry, &launch, event).await;
+                    }
+                } else {
+                    job_registry
+                        .append_output(launch, TerminalStream::Stdout, bytes)
+                        .await;
+                }
             }
             TerminalChunk::Stderr(bytes) => {
                 job_registry
@@ -5231,6 +5337,11 @@ async fn drain_terminal_chunks(
                     .await;
             }
             TerminalChunk::StdoutClosed => {
+                if let Some(decoder) = mux.as_mut() {
+                    for event in decoder.finish() {
+                        apply_mux_event(&job_registry, &launch, event).await;
+                    }
+                }
                 job_registry
                     .close_output(launch, TerminalStream::Stdout)
                     .await;
@@ -5240,6 +5351,47 @@ async fn drain_terminal_chunks(
                     .close_output(launch, TerminalStream::Stderr)
                     .await;
             }
+        }
+    }
+}
+
+async fn apply_mux_event(
+    job_registry: &JobRegistry,
+    launch: &crate::job_registry::LaunchLease,
+    event: crate::pipeline::MuxEvent,
+) {
+    match event {
+        crate::pipeline::MuxEvent::OuterStdout(bytes) => {
+            job_registry
+                .append_output(launch.clone(), TerminalStream::Stdout, bytes)
+                .await;
+        }
+        crate::pipeline::MuxEvent::OuterStderr(bytes) => {
+            job_registry
+                .append_output(launch.clone(), TerminalStream::Stderr, bytes)
+                .await;
+        }
+        crate::pipeline::MuxEvent::StageStarted { step } => {
+            job_registry.stage_started(launch.clone(), step).await;
+        }
+        crate::pipeline::MuxEvent::StageChunk {
+            step,
+            stream,
+            injected_color,
+            bytes,
+        } => {
+            job_registry
+                .append_stage_output(launch.clone(), step, stream, injected_color, bytes)
+                .await;
+        }
+        crate::pipeline::MuxEvent::StageExited {
+            step,
+            exit_code,
+            own_duration,
+        } => {
+            job_registry
+                .stage_exited(launch.clone(), step, exit_code, own_duration)
+                .await;
         }
     }
 }
@@ -5633,6 +5785,7 @@ mod tests {
             stdout,
             stderr,
             outcome: CommandOutcome::Exited { code: exit_code },
+            retained_pid: None,
             interruptions: Vec::new(),
         }
     }
@@ -6444,6 +6597,7 @@ mod tests {
             carry: None,
             carried_dir: None,
             script: "/bin/pwd".to_string(),
+            instrumented: None,
             interpreter: Interpreter::Shell,
             mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local {
@@ -6513,6 +6667,7 @@ mod tests {
             carry: None,
             carried_dir: None,
             script,
+            instrumented: None,
             interpreter: Interpreter::Shell,
             mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local {
@@ -6626,6 +6781,7 @@ mod tests {
             carry: None,
             carried_dir: None,
             script,
+            instrumented: None,
             interpreter: Interpreter::Shell,
             mode: SandboxMode::Sandboxed,
             backend: ExecutionBackend::Local {
@@ -7168,6 +7324,7 @@ mod tests {
             .call(
                 crate::JobReadArgs {
                     pid: sleeping.pid(),
+                    step: None,
                     cursor,
                     max_bytes: None,
                 },
@@ -7916,6 +8073,7 @@ mod tests {
             info: info.clone(),
             execution_id: "exec-test",
             script: "probe",
+            instrumented: None,
             interpreter: Interpreter::Shell,
             mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,
@@ -8050,6 +8208,7 @@ mod tests {
             info: crate::LaunchInfo::default(),
             execution_id: "exec-test",
             script: "make",
+            instrumented: None,
             interpreter: Interpreter::Shell,
             mode: SandboxMode::Sandboxed,
             container_runtime: &runtime,

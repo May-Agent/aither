@@ -4,4 +4,4 @@
 {% when CommandOutcome::Running { pid, output } %}Started in background with PID {{ pid }}; output is being written to {{ output.url }} (absolute path: {{ output.path }}).
 {% when CommandOutcome::Killed { pid, notice } %}{{ notice }}
 PID: {{ pid }}.
-{% endmatch %}{{ interruptions }}
+{% endmatch %}{{ retained_pid }}{{ interruptions }}
