@@ -93,10 +93,17 @@ def pipe_unread_bytes(fd):
         return 0
 
 
+def safe_unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 try:
-    tap_dir = tempfile.mkdtemp(prefix=".aither-tap-")
+    tap_dir = os.path.abspath(tempfile.mkdtemp(prefix=".aither-tap-"))
 except OSError:
-    tap_dir = tempfile.mkdtemp(prefix=".aither-tap-", dir=".")
+    tap_dir = os.path.abspath(tempfile.mkdtemp(prefix=".aither-tap-", dir="."))
 
 rset = set()
 wset = set()
@@ -132,6 +139,7 @@ class StageState:
         self.err_stripper = SgrStripper()
 
         prefix = os.path.join(tap_dir, f"p{p_idx}_s{k_idx}")
+        self.prefix = prefix
         self.times_path = f"{prefix}.times"
 
         os.mkfifo(f"{prefix}.out", 0o600)
@@ -416,6 +424,9 @@ try:
                         ctl_w_hold = close_fd(ctl_w_hold)
                         outer_w_hold = close_fd(outer_w_hold)
                         quit_r_hold = close_fd(quit_r_hold)
+                        safe_unlink(ctl_path)
+                        safe_unlink(outer_path)
+                        safe_unlink(quit_path)
                     elif cmd == "S":
                         p_i, k_i = int(parts[1]), int(parts[2])
                         st = pipelines[p_i][k_i]
@@ -423,6 +434,8 @@ try:
                         st.out_w_hold = close_fd(st.out_w_hold)
                         st.err_w_hold = close_fd(st.err_w_hold)
                         st.in_r_hold = close_fd(st.in_r_hold)
+                        for ext in ("out", "err", "ack", "done", "in"):
+                            safe_unlink(f"{st.prefix}.{ext}")
                         emit_frame(4, st.step)
                         if k_i > 0:
                             flush_stage_in(st)
