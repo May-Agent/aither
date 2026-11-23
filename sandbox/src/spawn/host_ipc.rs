@@ -32,8 +32,15 @@ const IPC_TOKEN_HEX_LEN: usize = 64;
 /// Longest command name `heel-shim` can encode (`u8::MAX`) after `<token>:`.
 const MAX_COMMAND_NAME_LEN: usize = (u8::MAX as usize) - IPC_TOKEN_HEX_LEN - 1;
 
-/// Connect timeout for heel's local loopback `external_ipc` relay.
-const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Request deadline for heel's local loopback `external_ipc` relay.
+///
+/// `heel`'s [`TcpIpcEndpoint`] applies this duration to the entire connect,
+/// request, and response round-trip. Host IPC handlers (`issue`, `pr`,
+/// `subagent`, `ask_user`, `request_workspace`) can legitimately take minutes
+/// and pause the caller's command clock while waiting on the user, so the
+/// loopback relay ceiling stays well above the terminal timeout cap while the
+/// command's own timeout and [`HostIpcLease`] govern execution lifetime.
+const IPC_REQUEST_TIMEOUT: Duration = Duration::from_hours(24);
 
 fn generate_token() -> Result<Arc<str>, SpawnError> {
     let mut random = [0_u8; 32];
@@ -82,7 +89,7 @@ impl HostIpcMux {
             .detach();
 
         Ok(Self {
-            endpoint: TcpIpcEndpoint::new(addr, RELAY_CONNECT_TIMEOUT),
+            endpoint: TcpIpcEndpoint::new(addr, IPC_REQUEST_TIMEOUT),
             routers,
             shutdown,
         })
@@ -322,5 +329,49 @@ async fn connection(mut stream: Async<TcpStream>, routers: &RouterTable) -> Resu
         if !authorized {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use executor_core::tokio::TokioGlobal;
+
+    struct PingCommand;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct PingArgs;
+
+    impl heel::IpcCommand for PingCommand {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "ping".into()
+        }
+
+        type Args = PingArgs;
+        type Response = String;
+
+        fn handle(
+            &self,
+            _args: Self::Args,
+            _context: IpcContext,
+        ) -> impl std::future::Future<Output = Result<Self::Response, heel::IpcError>> + Send
+        {
+            std::future::ready(Ok("pong".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_ipc_mux_gives_long_running_handlers_full_request_budget() {
+        let executor = Arc::new(AnyExecutor::new(TokioGlobal));
+        let mux = HostIpcMux::start(&executor).expect("mux starts");
+        assert!(
+            mux.endpoint().timeout() >= Duration::from_hours(1),
+            "host IPC endpoint must not cap long-running commands at connect timeout: {:?}",
+            mux.endpoint().timeout()
+        );
+
+        let router = IpcRouter::new().register(PingCommand);
+        let lease = mux.register(router).await.expect("register router");
+        assert!(lease.shim_dir().is_dir());
     }
 }
