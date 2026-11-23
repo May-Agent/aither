@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -16,8 +16,11 @@ use futures_lite::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::LaunchId;
 use crate::interpreter::Interpreter;
+use crate::limits::LiveDuration;
 use crate::memory::MemoryDomain;
 use crate::output_policy::OutputPolicy;
+use crate::pipeline::{PipelineReadError, PipelineSnapshot, StageStreamSelector, StageUiDelta};
+use crate::pipeline_store::{LivePipeline, PipelineRetentionStore, RetainedEntry};
 use crate::policy::SandboxMode;
 #[cfg(unix)]
 use crate::process_tree::KillTreeError;
@@ -446,6 +449,7 @@ struct JobState {
     completion_owed: bool,
     claimed: bool,
     watchers: usize,
+    pipeline: Option<LivePipeline>,
 }
 
 #[derive(Debug)]
@@ -457,19 +461,46 @@ enum SettledWaiter {
     },
 }
 
-enum StateCommand {
-    Register {
-        pid: u32,
-        host_pid: u32,
+struct RegisterJob {
+    pid: u32,
+    host_pid: u32,
+    launch: LaunchLease,
+    execution_key: String,
+    script: String,
+    interpreter: Interpreter,
+    mode: SandboxMode,
+    output_path: Option<PathBuf>,
+    process_tree: Option<JobTree>,
+    place: JobPlace,
+}
+
+enum PipelineStateCommand {
+    Init {
         launch: LaunchLease,
-        execution_key: String,
-        script: String,
-        interpreter: Interpreter,
-        mode: SandboxMode,
-        output_path: Option<PathBuf>,
-        process_tree: Option<JobTree>,
-        place: JobPlace,
+        commands: Vec<String>,
+        background: bool,
     },
+    StageStarted {
+        launch: LaunchLease,
+        step: usize,
+    },
+    AppendStageOutput {
+        launch: LaunchLease,
+        step: usize,
+        stream: TerminalStream,
+        injected_color: bool,
+        chunk: Vec<u8>,
+    },
+    StageExited {
+        launch: LaunchLease,
+        step: usize,
+        exit_code: i32,
+        own_duration: Duration,
+    },
+}
+
+enum StateCommand {
+    Register(RegisterJob),
     Bound {
         launch: LaunchLease,
         timeout: Duration,
@@ -513,6 +544,7 @@ enum StateCommand {
     Unwatch {
         launch: LaunchLease,
     },
+    Pipeline(PipelineStateCommand),
 }
 
 enum JobRequest {
@@ -637,6 +669,40 @@ enum JobRequest {
         launch: LaunchLease,
         reply: Sender<()>,
     },
+    HasRetainedNonFinalStage {
+        launch: LaunchId,
+        reply: Sender<bool>,
+    },
+    ListPipelines {
+        reply: Sender<Vec<PipelineSnapshot>>,
+    },
+    PipelineByPid {
+        pid: u32,
+        reply: Sender<Result<PipelineSnapshot, PipelineReadError>>,
+    },
+    ReadPipelineStage {
+        pid: u32,
+        step: usize,
+        selector: StageStreamSelector,
+        raw: bool,
+        reply: Sender<Result<Vec<u8>, PipelineReadError>>,
+    },
+    ReadPipelineStageDelta {
+        pid: u32,
+        step: usize,
+        cursor: usize,
+        max_bytes: usize,
+        tracked: bool,
+        reply: Sender<Result<JobRead, PipelineReadError>>,
+    },
+    ReadPipelineStageUi {
+        pid: u32,
+        launch: Option<LaunchId>,
+        step: usize,
+        cursor: usize,
+        max_bytes: usize,
+        reply: Sender<Result<StageUiDelta, PipelineReadError>>,
+    },
 }
 
 enum KillPlan {
@@ -691,6 +757,9 @@ pub struct JobRegistryService {
     tx: WeakSender<JobCommand>,
     policy: OutputPolicy,
     wording: Option<AnyShellWording>,
+    pipeline_record_after: LiveDuration,
+    pipeline_retention: LiveDuration,
+    spill_root: Option<PathBuf>,
 }
 
 /// Creates a registry handle and its background service; job listings are
@@ -709,6 +778,9 @@ pub fn job_registry_channel(policy: OutputPolicy) -> (JobRegistry, JobRegistrySe
             tx: weak,
             policy,
             wording: None,
+            pipeline_record_after: LiveDuration::new(Duration::from_secs(3)),
+            pipeline_retention: LiveDuration::new(Duration::from_mins(15)),
+            spill_root: None,
         },
     )
 }
@@ -718,6 +790,21 @@ impl JobRegistryService {
     #[must_use]
     pub fn with_wording(mut self, wording: AnyShellWording) -> Self {
         self.wording = Some(wording);
+        self
+    }
+
+    /// Configures live pipeline stage retention thresholds and on-disk spill
+    /// storage directory.
+    #[must_use]
+    pub fn with_pipeline_settings(
+        mut self,
+        record_after: LiveDuration,
+        retention: LiveDuration,
+        spill_root: PathBuf,
+    ) -> Self {
+        self.pipeline_record_after = record_after;
+        self.pipeline_retention = retention;
+        self.spill_root = Some(spill_root);
         self
     }
 }
@@ -805,7 +892,7 @@ impl JobRegistry {
         process_tree: Option<JobTree>,
         place: JobPlace,
     ) {
-        self.send_command(StateCommand::Register {
+        self.send_command(StateCommand::Register(RegisterJob {
             place,
             pid,
             host_pid,
@@ -816,7 +903,7 @@ impl JobRegistry {
             mode,
             output_path,
             process_tree,
-        })
+        }))
         .await;
     }
 
@@ -1406,6 +1493,165 @@ impl JobRegistry {
         .await;
         Self::recv_reply(reply_rx).await
     }
+
+    /// Initializes per-stage pipeline tracking on `launch`.
+    pub(crate) async fn init_pipeline(
+        &self,
+        launch: &LaunchLease,
+        commands: Vec<String>,
+        background: bool,
+    ) {
+        self.send_command(StateCommand::Pipeline(PipelineStateCommand::Init {
+            launch: launch.clone(),
+            commands,
+            background,
+        }))
+        .await;
+    }
+
+    /// Records that `step` started running on `launch`.
+    pub(crate) async fn stage_started(&self, launch: LaunchLease, step: usize) {
+        self.send_command(StateCommand::Pipeline(PipelineStateCommand::StageStarted {
+            launch,
+            step,
+        }))
+        .await;
+    }
+
+    /// Appends raw stage output bytes for `step` on `launch`.
+    pub(crate) async fn append_stage_output(
+        &self,
+        launch: LaunchLease,
+        step: usize,
+        stream: TerminalStream,
+        injected_color: bool,
+        chunk: Vec<u8>,
+    ) {
+        self.send_command(StateCommand::Pipeline(
+            PipelineStateCommand::AppendStageOutput {
+                launch,
+                step,
+                stream,
+                injected_color,
+                chunk,
+            },
+        ))
+        .await;
+    }
+
+    /// Records that `step` exited with `exit_code` after `own_duration`.
+    pub(crate) async fn stage_exited(
+        &self,
+        launch: LaunchLease,
+        step: usize,
+        exit_code: i32,
+        own_duration: Duration,
+    ) {
+        self.send_command(StateCommand::Pipeline(PipelineStateCommand::StageExited {
+            launch,
+            step,
+            exit_code,
+            own_duration,
+        }))
+        .await;
+    }
+
+    /// Whether `launch` retained at least one non-final pipeline stage.
+    pub(crate) async fn has_retained_non_final_stage(&self, launch: LaunchId) -> bool {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::HasRetainedNonFinalStage {
+            launch,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Lists all visible running and retained pipelines.
+    pub(crate) async fn list_pipelines(&self) -> Vec<PipelineSnapshot> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::ListPipelines { reply: reply_tx })
+            .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Looks up the pipeline snapshot of `pid`.
+    pub(crate) async fn pipeline_by_pid(
+        &self,
+        pid: u32,
+    ) -> Result<PipelineSnapshot, PipelineReadError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::PipelineByPid {
+            pid,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Reads full native or cleaned bytes of `step` for `pid`.
+    pub(crate) async fn read_pipeline_stage(
+        &self,
+        pid: u32,
+        step: usize,
+        selector: StageStreamSelector,
+        raw: bool,
+    ) -> Result<Vec<u8>, PipelineReadError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::ReadPipelineStage {
+            pid,
+            step,
+            selector,
+            raw,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Incremental cleaned stage read for `terminal_read`.
+    pub(crate) async fn read_pipeline_stage_delta(
+        &self,
+        pid: u32,
+        step: usize,
+        cursor: usize,
+        max_bytes: usize,
+        tracked: bool,
+    ) -> Result<JobRead, PipelineReadError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::ReadPipelineStageDelta {
+            pid,
+            step,
+            cursor,
+            max_bytes,
+            tracked,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Incremental UI-colored stage read.
+    pub(crate) async fn read_pipeline_stage_ui(
+        &self,
+        pid: u32,
+        launch: Option<LaunchId>,
+        step: usize,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Result<StageUiDelta, PipelineReadError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::ReadPipelineStageUi {
+            pid,
+            launch,
+            step,
+            cursor,
+            max_bytes,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
 }
 
 #[derive(Default)]
@@ -1413,6 +1659,7 @@ struct ParkedOutput {
     by_launch: HashMap<LaunchId, Parked>,
     forgotten: Vec<WeakLaunchLease>,
     bounds: HashMap<LaunchId, (WeakLaunchLease, Duration)>,
+    pipelines: HashMap<LaunchId, (WeakLaunchLease, Vec<String>, bool)>,
     launching: HashMap<LaunchId, WeakLaunchLease>,
 }
 
@@ -1500,6 +1747,26 @@ impl ParkedOutput {
         })
     }
 
+    fn park_pipeline(&mut self, launch: &LaunchLease, commands: Vec<String>, background: bool) {
+        self.prune();
+        self.pipelines
+            .insert(launch.id(), (launch.downgrade(), commands, background));
+    }
+
+    fn take_pipeline(&mut self, launch: &LaunchLease) -> Option<(Vec<String>, bool)> {
+        self.prune();
+        self.pipelines
+            .remove(&launch.id())
+            .map(|(lease, commands, background)| {
+                assert!(
+                    lease.refers_to(launch),
+                    "two live leases share launch {}",
+                    launch.id()
+                );
+                (commands, background)
+            })
+    }
+
     fn forgot(&mut self, launch: &LaunchLease) {
         self.prune();
         self.forgotten.push(launch.downgrade());
@@ -1512,6 +1779,8 @@ impl ParkedOutput {
             .retain(|forgotten| forgotten.upgrade().is_some());
         self.bounds
             .retain(|_, (lease, _)| lease.upgrade().is_some());
+        self.pipelines
+            .retain(|_, (lease, _, _)| lease.upgrade().is_some());
         self.launching.retain(|_, lease| lease.upgrade().is_some());
     }
 }
@@ -1525,6 +1794,7 @@ struct ReadTracker {
 struct RegistryStore {
     jobs: HashMap<LaunchId, JobState>,
     by_pid: HashMap<u32, Vec<LaunchId>>,
+    retained_pipelines: PipelineRetentionStore,
 }
 
 impl RegistryStore {
@@ -1536,6 +1806,7 @@ impl RegistryStore {
 
     fn insert(&mut self, launch: LaunchId, state: JobState) {
         let pid = state.info.pid;
+        self.retained_pipelines.on_pid_registered(pid);
         let replaced = self.jobs.insert(launch, state);
         assert!(replaced.is_none(), "two live leases share launch {launch}");
         self.by_pid.entry(pid).or_default().push(launch);
@@ -1553,6 +1824,12 @@ impl RegistryStore {
     }
 }
 
+struct PipelineConfig<'a> {
+    record_after: Duration,
+    retention: Duration,
+    spill_root: Option<&'a Path>,
+}
+
 impl JobRegistryService {
     /// Runs the registry service loop until all senders are dropped.
     pub async fn serve(self) {
@@ -1560,10 +1837,41 @@ impl JobRegistryService {
         let mut reads = ReadTracker::default();
         let mut parked = ParkedOutput::default();
 
-        while let Ok(command) = self.rx.recv().await {
+        loop {
+            let retention = self.pipeline_retention.get();
+            store
+                .retained_pipelines
+                .sweep_expired(Instant::now(), retention)
+                .await;
+            let next_deadline = store.retained_pipelines.next_expiry(retention);
+            let received = match next_deadline {
+                Some(deadline) => {
+                    futures_lite::future::or(async { Some(self.rx.recv().await) }, async {
+                        async_io::Timer::at(deadline).await;
+                        None
+                    })
+                    .await
+                }
+                None => Some(self.rx.recv().await),
+            };
+            let Some(command) = received else {
+                continue;
+            };
+            let Ok(command) = command else {
+                break;
+            };
+            let cfg = PipelineConfig {
+                record_after: self.pipeline_record_after.get(),
+                retention: self.pipeline_retention.get(),
+                spill_root: self.spill_root.as_deref(),
+            };
+            store
+                .retained_pipelines
+                .sweep_expired(Instant::now(), cfg.retention)
+                .await;
             match command {
                 JobCommand::State(command) => {
-                    handle_state_command(&mut store, &mut reads, &mut parked, command).await;
+                    handle_state_command(&mut store, &mut reads, &mut parked, &cfg, command).await;
                 }
                 JobCommand::Request(request) => {
                     let preview = self.policy.get().job_preview_bytes;
@@ -1571,6 +1879,7 @@ impl JobRegistryService {
                         &mut store,
                         &mut reads,
                         &mut parked,
+                        &cfg,
                         &self.tx,
                         preview,
                         self.wording.as_deref(),
@@ -1580,6 +1889,9 @@ impl JobRegistryService {
                 }
             }
         }
+        if let Some(root) = self.spill_root {
+            let _ = async_fs::remove_dir_all(root).await;
+        }
     }
 }
 
@@ -1587,45 +1899,12 @@ async fn handle_state_command(
     store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
+    cfg: &PipelineConfig<'_>,
     command: StateCommand,
 ) {
     match command {
-        StateCommand::Register {
-            pid,
-            host_pid,
-            launch,
-            execution_key,
-            script,
-            interpreter,
-            mode,
-            output_path,
-            process_tree,
-            place,
-        } => {
-            let key = launch.id();
-            parked.launching.remove(&key);
-            let waiting = parked.take(&launch);
-            let timeout = parked.take_bound(&launch);
-            register_job(
-                store,
-                pid,
-                host_pid,
-                launch,
-                execution_key,
-                script,
-                interpreter,
-                mode,
-                output_path,
-                place,
-                timeout,
-            );
-            if let Some(job) = store.jobs.get_mut(&key) {
-                job.process_tree = process_tree;
-            }
-            for (chunk, reply) in waiting {
-                append_terminal_output(&mut store.jobs, key, TerminalStream::Stdout, chunk).await;
-                let _ = reply.send(true).await;
-            }
+        StateCommand::Register(reg) => {
+            register_job(store, parked, cfg.spill_root, reg).await;
         }
         StateCommand::Bound { launch, timeout } => parked.bound(&launch, timeout),
         StateCommand::Launching { launch } => parked.launching(&launch),
@@ -1667,30 +1946,116 @@ async fn handle_state_command(
             launch,
             exit_code,
             output_path,
-        } => complete_job(&mut store.jobs, launch.id(), exit_code, output_path).await,
+        } => {
+            complete_job(
+                &mut store.jobs,
+                launch.id(),
+                exit_code,
+                output_path,
+                cfg.record_after,
+            )
+            .await;
+        }
         StateCommand::Fail {
             launch,
             error,
             output_path,
-        } => fail_job(&mut store.jobs, launch.id(), error, output_path).await,
+        } => {
+            fail_job(
+                &mut store.jobs,
+                launch.id(),
+                error,
+                output_path,
+                cfg.record_after,
+            )
+            .await;
+        }
         StateCommand::TakeCompletion { launch } => {
-            take_completion(store, reads, parked, launch.id());
+            take_completion(store, reads, parked, launch.id(), cfg.retention).await;
         }
         StateCommand::Unwatch { launch } => {
             let key = launch.id();
             if let Some(job) = store.jobs.get_mut(&key) {
                 job.watchers -= 1;
-                forget_if_done(store, reads, parked, key);
+                forget_if_done(store, reads, parked, key, cfg.retention).await;
+            }
+        }
+        StateCommand::Pipeline(command) => {
+            handle_pipeline_state_command(store, parked, cfg, command).await;
+        }
+    }
+}
+
+async fn handle_pipeline_state_command(
+    store: &mut RegistryStore,
+    parked: &mut ParkedOutput,
+    cfg: &PipelineConfig<'_>,
+    command: PipelineStateCommand,
+) {
+    match command {
+        PipelineStateCommand::Init {
+            launch,
+            commands,
+            background,
+        } => {
+            let key = launch.id();
+            if let Some(job) = store.jobs.get_mut(&key) {
+                job.pipeline = Some(LivePipeline::new(commands, background, cfg.spill_root, key));
+            } else {
+                parked.park_pipeline(&launch, commands, background);
+            }
+        }
+        PipelineStateCommand::StageStarted { launch, step } => {
+            if let Some(pipeline) = store
+                .jobs
+                .get_mut(&launch.id())
+                .and_then(|job| job.pipeline.as_mut())
+            {
+                pipeline.stage_started(step);
+            }
+        }
+        PipelineStateCommand::AppendStageOutput {
+            launch,
+            step,
+            stream,
+            injected_color,
+            chunk,
+        } => {
+            if let Some(pipeline) = store
+                .jobs
+                .get_mut(&launch.id())
+                .and_then(|job| job.pipeline.as_mut())
+            {
+                pipeline
+                    .append_chunk(step, stream, injected_color, chunk)
+                    .await;
+            }
+        }
+        PipelineStateCommand::StageExited {
+            launch,
+            step,
+            exit_code,
+            own_duration,
+        } => {
+            if let Some(pipeline) = store
+                .jobs
+                .get_mut(&launch.id())
+                .and_then(|job| job.pipeline.as_mut())
+            {
+                pipeline
+                    .stage_exited(step, exit_code, own_duration, cfg.record_after)
+                    .await;
             }
         }
     }
 }
 
-fn forget_if_done(
+async fn forget_if_done(
     store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
     launch: LaunchId,
+    retention: Duration,
 ) {
     let Some(job) = store.jobs.get(&launch) else {
         return;
@@ -1699,18 +2064,38 @@ fn forget_if_done(
         && job.info.status.delivery() == Some(Delivery::Taken)
         && job.watchers == 0
     {
-        let job = store.remove(launch).expect("the job is registered");
+        let mut job = store.remove(launch).expect("the job is registered");
         reads.delta_reads.remove(&launch);
         parked.forgot(&job.launch);
+        if let Some(mut pipeline) = job.pipeline.take() {
+            if !retention.is_zero() && pipeline.should_retain_after_job() {
+                let finished_at = job.finished_at.unwrap_or_else(Instant::now);
+                store.retained_pipelines.insert(RetainedEntry {
+                    pid: job.info.pid,
+                    launch,
+                    job_status: job.info.status.clone(),
+                    started_at: job.info.started_at,
+                    finished_at,
+                    pipeline,
+                });
+            } else {
+                store
+                    .retained_pipelines
+                    .step_reads
+                    .retain(|(l, _), _| *l != launch);
+                pipeline.destroy().await;
+            }
+        }
         tracing::debug!(%launch, pid = %job.info.pid, "forgot finished job");
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn handle_job_request(
     store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
+    cfg: &PipelineConfig<'_>,
     tx: &WeakSender<JobCommand>,
     script_preview_bytes: usize,
     wording: Option<&dyn crate::wording::ShellWording>,
@@ -1784,7 +2169,9 @@ async fn handle_job_request(
             launch,
             ending,
             reply,
-        } => owe_settled_completion(store, reads, parked, launch, ending, reply, tx).await,
+        } => {
+            owe_settled_completion(store, reads, parked, cfg, launch, ending, reply, tx).await;
+        }
         JobRequest::BeginKillByPid { pid, cause, reply } => {
             let plan = store
                 .latest_launch(pid)
@@ -1825,8 +2212,8 @@ async fn handle_job_request(
             killed,
             reply,
         } => {
-            let result = end_kill(&mut store.jobs, launch, killed).await;
-            release_settled_waiters(store, reads, parked, launch, tx).await;
+            let result = end_kill(&mut store.jobs, launch, killed, cfg.record_after).await;
+            release_settled_waiters(store, reads, parked, cfg, launch, tx).await;
             let _ = reply.send(result).await;
         }
         JobRequest::InputTerminal {
@@ -1925,7 +2312,7 @@ async fn handle_job_request(
             let _ = reply.send(has_running_job(&store.jobs)).await;
         }
         JobRequest::TakeCompletion { launch, reply } => {
-            take_completion(store, reads, parked, launch.id());
+            take_completion(store, reads, parked, launch.id(), cfg.retention).await;
             let _ = reply.send(()).await;
         }
         JobRequest::WatchByPid { pid, reply } => {
@@ -1937,6 +2324,61 @@ async fn handle_job_request(
         JobRequest::WatchByLaunch { launch, reply } => {
             let watch = watch_job(&mut store.jobs, launch, tx);
             let _ = reply.send(watch).await;
+        }
+        JobRequest::HasRetainedNonFinalStage { launch, reply } => {
+            let has = store
+                .jobs
+                .get(&launch)
+                .and_then(|job| job.pipeline.as_ref())
+                .is_some_and(LivePipeline::has_retained_non_final_stage)
+                || store
+                    .retained_pipelines
+                    .by_launch
+                    .get(&launch)
+                    .is_some_and(|entry| entry.pipeline.has_retained_non_final_stage());
+            let _ = reply.send(has).await;
+        }
+        JobRequest::ListPipelines { reply } => {
+            let items = collect_visible_pipelines(store, cfg);
+            let _ = reply.send(items).await;
+        }
+        JobRequest::PipelineByPid { pid, reply } => {
+            let res = lookup_pipeline_snapshot(store, pid, cfg);
+            let _ = reply.send(res).await;
+        }
+        JobRequest::ReadPipelineStage {
+            pid,
+            step,
+            selector,
+            raw,
+            reply,
+        } => {
+            let res = read_pipeline_stage_by_pid(store, pid, step, selector, raw).await;
+            let _ = reply.send(res).await;
+        }
+        JobRequest::ReadPipelineStageDelta {
+            pid,
+            step,
+            cursor,
+            max_bytes,
+            tracked,
+            reply,
+        } => {
+            let res =
+                read_pipeline_stage_delta_by_pid(store, pid, step, cursor, max_bytes, tracked)
+                    .await;
+            let _ = reply.send(res).await;
+        }
+        JobRequest::ReadPipelineStageUi {
+            pid,
+            launch,
+            step,
+            cursor,
+            max_bytes,
+            reply,
+        } => {
+            let res = read_pipeline_stage_ui(store, pid, launch, step, cursor, max_bytes).await;
+            let _ = reply.send(res).await;
         }
     }
 }
@@ -1974,21 +2416,29 @@ fn has_running_job(jobs: &HashMap<LaunchId, JobState>) -> bool {
         .any(|job| matches!(job.info.status, JobStatus::Running))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn register_job(
+async fn register_job(
     store: &mut RegistryStore,
-    pid: u32,
-    host_pid: u32,
-    launch: LaunchLease,
-    execution_key: String,
-    script: String,
-    interpreter: Interpreter,
-    mode: SandboxMode,
-    output_path: Option<PathBuf>,
-    place: JobPlace,
-    timeout: Option<Duration>,
+    parked: &mut ParkedOutput,
+    spill_root: Option<&Path>,
+    reg: RegisterJob,
 ) {
+    let RegisterJob {
+        pid,
+        host_pid,
+        launch,
+        execution_key,
+        script,
+        interpreter,
+        mode,
+        output_path,
+        process_tree,
+        place,
+    } = reg;
     let key = launch.id();
+    parked.launching.remove(&key);
+    let waiting = parked.take(&launch);
+    let timeout = parked.take_bound(&launch);
+    let parked_pipeline = parked.take_pipeline(&launch);
     let info = JobInfo {
         timeout,
         place,
@@ -2001,8 +2451,17 @@ fn register_job(
         status: JobStatus::Running,
         output_path,
     };
-    store.insert(key, JobState::new(info, host_pid, launch));
+    let mut state = JobState::new(info, host_pid, launch);
+    state.process_tree = process_tree;
+    if let Some((commands, background)) = parked_pipeline {
+        state.pipeline = Some(LivePipeline::new(commands, background, spill_root, key));
+    }
+    store.insert(key, state);
     tracing::debug!(%key, pid = %pid, host_pid = %host_pid, "registered background job");
+    for (chunk, reply) in waiting {
+        append_terminal_output(&mut store.jobs, key, TerminalStream::Stdout, chunk).await;
+        let _ = reply.send(true).await;
+    }
 }
 
 impl JobState {
@@ -2037,6 +2496,7 @@ impl JobState {
             completion_owed: false,
             claimed: false,
             watchers: 0,
+            pipeline: None,
         }
     }
 }
@@ -2130,15 +2590,16 @@ fn finish(job: &mut JobState, end: JobEnd) {
     job.input_tx = None;
 }
 
-fn take_completion(
+async fn take_completion(
     store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
     launch: LaunchId,
+    retention: Duration,
 ) {
     if let Some(job) = store.jobs.get_mut(&launch) {
         mark_taken(job);
-        forget_if_done(store, reads, parked, launch);
+        forget_if_done(store, reads, parked, launch, retention).await;
     }
 }
 
@@ -2158,10 +2619,12 @@ fn mark_taken(job: &mut JobState) {
     *delivery = Delivery::Taken;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn owe_settled_completion(
     store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
+    cfg: &PipelineConfig<'_>,
     launch: LaunchId,
     ending: Result<i32, String>,
     reply: Sender<Option<OwedCompletion>>,
@@ -2176,8 +2639,8 @@ async fn owe_settled_completion(
             .push(SettledWaiter::Owe { ending, reply });
         return;
     }
-    let owed = owe_completion(&mut store.jobs, launch, ending, tx).await;
-    forget_if_done(store, reads, parked, launch);
+    let owed = owe_completion(&mut store.jobs, launch, ending, cfg.record_after, tx).await;
+    forget_if_done(store, reads, parked, launch, cfg.retention).await;
     let _ = reply.send(Some(owed)).await;
 }
 
@@ -2185,12 +2648,13 @@ async fn owe_completion(
     jobs: &mut HashMap<LaunchId, JobState>,
     launch: LaunchId,
     ending: Result<i32, String>,
+    record_after: Duration,
     tx: &WeakSender<JobCommand>,
 ) -> OwedCompletion {
     if matches!(jobs[&launch].info.status, JobStatus::Running) {
         match ending {
-            Ok(exit_code) => complete_job(jobs, launch, exit_code, None).await,
-            Err(error) => fail_job(jobs, launch, error, None).await,
+            Ok(exit_code) => complete_job(jobs, launch, exit_code, None, record_after).await,
+            Err(error) => fail_job(jobs, launch, error, None, record_after).await,
         }
     }
     let job = jobs.get_mut(&launch).expect("the job is registered");
@@ -2290,6 +2754,7 @@ async fn complete_job(
     launch: LaunchId,
     exit_code: i32,
     output_path: Option<PathBuf>,
+    record_after: Duration,
 ) {
     if let Some(job) = jobs.get_mut(&launch) {
         if !matches!(job.info.status, JobStatus::Running) {
@@ -2314,12 +2779,14 @@ async fn complete_job(
                 "failed to flush redirected output on complete"
             );
             mark_job_failed(job, error);
+            settle_job_pipeline(job, record_after).await;
             return;
         }
         finish(job, JobEnd::Completed { exit_code });
         if output_path.is_some() {
             job.info.output_path = output_path;
         }
+        settle_job_pipeline(job, record_after).await;
         tracing::debug!(%launch, pid = %job.info.pid, exit_code = %exit_code, "job completed");
     }
 }
@@ -2329,6 +2796,7 @@ async fn fail_job(
     launch: LaunchId,
     error: String,
     output_path: Option<PathBuf>,
+    record_after: Duration,
 ) {
     if let Some(job) = jobs.get_mut(&launch) {
         if !matches!(job.info.status, JobStatus::Running) {
@@ -2352,7 +2820,21 @@ async fn fail_job(
         if output_path.is_some() {
             job.info.output_path = output_path;
         }
+        settle_job_pipeline(job, record_after).await;
         tracing::debug!(%launch, pid = %job.info.pid, "job failed");
+    }
+}
+
+async fn settle_job_pipeline(job: &mut JobState, record_after: Duration) {
+    if let Some(pipeline) = job.pipeline.as_mut() {
+        pipeline
+            .settle_on_job_end(
+                record_after,
+                job.info.output_path.clone(),
+                &job.stdout_buffer,
+                &job.stderr_buffer,
+            )
+            .await;
     }
 }
 
@@ -2570,7 +3052,12 @@ fn begin_kill(
         .map_or(KillPlan::Group(group), |tree| KillPlan::Tree(tree.clone()))
 }
 
-async fn end_kill(jobs: &mut HashMap<LaunchId, JobState>, launch: LaunchId, killed: bool) -> bool {
+async fn end_kill(
+    jobs: &mut HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    killed: bool,
+    record_after: Duration,
+) -> bool {
     let Some(job) = jobs.get_mut(&launch) else {
         return false;
     };
@@ -2597,6 +3084,7 @@ async fn end_kill(jobs: &mut HashMap<LaunchId, JobState>, launch: LaunchId, kill
             finish(job, JobEnd::Killed(cause));
             job.stdout_closed = true;
             job.stderr_closed = true;
+            settle_job_pipeline(job, record_after).await;
             tracing::info!(%launch, pid = %job.info.pid, ?cause, "killed job");
         }
         return true;
@@ -2605,9 +3093,9 @@ async fn end_kill(jobs: &mut HashMap<LaunchId, JobState>, launch: LaunchId, kill
         Some(Ending::Complete {
             exit_code,
             output_path,
-        }) => complete_job(jobs, launch, exit_code, output_path).await,
+        }) => complete_job(jobs, launch, exit_code, output_path, record_after).await,
         Some(Ending::Fail { error, output_path }) => {
-            fail_job(jobs, launch, error, output_path).await;
+            fail_job(jobs, launch, error, output_path, record_after).await;
         }
         None => {}
     }
@@ -2636,6 +3124,7 @@ async fn release_settled_waiters(
     store: &mut RegistryStore,
     reads: &mut ReadTracker,
     parked: &mut ParkedOutput,
+    cfg: &PipelineConfig<'_>,
     launch: LaunchId,
     tx: &WeakSender<JobCommand>,
 ) {
@@ -2651,12 +3140,239 @@ async fn release_settled_waiters(
                 let _ = reply.send(Some(store.jobs[&launch].info.clone())).await;
             }
             SettledWaiter::Owe { ending, reply } => {
-                let owed = owe_completion(&mut store.jobs, launch, ending, tx).await;
+                let owed =
+                    owe_completion(&mut store.jobs, launch, ending, cfg.record_after, tx).await;
                 let _ = reply.send(Some(owed)).await;
             }
         }
     }
-    forget_if_done(store, reads, parked, launch);
+    forget_if_done(store, reads, parked, launch, cfg.retention).await;
+}
+
+fn collect_visible_pipelines(
+    store: &RegistryStore,
+    cfg: &PipelineConfig<'_>,
+) -> Vec<PipelineSnapshot> {
+    let mut out = Vec::new();
+    let now = Instant::now();
+    for (&launch, job) in &store.jobs {
+        let Some(pipeline) = &job.pipeline else {
+            continue;
+        };
+        let visible = if matches!(job.info.status, JobStatus::Running) {
+            pipeline.background
+                || job.redirected_disk
+                || now.saturating_duration_since(job.info.started_at) >= cfg.record_after
+        } else {
+            pipeline.should_retain_after_job()
+        };
+        if visible {
+            out.push(pipeline.snapshot(
+                job.info.pid,
+                launch,
+                job.info.status.clone(),
+                job.info.started_at,
+                job.finished_at,
+                cfg.retention,
+            ));
+        }
+    }
+    for (&launch, entry) in &store.retained_pipelines.by_launch {
+        if entry.finished_at + cfg.retention > now {
+            out.push(entry.pipeline.snapshot(
+                entry.pid,
+                launch,
+                entry.job_status.clone(),
+                entry.started_at,
+                Some(entry.finished_at),
+                cfg.retention,
+            ));
+        }
+    }
+    out.sort_by_key(|snap| snap.launch.raw());
+    out
+}
+
+fn lookup_pipeline_snapshot(
+    store: &RegistryStore,
+    pid: u32,
+    cfg: &PipelineConfig<'_>,
+) -> Result<PipelineSnapshot, PipelineReadError> {
+    if let Some(launch) = store.latest_launch(pid)
+        && let Some(job) = store.jobs.get(&launch)
+    {
+        let Some(pipeline) = &job.pipeline else {
+            return Err(PipelineReadError::NoPipeline { pid });
+        };
+        return Ok(pipeline.snapshot(
+            job.info.pid,
+            launch,
+            job.info.status.clone(),
+            job.info.started_at,
+            job.finished_at,
+            cfg.retention,
+        ));
+    }
+    if let Some(&launch) = store.retained_pipelines.latest_by_pid.get(&pid)
+        && let Some(entry) = store.retained_pipelines.by_launch.get(&launch)
+    {
+        return Ok(entry.pipeline.snapshot(
+            entry.pid,
+            launch,
+            entry.job_status.clone(),
+            entry.started_at,
+            Some(entry.finished_at),
+            cfg.retention,
+        ));
+    }
+    if store.retained_pipelines.expired_pids.contains(&pid) {
+        return Err(PipelineReadError::Expired { pid });
+    }
+    Err(PipelineReadError::UnknownJob { pid })
+}
+
+async fn read_pipeline_stage_by_pid(
+    store: &RegistryStore,
+    pid: u32,
+    step: usize,
+    selector: StageStreamSelector,
+    raw: bool,
+) -> Result<Vec<u8>, PipelineReadError> {
+    if let Some(launch) = store.latest_launch(pid)
+        && let Some(job) = store.jobs.get(&launch)
+    {
+        let Some(pipeline) = &job.pipeline else {
+            return Err(PipelineReadError::NoPipeline { pid });
+        };
+        return pipeline.read_stage_bytes(pid, step, selector, raw).await;
+    }
+    if let Some(&launch) = store.retained_pipelines.latest_by_pid.get(&pid)
+        && let Some(entry) = store.retained_pipelines.by_launch.get(&launch)
+    {
+        return entry
+            .pipeline
+            .read_stage_bytes(pid, step, selector, raw)
+            .await;
+    }
+    if store.retained_pipelines.expired_pids.contains(&pid) {
+        return Err(PipelineReadError::Expired { pid });
+    }
+    Err(PipelineReadError::UnknownJob { pid })
+}
+
+async fn read_pipeline_stage_delta_by_pid(
+    store: &mut RegistryStore,
+    pid: u32,
+    step: usize,
+    cursor: usize,
+    max_bytes: usize,
+    tracked: bool,
+) -> Result<JobRead, PipelineReadError> {
+    if let Some(launch) = store.latest_launch(pid)
+        && let Some(job) = store.jobs.get(&launch)
+    {
+        let Some(pipeline) = &job.pipeline else {
+            return Err(PipelineReadError::NoPipeline { pid });
+        };
+        let delta = pipeline
+            .read_stage_delta(pid, job.info.status.clone(), step, cursor, max_bytes)
+            .await?;
+        return Ok(store
+            .retained_pipelines
+            .track_step_delta(launch, step, delta, tracked));
+    }
+    if let Some(&launch) = store.retained_pipelines.latest_by_pid.get(&pid)
+        && let Some(entry) = store.retained_pipelines.by_launch.get(&launch)
+    {
+        let delta = entry
+            .pipeline
+            .read_stage_delta(pid, entry.job_status.clone(), step, cursor, max_bytes)
+            .await?;
+        return Ok(store
+            .retained_pipelines
+            .track_step_delta(launch, step, delta, tracked));
+    }
+    if store.retained_pipelines.expired_pids.contains(&pid) {
+        return Err(PipelineReadError::Expired { pid });
+    }
+    Err(PipelineReadError::UnknownJob { pid })
+}
+
+async fn read_pipeline_stage_ui(
+    store: &RegistryStore,
+    pid: u32,
+    launch: Option<LaunchId>,
+    step: usize,
+    cursor: usize,
+    max_bytes: usize,
+) -> Result<StageUiDelta, PipelineReadError> {
+    if let Some(launch) = launch {
+        if let Some(job) = store.jobs.get(&launch) {
+            let Some(pipeline) = &job.pipeline else {
+                return Err(PipelineReadError::NoPipeline { pid: job.info.pid });
+            };
+            return pipeline
+                .read_stage_ui_delta(
+                    job.info.pid,
+                    launch,
+                    job.info.status.clone(),
+                    step,
+                    cursor,
+                    max_bytes,
+                )
+                .await;
+        }
+        if let Some(entry) = store.retained_pipelines.by_launch.get(&launch) {
+            return entry
+                .pipeline
+                .read_stage_ui_delta(
+                    entry.pid,
+                    launch,
+                    entry.job_status.clone(),
+                    step,
+                    cursor,
+                    max_bytes,
+                )
+                .await;
+        }
+        return Err(PipelineReadError::Expired { pid });
+    }
+    if let Some(launch) = store.latest_launch(pid)
+        && let Some(job) = store.jobs.get(&launch)
+    {
+        let Some(pipeline) = &job.pipeline else {
+            return Err(PipelineReadError::NoPipeline { pid });
+        };
+        return pipeline
+            .read_stage_ui_delta(
+                pid,
+                launch,
+                job.info.status.clone(),
+                step,
+                cursor,
+                max_bytes,
+            )
+            .await;
+    }
+    if let Some(&launch) = store.retained_pipelines.latest_by_pid.get(&pid)
+        && let Some(entry) = store.retained_pipelines.by_launch.get(&launch)
+    {
+        return entry
+            .pipeline
+            .read_stage_ui_delta(
+                pid,
+                launch,
+                entry.job_status.clone(),
+                step,
+                cursor,
+                max_bytes,
+            )
+            .await;
+    }
+    if store.retained_pipelines.expired_pids.contains(&pid) {
+        return Err(PipelineReadError::Expired { pid });
+    }
+    Err(PipelineReadError::UnknownJob { pid })
 }
 
 fn script_preview(script: &str, limit: usize) -> String {
