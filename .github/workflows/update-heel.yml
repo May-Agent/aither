@@ -50,11 +50,9 @@ jobs:
         if: steps.release.outputs.version
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust artifacts
+      - name: Setup stow
         if: steps.release.outputs.version
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: update-heel
+        uses: water-rs/stow@main
 
       - name: Move the library and the pin
         if: steps.release.outputs.version
