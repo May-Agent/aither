@@ -31,13 +31,7 @@ jobs:
       # `cargo publish` verifies each tarball by compiling it; aither-search
       # builds lance/prost, which needs protoc. CI installs it too.
       - uses: ./.github/actions/install-protoc
-      # Every crate's publish verification shares the ci-ubuntu cache: CI
-      # keeps it warm between releases, a release-scoped key would go cold and
-      # never hit.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: ci-ubuntu
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@v2
         with:
           tool: release-plz@0.4.3

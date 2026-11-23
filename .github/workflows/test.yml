@@ -7,10 +7,9 @@ on:
         description: Cargo flags selecting packages and features to test.
         required: true
         type: string
-      cache-key:
+      label:
         description: >-
-          Short label distinguishing this run's cache. Kept separate from
-          `flags` because a GitHub cache key may not contain commas or spaces.
+          Short label distinguishing this run's cargo-timings artifact.
         required: true
         type: string
       os:
@@ -20,8 +19,7 @@ on:
       filterset:
         description: >-
           Nextest filterset naming the affected packages, empty to run every
-          test. It narrows what runs, never what is built, so the build keeps
-          the `flags` feature resolution the saved caches were built with.
+          test. It narrows what runs, never what is built.
         required: false
         default: ''
         type: string
@@ -61,10 +59,7 @@ jobs:
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h /
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          shared-key: test-${{ matrix.os }}-${{ inputs.cache-key }}
+      - uses: water-rs/stow@main
       - uses: ./.github/actions/install-protoc
       - uses: taiki-e/install-action@nextest
       - name: Allow unprivileged user namespaces on Ubuntu 24.04
@@ -88,5 +83,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cargo-timings-test-${{ inputs.cache-key }}-${{ matrix.os }}
+          name: cargo-timings-test-${{ inputs.label }}-${{ matrix.os }}
           path: target/cargo-timings/
