@@ -11,6 +11,7 @@ use crate::job_registry::{
     JobInfo, JobInputError, JobRead, JobRegistry, JobStatus, JobWatch, KillCause, WeakLaunchLease,
 };
 use crate::output::{MediaResolution, OutputFormat, OutputStore};
+use crate::pipeline::{PipelineReadError, PipelineSnapshot, StageStreamSelector, StageUiDelta};
 use crate::wording::CommandKilled;
 
 /// How a script ended.
@@ -54,6 +55,7 @@ impl ScriptResult {
             stdout: self.stdout,
             stderr: self.stderr,
             outcome,
+            retained_pid: None,
             interruptions: self.interruptions,
         }
     }
@@ -142,6 +144,84 @@ impl Jobs {
     #[must_use]
     pub fn events(&self) -> ShellEvents {
         self.events.clone()
+    }
+
+    /// Every pipeline currently visible for live UI streaming or post-completion
+    /// stage inspection.
+    ///
+    /// Foreground pipelines that have not yet run for `pipeline_record_after`
+    /// are excluded so fast pipelines never flash staged UI.
+    pub async fn pipelines(&self) -> Vec<PipelineSnapshot> {
+        self.registry.list_pipelines().await
+    }
+
+    /// Snapshot of the pipeline for `pid`, running or within its post-exit
+    /// retention window.
+    ///
+    /// # Errors
+    /// Returns [`PipelineReadError`] when `pid` is unknown, had no tapped
+    /// pipeline, or expired after its retention window.
+    pub async fn pipeline(&self, pid: u32) -> Result<PipelineSnapshot, PipelineReadError> {
+        self.registry.pipeline_by_pid(pid).await
+    }
+
+    /// Reads the full native or terminal-rendered output of `step` for `pid`.
+    ///
+    /// When `raw` is `false`, terminal control sequences and `\r` overwrites
+    /// are rendered to plain text; when `true`, the stage's native byte stream
+    /// (with harness-injected SGR stripped and command-authored ANSI kept) is
+    /// returned verbatim.
+    ///
+    /// # Errors
+    /// Returns [`PipelineReadError`] when `pid` is unknown, expired, or `step`
+    /// was not retained.
+    pub async fn read_pipeline_stage(
+        &self,
+        pid: u32,
+        step: usize,
+        selector: StageStreamSelector,
+        raw: bool,
+    ) -> Result<Vec<u8>, PipelineReadError> {
+        self.registry
+            .read_pipeline_stage(pid, step, selector, raw)
+            .await
+    }
+
+    /// Incremental terminal-rendered stage read for `terminal_read`, tracking
+    /// unchanged polls per `(launch, step)`.
+    ///
+    /// # Errors
+    /// Returns [`PipelineReadError`] when `pid` is unknown, expired, or `step`
+    /// was not retained.
+    pub async fn read_pipeline_stage_delta(
+        &self,
+        pid: u32,
+        step: usize,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Result<JobRead, PipelineReadError> {
+        self.registry
+            .read_pipeline_stage_delta(pid, step, cursor, max_bytes, true)
+            .await
+    }
+
+    /// Incremental UI-colored stage read (preserving ANSI colors), optionally
+    /// pinned to `launch` so historical cards never collide on OS PID reuse.
+    ///
+    /// # Errors
+    /// Returns [`PipelineReadError`] when `pid`/`launch` is unknown, expired,
+    /// or `step` was not retained.
+    pub async fn read_pipeline_stage_ui(
+        &self,
+        pid: u32,
+        launch: Option<LaunchId>,
+        step: usize,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Result<StageUiDelta, PipelineReadError> {
+        self.registry
+            .read_pipeline_stage_ui(pid, launch, step, cursor, max_bytes)
+            .await
     }
 }
 

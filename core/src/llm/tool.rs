@@ -1943,6 +1943,7 @@ mod tests {
             },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 3 },
+            retained_pid: None,
             interruptions: Vec::new(),
         }));
         assert_eq!(result.render_for_model(), "hi\nExit code: 3.\n");
@@ -1968,6 +1969,7 @@ mod tests {
                     text: "oops".to_string(),
                 }),
                 outcome: CommandOutcome::Exited { code: 1 },
+                retained_pid: Some(48210),
                 interruptions: Vec::new(),
             },
             CommandResult {
@@ -1978,6 +1980,7 @@ mod tests {
                 },
                 stderr: None,
                 outcome: CommandOutcome::Exited { code: 0 },
+                retained_pid: None,
                 interruptions: Vec::new(),
             },
             CommandResult {
@@ -1990,6 +1993,7 @@ mod tests {
                     pid: 4242,
                     output: file(),
                 },
+                retained_pid: None,
                 interruptions: Vec::new(),
             },
         ];

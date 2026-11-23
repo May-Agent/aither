@@ -1,2 +1,2 @@
 {{ empty }}{{ stdout }}{% if let Some(stderr) = stderr %}stderr:
-{{ stderr }}{% endif %}{{ outcome }}{{ interruptions }}
+{{ stderr }}{% endif %}{{ outcome }}{{ retained_pid }}{{ interruptions }}
