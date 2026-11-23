@@ -123,6 +123,14 @@ pub struct CommandResult {
     pub stderr: Option<CommandStream>,
     /// How the run ended.
     pub outcome: CommandOutcome,
+    /// Process identifier whose upstream pipeline stage outputs remain
+    /// inspectable after a foreground run completed, when at least one
+    /// non-final stage met the retention threshold.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub retained_pid: Option<u32>,
     /// Spans of the run during which the machine was asleep or offline.
     #[cfg_attr(feature = "serde", serde(default))]
     pub interruptions: Vec<Interruption>,
@@ -141,11 +149,18 @@ struct CommandStreamTemplate<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "retained_pid.txt", escape = "none")]
+struct RetainedPidTemplate {
+    pid: u32,
+}
+
+#[derive(Template)]
 #[template(path = "command_result.txt", escape = "none")]
 struct CommandResultTemplate<'a> {
     stdout: &'a str,
     stderr: Option<&'a str>,
     outcome: &'a CommandOutcome,
+    retained_pid: &'a str,
     interruptions: &'a str,
 }
 
@@ -193,10 +208,17 @@ impl CommandResult {
             .as_ref()
             .map(CommandStream::render_for_model)
             .filter(|block| !block.is_empty());
+        let retained_pid = match (&self.outcome, self.retained_pid) {
+            (CommandOutcome::Exited { .. }, Some(pid)) => RetainedPidTemplate { pid }
+                .render()
+                .expect("retained pid template must render"),
+            _ => String::new(),
+        };
         CommandResultTemplate {
             stdout: &stdout,
             stderr: stderr.as_deref(),
             outcome: &self.outcome,
+            retained_pid: &retained_pid,
             interruptions: &render_interruptions(&self.interruptions),
         }
         .render()
@@ -226,6 +248,7 @@ mod tests {
             stdout,
             stderr,
             outcome,
+            retained_pid: None,
             interruptions: Vec::new(),
         }
         .render_for_model()
@@ -316,6 +339,7 @@ mod tests {
             },
             stderr: None,
             outcome: CommandOutcome::Exited { code: 1 },
+            retained_pid: None,
             interruptions: alloc::vec![
                 Interruption {
                     cause: InterruptionCause::Asleep,
@@ -332,6 +356,40 @@ mod tests {
         assert_eq!(
             command.render_for_model(),
             "out\nExit code: 1.\nThe machine was asleep from 14:02:11 to 14:31:40 while this ran.\nThe network was offline from 14:31:40 to 14:32:05 while this ran.\n"
+        );
+    }
+
+    #[test]
+    fn retained_pid_renders_only_for_completed_foreground_runs() {
+        let exited = CommandResult {
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 1 },
+            retained_pid: Some(48210),
+            interruptions: Vec::new(),
+        };
+        assert_eq!(
+            exited.render_for_model(),
+            "(no output)\nExit code: 1.\nPID: 48210.\n"
+        );
+
+        let running = CommandResult {
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Running {
+                pid: 48210,
+                output: file(),
+            },
+            retained_pid: Some(48210),
+            interruptions: Vec::new(),
+        };
+        assert_eq!(
+            running.render_for_model(),
+            "Started in background with PID 48210; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt).\n"
         );
     }
 }

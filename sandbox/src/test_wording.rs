@@ -193,6 +193,7 @@ pub fn argument_descriptions()
         ("timeout", "The maximum runtime in seconds."),
         ("background", "Whether the command is detached at once."),
         ("pid", "Process ID of the job."),
+        ("step", "Zero-based pipeline stage index to read."),
         ("cursor", "The offset after which output is read."),
         ("max_bytes", "The most bytes returned."),
         ("input", "The text written to stdin."),

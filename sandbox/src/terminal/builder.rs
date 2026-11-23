@@ -6,6 +6,7 @@ use executor_core::AnyExecutor;
 
 use super::{Interpreter, Shell, ShellToolSettings, TerminalError};
 use crate::output_treatment::AnyTreatOutput;
+use crate::pipeline::{AnyPlanPipelines, PlanPipelines};
 use crate::{
     AnyIpcProvider, AnyScriptPolicy, AnyShellWording, HostLaunch, IpcProvider, OutputPolicy,
     Sandbox, ScriptPolicy, ShellEvents, ShellLimits, ShellWording, TreatOutput,
@@ -30,6 +31,7 @@ pub struct ShellParts {
     pub(crate) policies: Vec<AnyScriptPolicy>,
     pub(crate) ipc: Option<AnyIpcProvider>,
     pub(crate) treat_output: Option<AnyTreatOutput>,
+    pub(crate) plan_pipelines: Option<AnyPlanPipelines>,
     pub(crate) host_shell: Option<HostLaunch>,
 }
 
@@ -49,6 +51,7 @@ pub struct ShellBuilder<I, L, O, W, T> {
     policies: Vec<AnyScriptPolicy>,
     ipc: Option<AnyIpcProvider>,
     treat_output: Option<AnyTreatOutput>,
+    plan_pipelines: Option<AnyPlanPipelines>,
     host_shell: Option<HostLaunch>,
 }
 
@@ -73,6 +76,7 @@ impl Shell<Arc<AnyExecutor>> {
             policies: Vec::new(),
             ipc: None,
             treat_output: None,
+            plan_pipelines: None,
             host_shell: None,
         }
     }
@@ -97,6 +101,7 @@ impl Shell<Arc<AnyExecutor>> {
             policies: Vec::new(),
             ipc: None,
             treat_output: None,
+            plan_pipelines: None,
             host_shell: Some(host_shell),
         }
     }
@@ -135,6 +140,15 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
         self
     }
 
+    /// Configures per-stage pipeline tapping and non-TTY color injection for
+    /// multi-stage shell pipelines selected by `planner`, shared with every
+    /// subagent shell derived from this one.
+    #[must_use]
+    pub fn plan_pipelines(mut self, planner: impl PlanPipelines) -> Self {
+        self.plan_pipelines = Some(AnyPlanPipelines::new(planner));
+        self
+    }
+
     /// Raises the shell's events, and those of the subagent shells it
     /// launches, on `events`, which other shells may share. Without it the
     /// shell has a handle of its own, read with [`Shell::events`].
@@ -162,6 +176,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
+            plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
         }
     }
@@ -180,6 +195,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
+            plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
         }
     }
@@ -198,6 +214,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
+            plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
         }
     }
@@ -219,6 +236,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
+            plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
         }
     }
@@ -241,6 +259,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
+            plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
         }
     }
@@ -276,6 +295,7 @@ impl
             policies,
             ipc,
             treat_output,
+            plan_pipelines,
             host_shell,
         } = self;
         let executor = sandbox.executor();
@@ -292,6 +312,7 @@ impl
                 policies,
                 ipc,
                 treat_output,
+                plan_pipelines,
                 host_shell,
             },
         )

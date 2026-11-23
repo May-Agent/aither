@@ -209,6 +209,9 @@ impl JobReadTool {
 pub struct JobReadArgs {
     // The process ID of the job to read.
     pub pid: u32,
+    // Optional zero-based pipeline stage index to read instead of the final stream.
+    #[serde(default)]
+    pub step: Option<usize>,
     // The offset after which output is read.
     #[serde(default)]
     pub cursor: usize,
@@ -245,15 +248,60 @@ impl Tool for JobReadTool {
         if max_bytes == 0 {
             return Err(Refused::call(&*self.wording, CallRefusal::ZeroMaxBytes));
         }
-        let job = self
-            .jobs
-            .get(pid)
-            .await
-            .ok_or_else(|| unknown_job(pid, &self.wording))?;
-        let read = job
-            .read(args.cursor, max_bytes)
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let read = if let Some(step) = args.step {
+            match self
+                .jobs
+                .read_pipeline_stage_delta(pid, step, args.cursor, max_bytes)
+                .await
+            {
+                Ok(read) => read,
+                Err(crate::PipelineReadError::UnknownJob { pid }) => {
+                    return Err(unknown_job(pid, &self.wording));
+                }
+                Err(crate::PipelineReadError::Expired { pid }) => {
+                    return Err(Refused::call(
+                        &*self.wording,
+                        CallRefusal::ExpiredJob { pid },
+                    ));
+                }
+                Err(crate::PipelineReadError::NoPipeline { pid }) => {
+                    return Err(Refused::call(
+                        &*self.wording,
+                        CallRefusal::InvalidPipelineStep {
+                            pid,
+                            step,
+                            kept_steps: Vec::new(),
+                        },
+                    ));
+                }
+                Err(crate::PipelineReadError::InvalidStep {
+                    pid,
+                    step,
+                    kept_steps,
+                }) => {
+                    return Err(Refused::call(
+                        &*self.wording,
+                        CallRefusal::InvalidPipelineStep {
+                            pid,
+                            step,
+                            kept_steps,
+                        },
+                    ));
+                }
+                Err(crate::PipelineReadError::Io(detail)) => {
+                    return Err(anyhow::Error::msg(detail));
+                }
+            }
+        } else {
+            let job = self
+                .jobs
+                .get(pid)
+                .await
+                .ok_or_else(|| unknown_job(pid, &self.wording))?;
+            job.read(args.cursor, max_bytes)
+                .await
+                .map_err(anyhow::Error::msg)?
+        };
         match read {
             JobRead::Delta(_) => Ok(ToolResult::text(self.wording.job_read(&read))),
             // A poll is a refusal the loop can tell from a read, worded as
