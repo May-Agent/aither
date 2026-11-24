@@ -479,3 +479,146 @@ async fn v1_cancel_returns_cancelled() {
     let result = prompt.await.unwrap().expect("prompt result");
     assert_eq!(result["stopReason"], "cancelled");
 }
+
+// --- direct in-process Server ----------------------------------------------
+
+struct ConfiguredServer {
+    server: Server,
+    auth_events: Arc<Mutex<Vec<aither_acp::server::AuthRequest>>>,
+    notifications: Arc<Mutex<Vec<String>>>,
+}
+
+fn configured_e2e_server() -> ConfiguredServer {
+    use aither_acp::domain::{AgentAuth, AuthKind, AuthMethod, AuthMethodId, ExtMethod};
+    use aither_acp::server::{AuthConfig, AuthRequest};
+
+    let auth_events: Arc<Mutex<Vec<AuthRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let auth_events_cb = auth_events.clone();
+    let notifications: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let notifications_cb = notifications.clone();
+
+    let method = AuthMethod {
+        method_id: AuthMethodId::from("api-key"),
+        name: "API Key".to_string(),
+        description: None,
+        kind: Open::Known(AuthKind::Agent(AgentAuth::default())),
+        meta: None,
+        extra: BTreeMap::new(),
+    };
+
+    let server = Server::builder(echo_host(), Implementation::new("custom-agent", "1.2.3"))
+        .auth(AuthConfig::new(vec![method], move |req| {
+            let events = auth_events_cb.clone();
+            async move {
+                match &req {
+                    AuthRequest::Login(login) if login.method_id.as_str() == "api-key" => {
+                        events.lock().expect("auth").push(req);
+                        Ok(())
+                    }
+                    AuthRequest::Login(_) => Err(rpc::RpcError::auth_required()),
+                    AuthRequest::Logout(_) => {
+                        events.lock().expect("auth").push(req);
+                        Ok(())
+                    }
+                }
+            }
+        }))
+        .ext(move |ext: ExtMethod, params| {
+            let notes = notifications_cb.clone();
+            async move {
+                match ext.as_str() {
+                    "_agent/status" => Ok(json!({ "ready": true, "params": params })),
+                    "_agent/ping" => {
+                        notes.lock().expect("notes").push(ext.as_str().to_string());
+                        Ok(json!({}))
+                    }
+                    other => Err(rpc::RpcError::method_not_found(other)),
+                }
+            }
+        })
+        .build();
+
+    ConfiguredServer {
+        server,
+        auth_events,
+        notifications,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_server_end_to_end() {
+    use aither_acp::client::ClientError;
+    use aither_acp::domain::{AuthMethodId, ExtMethod};
+
+    let ConfiguredServer {
+        server,
+        auth_events,
+        notifications,
+    } = configured_e2e_server();
+    let (client, conn) = Client::builder(Implementation::new("e2e-client", "0.0.0"))
+        .in_process_server(server)
+        .await
+        .expect("in_process_server");
+    let driver = tokio::spawn(conn);
+
+    assert_eq!(client.protocol_version(), 2);
+    let agent = client.agent_info().expect("agent info");
+    assert_eq!(agent.name, "custom-agent");
+    assert_eq!(agent.version, "1.2.3");
+    assert_eq!(client.auth_methods().len(), 1);
+    assert_eq!(client.auth_methods()[0].method_id.as_str(), "api-key");
+
+    client.authenticate("api-key").await.expect("authenticate");
+    let rejected = client
+        .authenticate("wrong")
+        .await
+        .expect_err("wrong method rejected");
+    assert!(matches!(rejected, ClientError::Rejected(_)));
+    client
+        .logout(Some(AuthMethodId::from("api-key")))
+        .await
+        .expect("logout");
+    assert_eq!(auth_events.lock().expect("auth").len(), 2);
+
+    let status_method = ExtMethod::try_new("_agent/status").expect("ext method");
+    let status = client
+        .ext_request(&status_method, &json!({ "verbose": true }))
+        .await
+        .expect("ext_request");
+    assert_eq!(status["ready"], true);
+    assert_eq!(status["params"]["verbose"], true);
+
+    let ping_method = ExtMethod::try_new("_agent/ping").expect("ext method");
+    client
+        .ext_notify(&ping_method, &json!({}))
+        .await
+        .expect("ext_notify");
+    assert_eq!(*notifications.lock().expect("notes"), vec!["_agent/ping"]);
+
+    let missing_method = ExtMethod::try_new("_agent/missing").expect("ext method");
+    let missing_err = client
+        .ext_request(&missing_method, &json!({}))
+        .await
+        .expect_err("missing ext rejected");
+    assert!(
+        matches!(missing_err, ClientError::Rejected(ref e) if e.code() == rpc::METHOD_NOT_FOUND)
+    );
+
+    let session = client
+        .new_session("/tmp")
+        .open()
+        .await
+        .expect("session/new");
+    let outcome = session.prompt_run("hello direct").await.expect("prompt");
+    let TurnOutcome::Finished {
+        stop_reason, text, ..
+    } = outcome
+    else {
+        panic!("expected finished turn, got {outcome:?}");
+    };
+    assert_eq!(stop_reason, Some(Open::Known(StopReason::EndTurn)));
+    assert_eq!(text, "echo: hello direct");
+
+    client.close().await;
+    driver.await.expect("driver");
+}

@@ -8,7 +8,8 @@
 //!   [`Transport`](crate::rpc::Transport);
 //!   `initialize` negotiates ACP v1 or v2 and v1 traffic is translated
 //!   through per-session [`V1Codec`](crate::wire::codec::V1Codec)s.
-//! - **direct** — [`ClientBuilder::in_process`]: zero-serde, always v2
+//! - **direct** — [`ClientBuilder::in_process`] /
+//!   [`ClientBuilder::in_process_server`]: zero-serde, always v2
 //!   semantics, straight into
 //!   [`ServerCore`](crate::server::ServerCore).
 //!

@@ -4,7 +4,10 @@
 //! and ACP v2 clients. The transport-independent [`ServerCore`]
 //! dispatching logic is fronted by [`WireAdapter`] on a JSON-RPC
 //! transport ([`Server::serve`]) or called directly by
-//! `client::in_process` (the direct lane).
+//! [`ClientBuilder::in_process`](crate::client::ClientBuilder::in_process)
+//! and
+//! [`ClientBuilder::in_process_server`](crate::client::ClientBuilder::in_process_server)
+//! (the direct lane).
 //!
 //! ```rust,no_run
 //! use std::path::PathBuf;
@@ -114,7 +117,10 @@ impl Server {
     }
 
     /// The core dispatcher — the object the in-process direct lane
-    /// (`client::in_process`) calls into.
+    /// ([`ClientBuilder::in_process`](crate::client::ClientBuilder::in_process)
+    /// and
+    /// [`ClientBuilder::in_process_server`](crate::client::ClientBuilder::in_process_server))
+    /// calls into.
     #[must_use]
     pub const fn core(&self) -> &Arc<ServerCore> {
         &self.core

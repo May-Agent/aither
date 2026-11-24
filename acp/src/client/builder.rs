@@ -238,8 +238,10 @@ impl ClientBuilder {
     /// spawn (or `or`) it for turns to progress. The agent's
     /// `Implementation` reported at `initialize` is the fixed
     /// in-process label; `SessionHost` carries no identity of its own.
-    /// Closing the [`Connection`] — or dropping the last [`Client`]
-    /// clone — ends the host.
+    /// Use [`in_process_server`](Self::in_process_server) when driving a
+    /// [`crate::server::Server`] configured with custom identity, auth,
+    /// or extension handlers. Closing the [`Connection`] — or dropping
+    /// the last [`Client`] clone — ends the host.
     ///
     /// # Errors
     ///
@@ -248,16 +250,93 @@ impl ClientBuilder {
         self,
         host: H,
     ) -> Result<(Client, Connection), ClientError> {
+        self.in_process_server(crate::server::Server::new(
+            host,
+            crate::domain::Implementation::new("in-process-agent", env!("CARGO_PKG_VERSION")),
+        ))
+        .await
+    }
+
+    /// Attach to a configured in-process [`crate::server::Server`] over
+    /// the zero-serde direct lane (always v2 semantics).
+    ///
+    /// Unlike [`in_process`](Self::in_process), this reuses `server`'s
+    /// [`crate::server::ServerCore`] directly, preserving the configured
+    /// [`Implementation`], [`crate::server::AuthConfig`] (`auth/login`
+    /// and `auth/logout`), [`crate::server::ExtHandler`] (`_`-prefixed
+    /// extension requests and notifications), and
+    /// [`crate::server::UnknownHandler`].
+    ///
+    /// The returned [`Connection`] drives the agent's prompt scheduler —
+    /// spawn (or `or`) it for turns to progress. Closing the
+    /// [`Connection`] — or dropping the last [`Client`] clone — ends the
+    /// host.
+    ///
+    /// ```rust,no_run
+    /// use aither_acp::{
+    ///     Client, ExtMethod, Implementation, PendingPrompt, PromptError, Server, Session,
+    ///     SessionContext, SessionHost, SessionSetupParams, StopReason, server::ServerError,
+    /// };
+    /// use serde_json::json;
+    ///
+    /// # struct DemoSession;
+    /// # impl Session for DemoSession {
+    /// #     async fn prompt(
+    /// #         &self,
+    /// #         pending: PendingPrompt,
+    /// #         _cx: &SessionContext,
+    /// #     ) -> Result<StopReason, PromptError> {
+    /// #         let turn = pending
+    /// #             .accept()
+    /// #             .await
+    /// #             .map_err(|e| PromptError::from(e.into_inner()))?;
+    /// #         turn.message().text("ok").await.ok();
+    /// #         Ok(StopReason::EndTurn)
+    /// #     }
+    /// # }
+    /// # struct DemoHost;
+    /// # impl SessionHost for DemoHost {
+    /// #     type Session = DemoSession;
+    /// #     async fn new_session(
+    /// #         &self,
+    /// #         _params: SessionSetupParams,
+    /// #         _cx: &SessionContext,
+    /// #     ) -> Result<DemoSession, ServerError> {
+    /// #         Ok(DemoSession)
+    /// #     }
+    /// # }
+    /// # async fn run() {
+    /// let server = Server::builder(DemoHost, Implementation::new("demo-agent", "1.0.0"))
+    ///     .ext(|method: ExtMethod, _params| async move {
+    ///         Ok(json!({ "method": method.as_str() }))
+    ///     })
+    ///     .build();
+    /// let (client, conn) = Client::builder(Implementation::new("my-client", "1.0.0"))
+    ///     .in_process_server(server)
+    ///     .await
+    ///     .expect("in_process_server");
+    /// tokio::spawn(conn);
+    /// let ping = ExtMethod::try_new("_demo/ping").expect("ext method");
+    /// let reply = client.ext_request(&ping, &json!({})).await.expect("ext");
+    /// assert_eq!(reply["method"], "_demo/ping");
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The `initialize` capability exchange failed.
+    pub async fn in_process_server(
+        self,
+        server: crate::server::Server,
+    ) -> Result<(Client, Connection), ClientError> {
         let sessions = SessionRegistry::new();
         let hooks = self.hooks(sessions.clone());
         let caps = self.client_capabilities();
         // The client's handler table answers agent→client traffic.
         let server_hooks =
             crate::server::AnyAgentHooks::new(super::direct::DirectHooks::new(hooks, caps.clone()));
-        let core = std::sync::Arc::new(crate::server::ServerCore::new(
-            host,
-            crate::domain::Implementation::new("in-process-agent", env!("CARGO_PKG_VERSION")),
-        ));
+        let core = server.core().clone();
+        drop(server);
         let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
         let lane = AnyAgentLane::new(super::direct::DirectLane::new(
             super::direct::DirectServer::new(core.clone(), server_hooks, shutdown_tx),

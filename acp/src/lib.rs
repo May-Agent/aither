@@ -10,8 +10,9 @@
 //! - **Drive an agent**: [`Client::builder`] registers agent→client
 //!   handlers (permissions, elicitation, extension methods), then
 //!   [`ClientBuilder::connect`]s over a transport, `spawn`s a child
-//!   process (`process` feature), or [`ClientBuilder::in_process`]
-//!   attaches an in-process [`SessionHost`] over the zero-serde direct
+//!   process (`process` feature), or [`ClientBuilder::in_process`] /
+//!   [`ClientBuilder::in_process_server`] attaches an in-process
+//!   [`SessionHost`] or configured [`Server`] over the zero-serde direct
 //!   lane.
 //! - [`state`]: the canonical [`SessionReducer`] folding
 //!   `session/update`s into a [`SessionState`] snapshot plus
@@ -66,7 +67,8 @@
 //!
 //! [`ClientBuilder::spawn`] (`process` feature) launches an agent child,
 //! [`ClientBuilder::connect`] attaches any [`Transport`], and
-//! [`ClientBuilder::in_process`] attaches a [`SessionHost`] with zero
+//! [`ClientBuilder::in_process`] / [`ClientBuilder::in_process_server`]
+//! attach a [`SessionHost`] or configured [`Server`] with zero
 //! serialization:
 //!
 //! ```rust,no_run
