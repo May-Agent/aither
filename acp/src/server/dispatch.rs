@@ -4,8 +4,11 @@
 //! `ServerCore` owns the session table, negotiation state, the FIFO
 //! prompt scheduler, cancellation, and idempotency. [`WireAdapter`]
 //! decodes wire params (through the per-session [`V1Codec`] on v1),
-//! calls `ServerCore`, and encodes results. `client::in_process` calls
-//! the same domain-level API through the direct lane.
+//! calls `ServerCore`, and encodes results.
+//! [`ClientBuilder::in_process`](crate::client::ClientBuilder::in_process)
+//! and
+//! [`ClientBuilder::in_process_server`](crate::client::ClientBuilder::in_process_server)
+//! call the same domain-level API through the direct lane.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -95,8 +98,10 @@ pub type UnknownHandler = Arc<
 /// One `ServerCore` serves one connection: it tracks negotiated
 /// protocol version, client capabilities, the live session table, and
 /// per-session prompt scheduling. The same domain-level API is consumed
-/// by [`WireAdapter`] (JSON-RPC) and by `client::in_process` (the
-/// direct lane, always v2 semantics).
+/// by [`WireAdapter`] (JSON-RPC) and by
+/// [`ClientBuilder::in_process`](crate::client::ClientBuilder::in_process)
+/// / [`ClientBuilder::in_process_server`](crate::client::ClientBuilder::in_process_server)
+/// (the direct lane, always v2 semantics).
 ///
 /// Prompt turns do not run inside `prompt()` — they are driven by
 /// [`drive`](Self::drive), which `Server::serve` polls alongside the
