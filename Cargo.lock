@@ -44,6 +44,7 @@ dependencies = [
  "aither-command",
  "aither-connectivity",
  "aither-core",
+ "aither-dap",
  "aither-derive",
  "aither-fs",
  "aither-gemini",
@@ -350,6 +351,28 @@ dependencies = [
  "url",
  "wasm-bindgen-futures",
  "zenwave",
+]
+
+[[package]]
+name = "aither-dap"
+version = "0.31.0"
+dependencies = [
+ "aither-core",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "async-io",
+ "async-net",
+ "async-process",
+ "executor-core",
+ "futures-lite",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2186,9 +2209,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "time",
  "version_check",

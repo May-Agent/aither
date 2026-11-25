@@ -86,6 +86,9 @@ pub use aither_skills as skills;
 #[cfg(feature = "browser")]
 pub use aither_browser as browser;
 
+#[cfg(feature = "dap")]
+pub use aither_dap as dap;
+
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 

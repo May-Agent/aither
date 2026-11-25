@@ -1,0 +1,6 @@
+{% match notification %}{% when DebugNotification::Stopped(stop) %}Debug target stopped ({{ stop.reason }}){% if let Some(tid) = stop.thread_id %} on thread {{ tid }}{% endif %}{% if !stop.hit_breakpoint_ids.is_empty() %} [breakpoints: {% for id in stop.hit_breakpoint_ids %}{% if !loop.first %}, {% endif %}#{{ id }}{% endfor %}]{% endif %}.{% if let Some(frame) = stop.top_frame %}
+Frame: {{ frame }}{% endif %}{% if let Some(text) = stop.text %}
+{{ text }}{% endif %}{% if let Some(snippet) = stop.source_snippet %}
+Source ({{ snippet.path }}):
+{% for line in snippet.lines %}{% if line.current %}> {% else %}  {% endif %}{{ line.line }} | {{ line.text }}{% if !loop.last %}
+{% endif %}{% endfor %}{% endif %}{% when DebugNotification::Terminated(term) %}Debug target terminated{% if let Some(code) = term.exit_code %} (exit code {{ code }}){% endif %}{% if let Some(reason) = term.reason %}: {{ reason }}{% endif %}.{% endmatch %}
