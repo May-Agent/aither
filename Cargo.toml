@@ -21,6 +21,7 @@ members = [
     "skills",
     "models",
     "tools/browser",
+    "tools/dap",
     "tools/websearch",
     "tools/webfetch",
     "tools/search",
@@ -69,6 +70,7 @@ aither-ort = { path = "./ort", version = "0.31.0" }
 aither-skills = { path = "./skills", version = "0.31.0" }
 aither-attachments = { path = "./attachments", version = "0.31.0" }
 aither-browser = { path = "./tools/browser", version = "0.31.0" }
+aither-dap = { path = "./tools/dap", version = "0.31.0" }
 aither-websearch = { path = "./tools/websearch", version = "0.31.0" }
 aither-webfetch = { path = "./tools/webfetch", version = "0.31.0" }
 aither-search = { path = "./tools/search", version = "0.31.0" }
@@ -109,6 +111,7 @@ aither-skills = { workspace = true, optional = true }
 
 # Tools
 aither-browser = { workspace = true, optional = true }
+aither-dap = { workspace = true, optional = true }
 aither-websearch = { workspace = true, optional = true }
 aither-webfetch = { workspace = true, optional = true }
 aither-search = { workspace = true, optional = true }
@@ -191,6 +194,7 @@ skills = ["dep:aither-skills"]
 
 # Tools
 browser = ["dep:aither-browser"]
+dap = ["dep:aither-dap"]
 websearch = ["dep:aither-websearch"]
 webfetch = ["dep:aither-webfetch"]
 search = ["dep:aither-search"]
@@ -204,7 +208,7 @@ mcp = ["dep:aither-mcp"]
 all-providers = ["openai", "claude", "gemini", "llama", "ort", "apple"]
 
 # Convenience feature to enable all tools
-all-tools = ["browser", "websearch", "webfetch", "search", "fs", "command"]
+all-tools = ["browser", "dap", "websearch", "webfetch", "search", "fs", "command"]
 
 # Convenience feature to enable everything
 full = ["std", "derive", "serde", "all-providers", "all-tools", "agent", "rag", "mem0", "skills", "mcp", "connectivity"]

@@ -1,0 +1,23 @@
+{% match result %}{% when DebugResult::Status(status) %}Debug session: {{ status.state.as_str() }}{% if let Some(adapter) = status.adapter %} (adapter: {{ adapter }}){% endif %}{% if let Some(pid) = status.target_pid %}, pid {{ pid }}{% endif %}{% if let Some(target) = status.target %}, target: {{ target }}{% endif %}.
+Breakpoints: {{ status.breakpoint_count }}.{% if let Some(loc) = status.stop_location %}
+Stopped at {{ loc }}{% if let Some(reason) = status.stop_reason %} ({{ reason }}){% endif %}.{% endif %}{% if let Some(code) = status.exit_code %}
+Exit code: {{ code }}.{% endif %}{% when DebugResult::Stopped(stop) %}Stopped ({{ stop.reason }}){% if let Some(tid) = stop.thread_id %} on thread {{ tid }}{% endif %}{% if !stop.hit_breakpoint_ids.is_empty() %} [breakpoints: {% for id in stop.hit_breakpoint_ids %}{% if !loop.first %}, {% endif %}#{{ id }}{% endfor %}]{% endif %}.{% if let Some(desc) = stop.description %}
+{{ desc }}{% endif %}{% if let Some(text) = stop.text %}
+{{ text }}{% endif %}{% if let Some(frame) = stop.top_frame %}
+Frame: {{ frame }}{% endif %}{% if let Some(snippet) = stop.source_snippet %}
+Source ({{ snippet.path }}):
+{% for line in snippet.lines %}{% if line.current %}> {% else %}  {% endif %}{{ line.line }} | {{ line.text }}{% if !loop.last %}
+{% endif %}{% endfor %}{% endif %}{% when DebugResult::Running { note } %}{{ note }} An asynchronous notification will arrive when the target stops or exits.{% when DebugResult::BreakpointSet(bp) %}Breakpoint set: {{ bp }}{% when DebugResult::Breakpoints(list) %}{% if list.is_empty() %}No breakpoints set.{% else %}Breakpoints ({{ list.len() }}):
+{% for bp in list %}- {{ bp }}{% if !loop.last %}
+{% endif %}{% endfor %}{% endif %}{% when DebugResult::BreakpointRemoved(bp) %}Removed breakpoint: {{ bp }}{% when DebugResult::Threads(threads) %}{% if threads.is_empty() %}No active threads.{% else %}Threads ({{ threads.len() }}):
+{% for thread in threads %}- {% if thread.active %}* {% endif %}[{{ thread.id }}] {{ thread.name }}{% if !loop.last %}
+{% endif %}{% endfor %}{% endif %}{% when DebugResult::Stack(stack) %}Call stack for thread {{ stack.thread_id }} ({{ stack.frames.len() }}{% if let Some(total) = stack.total_frames %} of {{ total }}{% endif %} frames):
+{% for frame in stack.frames %}- {{ frame }}{% if !loop.last %}
+{% endif %}{% endfor %}{% when DebugResult::Variables(view) %}{% match view %}{% when VariablesView::Frame { frame, frame_name, scopes } %}Variables in frame #{{ frame }} ({{ frame_name }}):{% if scopes.is_empty() %}
+(no scopes){% else %}{% for scope in scopes %}
+{{ scope.name }}:{% if scope.variables.is_empty() %}
+  (empty){% else %}{% for var in scope.variables %}
+  - {{ var }}{% endfor %}{% endif %}{% endfor %}{% endif %}{% when VariablesView::Expanded { handle, label, variables } %}Expanded handle #{{ handle }} ({{ label }}):{% if variables.is_empty() %}
+  (no children){% else %}{% for var in variables %}
+  - {{ var }}{% endfor %}{% endif %}{% endmatch %}{% when DebugResult::Eval(eval) %}{{ eval.expression }} = {{ eval.value }}{% if let Some(ty) = eval.value_type %}{% if !ty.is_empty() %} ({{ ty }}){% endif %}{% endif %}{% if let Some(handle) = eval.expand %} [expand={{ handle }}]{% endif %}{% when DebugResult::Output(out) %}{% if out.entries.is_empty() %}No captured {{ out.category.as_str() }} output.{% else %}Captured {{ out.category.as_str() }} output ({{ out.entries.len() }} entries{% if out.dropped_entries > 0 %}, {{ out.dropped_entries }} older entries / {{ out.dropped_bytes }} bytes dropped{% endif %}):
+{% for entry in out.entries %}[{{ entry.category.as_str() }}] {{ entry.text }}{% endfor %}{% endif %}{% when DebugResult::Detached { target_pid } %}Detached from debug target{% if let Some(pid) = target_pid %} (pid {{ pid }} left running){% endif %}.{% when DebugResult::Terminated(term) %}Debug target terminated{% if let Some(code) = term.exit_code %} (exit code {{ code }}){% endif %}{% if let Some(reason) = term.reason %}: {{ reason }}{% endif %}.{% endmatch %}

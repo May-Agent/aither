@@ -44,6 +44,7 @@ dependencies = [
  "aither-command",
  "aither-connectivity",
  "aither-core",
+ "aither-dap",
  "aither-derive",
  "aither-fs",
  "aither-gemini",
@@ -350,6 +351,28 @@ dependencies = [
  "url",
  "wasm-bindgen-futures",
  "zenwave",
+]
+
+[[package]]
+name = "aither-dap"
+version = "0.31.0"
+dependencies = [
+ "aither-core",
+ "askama 0.16.1",
+ "async-channel",
+ "async-fs",
+ "async-io",
+ "async-net",
+ "async-process",
+ "executor-core",
+ "futures-lite",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

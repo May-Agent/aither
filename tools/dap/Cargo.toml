@@ -1,0 +1,36 @@
+[package]
+name = "aither-dap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Debug Adapter Protocol client, session state, and agent tool for aither"
+readme = "../../README.md"
+keywords = ["ai", "agent", "tool", "dap", "debugger"]
+categories = ["api-bindings", "development-tools::debugging"]
+
+[dependencies]
+aither-core.workspace = true
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+async-channel = "2"
+async-fs = "2"
+async-io = "2"
+async-net = "2"
+async-process = "2"
+executor-core = { version = "0.7", default-features = false }
+futures-lite = { version = "2.6", default-features = false, features = ["std"] }
+schemars = { version = "1.2", default-features = false, features = ["derive", "std"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+executor-core = { version = "0.7", features = ["tokio"] }
+tempfile = { version = "3.27", default-features = false, features = ["getrandom"] }
+tokio = { version = "1.53", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
