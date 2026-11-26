@@ -462,6 +462,46 @@ impl From<ServiceArgs> for ShellArgs {
     }
 }
 
+/// Arguments for starting a PTY-backed interactive background job through
+/// [`Shell::run_pty`].
+#[derive(Debug, Clone)]
+pub struct PtyArgs {
+    /// A short, human-readable explanation of what this command does.
+    pub description: String,
+    /// The source to run inside the PTY.
+    pub script: String,
+    /// The interpreter `script` runs under.
+    pub interpreter: Interpreter,
+    /// Initial terminal width in columns (must be non-zero).
+    pub cols: u16,
+    /// Initial terminal height in rows (must be non-zero).
+    pub rows: u16,
+    /// Maximum runtime in seconds; capped by the shell's `timeout_cap`.
+    pub timeout: u64,
+    /// Optional host working directory to start the PTY process in.
+    pub working_dir: Option<PathBuf>,
+    /// Whether the PTY job runs inside or outside the sandbox.
+    pub sandbox: SandboxMode,
+    /// Optional already-approved outer [`crate::LaunchInfo`] when invoked from
+    /// an IPC command inside an active `terminal` script.
+    ///
+    /// When `Some(info)` has `info.mode == SandboxMode::Unsandboxed`, the PTY
+    /// job inherits [`SandboxMode::Unsandboxed`] without prompting the
+    /// [`Approver`] a second time while still running all [`crate::ScriptPolicy`]
+    /// checks on `script`.
+    pub inherited_launch: Option<crate::LaunchInfo>,
+}
+
+/// A running PTY background job started by [`Shell::run_pty`].
+#[derive(Debug)]
+pub struct PtyJob {
+    /// Handle on the registered job, carrying its real `pid`, input, resize,
+    /// kill, and completion hooks.
+    pub job: crate::Job,
+    /// Raw byte stream read from the PTY master; closes when the process ends.
+    pub output: Receiver<Vec<u8>>,
+}
+
 /// Time bounds applied to every execution this terminal spawns.
 #[derive(Debug, Clone)]
 struct TerminalLimits {
@@ -950,6 +990,15 @@ impl<E: Clone> Clone for Shell<E> {
 }
 
 impl<E: Executor + Clone + 'static> Shell<E> {
+    /// Replaces the IPC provider this shell and its spawned scripts call back
+    /// through, allowing a derived subagent shell to bind its own command
+    /// bridge and shell slot.
+    #[must_use]
+    pub fn with_ipc(mut self, provider: impl crate::IpcProvider) -> Self {
+        self.ipc = Some(crate::AnyIpcProvider::new(provider));
+        self
+    }
+
     /// Sets the approver that answers the approvals of scripts no tool call
     /// carries ([`Shell::run`] and [`Self::run_background`]), and
     /// of calls whose dispatcher attached none. Without one, such a script
@@ -1058,20 +1107,25 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         )
         .await?;
 
-        // Start job registry service
+        // Start or reuse job registry service
         let limits = TerminalLimits::new(parts.limits);
-        let (job_registry, job_registry_service) =
-            job_registry_channel(output_store.policy().clone());
-        let job_registry_service = job_registry_service
-            .with_wording(output_store.wording().clone())
-            .with_pipeline_settings(
-                limits.pipeline_record_after.clone(),
-                limits.pipeline_retention.clone(),
-                output_store.dir().join(".stages"),
-            );
-        executor
-            .spawn(async move { job_registry_service.serve().await })
-            .detach();
+        let job_registry = if let Some(jobs) = parts.jobs {
+            jobs.registry
+        } else {
+            let (job_registry, job_registry_service) =
+                job_registry_channel(output_store.policy().clone());
+            let job_registry_service = job_registry_service
+                .with_wording(output_store.wording().clone())
+                .with_pipeline_settings(
+                    limits.pipeline_record_after.clone(),
+                    limits.pipeline_retention.clone(),
+                    output_store.dir().join(".stages"),
+                );
+            executor
+                .spawn(async move { job_registry_service.serve().await })
+                .detach();
+            job_registry
+        };
 
         let events_rx = parts.events.unwrap_or_default();
         let events_tx = events_rx.sender(AgentPath::main());
@@ -1155,6 +1209,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 wording,
                 tools,
                 events: None,
+                jobs: None,
                 policies: Vec::new(),
                 ipc: None,
                 treat_output: None,
@@ -2596,6 +2651,158 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         .await?;
         Ok(crate::Job::new(self.jobs(), detached.watch))
     }
+
+    /// Runs `arguments`' script attached to a pseudo-terminal as a detached
+    /// background job, returning the registered [`crate::Job`] handle paired
+    /// with the PTY master output byte stream.
+    ///
+    /// Runs full [`crate::ScriptPolicy`] checks on `script` (and [`Approver`] when
+    /// running unsandboxed directly, while inheriting an already-approved
+    /// outer [`crate::LaunchInfo`] `SandboxMode::Unsandboxed` without
+    /// prompting a second time). Registers the job under its real `pid: u32`
+    /// with timeout enforcement, tree teardown, memory footprint tracking, and
+    /// background completion wakeups, skips pipe `stdin_watch`, and routes
+    /// master output strictly to the returned channel so job buffers stay
+    /// bounded.
+    ///
+    /// # Errors
+    /// Fails on invalid dimensions or timeout, unconfigured interpreter,
+    /// policy refusal, denied approval, unsupported backend, or spawn failure.
+    ///
+    /// # Panics
+    /// Panics only if the internal job-registry invariant is violated and a
+    /// started PTY launch cannot be watched immediately after startup.
+    #[allow(clippy::too_many_lines)]
+    pub async fn run_pty(&self, arguments: PtyArgs) -> Result<PtyJob, ShellCallError> {
+        if arguments.description.trim().is_empty() {
+            return Err(
+                crate::Refused::call(&**self.wording(), CallRefusal::EmptyDescription).into(),
+            );
+        }
+        if !self.interpreters.contains(&arguments.interpreter) {
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::InterpreterNotConfigured {
+                    interpreter: arguments.interpreter,
+                },
+            )
+            .into());
+        }
+        if arguments.cols == 0 || arguments.rows == 0 {
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::InvalidPtySize {
+                    cols: arguments.cols,
+                    rows: arguments.rows,
+                },
+            )
+            .into());
+        }
+        let cap = self.limits.timeout_cap.get();
+        if arguments.timeout == 0 || arguments.timeout > cap.as_secs() {
+            return Err(crate::Refused::call(
+                &**self.wording(),
+                CallRefusal::TimeoutOutOfRange { cap },
+            )
+            .into());
+        }
+        let timeout = Duration::from_secs(arguments.timeout);
+        let inherited_unsandboxed = arguments
+            .inherited_launch
+            .as_ref()
+            .is_some_and(|info| info.mode == SandboxMode::Unsandboxed);
+        let mode = if inherited_unsandboxed {
+            SandboxMode::Unsandboxed
+        } else {
+            arguments.sandbox
+        };
+        let call = arguments
+            .inherited_launch
+            .as_ref()
+            .and_then(|info| info.call.clone());
+        let prepared = self
+            .admit_command(
+                Admission {
+                    script: &arguments.script,
+                    interpreter: arguments.interpreter,
+                    mode,
+                    location: None,
+                    max_lines: None,
+                    origin: ScriptOrigin::Background,
+                    call: call.clone(),
+                    run_dir: arguments.working_dir.as_deref(),
+                    inherited_unsandboxed,
+                },
+                None,
+            )
+            .await
+            .map_err(|error| error.into_tool_error(&**self.wording()))?;
+        let carry = match arguments.working_dir {
+            Some(dir) => match run_start(&prepared.target, dir) {
+                Ok(start) => Some(start),
+                Err(error) => {
+                    self.end_unrun(prepared.launch.id()).await;
+                    return Err(error.into_tool_error(&**self.wording()));
+                }
+            },
+            None => None,
+        };
+        let launch = prepared.launch;
+        let launch_id = launch.id();
+        let (startup_tx, startup_rx) = async_channel::bounded(1);
+        let background_startup = BackgroundStartup::new(startup_tx);
+        self.spawn_kill_watchdog(&launch, timeout, background_startup.settled());
+        self.spawn_long_job_alert(&launch);
+
+        let (pty_out_tx, pty_out_rx) = async_channel::bounded(256);
+        let info = crate::LaunchInfo::new(launch_id, call, mode);
+        let running_tasks = self.running_tasks.clone();
+        let completed_tx = self.events_tx.clone();
+        let outages = self.outages.clone();
+        outages.begin(launch_id);
+        running_tasks.fetch_add(1, Ordering::AcqRel);
+
+        self.executor
+            .spawn(execute_pty_task(SpawnedPtyTask {
+                sandbox: self.sandbox.clone(),
+                executor: self.executor.clone(),
+                policies: self.policies.clone(),
+                ipc: self.ipc.clone(),
+                committed: self.committed_worktrees(),
+                job_registry: self.job_registry.clone(),
+                launch,
+                info,
+                execution_id: prepared.execution_id,
+                timeout,
+                carry,
+                carried_dir: self.carried_dir.clone(),
+                script: arguments.script,
+                interpreter: arguments.interpreter,
+                mode,
+                cols: arguments.cols,
+                rows: arguments.rows,
+                backend: prepared.target.backend,
+                background_startup,
+                pty_out_tx,
+                completed_tx,
+                running_tasks,
+                #[cfg(all(unix, feature = "jobserver"))]
+                jobserver: self.jobserver.clone(),
+                outages,
+            }))
+            .detach();
+
+        wait_for_background_startup(&startup_rx, &**self.wording()).await?;
+        let watch = self
+            .job_registry
+            .watch_launch(launch_id)
+            .await
+            .expect("a started PTY job is registered before startup completes");
+        Ok(PtyJob {
+            job: crate::Job::new(self.jobs(), watch),
+            output: pty_out_rx,
+        })
+    }
 }
 
 impl<E> Shell<E>
@@ -2655,6 +2862,7 @@ where
                 origin,
                 call,
                 run_dir: None,
+                inherited_unsandboxed: false,
             },
             Some(cx),
         )
@@ -2826,7 +3034,7 @@ where
     ) -> Result<(), TerminalError> {
         let request = match clearance {
             Clearance::Ask(request) => request,
-            Clearance::Pass if admission.crosses_boundary() => admission.boundary_request(),
+            Clearance::Pass if admission.needs_boundary_approval() => admission.boundary_request(),
             Clearance::Allow | Clearance::Pass => return Ok(()),
         };
         self.approve(request, admission.call(), cx).await
@@ -2914,6 +3122,7 @@ where
                     origin: ScriptOrigin::Run,
                     call: None,
                     run_dir: Some(&run.dir),
+                    inherited_unsandboxed: false,
                 },
                 None,
             )
@@ -3037,6 +3246,10 @@ struct Admission<'a> {
     call: Option<CallIdentity>,
     /// The directory a run names; `None` for a `terminal` call.
     run_dir: Option<&'a Path>,
+    /// Whether an already-approved outer `LaunchInfo` authorized unsandboxed
+    /// execution, suppressing a duplicate boundary prompt while still
+    /// enforcing script policies.
+    inherited_unsandboxed: bool,
 }
 
 impl<'a> Admission<'a> {
@@ -3050,10 +3263,11 @@ impl<'a> Admission<'a> {
         self.location.map(str::trim).filter(|name| !name.is_empty())
     }
 
-    /// Whether the script runs outside the sandbox, unsandboxed or on a
-    /// server.
-    fn crosses_boundary(&self) -> bool {
-        self.mode == SandboxMode::Unsandboxed || self.location().is_some()
+    /// Whether the script crosses the sandbox boundary and still needs
+    /// boundary approval from the approver.
+    fn needs_boundary_approval(&self) -> bool {
+        self.location().is_some()
+            || (self.mode == SandboxMode::Unsandboxed && !self.inherited_unsandboxed)
     }
 
     /// What the approver is asked about a script the policies only passed.
@@ -3677,6 +3891,416 @@ where
     }
 }
 
+struct SpawnedPtyTask<E> {
+    sandbox: Sandbox,
+    executor: E,
+    policies: ScriptPolicies,
+    ipc: Option<crate::AnyIpcProvider>,
+    committed: Vec<CommittingWorktree>,
+    job_registry: JobRegistry,
+    launch: crate::job_registry::LaunchLease,
+    info: crate::LaunchInfo,
+    execution_id: String,
+    timeout: Duration,
+    carry: Option<CwdCarry>,
+    carried_dir: Option<CarriedDir>,
+    script: String,
+    interpreter: Interpreter,
+    mode: SandboxMode,
+    cols: u16,
+    rows: u16,
+    backend: ExecutionBackend,
+    background_startup: BackgroundStartup,
+    pty_out_tx: Sender<Vec<u8>>,
+    completed_tx: EventSender,
+    running_tasks: Arc<AtomicUsize>,
+    #[cfg(all(unix, feature = "jobserver"))]
+    jobserver: Option<JobBroker>,
+    outages: Outages,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_pty_task<E>(task: SpawnedPtyTask<E>)
+where
+    E: Executor + Clone + 'static,
+{
+    let SpawnedPtyTask {
+        sandbox,
+        executor,
+        policies,
+        ipc,
+        committed,
+        job_registry,
+        launch,
+        info,
+        execution_id,
+        timeout,
+        carry,
+        carried_dir,
+        script,
+        interpreter,
+        mode,
+        cols,
+        rows,
+        backend,
+        background_startup,
+        pty_out_tx,
+        completed_tx,
+        running_tasks,
+        #[cfg(all(unix, feature = "jobserver"))]
+        jobserver,
+        outages,
+    } = task;
+    let launch_id = launch.id();
+    job_registry.bound_by_timeout(&launch, timeout).await;
+    job_registry.launching(&launch).await;
+    let status_registry = job_registry.clone();
+    let end_view = (!policies.is_empty()).then(|| {
+        (
+            DirSpelling::of(&backend),
+            carried_dir,
+            sandbox.working_dir().to_path_buf(),
+        )
+    });
+
+    let run_result = run_pty_execution(
+        &sandbox,
+        executor,
+        ipc.as_ref(),
+        &committed,
+        &job_registry,
+        &launch,
+        info,
+        &execution_id,
+        carry.as_ref(),
+        &script,
+        interpreter,
+        mode,
+        cols,
+        rows,
+        &backend,
+        &background_startup,
+        pty_out_tx,
+        #[cfg(all(unix, feature = "jobserver"))]
+        jobserver.as_ref(),
+    )
+    .await;
+
+    let result = match run_result {
+        Ok(exit_code) => {
+            job_registry.complete(&launch, exit_code, None).await;
+            Ok(CompletedCommand {
+                stdout: CommandStream::Inline {
+                    text: String::new(),
+                },
+                stderr: None,
+                exit_code,
+                interruptions: outages.end(launch_id).await,
+            })
+        }
+        Err(error) => {
+            background_startup.report_failure(&error).await;
+            let _ = outages.end(launch_id).await;
+            Err(error)
+        }
+    };
+    status_registry.abandon_launch(&launch).await;
+
+    let outcome = result
+        .as_ref()
+        .map_or(ScriptOutcome::Failed, |command| ScriptOutcome::Exited {
+            code: command.exit_code,
+        });
+    if let Some((spelling, carried, working_dir)) = &end_view {
+        let host = carried.as_ref().and_then(CarriedDir::get);
+        let own = canonical_path(working_dir)
+            .await
+            .unwrap_or_else(|_| working_dir.clone());
+        let end = spelling.dir(host, &own);
+        policies
+            .ended(launch_id, outcome, &end, Carry::NotCarried)
+            .await;
+    }
+
+    let ending = match &result {
+        Ok(command) => Ok(command.exit_code),
+        Err(error) => Err(error.detail().into_owned()),
+    };
+    let (info, pending) = match status_registry.owe_completion(launch_id, ending).await {
+        Some(owed) => (Some(owed.info), owed.pending),
+        None => (None, None),
+    };
+    if let Some(info) = info {
+        let timeout_kill = match info.status.kill_cause() {
+            Some(crate::KillCause::Timeout(kill)) => Some(kill),
+            _ => None,
+        };
+        let _ = completed_tx
+            .send(ShellEvent::JobEnded(Box::new(JobEnded {
+                agent: completed_tx.agent().clone(),
+                info,
+                result,
+                timeout_kill,
+                pending,
+            })))
+            .await;
+    }
+    running_tasks.fetch_sub(1, Ordering::AcqRel);
+    drop(launch);
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_pty_execution<E: Executor + Clone + 'static>(
+    sandbox: &Sandbox,
+    executor: E,
+    ipc: Option<&crate::AnyIpcProvider>,
+    committed: &[CommittingWorktree],
+    job_registry: &JobRegistry,
+    launch: &crate::job_registry::LaunchLease,
+    info: crate::LaunchInfo,
+    execution_id: &str,
+    carry: Option<&CwdCarry>,
+    script: &str,
+    interpreter: Interpreter,
+    mode: SandboxMode,
+    cols: u16,
+    rows: u16,
+    backend: &ExecutionBackend,
+    background_startup: &BackgroundStartup,
+    pty_out_tx: Sender<Vec<u8>>,
+    #[cfg(all(unix, feature = "jobserver"))] jobserver: Option<&JobBroker>,
+) -> Result<i32, TerminalError> {
+    match backend {
+        ExecutionBackend::Local { shell } => {
+            #[cfg(all(unix, feature = "jobserver"))]
+            let job_fifo = match jobserver {
+                Some(broker) => Some(broker.open_fifo().await?),
+                None => None,
+            };
+            let mut environment = Vec::new();
+            #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
+            let mut grants = Vec::new();
+            #[cfg(all(unix, feature = "jobserver"))]
+            if let Some(fifo) = &job_fifo {
+                grants.push(
+                    job_fifo_grant(fifo.path())
+                        .map_err(|error| TerminalError::SandboxSetup(error.to_string()))?,
+                );
+                environment.extend(fifo.environment());
+            }
+            committed_git_environment(committed, &mut environment, |path| {
+                Ok(path.display().to_string())
+            })?;
+            let sandbox = match mode {
+                SandboxMode::Sandboxed => sandbox.clone(),
+                SandboxMode::Unsandboxed => sandbox.clone().unconfined(),
+            };
+            let launch_script = launch_script(interpreter, script, launch.id())?;
+            let (program, args) = match build_terminal_launch(shell.as_ref(), &launch_script, None)?
+            {
+                TerminalLaunch::Direct { program, args }
+                | TerminalLaunch::Shell { program, args } => (program, args),
+            };
+            let mut spec = SpawnSpec::new(program)
+                .args(args)
+                .env(environment)
+                .launch_info(info.clone())
+                .lifetime(TreeLifetime::Background)
+                .stdio(SpawnStdio::Pty { cols, rows })
+                .grants(grants.into_iter().map(crate::SpawnGrant::Host))
+                .ipc(ipc.and_then(|ipc| ipc.router(&info)));
+            if let Some(start) = carry.and_then(|carry| carry.start.as_deref()) {
+                spec = spec.cwd(start);
+            }
+            let child = sandbox.spawn(spec).await?;
+            let status = run_spawned_pty_job(
+                child,
+                executor,
+                job_registry,
+                background_startup,
+                crate::JobPlace::Host,
+                launch,
+                execution_id,
+                script,
+                interpreter,
+                mode,
+                pty_out_tx,
+            )
+            .await;
+            #[cfg(all(unix, feature = "jobserver"))]
+            drop(job_fifo);
+            status
+        }
+        ExecutionBackend::Container {
+            runtime,
+            #[cfg(all(unix, feature = "jobserver"))]
+                launch: container_launch,
+            ..
+        } => {
+            #[cfg(all(unix, feature = "jobserver"))]
+            let job_fifo = match jobserver {
+                Some(broker) => Some(
+                    crate::container_jobserver::open_container_job_fifo(
+                        broker,
+                        runtime,
+                        &container_launch.bin_dir().join("python3"),
+                        executor.clone(),
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
+            #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
+            let mut environment = Vec::new();
+            #[cfg_attr(not(all(unix, feature = "jobserver")), allow(unused_mut))]
+            let mut grants = Vec::new();
+            #[cfg(all(unix, feature = "jobserver"))]
+            if let Some(fifo) = &job_fifo {
+                environment.extend(fifo.environment());
+                grants.push(crate::SpawnGrant::Container {
+                    path: fifo.path().clone(),
+                    access: heel::Access::WRITE,
+                });
+            }
+            let inner_script = launch_script(interpreter, script, launch.id())?.into_owned();
+            let wrapped =
+                container_job_script(committed, runtime.workspace_mount(), None, &inner_script)?;
+            let mut spec = SpawnSpec::script(wrapped)
+                .env(environment)
+                .launch_info(info.clone())
+                .lifetime(TreeLifetime::Background)
+                .stdio(SpawnStdio::Pty { cols, rows })
+                .grants(grants)
+                .ipc(ipc.and_then(|ipc| ipc.router(&info)));
+            if let Some(carry) = carry.filter(|carry| carry.container.is_some())
+                && let Some(start) = &carry.start
+            {
+                spec = spec.cwd(start);
+            }
+            let child = sandbox.spawn(spec).await?;
+            let status = run_spawned_pty_job(
+                child,
+                executor,
+                job_registry,
+                background_startup,
+                crate::JobPlace::Container,
+                launch,
+                execution_id,
+                script,
+                interpreter,
+                mode,
+                pty_out_tx,
+            )
+            .await;
+            #[cfg(all(unix, feature = "jobserver"))]
+            drop(job_fifo);
+            status
+        }
+        ExecutionBackend::Ssh { .. } => Err(crate::SpawnError::Unsupported {
+            backend: "ssh",
+            what: "a pseudo-terminal",
+        }
+        .into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_spawned_pty_job<E: Executor + Clone + 'static>(
+    mut child: crate::SandboxedChild,
+    executor: E,
+    job_registry: &JobRegistry,
+    background_startup: &BackgroundStartup,
+    place: crate::JobPlace,
+    launch: &crate::job_registry::LaunchLease,
+    execution_id: &str,
+    script: &str,
+    interpreter: Interpreter,
+    mode: SandboxMode,
+    pty_out_tx: Sender<Vec<u8>>,
+) -> Result<i32, TerminalError> {
+    let stdout = child
+        .take_stdout()
+        .ok_or_else(|| TerminalError::Execution("missing PTY output stream".into()))?;
+    let stdin = child.take_stdin();
+    let resize = child.pty_resize();
+    let child = Arc::new(child);
+
+    let pid = child.id();
+    let host_pid = child.host_id();
+    job_registry
+        .register_pty(
+            pid,
+            host_pid,
+            launch,
+            execution_id,
+            script,
+            interpreter,
+            mode,
+            None,
+            place,
+        )
+        .await;
+    if let Some(stdin) = stdin {
+        job_registry.attach_terminal_input(launch, stdin).await;
+    }
+    if let Some(resize) = resize {
+        job_registry.attach_pty_resize(launch, resize).await;
+    }
+
+    let (drained_tx, drained_rx) = async_channel::bounded::<()>(1);
+    executor
+        .spawn(async move {
+            while let Ok(chunk) = stdout.recv().await {
+                if pty_out_tx.send(chunk).await.is_err() {
+                    // Consumer dropped its receiver; keep draining so the child
+                    // never blocks on a full PTY master buffer, without
+                    // accumulating bytes in memory.
+                    while stdout.recv().await.is_ok() {}
+                    break;
+                }
+            }
+            drop(pty_out_tx);
+            drop(drained_tx);
+        })
+        .detach();
+
+    let (kill_tx, kill_rx) = async_channel::bounded::<Sender<bool>>(1);
+    job_registry.attach_backend_killer(launch, kill_tx).await;
+    let killed = Arc::clone(&child);
+    let kill_drained = drained_rx.clone();
+    executor
+        .spawn(async move {
+            if let Ok(done_tx) = kill_rx.recv().await {
+                let ok = match killed.kill().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "ending the PTY job failed");
+                        false
+                    }
+                };
+                if ok {
+                    let _ = kill_drained.recv().await;
+                }
+                let _ = done_tx.send(ok).await;
+            }
+        })
+        .detach();
+
+    background_startup.report_ready().await;
+
+    let status = match child.wait().await {
+        crate::ChildExit::Exited(status) => status,
+        crate::ChildExit::Killed => killed_exit_status(),
+        crate::ChildExit::Failed(error) => {
+            let _ = drained_rx.recv().await;
+            job_registry.fail(launch, &error, None).await;
+            return Err(TerminalError::Execution(error));
+        }
+    };
+    let _ = drained_rx.recv().await;
+    Ok(status.code().unwrap_or(-1))
+}
+
 /// Standalone script execution that can be spawned in a background task.
 #[allow(clippy::too_many_lines)]
 async fn execute_script_standalone<E>(
@@ -4241,6 +4865,7 @@ async fn execute_local_background<E: Executor + Clone + 'static>(
     let LocalSpawn {
         child,
         tree,
+        pty_master: _,
         sandbox: _sandbox,
     } = sandbox.spawn_local(spec).await?;
 
@@ -4309,7 +4934,7 @@ impl JobLifetime {
             Self::Foreground { .. } => (TreeLifetime::Foreground, Pipe::Null),
             Self::Background { .. } => (TreeLifetime::Background, Pipe::Piped),
         };
-        spec.lifetime(tree).stdio(SpawnStdio {
+        spec.lifetime(tree).stdio(SpawnStdio::Pipes {
             stdin,
             stdout: Pipe::Piped,
             stderr: Pipe::Piped,
@@ -13127,5 +13752,503 @@ mod tests {
                 .exit_code,
             0
         );
+    }
+
+    #[cfg(unix)]
+    struct ShellPtyMockExec {
+        pid: u32,
+        resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+        received: Arc<Mutex<Vec<u8>>>,
+        burst_chunks: usize,
+    }
+
+    #[cfg(unix)]
+    impl crate::ContainerExec for ShellPtyMockExec {
+        fn exec(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _lifetime: ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("mock uses exec_pty".into()))
+        }
+
+        fn exec_streamed(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            _kill_rx: Receiver<()>,
+            _stdin_rx: Receiver<Vec<u8>>,
+            _stdout: Sender<Vec<u8>>,
+            _lifetime: ExecLifetime,
+        ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send
+        {
+            std::future::ready(Err("mock uses exec_pty".into()))
+        }
+
+        async fn exec_pty(
+            &self,
+            _container_id: &str,
+            _script: &str,
+            _working_dir: &str,
+            kill_rx: Receiver<()>,
+            stdin_rx: Receiver<Vec<u8>>,
+            output: Sender<Vec<u8>>,
+            pty: crate::ContainerPty,
+        ) -> Result<ContainerExecOutcome, String> {
+            if let Some(pid_tx) = pty.pid {
+                let _ = pid_tx.send(self.pid).await;
+            }
+            for i in 0..self.burst_chunks {
+                let frame = format!("\x1b[2J\x1b[Hframe-{i:04}\r\n");
+                let _ = output.send(frame.into_bytes()).await;
+            }
+            loop {
+                tokio::select! {
+                    _ = kill_rx.recv() => return Ok(ContainerExecOutcome::Killed),
+                    req = pty.resize_rx.recv() => {
+                        if let Ok((cols, rows, reply)) = req {
+                            self.resizes.lock().unwrap().push((cols, rows));
+                            let _ = reply.send(Ok(())).await;
+                        }
+                    }
+                    bytes = stdin_rx.recv() => {
+                        match bytes {
+                            Ok(data) => {
+                                self.received.lock().unwrap().extend_from_slice(&data);
+                                let _ = output.send(data.clone()).await;
+                                if data == b"q" {
+                                    return Ok(ContainerExecOutcome::Completed {
+                                        output: std::process::Output {
+                                            status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                                            stdout: Vec::new(),
+                                            stderr: Vec::new(),
+                                        },
+                                        killed: Vec::new(),
+                                    });
+                                }
+                            }
+                            Err(_) => return Ok(ContainerExecOutcome::Killed),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pty_job_routes_output_without_buffering_refuses_pipe_tools_and_shares_jobs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingApprover(Arc<AtomicUsize>);
+        impl aither_core::llm::Approver for CountingApprover {
+            fn approve(
+                &self,
+                _request: aither_core::llm::ApprovalRequest,
+            ) -> impl std::future::Future<
+                Output = Result<aither_core::llm::Approval, aither_core::llm::ApproverFailure>,
+            > + Send {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                std::future::ready(Ok(aither_core::llm::Approval::Approved))
+            }
+        }
+
+        struct RefusePolicy;
+        impl crate::ScriptPolicy for RefusePolicy {
+            type State = ();
+
+            fn check(
+                &self,
+                check: &crate::ScriptCheck<'_>,
+                _state: &Self::State,
+            ) -> impl std::future::Future<Output = crate::ScriptDecision> + Send {
+                std::future::ready(if check.script.contains("forbidden") {
+                    crate::ScriptDecision::Refuse(crate::ScriptRefusal::new(
+                        "policy refused pty script",
+                    ))
+                } else {
+                    crate::ScriptDecision::Pass
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let resizes = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let exec = ShellPtyMockExec {
+            pid: 9102,
+            resizes: resizes.clone(),
+            received: received.clone(),
+            burst_chunks: 16,
+        };
+        let runtime = crate::ContainerShellRuntime::new(
+            "aither-test-shell-pty",
+            crate::HostRoute::new(
+                "host.docker.internal",
+                std::net::IpAddr::from([127, 0, 0, 1]),
+            )
+            .unwrap(),
+            crate::AnyContainerExec::new(Arc::new(exec)),
+        );
+        let bin_dir = crate::ContainerPath::new("/opt/tools/bin").unwrap();
+        let launch = crate::ContainerLaunch::new(bin_dir.clone(), bin_dir.join("bash"));
+        let sandbox = crate::Sandbox::new(
+            crate::Backend::Container { runtime, launch },
+            executor_core::tokio::TokioGlobal,
+            dir.path(),
+        );
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let shell = Shell::builder(sandbox.clone())
+            .interpreters(vec![Interpreter::Shell])
+            .limits(crate::limits::fixture::limits())
+            .output(crate::output_policy::fixture::policy())
+            .wording(TestWording)
+            .tools(crate::test_wording::job_tools())
+            .policy(RefusePolicy)
+            .build()
+            .await
+            .unwrap()
+            .with_approver(CountingApprover(approvals.clone()));
+
+        // Policy refusal blocks run_pty.
+        let refused = shell
+            .run_pty(crate::PtyArgs {
+                description: "blocked".into(),
+                script: "forbidden".into(),
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
+                cols: 80,
+                rows: 24,
+                timeout: 60,
+                working_dir: None,
+                inherited_launch: None,
+            })
+            .await
+            .expect_err("policy must refuse");
+        assert!(
+            refused.to_string().contains("policy refused pty script"),
+            "{refused}"
+        );
+
+        // Invalid dimensions are refused.
+        let bad_dims = shell
+            .run_pty(crate::PtyArgs {
+                description: "bad dims".into(),
+                script: "tui".into(),
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
+                cols: 0,
+                rows: 24,
+                timeout: 60,
+                working_dir: None,
+                inherited_launch: None,
+            })
+            .await
+            .expect_err("zero cols refused");
+        assert!(bad_dims.to_string().contains("0x24"), "{bad_dims}");
+
+        let pty_job = shell
+            .run_pty(crate::PtyArgs {
+                description: "interactive app".into(),
+                script: "demo-tui".into(),
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
+                cols: 120,
+                rows: 40,
+                timeout: 60,
+                working_dir: None,
+                inherited_launch: None,
+            })
+            .await
+            .expect("pty job starts");
+        assert_eq!(
+            approvals.load(Ordering::Acquire),
+            0,
+            "sandboxed pty launch needs no approval"
+        );
+        assert_eq!(pty_job.job.pid(), 9102);
+
+        let info = pty_job.job.info().await;
+        assert!(info.pty);
+        assert_eq!(info.pid, 9102);
+
+        // Drain the 16 burst frames from PTY output channel.
+        let mut received_frames = Vec::new();
+        for _ in 0..16 {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), pty_job.output.recv())
+                .await
+                .expect("frame arrives")
+                .expect("channel open");
+            received_frames.extend_from_slice(&chunk);
+        }
+        assert!(
+            String::from_utf8_lossy(&received_frames).contains("frame-0015"),
+            "all redraw chunks delivered directly to attached consumer"
+        );
+
+        // terminal_buffer / line_buffer stayed at 0 bytes and pipe tools refuse PTY PID.
+        let read_tool = crate::JobReadTool::new(
+            crate::test_wording::job_tools().read,
+            shell.jobs(),
+            TestWording::any(),
+            crate::output_policy::fixture::policy(),
+        );
+        let read_err = read_tool
+            .call(
+                crate::JobReadArgs {
+                    pid: 9102,
+                    cursor: 0,
+                    max_bytes: None,
+                    step: None,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("JobReadTool must refuse PTY PID");
+        assert!(read_err.to_string().contains("9102"), "{read_err}");
+
+        let input_tool = crate::JobInputTool::new(
+            crate::test_wording::job_tools().input,
+            shell.jobs(),
+            TestWording::any(),
+        );
+        let input_err = input_tool
+            .call(
+                crate::JobInputArgs {
+                    pid: 9102,
+                    input: "hi".into(),
+                    append_newline: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("JobInputTool must refuse PTY PID");
+        assert!(input_err.to_string().contains("9102"), "{input_err}");
+
+        let monitor = MonitorTool::new(shell.clone(), crate::monitor::fixture_settings());
+        let monitor_err = monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::Pid { pid: 9102 },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("MonitorTool must refuse PTY PID");
+        assert!(monitor_err.to_string().contains("9102"), "{monitor_err}");
+
+        // Shared Jobs via ShellBuilder::jobs can resize and feed PTY input from a rebuilt Shell.
+        let rebuilt = Shell::builder(sandbox)
+            .interpreters(vec![Interpreter::Shell])
+            .limits(crate::limits::fixture::limits())
+            .output(crate::output_policy::fixture::policy())
+            .wording(TestWording)
+            .tools(crate::test_wording::job_tools())
+            .jobs(shell.jobs())
+            .build()
+            .await
+            .unwrap();
+        rebuilt
+            .jobs()
+            .resize(9102, 100, 30)
+            .await
+            .expect("rebuilt shell resizes live PTY job");
+        assert_eq!(*resizes.lock().unwrap(), vec![(100, 30)]);
+
+        let events = shell.background_receiver();
+        rebuilt
+            .jobs()
+            .pty_input(9102, b"q".to_vec())
+            .await
+            .expect("rebuilt shell writes PTY input");
+
+        let ended = wait_for_completed_task(&events, 9102).await;
+        assert_eq!(*received.lock().unwrap(), b"q");
+        assert_eq!(ended.info.pid, 9102);
+        assert!(ended.info.pty);
+
+        // On a host shell, direct Unsandboxed prompts Approver once, whereas
+        // inheriting an already-approved Unsandboxed launch skips a second prompt.
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_approvals = Arc::new(AtomicUsize::new(0));
+        let host_shell = authority_terminal(host_dir.path())
+            .await
+            .with_approver(CountingApprover(host_approvals.clone()));
+        let direct = host_shell
+            .run_pty(crate::PtyArgs {
+                description: "direct unsafe pty".into(),
+                script: "true".into(),
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Unsandboxed,
+                cols: 80,
+                rows: 24,
+                timeout: 30,
+                working_dir: None,
+                inherited_launch: None,
+            })
+            .await
+            .expect("direct unsandboxed host PTY succeeds after approval");
+        let _ = direct.job.kill().await;
+        assert_eq!(
+            host_approvals.load(Ordering::Acquire),
+            1,
+            "direct unsandboxed run_pty must prompt Approver"
+        );
+        let inherited = host_shell
+            .run_pty(crate::PtyArgs {
+                description: "inherited unsafe pty".into(),
+                script: "true".into(),
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Unsandboxed,
+                cols: 80,
+                rows: 24,
+                timeout: 30,
+                working_dir: None,
+                inherited_launch: Some(crate::LaunchInfo {
+                    call: None,
+                    launch: None,
+                    mode: SandboxMode::Unsandboxed,
+                }),
+            })
+            .await
+            .expect("inherited unsandboxed host PTY succeeds without second prompt");
+        let _ = inherited.job.kill().await;
+        assert_eq!(
+            host_approvals.load(Ordering::Acquire),
+            1,
+            "inherited unsandboxed launch must not prompt Approver a second time"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_pty_job_resizes_kills_by_native_kill_and_keeps_job_buffers_empty() {
+        async fn read_until(output: &Receiver<Vec<u8>>, buf: &mut String, needle: &str) {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !buf.contains(needle) {
+                    let chunk = output.recv().await.expect("pty output open");
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}; got {buf:?}"));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let events = shell.background_receiver();
+
+        let pty_job = shell
+            .run_pty(crate::PtyArgs {
+                description: "host interactive pty".into(),
+                script: "stty -echo; printf 'pid=%d\\n' $$; stty size; trap 'stty size' WINCH; while :; do sleep 0.1; done".into(),
+                interpreter: Interpreter::Shell,
+                sandbox: SandboxMode::Sandboxed,
+                cols: 120,
+                rows: 40,
+                timeout: 60,
+                working_dir: None,
+                inherited_launch: None,
+            })
+            .await
+            .expect("host PTY job starts");
+
+        let pid = pty_job.job.pid();
+        assert!(pty_job.job.info().await.pty);
+
+        let mut buf = String::new();
+        read_until(&pty_job.output, &mut buf, &format!("pid={pid}")).await;
+        read_until(&pty_job.output, &mut buf, "40 120").await;
+
+        shell
+            .jobs()
+            .resize(pid, 100, 30)
+            .await
+            .expect("resize succeeds");
+        read_until(&pty_job.output, &mut buf, "30 100").await;
+
+        let read_tool = crate::JobReadTool::new(
+            crate::test_wording::job_tools().read,
+            shell.jobs(),
+            TestWording::any(),
+            crate::output_policy::fixture::policy(),
+        );
+        let read_err = read_tool
+            .call(
+                crate::JobReadArgs {
+                    pid,
+                    cursor: 0,
+                    max_bytes: None,
+                    step: None,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("JobReadTool must refuse host PTY PID");
+        assert!(
+            read_err.to_string().contains(&pid.to_string()),
+            "{read_err}"
+        );
+
+        let input_tool = crate::JobInputTool::new(
+            crate::test_wording::job_tools().input,
+            shell.jobs(),
+            TestWording::any(),
+        );
+        let input_err = input_tool
+            .call(
+                crate::JobInputArgs {
+                    pid,
+                    input: "x".into(),
+                    append_newline: false,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("JobInputTool must refuse host PTY PID");
+        assert!(
+            input_err.to_string().contains(&pid.to_string()),
+            "{input_err}"
+        );
+
+        let monitor = MonitorTool::new(shell.clone(), crate::monitor::fixture_settings());
+        let monitor_err = monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::Pid { pid },
+                    ..monitor_command("true", 30)
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("MonitorTool must refuse host PTY PID");
+        assert!(
+            monitor_err.to_string().contains(&pid.to_string()),
+            "{monitor_err}"
+        );
+
+        assert_eq!(
+            exit_code_of(&shell, &format!("/bin/kill -TERM {pid}")).await,
+            0,
+            "native kill inside sandbox terminates PTY job"
+        );
+        let ended = wait_for_completed_task(&events, pid).await;
+        assert_eq!(ended.info.pid, pid);
+        assert!(ended.info.pty);
     }
 }

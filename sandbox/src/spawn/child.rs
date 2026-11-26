@@ -92,6 +92,104 @@ impl ExitSetter {
     }
 }
 
+/// Why resizing a PTY process failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PtyResizeError {
+    /// One or both dimensions were zero.
+    #[error("terminal dimensions must be non-zero (got {cols}x{rows})")]
+    InvalidSize {
+        /// Requested width in columns.
+        cols: u16,
+        /// Requested height in rows.
+        rows: u16,
+    },
+    /// The registry holds no job with that PID.
+    #[error("unknown pid: {pid}")]
+    UnknownJob {
+        /// Process ID named.
+        pid: u32,
+    },
+    /// The target job is not backed by a PTY.
+    #[error("process {pid} is not a PTY job")]
+    NotPty {
+        /// Process ID of the job.
+        pid: u32,
+    },
+    /// The target job is no longer running.
+    #[error("process {pid} is not running")]
+    NotRunning {
+        /// Process ID of the job.
+        pid: u32,
+    },
+    /// The underlying backend could not apply the resize.
+    #[error("failed to resize PTY: {0}")]
+    Backend(String),
+}
+
+/// Request sent to an async PTY resize loop.
+pub type PtyResizeRequest = (u16, u16, Sender<Result<(), PtyResizeError>>);
+
+#[derive(Clone)]
+enum PtyResizeBackend {
+    Channel(Sender<PtyResizeRequest>),
+    #[allow(dead_code, reason = "wired by host PTY backend once heel PTY lands")]
+    Sync(Arc<dyn Fn(u16, u16) -> Result<(), PtyResizeError> + Send + Sync>),
+}
+
+/// Handle for resizing a running PTY process's terminal window.
+#[derive(Clone)]
+pub struct PtyResizeHandle {
+    backend: PtyResizeBackend,
+}
+
+impl std::fmt::Debug for PtyResizeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyResizeHandle").finish_non_exhaustive()
+    }
+}
+
+impl PtyResizeHandle {
+    pub(crate) const fn channel(tx: Sender<PtyResizeRequest>) -> Self {
+        Self {
+            backend: PtyResizeBackend::Channel(tx),
+        }
+    }
+
+    #[allow(dead_code, reason = "wired by host PTY backend once heel PTY lands")]
+    pub(crate) fn sync(
+        f: impl Fn(u16, u16) -> Result<(), PtyResizeError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            backend: PtyResizeBackend::Sync(Arc::new(f)),
+        }
+    }
+
+    /// Updates the PTY window size to `cols` by `rows` and delivers `SIGWINCH`.
+    ///
+    /// # Errors
+    /// Returns [`PtyResizeError::InvalidSize`] when either dimension is zero,
+    /// or [`PtyResizeError::Backend`] when the PTY is closed or the backend
+    /// fails to resize it.
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyResizeError> {
+        if cols == 0 || rows == 0 {
+            return Err(PtyResizeError::InvalidSize { cols, rows });
+        }
+        match &self.backend {
+            PtyResizeBackend::Channel(tx) => {
+                let (reply_tx, reply_rx) = async_channel::bounded(1);
+                tx.send((cols, rows, reply_tx))
+                    .await
+                    .map_err(|_| PtyResizeError::Backend("PTY resize channel closed".into()))?;
+                reply_rx
+                    .recv()
+                    .await
+                    .map_err(|_| PtyResizeError::Backend("PTY resize response dropped".into()))?
+            }
+            PtyResizeBackend::Sync(resize) => resize(cols, rows),
+        }
+    }
+}
+
 /// A process spawned through [`Sandbox::spawn`](crate::Sandbox::spawn).
 ///
 /// The streams are channels of byte chunks, which every backend can supply:
@@ -105,6 +203,7 @@ pub struct SandboxedChild {
     stdout: Option<Receiver<Vec<u8>>>,
     stderr: Option<Receiver<Vec<u8>>>,
     stdin_blocked: Option<Receiver<StdinWatchSignal>>,
+    pty_resize: Option<PtyResizeHandle>,
     kill: KillHandle,
     exit: Arc<ExitWatch>,
 }
@@ -135,6 +234,7 @@ impl SandboxedChild {
             stdout,
             stderr,
             stdin_blocked,
+            pty_resize,
         } = streams;
         Self {
             id,
@@ -143,6 +243,7 @@ impl SandboxedChild {
             stdout,
             stderr,
             stdin_blocked,
+            pty_resize,
             kill,
             exit,
         }
@@ -193,6 +294,24 @@ impl SandboxedChild {
     /// which cannot tell whether a process on the server reads it.
     pub const fn take_stdin_blocked(&mut self) -> Option<Receiver<StdinWatchSignal>> {
         self.stdin_blocked.take()
+    }
+
+    /// Resize handle for a PTY-backed child, or `None` for piped spawns.
+    #[must_use]
+    pub fn pty_resize(&self) -> Option<PtyResizeHandle> {
+        self.pty_resize.clone()
+    }
+
+    /// Resizes a PTY-backed child's terminal window.
+    ///
+    /// # Errors
+    /// Returns [`PtyResizeError::NotPty`] when the child was not spawned with
+    /// [`Stdio::Pty`](crate::Stdio::Pty), or the backend resize error.
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyResizeError> {
+        let Some(handle) = &self.pty_resize else {
+            return Err(PtyResizeError::NotPty { pid: self.id });
+        };
+        handle.resize(cols, rows).await
     }
 
     /// Kills the whole process tree: the process and every descendant,
@@ -267,4 +386,5 @@ pub struct Streams {
     pub(crate) stdout: Option<Receiver<Vec<u8>>>,
     pub(crate) stderr: Option<Receiver<Vec<u8>>>,
     pub(crate) stdin_blocked: Option<Receiver<StdinWatchSignal>>,
+    pub(crate) pty_resize: Option<PtyResizeHandle>,
 }

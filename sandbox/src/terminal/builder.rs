@@ -28,6 +28,7 @@ pub struct ShellParts {
     pub(crate) wording: AnyShellWording,
     pub(crate) tools: ShellToolSettings,
     pub(crate) events: Option<ShellEvents>,
+    pub(crate) jobs: Option<crate::Jobs>,
     pub(crate) policies: Vec<AnyScriptPolicy>,
     pub(crate) ipc: Option<AnyIpcProvider>,
     pub(crate) treat_output: Option<AnyTreatOutput>,
@@ -48,6 +49,7 @@ pub struct ShellBuilder<I, L, O, W, T> {
     wording: W,
     tools: T,
     events: Option<ShellEvents>,
+    jobs: Option<crate::Jobs>,
     policies: Vec<AnyScriptPolicy>,
     ipc: Option<AnyIpcProvider>,
     treat_output: Option<AnyTreatOutput>,
@@ -73,6 +75,7 @@ impl Shell<Arc<AnyExecutor>> {
             wording: Missing,
             tools: Missing,
             events: None,
+            jobs: None,
             policies: Vec::new(),
             ipc: None,
             treat_output: None,
@@ -98,6 +101,7 @@ impl Shell<Arc<AnyExecutor>> {
             wording: Missing,
             tools: Missing,
             events: None,
+            jobs: None,
             policies: Vec::new(),
             ipc: None,
             treat_output: None,
@@ -158,6 +162,16 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
         self
     }
 
+    /// Reuses an existing [`Jobs`](crate::Jobs) registry across shell rebuilds
+    /// so running background and PTY PIDs remain reachable after rebuilding the
+    /// shell. Subagent shells derived from this shell still receive isolated
+    /// per-run registries.
+    #[must_use]
+    pub fn jobs(mut self, jobs: crate::Jobs) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
     /// The interpreters a script may run under, and the ones the model's
     /// `interpreter` argument lists.
     #[must_use]
@@ -173,6 +187,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: self.tools,
             events: self.events,
+            jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
@@ -192,6 +207,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: self.tools,
             events: self.events,
+            jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
@@ -211,6 +227,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: self.tools,
             events: self.events,
+            jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
@@ -233,6 +250,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: Given(AnyShellWording::new(wording)),
             tools: self.tools,
             events: self.events,
+            jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
@@ -256,6 +274,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             wording: self.wording,
             tools: Given(tools),
             events: self.events,
+            jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
             treat_output: self.treat_output,
@@ -292,6 +311,7 @@ impl
             wording: Given(wording),
             tools: Given(tools),
             events,
+            jobs,
             policies,
             ipc,
             treat_output,
@@ -309,6 +329,7 @@ impl
                 wording,
                 tools,
                 events,
+                jobs,
                 policies,
                 ipc,
                 treat_output,

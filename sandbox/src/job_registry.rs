@@ -25,6 +25,7 @@ use crate::policy::SandboxMode;
 #[cfg(unix)]
 use crate::process_tree::KillTreeError;
 use crate::process_tree::{JobTree, ProcessScanner};
+use crate::spawn::{PtyResizeError, PtyResizeHandle};
 use crate::terminal::TimeoutKill;
 use crate::wording::{AnyShellWording, RunningJob, render_default_running_jobs};
 
@@ -115,6 +116,8 @@ pub struct JobInfo {
     /// The bound the job was started under: it is killed once this long has
     /// passed since it started. `None` when nothing bounds it.
     pub timeout: Option<Duration>,
+    /// Whether this job runs attached to a pseudo-terminal rather than pipes.
+    pub pty: bool,
 }
 
 impl JobInfo {
@@ -244,6 +247,18 @@ pub enum JobInputError {
     /// The job's stdin pipe is closed.
     #[error("terminal input channel closed for process {pid}")]
     Closed {
+        /// Process ID of the job.
+        pid: u32,
+    },
+    /// Piped stdin input was attempted on a PTY-backed job.
+    #[error("process {pid} is a PTY job; send input through the PTY driver")]
+    PtyJob {
+        /// Process ID of the job.
+        pid: u32,
+    },
+    /// PTY input was attempted on a non-PTY job.
+    #[error("process {pid} is not a PTY job")]
+    NotPty {
         /// Process ID of the job.
         pid: u32,
     },
@@ -434,6 +449,7 @@ struct JobState {
     stdout_closed: bool,
     stderr_closed: bool,
     input_tx: Option<TerminalInputSender>,
+    pty_resize: Option<PtyResizeHandle>,
     kill_switch: Option<KillSwitch>,
     switch_kill_in_flight: bool,
     switch_kill_waiters: Vec<Sender<bool>>,
@@ -472,6 +488,7 @@ struct RegisterJob {
     output_path: Option<PathBuf>,
     process_tree: Option<JobTree>,
     place: JobPlace,
+    pty: bool,
 }
 
 enum PipelineStateCommand {
@@ -514,6 +531,10 @@ enum StateCommand {
     AttachTerminalInput {
         launch: LaunchLease,
         input_tx: TerminalInputSender,
+    },
+    AttachPtyResize {
+        launch: LaunchLease,
+        resize: PtyResizeHandle,
     },
     AttachKillSwitch {
         launch: LaunchLease,
@@ -614,6 +635,26 @@ enum JobRequest {
         pid: u32,
         bytes: Vec<u8>,
         reply: Sender<Result<(), JobInputError>>,
+    },
+    PtyInputTerminal {
+        launch: LaunchId,
+        pid: u32,
+        bytes: Vec<u8>,
+        reply: Sender<Result<(), JobInputError>>,
+    },
+    PtyInputByPid {
+        pid: u32,
+        bytes: Vec<u8>,
+        reply: Sender<Result<(), JobInputError>>,
+    },
+    GetPtyResizeByPid {
+        pid: u32,
+        reply: Sender<Result<PtyResizeHandle, PtyResizeError>>,
+    },
+    GetPtyResizeByLaunch {
+        launch: LaunchId,
+        pid: u32,
+        reply: Sender<Result<PtyResizeHandle, PtyResizeError>>,
     },
     StartOutputRedirect {
         launch: LaunchId,
@@ -892,7 +933,7 @@ impl JobRegistry {
         process_tree: Option<JobTree>,
         place: JobPlace,
     ) {
-        self.send_command(StateCommand::Register(RegisterJob {
+        self.register_entry(RegisterJob {
             place,
             pid,
             host_pid,
@@ -903,8 +944,44 @@ impl JobRegistry {
             mode,
             output_path,
             process_tree,
-        }))
+            pty: false,
+        })
         .await;
+    }
+
+    /// Registers a new running PTY job with its inside-environment `pid`,
+    /// host `host_pid`, and optional [`JobTree`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_pty(
+        &self,
+        pid: u32,
+        host_pid: u32,
+        launch: &LaunchLease,
+        execution_key: &str,
+        script: &str,
+        interpreter: Interpreter,
+        mode: SandboxMode,
+        process_tree: Option<JobTree>,
+        place: JobPlace,
+    ) {
+        self.register_entry(RegisterJob {
+            place,
+            pid,
+            host_pid,
+            launch: launch.clone(),
+            execution_key: execution_key.to_string(),
+            script: script.to_string(),
+            interpreter,
+            mode,
+            output_path: None,
+            process_tree,
+            pty: true,
+        })
+        .await;
+    }
+
+    async fn register_entry(&self, reg: RegisterJob) {
+        self.send_command(StateCommand::Register(reg)).await;
     }
 
     /// Records that `launch` runs under a `timeout` bound.
@@ -921,6 +998,15 @@ impl JobRegistry {
         self.send_command(StateCommand::AttachTerminalInput {
             launch: launch.clone(),
             input_tx,
+        })
+        .await;
+    }
+
+    /// Attaches a PTY resize handle to a running PTY job.
+    pub(crate) async fn attach_pty_resize(&self, launch: &LaunchLease, resize: PtyResizeHandle) {
+        self.send_command(StateCommand::AttachPtyResize {
+            launch: launch.clone(),
+            resize,
         })
         .await;
     }
@@ -1071,6 +1157,78 @@ impl JobRegistry {
         })
         .await;
         Self::recv_reply(reply_rx).await
+    }
+
+    /// Writes bytes to the PTY master of the job currently identified by `pid`.
+    pub(crate) async fn pty_input(&self, pid: u32, bytes: Vec<u8>) -> Result<(), JobInputError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::PtyInputByPid {
+            pid,
+            bytes,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Writes bytes to the PTY master of a specific watched `launch`.
+    pub(crate) async fn pty_input_launch(
+        &self,
+        launch: LaunchId,
+        pid: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), JobInputError> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::PtyInputTerminal {
+            launch,
+            pid,
+            bytes,
+            reply: reply_tx,
+        })
+        .await;
+        Self::recv_reply(reply_rx).await
+    }
+
+    /// Resizes the PTY job currently identified by `pid`.
+    pub(crate) async fn resize_by_pid(
+        &self,
+        pid: u32,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), PtyResizeError> {
+        if cols == 0 || rows == 0 {
+            return Err(PtyResizeError::InvalidSize { cols, rows });
+        }
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::GetPtyResizeByPid {
+            pid,
+            reply: reply_tx,
+        })
+        .await;
+        let handle = Self::recv_reply(reply_rx).await?;
+        handle.resize(cols, rows).await
+    }
+
+    /// Resizes a specific watched PTY `launch`.
+    pub(crate) async fn resize_launch(
+        &self,
+        launch: LaunchId,
+        pid: u32,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), PtyResizeError> {
+        if cols == 0 || rows == 0 {
+            return Err(PtyResizeError::InvalidSize { cols, rows });
+        }
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.send_command(JobRequest::GetPtyResizeByLaunch {
+            launch,
+            pid,
+            reply: reply_tx,
+        })
+        .await;
+        let handle = Self::recv_reply(reply_rx).await?;
+        handle.resize(cols, rows).await
     }
 
     /// Starts continuous output redirection for `launch` and returns current snapshot bytes.
@@ -1924,6 +2082,15 @@ async fn handle_state_command(
                 job.input_tx = Some(input_tx);
             }
         }
+        StateCommand::AttachPtyResize { launch, resize } => {
+            if let Some(job) = store
+                .jobs
+                .get_mut(&launch.id())
+                .filter(|job| job.info.pty && matches!(job.info.status, JobStatus::Running))
+            {
+                job.pty_resize = Some(resize);
+            }
+        }
         StateCommand::AttachKillSwitch {
             launch,
             kill_switch,
@@ -2222,14 +2389,41 @@ async fn handle_job_request(
             bytes,
             reply,
         } => {
-            let result = input_terminal(&store.jobs, launch, pid, bytes).await;
+            let result = input_terminal(&store.jobs, launch, pid, bytes, false).await;
             let _ = reply.send(result).await;
         }
         JobRequest::InputByPid { pid, bytes, reply } => {
             let result = match store.latest_launch(pid) {
-                Some(launch) => input_terminal(&store.jobs, launch, pid, bytes).await,
+                Some(launch) => input_terminal(&store.jobs, launch, pid, bytes, false).await,
                 None => Err(JobInputError::UnknownJob { pid }),
             };
+            let _ = reply.send(result).await;
+        }
+        JobRequest::PtyInputTerminal {
+            launch,
+            pid,
+            bytes,
+            reply,
+        } => {
+            let result = input_terminal(&store.jobs, launch, pid, bytes, true).await;
+            let _ = reply.send(result).await;
+        }
+        JobRequest::PtyInputByPid { pid, bytes, reply } => {
+            let result = match store.latest_launch(pid) {
+                Some(launch) => input_terminal(&store.jobs, launch, pid, bytes, true).await,
+                None => Err(JobInputError::UnknownJob { pid }),
+            };
+            let _ = reply.send(result).await;
+        }
+        JobRequest::GetPtyResizeByPid { pid, reply } => {
+            let result = match store.latest_launch(pid) {
+                Some(launch) => pty_resize_handle(&store.jobs, launch, pid),
+                None => Err(PtyResizeError::UnknownJob { pid }),
+            };
+            let _ = reply.send(result).await;
+        }
+        JobRequest::GetPtyResizeByLaunch { launch, pid, reply } => {
+            let result = pty_resize_handle(&store.jobs, launch, pid);
             let _ = reply.send(result).await;
         }
         JobRequest::StartOutputRedirect {
@@ -2433,6 +2627,7 @@ async fn register_job(
         output_path,
         process_tree,
         place,
+        pty,
     } = reg;
     let key = launch.id();
     parked.launching.remove(&key);
@@ -2450,6 +2645,7 @@ async fn register_job(
         started_at: Instant::now(),
         status: JobStatus::Running,
         output_path,
+        pty,
     };
     let mut state = JobState::new(info, host_pid, launch);
     state.process_tree = process_tree;
@@ -2481,6 +2677,7 @@ impl JobState {
             stdout_closed: false,
             stderr_closed: false,
             input_tx: None,
+            pty_resize: None,
             kill_switch: None,
             switch_kill_in_flight: false,
             switch_kill_waiters: Vec::new(),
@@ -2588,6 +2785,7 @@ fn finish(job: &mut JobState, end: JobEnd) {
     }
     job.kill_switch = None;
     job.input_tx = None;
+    job.pty_resize = None;
 }
 
 async fn take_completion(
@@ -2702,6 +2900,11 @@ async fn append_terminal_output(
         return;
     }
     if let Some(job) = jobs.get_mut(&launch) {
+        if job.info.pty {
+            // PTY master streams go straight to their attached consumer rather
+            // than accumulating unbounded redraw bytes in job buffers.
+            return;
+        }
         job.terminal_buffer.extend_from_slice(&chunk);
         if let Some(file) = job.output_redirect.as_mut()
             && let Err(error) = file.write_all(&chunk).await
@@ -2865,11 +3068,18 @@ async fn input_terminal(
     launch: LaunchId,
     pid: u32,
     bytes: Vec<u8>,
+    expect_pty: bool,
 ) -> Result<(), JobInputError> {
     let Some(job) = jobs.get(&launch) else {
         return Err(JobInputError::UnknownJob { pid });
     };
     let pid = job.info.pid;
+    if job.info.pty && !expect_pty {
+        return Err(JobInputError::PtyJob { pid });
+    }
+    if !job.info.pty && expect_pty {
+        return Err(JobInputError::NotPty { pid });
+    }
     if !matches!(job.info.status, JobStatus::Running) {
         return Err(JobInputError::NotRunning {
             pid,
@@ -2882,6 +3092,26 @@ async fn input_terminal(
     tx.send(bytes)
         .await
         .map_err(|_| JobInputError::Closed { pid })
+}
+
+fn pty_resize_handle(
+    jobs: &HashMap<LaunchId, JobState>,
+    launch: LaunchId,
+    pid: u32,
+) -> Result<PtyResizeHandle, PtyResizeError> {
+    let Some(job) = jobs.get(&launch) else {
+        return Err(PtyResizeError::UnknownJob { pid });
+    };
+    let pid = job.info.pid;
+    if !job.info.pty {
+        return Err(PtyResizeError::NotPty { pid });
+    }
+    if !matches!(job.info.status, JobStatus::Running) {
+        return Err(PtyResizeError::NotRunning { pid });
+    }
+    job.pty_resize
+        .clone()
+        .ok_or_else(|| PtyResizeError::Backend(format!("process {pid} has no PTY resize handle")))
 }
 
 async fn redirect_task_output(
@@ -2947,6 +3177,9 @@ async fn read_terminal_delta(
     let Some(job) = jobs.get_mut(&launch) else {
         return Err(format!("unknown launch: {launch}"));
     };
+    if job.info.pty {
+        return Err(format!("process {} is a PTY job", job.info.pid));
+    }
     terminal_read(job, cursor, max_bytes, lines).await
 }
 

@@ -13,7 +13,10 @@ use heel::{
     Access, Audited, Grant, NetworkPolicy, ResolvedPath, SandboxConfig, SecurityConfig, StdioConfig,
 };
 
-use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
+use super::child::{
+    ChildExit, Descendants, KillHandle, PtyResizeError, PtyResizeHandle, SandboxedChild, Streams,
+    exit_watch,
+};
 use super::domain::DomainGate;
 use super::host_ipc::{HostIpcLease, HostIpcMux, prepend_shim_path};
 use super::stdio::{read_chunks, write_chunks};
@@ -36,11 +39,13 @@ pub enum TreeLifetime {
     Background,
 }
 
-/// A process spawned on the host: the child, the handle that ends its tree
-/// and the runtime/IPC guard kept alive while the process runs.
+/// A process spawned on the host: the child, the handle that ends its tree,
+/// an optional PTY master when spawned with [`Stdio::Pty`], and the runtime/IPC
+/// guard kept alive while the process runs.
 pub struct LocalSpawn {
     pub(crate) child: LocalChild,
     pub(crate) tree: JobTree,
+    pub(crate) pty_master: Option<heel::PtyMaster>,
     /// Kept alive for as long as the process runs.
     pub(crate) sandbox: Box<dyn Any + Send>,
 }
@@ -88,7 +93,7 @@ trait HeelSandboxOps: Send + Sync {
         launch: Launch,
         executor: &'a executor_core::AnyExecutor,
         scanner: crate::process_tree::ProcessScanner,
-    ) -> BoxedFuture<'a, (LocalChild, JobTree)>;
+    ) -> BoxedFuture<'a, (LocalChild, JobTree, Option<heel::PtyMaster>)>;
 }
 
 impl<N: NetworkPolicy + 'static> HeelSandboxOps for heel::Sandbox<N> {
@@ -120,12 +125,13 @@ impl<N: NetworkPolicy + 'static> HeelSandboxOps for heel::Sandbox<N> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_boxed<'a>(
         &'a self,
         launch: Launch,
         executor: &'a executor_core::AnyExecutor,
         scanner: crate::process_tree::ProcessScanner,
-    ) -> BoxedFuture<'a, (LocalChild, JobTree)> {
+    ) -> BoxedFuture<'a, (LocalChild, JobTree, Option<heel::PtyMaster>)> {
         Box::pin(async move {
             let Launch {
                 program,
@@ -136,44 +142,101 @@ impl<N: NetworkPolicy + 'static> HeelSandboxOps for heel::Sandbox<N> {
                 lifetime,
                 marker,
             } = launch;
-            let command = self
-                .command(program)
-                .current_dir(cwd)
-                .args(args)
-                .envs(env)
-                .stdin(stdio_config(stdio.stdin))
-                .stdout(stdio_config(stdio.stdout))
-                .stderr(stdio_config(stdio.stderr));
-            let start = |error: heel::Error| SpawnError::Start(error.to_string());
+            let start = |error: heel::Error| match error {
+                heel::Error::Unsupported { operation, .. } => SpawnError::Unsupported {
+                    backend: "host",
+                    what: operation,
+                },
+                other => SpawnError::Start(other.to_string()),
+            };
+            match stdio {
+                Stdio::Pipes {
+                    stdin: stdin_pipe,
+                    stdout: stdout_pipe,
+                    stderr: stderr_pipe,
+                } => {
+                    let command = self
+                        .command(program)
+                        .current_dir(cwd)
+                        .args(args)
+                        .envs(env)
+                        .stdin(stdio_config(stdin_pipe))
+                        .stdout(stdio_config(stdout_pipe))
+                        .stderr(stdio_config(stderr_pipe));
 
-            #[cfg(target_os = "linux")]
-            {
-                let _ = (executor, scanner, marker);
-                let reap_timeout = crate::terminal::SUPERVISED_REAP_TIMEOUT;
-                let child = match lifetime {
-                    TreeLifetime::Foreground => LocalChild::Foreground(
-                        command
-                            .spawn_supervised(heel::supervisor::Foreground { reap_timeout })
-                            .await
-                            .map_err(start)?,
-                    ),
-                    TreeLifetime::Background => LocalChild::Background(
-                        command
-                            .spawn_supervised(heel::supervisor::Background { reap_timeout })
-                            .await
-                            .map_err(start)?,
-                    ),
-                };
-                let tree = JobTree::supervised(child.tree_control());
-                Ok((child, tree))
-            }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = (executor, scanner, marker);
+                        let reap_timeout = crate::terminal::SUPERVISED_REAP_TIMEOUT;
+                        let child = match lifetime {
+                            TreeLifetime::Foreground => LocalChild::Foreground(
+                                command
+                                    .spawn_supervised(heel::supervisor::Foreground { reap_timeout })
+                                    .await
+                                    .map_err(start)?,
+                            ),
+                            TreeLifetime::Background => LocalChild::Background(
+                                command
+                                    .spawn_supervised(heel::supervisor::Background { reap_timeout })
+                                    .await
+                                    .map_err(start)?,
+                            ),
+                        };
+                        let tree = JobTree::supervised(child.tree_control());
+                        Ok((child, tree, None))
+                    }
 
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = lifetime;
-                let child = command.spawn().await.map_err(start)?;
-                let tree = JobTree::spawn(executor, scanner, child.id(), &marker);
-                Ok((LocalChild::Plain(child), tree))
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = lifetime;
+                        let child = command.spawn().await.map_err(start)?;
+                        let tree = JobTree::spawn(executor, scanner, child.id(), &marker);
+                        Ok((LocalChild::Plain(child), tree, None))
+                    }
+                }
+                Stdio::Pty { cols, rows } => {
+                    let command = self.command(program).current_dir(cwd).args(args).envs(env);
+
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = (executor, scanner, marker);
+                        let reap_timeout = crate::terminal::SUPERVISED_REAP_TIMEOUT;
+                        let (child, master) = match lifetime {
+                            TreeLifetime::Foreground => {
+                                let (child, master) = command
+                                    .spawn_supervised_pty(
+                                        heel::supervisor::Foreground { reap_timeout },
+                                        cols,
+                                        rows,
+                                    )
+                                    .await
+                                    .map_err(start)?;
+                                (LocalChild::Foreground(child), master)
+                            }
+                            TreeLifetime::Background => {
+                                let (child, master) = command
+                                    .spawn_supervised_pty(
+                                        heel::supervisor::Background { reap_timeout },
+                                        cols,
+                                        rows,
+                                    )
+                                    .await
+                                    .map_err(start)?;
+                                (LocalChild::Background(child), master)
+                            }
+                        };
+                        let tree = JobTree::supervised(child.tree_control());
+                        Ok((child, tree, Some(master)))
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = lifetime;
+                        let (child, master) = command.spawn_pty(cols, rows).await.map_err(start)?;
+                        let tree = JobTree::spawn(executor, scanner, child.id(), &marker);
+                        Ok((LocalChild::Plain(child), tree, Some(master)))
+                    }
+                }
             }
         })
     }
@@ -655,7 +718,7 @@ impl Sandbox {
             lifetime,
             marker,
         };
-        let (child, tree) = runtime
+        let (child, tree, pty_master) = runtime
             .sandbox
             .spawn_boxed(launch, &self.inner.executor, self.inner.scanner.clone())
             .await?;
@@ -663,6 +726,7 @@ impl Sandbox {
         Ok(LocalSpawn {
             child,
             tree,
+            pty_master,
             sandbox: Box::new((runtime, ipc_lease, extras_lease)),
         })
     }
@@ -673,6 +737,7 @@ impl Sandbox {
         let LocalSpawn {
             mut child,
             tree,
+            pty_master,
             sandbox,
         } = self.spawn_local(spec).await?;
         let sandbox_id = child.sandbox_id();
@@ -680,31 +745,59 @@ impl Sandbox {
 
         let mut streams = Streams::default();
         let mut stdin_watch = None;
-        if stdio.stdin == Pipe::Piped
-            && let Some(stdin) = child.take_stdin()
-        {
-            let feed = FeedCounter::default();
-            let (signal_tx, signal_rx) = async_channel::unbounded();
-            match LocalStdinProbe::new(host_id, &stdin) {
-                Ok(probe) => {
-                    stdin_watch = Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
+        match stdio {
+            Stdio::Pipes {
+                stdin: stdin_pipe,
+                stdout: stdout_pipe,
+                stderr: stderr_pipe,
+            } => {
+                if stdin_pipe == Pipe::Piped
+                    && let Some(stdin) = child.take_stdin()
+                {
+                    let feed = FeedCounter::default();
+                    let (signal_tx, signal_rx) = async_channel::unbounded();
+                    match LocalStdinProbe::new(host_id, &stdin) {
+                        Ok(probe) => {
+                            stdin_watch =
+                                Some(LocalStdinWatch::new(probe, feed.clone(), signal_tx));
+                        }
+                        Err(error) => {
+                            let _ = signal_tx.try_send(StdinWatchSignal::Failed(error.to_string()));
+                        }
+                    }
+                    streams.stdin_blocked = Some(signal_rx);
+                    streams.stdin = Some(write_chunks(stdin, feed));
                 }
-                Err(error) => {
-                    let _ = signal_tx.try_send(StdinWatchSignal::Failed(error.to_string()));
+                if stdout_pipe == Pipe::Piped
+                    && let Some(stdout) = child.take_stdout()
+                {
+                    streams.stdout = Some(pump(stdout));
+                }
+                if stderr_pipe == Pipe::Piped
+                    && let Some(stderr) = child.take_stderr()
+                {
+                    streams.stderr = Some(pump(stderr));
                 }
             }
-            streams.stdin_blocked = Some(signal_rx);
-            streams.stdin = Some(write_chunks(stdin, feed));
-        }
-        if stdio.stdout == Pipe::Piped
-            && let Some(stdout) = child.take_stdout()
-        {
-            streams.stdout = Some(pump(stdout));
-        }
-        if stdio.stderr == Pipe::Piped
-            && let Some(stderr) = child.take_stderr()
-        {
-            streams.stderr = Some(pump(stderr));
+            Stdio::Pty { .. } => {
+                let master = pty_master.ok_or_else(|| {
+                    SpawnError::Start("host PTY spawn returned no master handle".to_string())
+                })?;
+                let read_file = master
+                    .try_clone_file()
+                    .map_err(|error| SpawnError::Start(error.to_string()))?;
+                let write_file = master
+                    .try_clone_file()
+                    .map_err(|error| SpawnError::Start(error.to_string()))?;
+                let master = Arc::new(master);
+                streams.stdout = Some(pump(read_file));
+                streams.stdin = Some(write_chunks(write_file, FeedCounter::default()));
+                streams.pty_resize = Some(PtyResizeHandle::sync(move |cols, rows| {
+                    master
+                        .resize(cols, rows)
+                        .map_err(|error| PtyResizeError::Backend(error.to_string()))
+                }));
+            }
         }
 
         let (setter, watch) = exit_watch();

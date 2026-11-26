@@ -7,13 +7,15 @@ use executor_core::Executor;
 use heel::Access;
 
 use super::ContainerLaunch;
-use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
+use super::child::{
+    ChildExit, Descendants, KillHandle, PtyResizeHandle, SandboxedChild, Streams, exit_watch,
+};
 use super::container_ipc::ContainerIpc;
 use super::{
-    EnvSource, LaunchInfo, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec,
+    EnvSource, LaunchInfo, Pipe, Sandbox, SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio,
     TreeLifetime, script_reading,
 };
-use crate::shell_session::{ContainerExecOutcome, ExecLifetime};
+use crate::shell_session::{ContainerExecOutcome, ContainerPty, ExecLifetime};
 use crate::terminal::{
     CONTAINER_EXEC_WORKING_DIR, ContainerConfinement, inject_env_exports,
     start_in_container_directory, wrap_container_script,
@@ -119,6 +121,7 @@ impl Sandbox {
         launch.shell_command(&script).map_err(|e| failed(&e))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn spawn_container(
         &self,
         runtime: &ContainerShellRuntime,
@@ -135,13 +138,17 @@ impl Sandbox {
             lifetime,
             info,
         } = spec;
+        let stdin_pipe = match stdio {
+            Stdio::Pipes { stdin, .. } => stdin,
+            Stdio::Pty { .. } => Pipe::Piped,
+        };
         let (script, working_dir, ipc) = self.exec_command(
             runtime,
             launch,
             command,
             env,
             cwd.as_deref(),
-            stdio.stdin,
+            stdin_pipe,
             grants,
             ipc,
             &info,
@@ -153,61 +160,109 @@ impl Sandbox {
         let (stderr_tx, stderr_rx) = async_channel::unbounded::<Vec<u8>>();
         let (pid_tx, pid_rx) = async_channel::bounded::<u32>(1);
         let mut streams = Streams::default();
-        if stdio.stdin == Pipe::Piped {
-            streams.stdin = Some(stdin_tx);
-        }
-        match stdio.stdout {
-            Pipe::Piped => streams.stdout = Some(stdout_rx),
-            Pipe::Null => self
-                .inner
-                .executor
-                .spawn(async move { while stdout_rx.recv().await.is_ok() {} })
-                .detach(),
-        }
-        if stdio.stderr == Pipe::Piped {
-            streams.stderr = Some(stderr_rx);
-        }
-        let exec_lifetime = match lifetime {
-            TreeLifetime::Foreground => ExecLifetime::Foreground { pid: Some(pid_tx) },
-            TreeLifetime::Background => {
-                let (signal_tx, signal_rx) = async_channel::unbounded();
-                if stdio.stdin == Pipe::Piped {
-                    streams.stdin_blocked = Some(signal_rx);
-                }
-                ExecLifetime::Background {
-                    stdin_blocked: signal_tx,
-                    pid: Some(pid_tx),
-                }
-            }
-        };
 
         let kill = kill_tx.clone();
         let exec = runtime.exec();
         let container_id = runtime.container_id().to_string();
         let working = working_dir.as_str().to_string();
         let (setter, watch) = exit_watch();
-        self.inner
-            .executor
-            .spawn(async move {
-                let _kill = kill;
-                let outcome = exec
-                    .exec_streamed_boxed(
-                        &container_id,
-                        &script,
-                        &working,
-                        kill_rx,
-                        stdin_rx,
-                        stdout_tx,
-                        exec_lifetime,
-                    )
-                    .await;
-                if let Some(ipc) = ipc {
-                    ipc.stop().await;
+
+        match stdio {
+            Stdio::Pipes {
+                stdin,
+                stdout,
+                stderr,
+            } => {
+                if stdin == Pipe::Piped {
+                    streams.stdin = Some(stdin_tx);
                 }
-                let (exit, descendants) = exit_of(outcome, &stderr_tx).await;
-                setter.finish(exit, descendants);
-            })
-            .detach();
+                match stdout {
+                    Pipe::Piped => streams.stdout = Some(stdout_rx),
+                    Pipe::Null => self
+                        .inner
+                        .executor
+                        .spawn(async move { while stdout_rx.recv().await.is_ok() {} })
+                        .detach(),
+                }
+                if stderr == Pipe::Piped {
+                    streams.stderr = Some(stderr_rx);
+                }
+                let exec_lifetime = match lifetime {
+                    TreeLifetime::Foreground => ExecLifetime::Foreground { pid: Some(pid_tx) },
+                    TreeLifetime::Background => {
+                        let (signal_tx, signal_rx) = async_channel::unbounded();
+                        if stdin == Pipe::Piped {
+                            streams.stdin_blocked = Some(signal_rx);
+                        }
+                        ExecLifetime::Background {
+                            stdin_blocked: signal_tx,
+                            pid: Some(pid_tx),
+                        }
+                    }
+                };
+                self.inner
+                    .executor
+                    .spawn(async move {
+                        let _kill = kill;
+                        let outcome = exec
+                            .exec_streamed_boxed(
+                                &container_id,
+                                &script,
+                                &working,
+                                kill_rx,
+                                stdin_rx,
+                                stdout_tx,
+                                exec_lifetime,
+                            )
+                            .await;
+                        if let Some(ipc) = ipc {
+                            ipc.stop().await;
+                        }
+                        let (exit, descendants) = exit_of(outcome, &stderr_tx).await;
+                        setter.finish(exit, descendants);
+                    })
+                    .detach();
+            }
+            Stdio::Pty { cols, rows } => {
+                if cols == 0 || rows == 0 {
+                    return Err(SpawnError::Start(format!(
+                        "terminal dimensions must be non-zero (got {cols}x{rows})"
+                    )));
+                }
+                let (resize_tx, resize_rx) = async_channel::unbounded();
+                streams.stdin = Some(stdin_tx);
+                streams.stdout = Some(stdout_rx);
+                streams.pty_resize = Some(PtyResizeHandle::channel(resize_tx));
+                let pty = ContainerPty {
+                    cols,
+                    rows,
+                    resize_rx,
+                    pid: Some(pid_tx),
+                };
+                self.inner
+                    .executor
+                    .spawn(async move {
+                        let _kill = kill;
+                        let outcome = exec
+                            .exec_pty_boxed(
+                                &container_id,
+                                &script,
+                                &working,
+                                kill_rx,
+                                stdin_rx,
+                                stdout_tx,
+                                pty,
+                            )
+                            .await;
+                        if let Some(ipc) = ipc {
+                            ipc.stop().await;
+                        }
+                        let (exit, descendants) = exit_of(outcome, &stderr_tx).await;
+                        setter.finish(exit, descendants);
+                    })
+                    .detach();
+            }
+        }
 
         let pid = pid_rx.recv().await.unwrap_or_else(|_| exec_id());
         Ok(SandboxedChild::new(

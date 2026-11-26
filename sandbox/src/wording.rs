@@ -71,6 +71,19 @@ pub enum CallRefusal {
         /// Process ID named.
         pid: u32,
     },
+    /// A piped job-control tool (`terminal_read` or `terminal_input`) was
+    /// called against a PTY job; direct the model to the embedder's TUI driver.
+    PtyJob {
+        /// Process ID of the PTY job.
+        pid: u32,
+    },
+    /// A PTY spawn requested a zero column or row dimension.
+    InvalidPtySize {
+        /// Requested width in columns.
+        cols: u16,
+        /// Requested height in rows.
+        rows: u16,
+    },
 }
 
 /// Why a foreground command the shell killed was killed.

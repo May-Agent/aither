@@ -85,6 +85,11 @@ pub enum MonitorSource {
         // The path, resolved against the working directory when relative.
         file: String,
     },
+    // An existing background job identified by its process ID.
+    Pid {
+        // Process ID of the job to watch.
+        pid: u32,
+    },
 }
 
 /// New output a monitor collected since the last delivery.
@@ -222,6 +227,16 @@ pub enum MonitorRefusal {
         /// The path as given.
         file: String,
     },
+    /// A `pid` source names no job held by the shell.
+    UnknownJob {
+        /// Process ID named.
+        pid: u32,
+    },
+    /// A `pid` source names a PTY job; direct the model to the TUI driver.
+    PtyJob {
+        /// Process ID of the PTY job.
+        pid: u32,
+    },
     /// The monitored job would not start.
     StartFailed {
         /// The spawn error.
@@ -236,6 +251,9 @@ struct Watch {
     /// Keeps the job until the pump reports its end, so a completion the agent
     /// took first still leaves the pump its status.
     _job: crate::Job,
+    /// Whether this monitor spawned the job itself and therefore kills it on
+    /// deadline timeout.
+    owns_job: bool,
     registry: JobRegistry,
     alerts: EventSender,
     interval: Duration,
@@ -371,6 +389,9 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
                     Interpreter::Shell,
                 ))
             }
+            MonitorSource::Pid { .. } => {
+                unreachable!("PID sources attach to an existing job rather than spawning a script")
+            }
         }
     }
 }
@@ -446,36 +467,55 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
         };
         let filter = compile("filter", &args.filter)?;
         let stop_on = compile("stop_on", &args.stop_on)?;
-        let (script, interpreter) = self.job_script(&args.source).await?;
-        let description = match &args.source {
-            MonitorSource::Command { .. } => "monitored command".to_string(),
-            MonitorSource::File { file } => format!("monitor file {file}"),
+        let (job, owns_job) = match &args.source {
+            MonitorSource::Pid { pid } => {
+                let job = self
+                    .terminal
+                    .jobs()
+                    .get(*pid)
+                    .await
+                    .ok_or(MonitorRefusal::UnknownJob { pid: *pid })?;
+                if job.info().await.pty {
+                    return Err(MonitorRefusal::PtyJob { pid: *pid });
+                }
+                (job, false)
+            }
+            MonitorSource::Command { .. } | MonitorSource::File { .. } => {
+                let (script, interpreter) = self.job_script(&args.source).await?;
+                let description = match &args.source {
+                    MonitorSource::Command { .. } => "monitored command".to_string(),
+                    MonitorSource::File { file } => format!("monitor file {file}"),
+                    MonitorSource::Pid { .. } => unreachable!(),
+                };
+                let job = self
+                    .terminal
+                    .run_background(ShellArgs {
+                        description,
+                        script,
+                        interpreter,
+                        sandbox: SandboxMode::Sandboxed,
+                        location: None,
+                        resolution: MediaResolution::Auto,
+                        max_lines: Some(1),
+                        raw: true,
+                        // The job's own watchdog stays a margin past the monitor's
+                        // deadline, so the pump's kill — not the watchdog's — ends a
+                        // timed-out run and the end reports `TimedOut`.
+                        timeout: args.timeout_secs + JOB_MARGIN.as_secs(),
+                        background: true,
+                    })
+                    .await
+                    .map_err(|error| MonitorRefusal::StartFailed {
+                        reason: error.to_string(),
+                    })?;
+                (job, true)
+            }
         };
-        let job = self
-            .terminal
-            .run_background(ShellArgs {
-                description,
-                script,
-                interpreter,
-                sandbox: SandboxMode::Sandboxed,
-                location: None,
-                resolution: MediaResolution::Auto,
-                max_lines: Some(1),
-                raw: true,
-                // The job's own watchdog stays a margin past the monitor's
-                // deadline, so the pump's kill — not the watchdog's — ends a
-                // timed-out run and the end reports `TimedOut`.
-                timeout: args.timeout_secs + JOB_MARGIN.as_secs(),
-                background: true,
-            })
-            .await
-            .map_err(|error| MonitorRefusal::StartFailed {
-                reason: error.to_string(),
-            })?;
         let pid = job.pid();
         let launch = job.launch();
         let watch = Watch {
             _job: job,
+            owns_job,
             pid,
             launch,
             registry: self.terminal.job_registry(),
@@ -517,6 +557,7 @@ async fn watch_task(watch: Watch) {
         pid,
         launch,
         _job,
+        owns_job,
         registry,
         alerts,
         interval,
@@ -603,7 +644,9 @@ async fn watch_task(watch: Watch) {
             Err(_) => Some(MonitorEnd::Lost),
         };
         if end.is_none() && now >= deadline {
-            registry.kill_launch(launch).await;
+            if owns_job {
+                registry.kill_launch(launch).await;
+            }
             end = Some(MonitorEnd::TimedOut);
         }
         if let Some(end) = end {

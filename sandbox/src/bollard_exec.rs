@@ -3,7 +3,7 @@
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
 use bollard::container::LogOutput;
-use bollard::exec::CreateExecOptions;
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions};
 use futures_lite::{Stream, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
@@ -11,7 +11,8 @@ use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 
 use crate::process_tree::JobProcess;
-use crate::shell_session::{ContainerExec, ContainerExecOutcome, ExecLifetime};
+use crate::shell_session::{ContainerExec, ContainerExecOutcome, ContainerPty, ExecLifetime};
+use crate::spawn::{PtyResizeError, PtyResizeRequest};
 use crate::stdin_watch::{
     CONTAINER_EXEC_WRAPPER, CONTAINER_JOB_SCRIPT, CONTAINER_STDIN_WATCH_INTERVAL, EpisodeDetector,
     Probe, StdinWatchSignal, parse_container_probe,
@@ -487,6 +488,257 @@ impl ContainerExec for BollardContainerExec {
             Some(stdout),
         )
     }
+
+    fn exec_pty(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        output: Sender<Vec<u8>>,
+        pty: ContainerPty,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        exec_pty_inner(
+            self.client.clone(),
+            container_id.to_string(),
+            script.to_string(),
+            working_dir.to_string(),
+            kill_rx,
+            stdin_rx,
+            output,
+            pty,
+        )
+    }
+}
+
+enum PtyStreamEvent {
+    Output(Option<Result<LogOutput, bollard::errors::Error>>),
+    Stdin(Result<Vec<u8>, async_channel::RecvError>),
+    Resize(Result<PtyResizeRequest, async_channel::RecvError>),
+    Cancel,
+}
+
+/// Strips the single `<pid_file> pid <pid>\r?\n` banner line emitted by
+/// `CONTAINER_EXEC_WRAPPER` from the start of a PTY output stream before
+/// forwarding bytes to the consumer.
+struct PtyPidBannerParser {
+    prefix: String,
+    buffer: Vec<u8>,
+    done: bool,
+    pid_tx: Option<Sender<u32>>,
+}
+
+impl PtyPidBannerParser {
+    fn new(pid_file: &str, pid_tx: Option<Sender<u32>>) -> Self {
+        Self {
+            prefix: format!("{pid_file} pid "),
+            buffer: Vec::new(),
+            done: false,
+            pid_tx,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Option<Vec<u8>> {
+        if self.done {
+            return (!chunk.is_empty()).then(|| chunk.to_vec());
+        }
+        self.buffer.extend_from_slice(chunk);
+        if let Some(nl) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            self.done = true;
+            let line = String::from_utf8_lossy(&self.buffer[..nl]);
+            let trimmed = line.trim_end_matches('\r');
+            if let Some(raw_pid) = trimmed.strip_prefix(&self.prefix)
+                && let Ok(pid) = raw_pid.trim().parse::<u32>()
+            {
+                if let Some(tx) = self.pid_tx.take() {
+                    let _ = tx.try_send(pid);
+                }
+                let rest = self.buffer[nl + 1..].to_vec();
+                self.buffer.clear();
+                return (!rest.is_empty()).then_some(rest);
+            }
+            // First line was not the PID marker; release waiter and forward everything.
+            self.pid_tx.take();
+            let whole = std::mem::take(&mut self.buffer);
+            return (!whole.is_empty()).then_some(whole);
+        }
+        if self.buffer.len() > 1024 {
+            self.done = true;
+            self.pid_tx.take();
+            let whole = std::mem::take(&mut self.buffer);
+            return (!whole.is_empty()).then_some(whole);
+        }
+        None
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        self.pid_tx.take();
+        if self.done || self.buffer.is_empty() {
+            return None;
+        }
+        self.done = true;
+        Some(std::mem::take(&mut self.buffer))
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn exec_pty_inner(
+    client: Arc<Docker>,
+    container_id: String,
+    script: String,
+    working_dir: String,
+    kill_rx: Receiver<()>,
+    stdin_rx: Receiver<Vec<u8>>,
+    output_sink: Sender<Vec<u8>>,
+    pty: ContainerPty,
+) -> Result<ContainerExecOutcome, String> {
+    let pid_file = format!("/tmp/aither-exec-pty-{}.pid", uuid::Uuid::new_v4().simple());
+    let config = CreateExecOptions {
+        cmd: Some(vec![
+            "sh",
+            "-c",
+            CONTAINER_EXEC_WRAPPER,
+            "sh",
+            pid_file.as_str(),
+            script.as_str(),
+            "background",
+            CONTAINER_JOB_SCRIPT,
+        ]),
+        attach_stdin: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(true),
+        env: Some(vec!["TERM=xterm-256color"]),
+        working_dir: Some(working_dir.as_str()),
+        ..Default::default()
+    };
+
+    let exec_id = client
+        .create_exec(&container_id, config)
+        .await
+        .map_err(|e| format!("failed to create PTY exec: {e}"))?
+        .id;
+
+    let (mut output, mut input) = match client
+        .start_exec(
+            &exec_id,
+            Some(StartExecOptions {
+                tty: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| format!("failed to start PTY exec: {e}"))?
+    {
+        bollard::exec::StartExecResults::Attached { output, input } => (output, input),
+        bollard::exec::StartExecResults::Detached => {
+            return Err("PTY exec started in detached mode unexpectedly".to_string());
+        }
+    };
+
+    client
+        .resize_exec(
+            &exec_id,
+            ResizeExecOptions {
+                width: pty.cols,
+                height: pty.rows,
+            },
+        )
+        .await
+        .map_err(|e| format!("failed to set initial PTY size: {e}"))?;
+
+    let mut banner = PtyPidBannerParser::new(&pid_file, pty.pid);
+    let resize_rx = pty.resize_rx;
+    let mut stdin_open = true;
+    let mut resize_open = true;
+
+    loop {
+        let event = tokio::select! {
+            output = async { output.next().await } => PtyStreamEvent::Output(output),
+            () = async {
+                let _ = kill_rx.recv().await;
+            } => PtyStreamEvent::Cancel,
+            bytes = async { stdin_rx.recv().await }, if stdin_open => PtyStreamEvent::Stdin(bytes),
+            req = async { resize_rx.recv().await }, if resize_open => PtyStreamEvent::Resize(req),
+        };
+
+        match event {
+            PtyStreamEvent::Output(Some(Ok(chunk))) => {
+                let bytes = match chunk {
+                    LogOutput::Console { message }
+                    | LogOutput::StdOut { message }
+                    | LogOutput::StdErr { message } => message,
+                    LogOutput::StdIn { .. } => continue,
+                };
+                if let Some(forward) = banner.push(&bytes)
+                    && !matches!(
+                        forward_stdout(&output_sink, forward, &kill_rx).await,
+                        Forwarded::Sent
+                    )
+                {
+                    if stdin_open {
+                        let _ = shutdown_container_stdin(&mut input).await;
+                    }
+                    kill_exec_inside_container(&client, &container_id, &exec_id, &pid_file)
+                        .await
+                        .map_err(|error| format!("failed to kill container PTY exec: {error}"))?;
+                    return Ok(ContainerExecOutcome::Killed);
+                }
+            }
+            PtyStreamEvent::Output(Some(Err(e))) => {
+                return Err(format!("PTY exec stream error: {e}"));
+            }
+            PtyStreamEvent::Output(None) => {
+                if let Some(trailing) = banner.finish() {
+                    let _ = forward_stdout(&output_sink, trailing, &kill_rx).await;
+                }
+                break;
+            }
+            PtyStreamEvent::Stdin(Ok(bytes)) => {
+                write_container_stdin(&mut input, &bytes).await?;
+            }
+            PtyStreamEvent::Stdin(Err(_)) => {
+                let _ = shutdown_container_stdin(&mut input).await;
+                stdin_open = false;
+            }
+            PtyStreamEvent::Resize(Ok((cols, rows, reply))) => {
+                let outcome = client
+                    .resize_exec(
+                        &exec_id,
+                        ResizeExecOptions {
+                            width: cols,
+                            height: rows,
+                        },
+                    )
+                    .await
+                    .map_err(|error| PtyResizeError::Backend(error.to_string()));
+                let _ = reply.send(outcome).await;
+            }
+            PtyStreamEvent::Resize(Err(_)) => {
+                resize_open = false;
+            }
+            PtyStreamEvent::Cancel => {
+                if stdin_open {
+                    let _ = shutdown_container_stdin(&mut input).await;
+                }
+                kill_exec_inside_container(&client, &container_id, &exec_id, &pid_file)
+                    .await
+                    .map_err(|error| format!("failed to kill container PTY exec: {error}"))?;
+                return Ok(ContainerExecOutcome::Killed);
+            }
+        }
+    }
+
+    let status = inspect_exec_exit_status(&client, &exec_id).await?;
+    Ok(ContainerExecOutcome::Completed {
+        output: Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        killed: Vec::new(),
+    })
 }
 
 /// One container exec's whole run, shared by the buffered and the streamed
@@ -1067,5 +1319,32 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&run.stderr)
         );
+    }
+
+    #[test]
+    fn pty_pid_banner_parser_strips_marker_across_chunks_and_passes_payload() {
+        let (pid_tx, pid_rx) = async_channel::bounded(1);
+        let mut parser = super::PtyPidBannerParser::new("/tmp/exec.pid", Some(pid_tx));
+        assert_eq!(parser.push(b"/tmp/exec."), None);
+        assert_eq!(parser.push(b"pid pid 42"), None);
+        assert_eq!(
+            parser.push(b"42\r\nhello world"),
+            Some(b"hello world".to_vec())
+        );
+        assert_eq!(pid_rx.try_recv().ok(), Some(4242));
+        assert_eq!(parser.push(b"\r\nmore"), Some(b"\r\nmore".to_vec()));
+        assert_eq!(parser.finish(), None);
+    }
+
+    #[test]
+    fn pty_pid_banner_parser_forwards_non_marker_lines_and_releases_pid_waiter() {
+        let (pid_tx, pid_rx) = async_channel::bounded(1);
+        let mut parser = super::PtyPidBannerParser::new("/tmp/exec.pid", Some(pid_tx));
+        assert_eq!(
+            parser.push(b"plain output\nsecond"),
+            Some(b"plain output\nsecond".to_vec())
+        );
+        assert!(pid_rx.is_closed());
+        assert_eq!(parser.finish(), None);
     }
 }

@@ -20,6 +20,8 @@ where
                 Ok(0) => break,
                 Ok(count) => emit(Some(buffer[..count].to_vec())),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                #[cfg(target_os = "linux")]
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) => {
                     warn!(%error, "a process pipe failed to read");
                     break;

@@ -43,7 +43,8 @@ use askama::Template;
 use executor_core::{AnyExecutor, Executor};
 
 pub use backend::Backend;
-pub use child::{ChildExit, Descendants, SandboxedChild};
+pub use child::PtyResizeRequest;
+pub use child::{ChildExit, Descendants, PtyResizeError, PtyResizeHandle, SandboxedChild};
 pub use domain::{
     AnyDomainApprover, ApproveAllDomains, DenyAllDomains, DomainApprover, DomainRequest,
 };
@@ -98,21 +99,51 @@ pub enum Pipe {
     Piped,
 }
 
-/// The standard streams of a spawned process. The default pipes `stdout` and
-/// `stderr` and gives `stdin` nothing.
+/// The standard streams of a spawned process.
+///
+/// The default is [`Stdio::Pipes`] with `stdin: Pipe::Null`,
+/// `stdout: Pipe::Piped`, and `stderr: Pipe::Piped`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stdio {
-    /// The process's standard input.
-    pub stdin: Pipe,
-    /// The process's standard output.
-    pub stdout: Pipe,
-    /// The process's standard error.
-    pub stderr: Pipe,
+pub enum Stdio {
+    /// Three independent standard streams.
+    Pipes {
+        /// The process's standard input.
+        stdin: Pipe,
+        /// The process's standard output.
+        stdout: Pipe,
+        /// The process's standard error.
+        stderr: Pipe,
+    },
+    /// A single pseudo-terminal attached to stdin, stdout, and stderr.
+    Pty {
+        /// Initial terminal width in columns.
+        cols: u16,
+        /// Initial terminal height in rows.
+        rows: u16,
+    },
+}
+
+impl Stdio {
+    /// Three independent standard streams.
+    #[must_use]
+    pub const fn pipes(stdin: Pipe, stdout: Pipe, stderr: Pipe) -> Self {
+        Self::Pipes {
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// A pseudo-terminal with initial dimensions `cols` by `rows`.
+    #[must_use]
+    pub const fn pty(cols: u16, rows: u16) -> Self {
+        Self::Pty { cols, rows }
+    }
 }
 
 impl Default for Stdio {
     fn default() -> Self {
-        Self {
+        Self::Pipes {
             stdin: Pipe::Null,
             stdout: Pipe::Piped,
             stderr: Pipe::Piped,
