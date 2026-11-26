@@ -14156,7 +14156,7 @@ mod tests {
         let pty_job = shell
             .run_pty(crate::PtyArgs {
                 description: "host interactive pty".into(),
-                script: "stty -echo; trap 'stty size' WINCH; printf 'pid=%d\\n' $$; stty size; while :; do sleep 0.1; done".into(),
+                script: "stty -echo; printf 'pid=%d\\n' $$; stty size; while IFS= read -r cmd; do [ \"$cmd\" = size ] && stty size; done".into(),
                 interpreter: Interpreter::Shell,
                 sandbox: SandboxMode::Sandboxed,
                 cols: 120,
@@ -14180,6 +14180,11 @@ mod tests {
             .resize(pid, 100, 30)
             .await
             .expect("resize succeeds");
+        shell
+            .jobs()
+            .pty_input(pid, b"size\n".to_vec())
+            .await
+            .expect("pty input succeeds");
         read_until(&pty_job.output, &mut buf, "30 100").await;
 
         let read_tool = crate::JobReadTool::new(
