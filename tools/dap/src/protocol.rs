@@ -66,13 +66,18 @@ pub struct DapEvent {
     reason = "DAP initialize schema defines independent boolean capability flags"
 )]
 pub struct InitializeRequestArguments {
-    /// Client identifier sent to the adapter.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Client identifier sent to the adapter (`clientID` in the DAP specification).
+    #[serde(
+        rename = "clientID",
+        alias = "clientId",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub client_id: Option<String>,
     /// Human-readable client name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
-    /// Debug adapter type identifier.
+    /// Debug adapter type identifier (`adapterID` in the DAP specification).
+    #[serde(rename = "adapterID", alias = "adapterId")]
     pub adapter_id: String,
     /// Whether source lines are 1-based (`true`).
     pub lines_start_at1: bool,
@@ -250,11 +255,16 @@ pub struct BreakpointEventBody {
     pub breakpoint: Breakpoint,
 }
 
+fn default_stop_reason() -> String {
+    "stopped".to_owned()
+}
+
 /// Body of a DAP `stopped` event.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoppedEventBody {
     /// Stop reason (for example `"breakpoint"`, `"step"`, `"exception"`, `"pause"`, `"entry"`).
+    #[serde(default = "default_stop_reason")]
     pub reason: String,
     /// Optional full description of the stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,5 +554,30 @@ mod tests {
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: ProtocolMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, evt);
+    }
+
+    #[test]
+    fn serializes_dap_initialize_id_casing_and_defaults_missing_stop_reason() {
+        let init_val =
+            serde_json::to_value(InitializeRequestArguments::for_adapter("lldb-dap")).unwrap();
+        assert_eq!(
+            init_val.get("adapterID").and_then(Value::as_str),
+            Some("lldb-dap")
+        );
+        assert_eq!(
+            init_val.get("clientID").and_then(Value::as_str),
+            Some("aither-dap")
+        );
+        assert!(init_val.get("adapterId").is_none());
+        assert!(init_val.get("clientId").is_none());
+
+        let stopped: StoppedEventBody = serde_json::from_value(serde_json::json!({
+            "allThreadsStopped": true,
+            "threadId": 200_048
+        }))
+        .unwrap();
+        assert_eq!(stopped.reason, "stopped");
+        assert_eq!(stopped.thread_id, Some(200_048));
+        assert_eq!(stopped.all_threads_stopped, Some(true));
     }
 }

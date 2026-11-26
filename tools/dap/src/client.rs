@@ -99,9 +99,7 @@ impl DapClient {
         } else {
             Err(DapError::RequestFailed {
                 command,
-                message: response
-                    .message
-                    .unwrap_or_else(|| "adapter reported failure without details".to_owned()),
+                message: extract_error_message(&response),
             })
         }
     }
@@ -276,8 +274,90 @@ async fn run_io_loop<T: DapTransport>(
     let _ = transport.exit_status().await;
 }
 
+fn extract_error_message(response: &DapResponse) -> String {
+    let structured = response
+        .body
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .and_then(|err| {
+            let format = err.get("format")?.as_str()?;
+            let trimmed = format.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let mut rendered = trimmed.to_owned();
+            if let Some(vars) = err.get("variables").and_then(Value::as_object) {
+                for (key, val) in vars {
+                    let placeholder = format!("{{{key}}}");
+                    let replacement = val
+                        .as_str()
+                        .map_or_else(|| val.to_string(), ToOwned::to_owned);
+                    rendered = rendered.replace(&placeholder, &replacement);
+                }
+            }
+            Some(rendered)
+        });
+
+    let top_message = response
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|msg| !msg.is_empty());
+
+    match (structured, top_message) {
+        (Some(detail), Some(short))
+            if !detail.eq_ignore_ascii_case(short) && short != "cancelled" =>
+        {
+            format!("{short}: {detail}")
+        }
+        (Some(detail), _) => detail,
+        (None, Some(short)) => short.to_owned(),
+        (None, None) => "adapter reported failure without details".to_owned(),
+    }
+}
+
 fn fail_all_pending(pending: &mut HashMap<i64, Sender<Result<DapResponse, DapError>>>) {
     for (_, reply) in pending.drain() {
         let _ = reply.try_send(Err(DapError::ConnectionClosed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_structured_dap_error_format_and_variables() {
+        let resp = DapResponse {
+            seq: 3,
+            request_seq: 2,
+            success: false,
+            command: "attach".to_owned(),
+            message: None,
+            body: Some(serde_json::json!({
+                "error": {
+                    "id": 3,
+                    "format": "cannot attach to pid {pid}: {reason}",
+                    "variables": {
+                        "pid": "26581",
+                        "reason": "permission denied"
+                    }
+                }
+            })),
+        };
+        assert_eq!(
+            extract_error_message(&resp),
+            "cannot attach to pid 26581: permission denied"
+        );
+
+        let fallback = DapResponse {
+            seq: 4,
+            request_seq: 3,
+            success: false,
+            command: "evaluate".to_owned(),
+            message: Some("error: No value".to_owned()),
+            body: Some(serde_json::json!({})),
+        };
+        assert_eq!(extract_error_message(&fallback), "error: No value");
     }
 }
