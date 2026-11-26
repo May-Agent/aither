@@ -1,6 +1,8 @@
 use url::Url;
 
 #[cfg(not(target_arch = "wasm32"))]
+use crate::DEFAULT_BASE_URL;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::error::OpenAIError;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -12,6 +14,8 @@ use aither_core::llm::{Attachment, Message};
 use crate::files::{FilePurpose, FilesConfig, upload_file};
 #[cfg(not(target_arch = "wasm32"))]
 use aither_attachments::{FileCache, default_cache_dir};
+#[cfg(not(target_arch = "wasm32"))]
+use base64::Engine as _;
 #[cfg(not(target_arch = "wasm32"))]
 use std::{
     collections::HashMap,
@@ -45,6 +49,23 @@ pub async fn resolve_messages(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn inlines_local_images(cfg: &Config) -> bool {
+    cfg.base_url.trim_end_matches('/') != DEFAULT_BASE_URL || cfg.store == Some(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn needs_file_cache(cfg: &Config, messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .flat_map(Message::attachments)
+        .any(|attachment| {
+            attachment.url().scheme() == "file"
+                && !(attachment.media_type().as_ref().starts_with("image/")
+                    && inlines_local_images(cfg))
+        })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 async fn resolve_messages_with_cache_dir(
     cfg: &Config,
     messages: Vec<Message>,
@@ -54,10 +75,16 @@ async fn resolve_messages_with_cache_dir(
         return Ok(messages);
     }
 
-    let mut cache = FileCache::open(cache_dir.as_ref().to_path_buf())
-        .await
-        .map_err(OpenAIError::from)?;
-    let mut cache_dirty = cache.prune_expired();
+    let mut cache = if needs_file_cache(cfg, &messages) {
+        Some(
+            FileCache::open(cache_dir.as_ref().to_path_buf())
+                .await
+                .map_err(OpenAIError::from)?,
+        )
+    } else {
+        None
+    };
+    let mut cache_dirty = cache.as_mut().is_some_and(FileCache::prune_expired);
 
     let mut resolved = Vec::with_capacity(messages.len());
     for message in messages {
@@ -94,7 +121,7 @@ async fn resolve_messages_with_cache_dir(
         }
     }
 
-    if cache_dirty {
+    if cache_dirty && let Some(cache) = &cache {
         cache.save().await.map_err(OpenAIError::from)?;
     }
 
@@ -110,7 +137,7 @@ enum AttachmentPlan {
 #[cfg(not(target_arch = "wasm32"))]
 async fn resolve_attachment_list(
     cfg: &Config,
-    cache: &mut FileCache,
+    cache: &mut Option<FileCache>,
     attachments: Vec<Attachment>,
     cache_dirty: &mut bool,
 ) -> Result<Vec<Attachment>, OpenAIError> {
@@ -133,6 +160,20 @@ async fn resolve_attachment_list(
                 } else {
                     OpenAIFileKind::FILE
                 };
+                if kind.is_image() && inlines_local_images(cfg) {
+                    let data = async_fs::read(&path).await?;
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+                    let data_url = Url::parse(&format!(
+                        "data:{};base64,{encoded}",
+                        attachment.media_type()
+                    ))
+                    .map_err(|e| OpenAIError::Api(format!("Invalid inline image data URL: {e}")))?;
+                    plans.push(AttachmentPlan::Direct(data_url));
+                    continue;
+                }
+                let cache = cache
+                    .as_mut()
+                    .expect("file cache opened whenever local files require /files upload");
                 let key = (path.clone(), kind);
                 if !resolved_ids.contains_key(&key) && !pending_uploads.contains(&key) {
                     if let Some(entry) = cache
@@ -157,6 +198,9 @@ async fn resolve_attachment_list(
     }
 
     if !pending_uploads.is_empty() {
+        let cache = cache
+            .as_mut()
+            .expect("file cache opened whenever local files require /files upload");
         let files_cfg = build_files_config(cfg);
         let uploaded = try_map_bounded(pending_uploads, MAX_CONCURRENT_UPLOADS, |(path, kind)| {
             let files_cfg = files_cfg.clone();
@@ -417,5 +461,90 @@ mod tests {
             "expected concurrent uploads, peak={}",
             max_seen.load(Ordering::SeqCst)
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_messages_inlines_local_images_on_custom_and_store_false_endpoints() {
+        use crate::request::to_responses_input;
+
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+
+        let mut dir_bytes = [0u8; 8];
+        getrandom::fill(&mut dir_bytes).expect("random dir suffix");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aither-openai-inline-img-{:x}",
+            u64::from_le_bytes(dir_bytes)
+        ));
+        async_fs::create_dir_all(&temp_dir).await.expect("temp dir");
+        let cache_dir = temp_dir.join("cache");
+        let img_path = temp_dir.join("screen.png");
+        let png_bytes = b"\x89PNG\r\n\x1a\ninline";
+        async_fs::write(&img_path, png_bytes)
+            .await
+            .expect("write png");
+
+        let mk_att = || {
+            Attachment::new(
+                Url::from_file_path(&img_path).expect("file URL"),
+                "image/png".parse().expect("mime"),
+            )
+        };
+
+        let custom_client = OpenAI::builder("key")
+            .base_url(format!("http://127.0.0.1:{closed_port}/v1"))
+            .build();
+        let store_false_client = OpenAI::builder("key").store(false).build();
+
+        for client in [custom_client, store_false_client] {
+            let messages = vec![
+                Message::user("see screen").with_attachment(mk_att()),
+                Message::tool("tui output", "call_1").with_attachment(mk_att()),
+            ];
+            let resolved = resolve_messages_with_cache_dir(&client.config(), messages, &cache_dir)
+                .await
+                .expect("inline resolution succeeds without hitting /files");
+            assert!(
+                !cache_dir.exists(),
+                "inline image resolution must not open or populate FileCache"
+            );
+            let input = to_responses_input(&resolved).expect("encode Responses input");
+            let json = serde_json::to_value(&input).expect("serialize");
+            let expected_url = format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png_bytes)
+            );
+            assert_eq!(json[0]["content"][0]["type"], "input_image");
+            assert_eq!(json[0]["content"][0]["image_url"], expected_url);
+            assert_eq!(json[1]["output"][0]["type"], "input_image");
+            assert_eq!(json[1]["output"][0]["image_url"], expected_url);
+        }
+
+        let _ = async_fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn inlines_local_images_preserves_files_api_on_default_openai_endpoint() {
+        let default_client = OpenAI::builder("key").build();
+        assert!(!inlines_local_images(&default_client.config()));
+
+        let trailing_slash = OpenAI::builder("key")
+            .base_url("https://api.openai.com/v1/")
+            .build();
+        assert!(!inlines_local_images(&trailing_slash.config()));
+
+        let store_true = OpenAI::builder("key").store(true).build();
+        assert!(!inlines_local_images(&store_true.config()));
+
+        let store_false = OpenAI::builder("key").store(false).build();
+        assert!(inlines_local_images(&store_false.config()));
+
+        let custom = OpenAI::builder("key")
+            .base_url("https://proxy.example.com/v1")
+            .build();
+        assert!(inlines_local_images(&custom.config()));
     }
 }
