@@ -167,6 +167,9 @@ impl Tool for JobInputTool {
             Err(JobInputError::NoStdin { pid }) => {
                 return Err(Refused::call(&*self.wording, CallRefusal::NoStdin { pid }).into());
             }
+            Err(JobInputError::PtyJob { pid }) => {
+                return Err(Refused::call(&*self.wording, CallRefusal::PtyJob { pid }).into());
+            }
             Err(error) => return Err(error.into()),
         }
 
@@ -250,6 +253,11 @@ impl Tool for JobReadTool {
             .unwrap_or_else(|| self.output.get().read_bytes);
         if max_bytes == 0 {
             return Err(Refused::call(&*self.wording, CallRefusal::ZeroMaxBytes).into());
+        }
+        if let Some(job) = self.jobs.get(pid).await
+            && job.info().await.pty
+        {
+            return Err(Refused::call(&*self.wording, CallRefusal::PtyJob { pid }).into());
         }
         let read = if let Some(step) = args.step {
             match self

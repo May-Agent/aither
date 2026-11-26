@@ -12,6 +12,7 @@ use crate::job_registry::{
 };
 use crate::output::{MediaResolution, OutputFormat, OutputStore};
 use crate::pipeline::{PipelineReadError, PipelineSnapshot, StageStreamSelector, StageUiDelta};
+use crate::spawn::PtyResizeError;
 use crate::wording::CommandKilled;
 
 /// How a script ended.
@@ -138,6 +139,24 @@ impl Jobs {
     /// Kills every running job and returns how many it killed.
     pub async fn kill_all(&self) -> usize {
         self.registry.kill_running().await
+    }
+
+    /// Writes `bytes` to the PTY master of the running PTY job with `pid`.
+    ///
+    /// # Errors
+    /// Returns [`JobInputError`] when `pid` is unknown, not a PTY job, not
+    /// running, or its input channel closed.
+    pub async fn pty_input(&self, pid: u32, bytes: Vec<u8>) -> Result<(), JobInputError> {
+        self.registry.pty_input(pid, bytes).await
+    }
+
+    /// Resizes the running PTY job with `pid` to `cols` by `rows`.
+    ///
+    /// # Errors
+    /// Returns [`PtyResizeError`] when the dimensions are zero, `pid` is
+    /// unknown, not a PTY job, not running, or the backend resize fails.
+    pub async fn resize(&self, pid: u32, cols: u16, rows: u16) -> Result<(), PtyResizeError> {
+        self.registry.resize_by_pid(pid, cols, rows).await
     }
 
     /// The facts raised about the shell's jobs.
@@ -370,11 +389,36 @@ impl Job {
     /// Writes `bytes` to the job's stdin.
     ///
     /// # Errors
-    /// Returns an error when the job is not running or takes no input.
+    /// Returns an error when the job is not running, is a PTY job, or takes no
+    /// input.
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), JobInputError> {
         self.jobs
             .registry
             .terminal_input_launch(self.watch.launch(), self.watch.pid(), bytes)
+            .await
+    }
+
+    /// Writes `bytes` to a PTY job's master stream.
+    ///
+    /// # Errors
+    /// Returns [`JobInputError`] when the job is not a PTY job, is not
+    /// running, or its input channel closed.
+    pub async fn pty_input(&self, bytes: Vec<u8>) -> Result<(), JobInputError> {
+        self.jobs
+            .registry
+            .pty_input_launch(self.watch.launch(), self.watch.pid(), bytes)
+            .await
+    }
+
+    /// Resizes a PTY job's terminal window to `cols` by `rows`.
+    ///
+    /// # Errors
+    /// Returns [`PtyResizeError`] when the dimensions are zero, the job is not
+    /// a PTY job, is not running, or the backend resize fails.
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyResizeError> {
+        self.jobs
+            .registry
+            .resize_launch(self.watch.launch(), self.watch.pid(), cols, rows)
             .await
     }
 

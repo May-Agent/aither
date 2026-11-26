@@ -10,7 +10,8 @@ use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::child::{ChildExit, Descendants, KillHandle, SandboxedChild, Streams, exit_watch};
 use super::{
-    EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnCommand, SpawnError, SpawnSpec, script_reading,
+    EnvSource, Pipe, RemoteLaunch, Sandbox, SpawnCommand, SpawnError, SpawnSpec, Stdio,
+    script_reading,
 };
 use crate::SshServer;
 use crate::process_tree::{KillTreeError, kill_process_tree};
@@ -169,6 +170,19 @@ impl Sandbox {
             info,
         } = spec;
         validate_ssh_spec(!grants.is_empty(), ipc.is_some(), cwd.is_some())?;
+        let (stdin_pipe, stdout_pipe, stderr_pipe) = match stdio {
+            Stdio::Pipes {
+                stdin,
+                stdout,
+                stderr,
+            } => (stdin, stdout, stderr),
+            Stdio::Pty { .. } => {
+                return Err(SpawnError::Unsupported {
+                    backend: "ssh",
+                    what: "a pseudo-terminal",
+                });
+            }
+        };
         // A confined process runs under the server's `heel`; one that is not
         // confined runs directly.
         let heel = if self.inner.unconfined {
@@ -192,7 +206,7 @@ impl Sandbox {
         };
         // On the server the command's stdin is its session's channel, a pipe
         // even while the local client reads the null device.
-        let script = script_reading(stdio.stdin, script)?;
+        let script = script_reading(stdin_pipe, script)?;
         let spec_env: Arc<dyn EnvSource> = Arc::new(env);
         let extra_exports =
             inject_env_exports(String::new(), Some(&spec_env), &info).map_err(|e| failed(&e))?;
@@ -222,8 +236,8 @@ impl Sandbox {
         // stderr is always piped so we can read and strip the remote PID marker
         // line (`<pidfile> pid <remote_pid>`) before forwarding user stderr.
         let mut child = async_process::Command::from(command)
-            .stdin(process_stdio(stdio.stdin)())
-            .stdout(process_stdio(stdio.stdout)())
+            .stdin(process_stdio(stdin_pipe)())
+            .stdout(process_stdio(stdout_pipe)())
             .stderr(ProcessStdio::piped())
             .spawn()
             .map_err(|error| SpawnError::Start(error.to_string()))?;
@@ -233,7 +247,7 @@ impl Sandbox {
         let (streams, pid_rx) = pipe_streams(
             executor,
             &mut child,
-            stdio.stderr == Pipe::Piped,
+            stderr_pipe == Pipe::Piped,
             pidfile_raw,
         );
         let remote_pid = pid_rx.recv().await.unwrap_or(local_id);

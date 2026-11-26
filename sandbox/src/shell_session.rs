@@ -4,9 +4,23 @@ use async_channel::{Receiver, Sender};
 
 use askama::Template as _;
 
+use crate::spawn::PtyResizeRequest;
 use crate::ssh::{PrepareSsh, SshEnvironments, SshServer, SshServerError};
 use crate::stdin_watch::StdinWatchSignal;
 use crate::{ContainerPath, HostRoute};
+
+/// Pseudo-terminal setup for [`ContainerExec::exec_pty`].
+#[derive(Debug)]
+pub struct ContainerPty {
+    /// Initial terminal width in columns.
+    pub cols: u16,
+    /// Initial terminal height in rows.
+    pub rows: u16,
+    /// Incoming resize requests; closed when no handle can resize the PTY.
+    pub(crate) resize_rx: Receiver<PtyResizeRequest>,
+    /// One-shot channel receiving the job's in-container PID once started.
+    pub pid: Option<Sender<u32>>,
+}
 
 /// How long the processes a container command leaves running when its
 /// top-level shell exits may live.
@@ -120,6 +134,25 @@ pub trait ContainerExec: Send + Sync {
         stdout: Sender<Vec<u8>>,
         lifetime: ExecLifetime,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
+
+    /// Executes a command inside a container attached to a pseudo-terminal,
+    /// streaming the merged PTY output through `output` and applying live
+    /// resize requests from `pty`.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_pty(
+        &self,
+        _container_id: &str,
+        _script: &str,
+        _working_dir: &str,
+        _kill_rx: Receiver<()>,
+        _stdin_rx: Receiver<Vec<u8>>,
+        _output: Sender<Vec<u8>>,
+        _pty: ContainerPty,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        std::future::ready(Err(
+            "PTY execution is not supported by this container runtime".to_string(),
+        ))
+    }
 }
 
 /// Object-safe twin of [`ContainerExec`], used only through
@@ -148,6 +181,20 @@ pub trait ContainerExecImpl: Send + Sync {
         stdin_rx: Receiver<Vec<u8>>,
         stdout: Sender<Vec<u8>>,
         lifetime: ExecLifetime,
+    ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
+
+    /// Execute a command inside a container attached to a PTY through a boxed
+    /// future.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_pty_boxed<'a>(
+        &'a self,
+        container_id: &'a str,
+        script: &'a str,
+        working_dir: &'a str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        output: Sender<Vec<u8>>,
+        pty: ContainerPty,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
 
@@ -232,6 +279,36 @@ impl ContainerExec for AnyContainerExec {
                     stdin_rx,
                     stdout,
                     lifetime,
+                )
+                .await
+        }
+    }
+
+    fn exec_pty(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        output: Sender<Vec<u8>>,
+        pty: ContainerPty,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let container_id = container_id.to_string();
+        let script = script.to_string();
+        let working_dir = working_dir.to_string();
+
+        async move {
+            inner
+                .exec_pty_boxed(
+                    &container_id,
+                    &script,
+                    &working_dir,
+                    kill_rx,
+                    stdin_rx,
+                    output,
+                    pty,
                 )
                 .await
         }
@@ -517,6 +594,27 @@ impl<T: ContainerExec> ContainerExecImpl for T {
             stdin_rx,
             stdout,
             lifetime,
+        ))
+    }
+
+    fn exec_pty_boxed<'a>(
+        &'a self,
+        container_id: &'a str,
+        script: &'a str,
+        working_dir: &'a str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        output: Sender<Vec<u8>>,
+        pty: ContainerPty,
+    ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
+        Box::pin(self.exec_pty(
+            container_id,
+            script,
+            working_dir,
+            kill_rx,
+            stdin_rx,
+            output,
+            pty,
         ))
     }
 }

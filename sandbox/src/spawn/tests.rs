@@ -93,10 +93,8 @@ async fn a_host_process_streams_its_output_and_reports_its_exit() {
 async fn a_process_reads_what_is_sent_to_its_stdin_until_it_is_dropped() {
     let (_work, work) = canonical_tempdir();
     let sandbox = host_sandbox(&work).await;
-    let spec = SpawnSpec::new("/bin/cat").stdio(Stdio {
-        stdin: Pipe::Piped,
-        ..Stdio::default()
-    });
+    let spec =
+        SpawnSpec::new("/bin/cat").stdio(Stdio::pipes(Pipe::Piped, Pipe::Piped, Pipe::Piped));
     let (exit, out) = tokio::time::timeout(BOUND, async {
         let mut child = sandbox.spawn(spec).await.expect("the process starts");
         let stdin = child.take_stdin().expect("stdin is piped");
@@ -425,10 +423,7 @@ async fn an_unpiped_container_stdin_is_the_null_device() {
         super::script_reading(Pipe::Null, String::new()).expect("the null stdin redirect renders");
     for (stdin, redirected) in [(Pipe::Null, true), (Pipe::Piped, false)] {
         let scripts = Arc::new(Mutex::new(Vec::new()));
-        let spec = SpawnSpec::new("job").stdio(Stdio {
-            stdin,
-            ..Stdio::default()
-        });
+        let spec = SpawnSpec::new("job").stdio(Stdio::pipes(stdin, Pipe::Piped, Pipe::Piped));
         let mut child = container_sandbox(&scripts, &work)
             .spawn(spec)
             .await
@@ -565,10 +560,7 @@ async fn a_background_container_child_signals_a_blocked_stdin() {
         None,
     );
     let mut child = sandbox
-        .spawn(SpawnSpec::script("cat").stdio(Stdio {
-            stdin: Pipe::Piped,
-            ..Stdio::default()
-        }))
+        .spawn(SpawnSpec::script("cat").stdio(Stdio::pipes(Pipe::Piped, Pipe::Piped, Pipe::Piped)))
         .await
         .expect("the exec starts");
     let signals = child.take_stdin_blocked().expect("stdin is watched");
@@ -856,10 +848,8 @@ async fn a_foreground_host_child_reports_the_descendants_it_killed() {
 async fn a_background_host_child_signals_a_blocked_stdin() {
     let (_work, work) = canonical_tempdir();
     let sandbox = host_sandbox(&work).await;
-    let spec = SpawnSpec::new("/bin/cat").stdio(Stdio {
-        stdin: Pipe::Piped,
-        ..Stdio::default()
-    });
+    let spec =
+        SpawnSpec::new("/bin/cat").stdio(Stdio::pipes(Pipe::Piped, Pipe::Piped, Pipe::Piped));
     let mut child = sandbox.spawn(spec).await.expect("the process starts");
     let signals = child.take_stdin_blocked().expect("stdin is watched");
     let stdin = child.take_stdin().expect("stdin is piped");
@@ -875,5 +865,250 @@ async fn a_background_host_child_signals_a_blocked_stdin() {
     let exit = tokio::time::timeout(BOUND, child.wait())
         .await
         .expect("cat ends at EOF");
+    assert!(exit.success(), "{exit:?}");
+}
+
+struct PtyMockExec {
+    initial_size: Arc<Mutex<Option<(u16, u16)>>>,
+    resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+    received_stdin: Arc<Mutex<Vec<u8>>>,
+    pid: u32,
+}
+
+impl ContainerExec for PtyMockExec {
+    fn exec(
+        &self,
+        _container_id: &str,
+        _script: &str,
+        _working_dir: &str,
+        _kill_rx: Receiver<()>,
+        _stdin_rx: Receiver<Vec<u8>>,
+        _lifetime: crate::ExecLifetime,
+    ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        std::future::ready(Err("pty mock handles exec_pty".into()))
+    }
+
+    fn exec_streamed(
+        &self,
+        _container_id: &str,
+        _script: &str,
+        _working_dir: &str,
+        _kill_rx: Receiver<()>,
+        _stdin_rx: Receiver<Vec<u8>>,
+        _stdout: Sender<Vec<u8>>,
+        _lifetime: crate::ExecLifetime,
+    ) -> impl std::future::Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        std::future::ready(Err("pty mock handles exec_pty".into()))
+    }
+
+    async fn exec_pty(
+        &self,
+        _container_id: &str,
+        _script: &str,
+        _working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        output: Sender<Vec<u8>>,
+        pty: crate::ContainerPty,
+    ) -> Result<ContainerExecOutcome, String> {
+        *self.initial_size.lock().unwrap() = Some((pty.cols, pty.rows));
+        if let Some(pid_tx) = pty.pid {
+            let _ = pid_tx.send(self.pid).await;
+        }
+        let _ = output.send(b"ready\r\n".to_vec()).await;
+        loop {
+            tokio::select! {
+                _ = kill_rx.recv() => {
+                    return Ok(ContainerExecOutcome::Killed);
+                }
+                req = pty.resize_rx.recv() => {
+                    if let Ok((cols, rows, reply)) = req {
+                        self.resizes.lock().unwrap().push((cols, rows));
+                        let _ = reply.send(Ok(())).await;
+                    }
+                }
+                input = stdin_rx.recv() => {
+                    match input {
+                        Ok(bytes) => {
+                            self.received_stdin.lock().unwrap().extend_from_slice(&bytes);
+                            let _ = output.send(bytes).await;
+                            if self.received_stdin.lock().unwrap().ends_with(b"quit") {
+                                return Ok(ContainerExecOutcome::Completed {
+                                    output: std::process::Output {
+                                        status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                                        stdout: Vec::new(),
+                                        stderr: Vec::new(),
+                                    },
+                                    killed: Vec::new(),
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            return Ok(ContainerExecOutcome::Completed {
+                                output: std::process::Output {
+                                    status: std::os::unix::process::ExitStatusExt::from_raw(0),
+                                    stdout: Vec::new(),
+                                    stderr: Vec::new(),
+                                },
+                                killed: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn container_pty_child_streams_io_forwards_resize_and_skips_stdin_watch() {
+    let (_work, work) = canonical_tempdir();
+    let initial_size = Arc::new(Mutex::new(None));
+    let resizes = Arc::new(Mutex::new(Vec::new()));
+    let received_stdin = Arc::new(Mutex::new(Vec::new()));
+    let exec = PtyMockExec {
+        initial_size: initial_size.clone(),
+        resizes: resizes.clone(),
+        received_stdin: received_stdin.clone(),
+        pid: 7777,
+    };
+    let runtime = ContainerShellRuntime::new(
+        "aither-test-pty",
+        HostRoute::new(
+            "host.docker.internal",
+            std::net::IpAddr::from([127, 0, 0, 1]),
+        )
+        .expect("loopback is routable"),
+        AnyContainerExec::new(Arc::new(exec)),
+    );
+    let sandbox = Sandbox::new(
+        Backend::Container {
+            runtime,
+            launch: container_launch(),
+        },
+        TokioGlobal,
+        &work,
+    );
+
+    let mut child = sandbox
+        .spawn(SpawnSpec::script("interactive-tui").stdio(Stdio::pty(120, 40)))
+        .await
+        .expect("pty spawn succeeds");
+    assert_eq!(child.id(), 7777);
+    assert!(
+        child.take_stderr().is_none(),
+        "PTY merges output onto stdout"
+    );
+    assert!(
+        child.take_stdin_blocked().is_none(),
+        "PTY skips pipe stdin_watch"
+    );
+
+    let stdout = child.take_stdout().expect("pty stdout is piped");
+    let stdin = child.take_stdin().expect("pty stdin is piped");
+    let first = tokio::time::timeout(BOUND, stdout.recv())
+        .await
+        .expect("banner arrives")
+        .expect("stream open");
+    assert_eq!(first, b"ready\r\n");
+    assert_eq!(*initial_size.lock().unwrap(), Some((120, 40)));
+
+    assert!(matches!(
+        child.resize(0, 24).await,
+        Err(super::PtyResizeError::InvalidSize { cols: 0, rows: 24 })
+    ));
+    child.resize(80, 24).await.expect("resize succeeds");
+    assert_eq!(*resizes.lock().unwrap(), vec![(80, 24)]);
+
+    stdin.send(b"quit".to_vec()).await.expect("stdin writes");
+    let echoed = tokio::time::timeout(BOUND, stdout.recv())
+        .await
+        .expect("echo arrives")
+        .expect("stream open");
+    assert_eq!(echoed, b"quit");
+    let exit = tokio::time::timeout(BOUND, child.wait())
+        .await
+        .expect("child exits");
+    assert!(exit.success(), "{exit:?}");
+}
+
+#[tokio::test]
+async fn ssh_backend_refuses_pty_with_unsupported() {
+    let (_work, work) = canonical_tempdir();
+    let server = crate::SshServer {
+        name: "test".to_string(),
+        target: "example.invalid".to_string(),
+    };
+    let launch = crate::RemoteLaunch::new(
+        crate::ContainerPath::new("/opt/tools/bin").unwrap(),
+        crate::ContainerPath::new("/opt/tools/bin/bash").unwrap(),
+    );
+    let sandbox = Sandbox::new(
+        Backend::Ssh {
+            server,
+            heel: None,
+            launch,
+        },
+        TokioGlobal,
+        &work,
+    );
+    let err = sandbox
+        .spawn(SpawnSpec::script("vim").stdio(Stdio::pty(80, 24)))
+        .await
+        .expect_err("SSH refuses PTY");
+    assert!(
+        matches!(err, super::SpawnError::Unsupported { backend: "ssh", .. }),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_host_pty_child_round_trips_io_resizes_and_skips_stdin_watch() {
+    async fn read_until(stdout: &Receiver<Vec<u8>>, buf: &mut String, needle: &str) {
+        tokio::time::timeout(BOUND, async {
+            while !buf.contains(needle) {
+                let chunk = stdout.recv().await.expect("pty output stays open");
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}; got {buf:?}"));
+    }
+
+    let (_work, work) = canonical_tempdir();
+    let sandbox = host_sandbox(&work).await;
+    let script = "stty -echo; stty size; trap 'stty size; exit 0' WINCH; read line; printf 'got:%s\\n' \"$line\"; sleep 10 & wait";
+    let mut child = sandbox
+        .spawn(
+            SpawnSpec::new("/bin/sh")
+                .args(["-c", script])
+                .stdio(Stdio::pty(90, 30)),
+        )
+        .await
+        .expect("host PTY spawn succeeds");
+
+    assert!(
+        child.take_stderr().is_none(),
+        "PTY merges output onto stdout"
+    );
+    assert!(
+        child.take_stdin_blocked().is_none(),
+        "PTY skips pipe stdin_watch"
+    );
+
+    let stdout = child.take_stdout().expect("pty stdout is piped");
+    let stdin = child.take_stdin().expect("pty stdin is piped");
+    let mut collected = String::new();
+    read_until(&stdout, &mut collected, "30 90").await;
+
+    stdin.send(b"hello\n".to_vec()).await.expect("write line");
+    read_until(&stdout, &mut collected, "got:hello").await;
+
+    child.resize(110, 42).await.expect("resize delivers WINCH");
+    read_until(&stdout, &mut collected, "42 110").await;
+
+    let exit = tokio::time::timeout(BOUND, child.wait())
+        .await
+        .expect("child exits after WINCH trap");
     assert!(exit.success(), "{exit:?}");
 }

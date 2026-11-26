@@ -160,7 +160,7 @@ pub use process_tree::{
 };
 pub use shell_session::{
     AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerProbe, ContainerProbeError,
-    ContainerShellRuntime, ExecLifetime, ShellSessionRegistry,
+    ContainerPty, ContainerShellRuntime, ExecLifetime, ShellSessionRegistry,
 };
 pub use shell_syntax::{
     CommandId, LineId, PipelineId, PipelineStage, ShellCommand, ShellParseError, ShellScript,
@@ -169,8 +169,8 @@ pub use spawn::{
     AnyDomainApprover, AnyIpcProvider, ApproveAllDomains, Backend, ChildExit, ContainerLaunch,
     DenyAllDomains, Descendants, DomainApprover, DomainRequest, EnvSource, GitDirAccess,
     GrantSnapshot, Grants, HostLaunch, HostRoute, HostRouteError, IpcProvider, LaunchId,
-    LaunchInfo, Pipe, RemoteLaunch, Sandbox, SandboxedChild, SpawnCommand, SpawnError, SpawnGrant,
-    SpawnSpec, Stdio, TreeLifetime,
+    LaunchInfo, Pipe, PtyResizeError, PtyResizeHandle, RemoteLaunch, Sandbox, SandboxedChild,
+    SpawnCommand, SpawnError, SpawnGrant, SpawnSpec, Stdio, TreeLifetime,
 };
 pub use ssh::{
     AnyPrepareSsh, PrepareSsh, PreparedSsh, SshPlatform, SshPrepareError, SshProbeError, SshServer,
@@ -183,8 +183,9 @@ pub use subagent::{
     SubagentSpaces,
 };
 pub use terminal::{
-    CompletedCommand, DirectoryResetReason, Given, Missing, Script, ServiceArgs, Shell, ShellArgs,
-    ShellBuilder, ShellRunError, ShellTool, TerminalError, TimeoutKill, open_network_audit_log,
+    CompletedCommand, DirectoryResetReason, Given, Missing, PtyArgs, PtyJob, Script, ServiceArgs,
+    Shell, ShellArgs, ShellBuilder, ShellRunError, ShellTool, TerminalError, TimeoutKill,
+    open_network_audit_log,
 };
 pub use wording::{
     AnyShellWording, CallRefusal, CommandKilled, FoldedLines, JobInputSent, JsonAsTsv, LineRange,
