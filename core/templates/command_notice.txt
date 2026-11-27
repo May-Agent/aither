@@ -1,0 +1,2 @@
+{% if !notice.is_empty() %}{{ notice }}
+{% endif %}

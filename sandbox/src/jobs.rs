@@ -58,6 +58,7 @@ impl ScriptResult {
             outcome,
             retained_pid: None,
             interruptions: self.interruptions,
+            notice: None,
         }
     }
 }

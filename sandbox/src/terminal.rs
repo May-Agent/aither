@@ -393,7 +393,8 @@ pub struct ShellArgs {
     #[serde(default)]
     pub max_lines: Option<u32>,
 
-    // Whether the output is returned verbatim, without compression.
+    // Whether the output is returned verbatim, disabling output compression
+    // and automatic script rewriting.
     #[serde(default)]
     pub raw: bool,
 
@@ -429,7 +430,8 @@ pub struct ServiceArgs {
     /// The most output lines to include inline.
     #[serde(default)]
     pub max_lines: Option<u32>,
-    /// Whether the output is returned verbatim.
+    /// Whether the output is returned verbatim, disabling output compression
+    /// and automatic script rewriting.
     #[serde(default)]
     pub raw: bool,
 }
@@ -930,6 +932,9 @@ pub struct Shell<E> {
     /// The script policies every script of this shell is put to, bound to
     /// the state of the agent the shell serves.
     policies: ScriptPolicies,
+    /// Statically rewrites shell scripts before execution when `raw` is
+    /// `false`, shared with every subagent shell derived from this one.
+    rewrite_script: Option<crate::rewrite::AnyRewriteScript>,
     /// Chooses each script's output treatment, shared with every subagent
     /// shell derived from this one; without it every output is command
     /// output.
@@ -978,6 +983,7 @@ impl<E: Clone> Clone for Shell<E> {
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.clone(),
+            rewrite_script: self.rewrite_script.clone(),
             treat_output: self.treat_output.clone(),
             plan_pipelines: self.plan_pipelines.clone(),
             ipc: self.ipc.clone(),
@@ -1157,6 +1163,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             outages: Outages::none(),
             subagent_spaces: None,
             policies: ScriptPolicies::new(parts.policies),
+            rewrite_script: parts.rewrite_script,
             treat_output: parts.treat_output,
             plan_pipelines: parts.plan_pipelines,
             ipc: parts.ipc,
@@ -1212,6 +1219,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 jobs: None,
                 policies: Vec::new(),
                 ipc: None,
+                rewrite_script: None,
                 treat_output: None,
                 plan_pipelines: None,
                 host_shell,
@@ -1746,6 +1754,7 @@ where
             outages: self.outages.clone(),
             subagent_spaces: self.subagent_spaces.clone(),
             policies: self.policies.for_agent(),
+            rewrite_script: self.rewrite_script.clone(),
             treat_output: self.treat_output.clone(),
             plan_pipelines: self.plan_pipelines.clone(),
             ipc: self.ipc.clone(),
@@ -2135,13 +2144,8 @@ impl<E: Executor + Clone + 'static> Shell<E> {
         }
     }
 
-    /// Runs one call to the point it answers: its result, or the job it
-    /// detached.
-    async fn execute(
-        &self,
-        arguments: ShellArgs,
-        mut cx: ToolContext,
-    ) -> Result<Execution, ShellCallError> {
+    /// Validates the interpreter and timeout bounds of a `terminal` call.
+    fn validate_call_args(&self, arguments: &ShellArgs) -> Result<Duration, ShellCallError> {
         if !self.interpreters.contains(&arguments.interpreter) {
             return Err(crate::Refused::call(
                 &**self.wording(),
@@ -2160,24 +2164,36 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             )
             .into());
         }
+        Ok(timeout)
+    }
+
+    /// Runs one call to the point it answers: its result, or the job it
+    /// detached.
+    async fn execute(
+        &self,
+        arguments: ShellArgs,
+        mut cx: ToolContext,
+    ) -> Result<Execution, ShellCallError> {
+        let timeout = self.validate_call_args(&arguments)?;
         if let Some(call) = self.effective_call_identity(cx.identity(), "terminal")
             && cx.identity() != Some(&call)
         {
             cx = cx.with_identity(call);
         }
-        let prepared = self.prepare_execution(&arguments, &mut cx).await?;
+        let mut prepared = self.prepare_execution(&arguments, &mut cx).await?;
+        let script = prepared.rewritten_script.take().unwrap_or(arguments.script);
         // A detached job cannot report a directory carry: its final
         // directory is unknowable when the call returns.
         let carry = if arguments.background {
             None
         } else {
-            self.cwd_carry(&prepared, &arguments.script, arguments.interpreter)
+            self.cwd_carry(&prepared, &script, arguments.interpreter)
         };
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
-            script: arguments.script,
+            script,
             instrumented: prepared.instrumented,
             interpreter: arguments.interpreter,
             expect: OutputFormat::Auto,
@@ -2197,6 +2213,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 prepared.launch.id(),
                 prepared.max_lines,
                 &self.events_tx,
+                prepared.notice,
             )
             .await
             .map(Execution::Detached);
@@ -2222,6 +2239,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 if retained && pid > 0 {
                     command.retained_pid = Some(pid);
                 }
+                command.notice = prepared.notice;
                 spawned.took_result().await;
                 Ok(Execution::Finished(command))
             }
@@ -2235,6 +2253,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 prepared.launch.id(),
                 prepared.max_lines,
                 &self.events_tx,
+                prepared.notice,
             )
             .await
             .map(Execution::Detached),
@@ -2255,13 +2274,17 @@ struct Detached {
     redirect: BackgroundRedirect,
     /// Holds the job until the caller took it over.
     watch: crate::job_registry::JobWatch,
+    /// Optional rewrite notice surfaced alongside the launch result.
+    notice: Option<String>,
 }
 
 impl Detached {
     /// The result the model reads for the job's start.
     fn into_command_result(self) -> CommandResult {
         let pid = self.watch.pid();
-        let Self { redirect, .. } = self;
+        let Self {
+            redirect, notice, ..
+        } = self;
         let stdout = if redirect.truncated {
             CommandStream::Stored {
                 file: redirect.file.clone(),
@@ -2278,6 +2301,7 @@ impl Detached {
             stderr: None,
             retained_pid: None,
             interruptions: Vec::new(),
+            notice,
             outcome: CommandOutcome::Running {
                 pid,
                 output: redirect.file,
@@ -2621,14 +2645,15 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             )
             .into());
         }
-        let prepared = self
+        let mut prepared = self
             .prepare_execution(&arguments, &mut ToolContext::new())
             .await?;
+        let script = prepared.rewritten_script.take().unwrap_or(arguments.script);
         let spawned = self.spawn_terminal_execution(TerminalSpawnRequest {
             target: prepared.target,
             launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
-            script: arguments.script,
+            script,
             instrumented: prepared.instrumented,
             interpreter: arguments.interpreter,
             expect: OutputFormat::Auto,
@@ -2647,6 +2672,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             prepared.launch.id(),
             prepared.max_lines,
             &self.events_tx,
+            prepared.notice,
         )
         .await?;
         Ok(crate::Job::new(self.jobs(), detached.watch))
@@ -2720,7 +2746,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             .inherited_launch
             .as_ref()
             .and_then(|info| info.call.clone());
-        let prepared = self
+        let mut prepared = self
             .admit_command(
                 Admission {
                     script: &arguments.script,
@@ -2728,6 +2754,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                     mode,
                     location: None,
                     max_lines: None,
+                    raw: false,
                     origin: ScriptOrigin::Background,
                     call: call.clone(),
                     run_dir: arguments.working_dir.as_deref(),
@@ -2737,6 +2764,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
             )
             .await
             .map_err(|error| error.into_tool_error(&**self.wording()))?;
+        let script = prepared.rewritten_script.take().unwrap_or(arguments.script);
         let carry = match arguments.working_dir {
             Some(dir) => match run_start(&prepared.target, dir) {
                 Ok(start) => Some(start),
@@ -2776,7 +2804,7 @@ impl<E: Executor + Clone + 'static> Shell<E> {
                 timeout,
                 carry,
                 carried_dir: self.carried_dir.clone(),
-                script: arguments.script,
+                script,
                 interpreter: arguments.interpreter,
                 mode,
                 cols: arguments.cols,
@@ -2859,6 +2887,7 @@ where
                 mode: arguments.sandbox,
                 location: arguments.location.as_deref(),
                 max_lines: arguments.max_lines,
+                raw: arguments.raw,
                 origin,
                 call,
                 run_dir: None,
@@ -2906,15 +2935,25 @@ where
             ),
         };
         let checked = self.check_script(launch_id, &admission, &start).await;
-        let (clearance, treatment, instrumented) = match checked {
+        let checked = match checked {
             Ok(checked) => checked,
             Err(error) => {
                 self.end_unrun(launch_id).await;
                 return Err(error);
             }
         };
+        let effective_script = checked
+            .rewritten_script
+            .as_deref()
+            .unwrap_or(admission.script);
         let admitted = self
-            .admit_checked(&admission, environment.as_deref(), clearance, cx)
+            .admit_checked(
+                &admission,
+                effective_script,
+                environment.as_deref(),
+                checked.clearance,
+                cx,
+            )
             .await;
         if admitted.is_err() {
             self.end_unrun(launch_id).await;
@@ -2926,9 +2965,11 @@ where
             launch,
             outputs: self.output_store.clone(),
             max_lines,
-            treatment,
-            instrumented,
+            treatment: checked.treatment,
+            instrumented: checked.instrumented,
             carried_start,
+            rewritten_script: checked.rewritten_script,
+            notice: checked.notice,
         })
     }
 
@@ -2951,17 +2992,23 @@ where
         launch: crate::LaunchId,
         admission: &Admission<'_>,
         start: &ScriptDir,
-    ) -> Result<
-        (
-            Clearance,
-            OutputTreatment,
-            Option<crate::pipeline::InstrumentedScript>,
-        ),
-        ShellRunError,
-    > {
+    ) -> Result<CheckedScript, ShellRunError> {
         let policies = &self.policies;
-        if policies.is_empty() && self.treat_output.is_none() && self.plan_pipelines.is_none() {
-            return Ok((Clearance::Pass, OutputTreatment::default(), None));
+        let may_rewrite = self.rewrite_script.is_some()
+            && !admission.raw
+            && admission.interpreter == Interpreter::Shell;
+        if policies.is_empty()
+            && !may_rewrite
+            && self.treat_output.is_none()
+            && self.plan_pipelines.is_none()
+        {
+            return Ok(CheckedScript {
+                clearance: Clearance::Pass,
+                rewritten_script: None,
+                notice: None,
+                treatment: OutputTreatment::default(),
+                instrumented: None,
+            });
         }
         let shell = (admission.interpreter == Interpreter::Shell)
             .then(|| crate::ShellScript::parse(admission.script));
@@ -2976,29 +3023,78 @@ where
             start,
             call: admission.call(),
         };
-        let treatment = self
-            .treat_output
-            .as_ref()
-            .map_or_else(OutputTreatment::default, |treat| treat.treatment(&check));
         let clearance = match policies.check(&check).await {
             ScriptDecision::Pass => Clearance::Pass,
             ScriptDecision::Allow => Clearance::Allow,
             ScriptDecision::Ask(request) => Clearance::Ask(request),
             ScriptDecision::Refuse(refusal) => return Err(ShellRunError::Refused(refusal)),
         };
-        let instrumented = match (&self.plan_pipelines, admission.interpreter) {
-            (Some(planner), Interpreter::Shell) => {
-                crate::pipeline::instrument_script(planner, &check)?
-            }
-            _ => None,
+        let rewrite = if may_rewrite {
+            self.rewrite_script
+                .as_ref()
+                .and_then(|rewriter| rewriter.rewrite(&check))
+        } else {
+            None
         };
-        Ok((clearance, treatment, instrumented))
+        let (rewritten_script, notice, treatment, instrumented) =
+            if let Some(crate::ScriptRewrite {
+                script: rewritten,
+                notice,
+            }) = rewrite
+            {
+                let notice = notice.filter(|text| !text.trim().is_empty());
+                let (treatment, instrumented) =
+                    if self.treat_output.is_some() || self.plan_pipelines.is_some() {
+                        let rewritten_shell = crate::ShellScript::parse(&rewritten);
+                        let rewritten_check = crate::ScriptCheck {
+                            script: &rewritten,
+                            shell: Some(rewritten_shell.as_ref()),
+                            ..check
+                        };
+                        let treatment = self
+                            .treat_output
+                            .as_ref()
+                            .map_or_else(OutputTreatment::default, |treat| {
+                                treat.treatment(&rewritten_check)
+                            });
+                        let instrumented = match &self.plan_pipelines {
+                            Some(planner) => {
+                                crate::pipeline::instrument_script(planner, &rewritten_check)?
+                            }
+                            None => None,
+                        };
+                        (treatment, instrumented)
+                    } else {
+                        (OutputTreatment::default(), None)
+                    };
+                (Some(rewritten), notice, treatment, instrumented)
+            } else {
+                let treatment = self
+                    .treat_output
+                    .as_ref()
+                    .map_or_else(OutputTreatment::default, |treat| treat.treatment(&check));
+                let instrumented = match (&self.plan_pipelines, admission.interpreter) {
+                    (Some(planner), Interpreter::Shell) => {
+                        crate::pipeline::instrument_script(planner, &check)?
+                    }
+                    _ => None,
+                };
+                (None, None, treatment, instrumented)
+            };
+        Ok(CheckedScript {
+            clearance,
+            rewritten_script,
+            notice,
+            treatment,
+            instrumented,
+        })
     }
 
     /// The rest of admission once the policies did not refuse the script.
     async fn admit_checked(
         &self,
         admission: &Admission<'_>,
+        effective_script: &str,
         environment: Option<&SshEnvironment>,
         clearance: Clearance,
         cx: Option<&mut ToolContext>,
@@ -3007,11 +3103,13 @@ where
         let target = match environment {
             None => {
                 let target = self.resolve_home_target(mode)?;
-                self.clear(admission, clearance, cx).await?;
+                self.clear(admission, effective_script, clearance, cx)
+                    .await?;
                 target
             }
             Some(environment) => {
-                self.clear(admission, clearance, cx).await?;
+                self.clear(admission, effective_script, clearance, cx)
+                    .await?;
                 self.resolve_ssh_target(environment, mode).await?
             }
         };
@@ -3029,12 +3127,15 @@ where
     async fn clear(
         &self,
         admission: &Admission<'_>,
+        effective_script: &str,
         clearance: Clearance,
         cx: Option<&mut ToolContext>,
     ) -> Result<(), TerminalError> {
         let request = match clearance {
             Clearance::Ask(request) => request,
-            Clearance::Pass if admission.needs_boundary_approval() => admission.boundary_request(),
+            Clearance::Pass if admission.needs_boundary_approval() => {
+                admission.boundary_request(effective_script)
+            }
             Clearance::Allow | Clearance::Pass => return Ok(()),
         };
         self.approve(request, admission.call(), cx).await
@@ -3111,7 +3212,7 @@ where
         }
         // A run starts in a host directory, so it resolves the terminal's
         // home backend, never an SSH server.
-        let prepared = self
+        let mut prepared = self
             .admit_command(
                 Admission {
                     script: &run.source,
@@ -3119,6 +3220,7 @@ where
                     mode: run.sandbox,
                     location: None,
                     max_lines: None,
+                    raw: false,
                     origin: ScriptOrigin::Run,
                     call: None,
                     run_dir: Some(&run.dir),
@@ -3127,6 +3229,7 @@ where
                 None,
             )
             .await?;
+        let script = prepared.rewritten_script.take().unwrap_or(run.source);
         let start = match run_start(&prepared.target, run.dir) {
             Ok(start) => start,
             Err(error) => {
@@ -3138,7 +3241,7 @@ where
             target: prepared.target,
             launch: prepared.launch.clone(),
             execution_id: prepared.execution_id,
-            script: run.source,
+            script,
             instrumented: prepared.instrumented,
             interpreter: Interpreter::Shell,
             expect: OutputFormat::Text,
@@ -3240,6 +3343,8 @@ struct Admission<'a> {
     /// The SSH server the command names; `None` or empty for home.
     location: Option<&'a str>,
     max_lines: Option<u32>,
+    /// Whether the caller disabled output compression and automatic script rewriting.
+    raw: bool,
     origin: ScriptOrigin,
     /// The tool call that carries the script and the agent that made it;
     /// `None` for a script no call carries.
@@ -3271,13 +3376,13 @@ impl<'a> Admission<'a> {
     }
 
     /// What the approver is asked about a script the policies only passed.
-    fn boundary_request(&self) -> ApprovalRequest {
+    fn boundary_request(&self, script: &str) -> ApprovalRequest {
         let (kind, reason) = if self.mode == SandboxMode::Unsandboxed {
             ("unsandboxed", "the script runs outside the sandbox")
         } else {
             ("remote", "the script runs on a remote server")
         };
-        ApprovalRequest::new(ApprovalKind::new(kind), self.script).with_reason(reason)
+        ApprovalRequest::new(ApprovalKind::new(kind), script).with_reason(reason)
     }
 }
 
@@ -3293,6 +3398,14 @@ enum Clearance {
     Ask(ApprovalRequest),
 }
 
+struct CheckedScript {
+    clearance: Clearance,
+    rewritten_script: Option<String>,
+    notice: Option<String>,
+    treatment: OutputTreatment,
+    instrumented: Option<crate::pipeline::InstrumentedScript>,
+}
+
 struct ExecutionPreparation {
     target: ExecutionTarget,
     launch: crate::job_registry::LaunchLease,
@@ -3302,6 +3415,8 @@ struct ExecutionPreparation {
     treatment: OutputTreatment,
     instrumented: Option<crate::pipeline::InstrumentedScript>,
     carried_start: Option<PathBuf>,
+    rewritten_script: Option<String>,
+    notice: Option<String>,
 }
 
 /// What the output pipeline does to a foreground script's stdout.
@@ -3443,6 +3558,7 @@ async fn detach_job(
     launch: crate::LaunchId,
     max_lines: usize,
     started_tx: &EventSender,
+    notice: Option<String>,
 ) -> Result<Detached, ShellCallError> {
     // The call still owns the job's completion, so the job is registered; the
     // hold keeps it past a consumer that takes the completion at once.
@@ -3461,7 +3577,11 @@ async fn detach_job(
             output_file: redirect.file.clone(),
         }))
         .await;
-    Ok(Detached { redirect, watch })
+    Ok(Detached {
+        redirect,
+        watch,
+        notice,
+    })
 }
 
 /// Output file a background job was redirected to, with what it holds so far.
@@ -6467,6 +6587,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: exit_code },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }
     }
 

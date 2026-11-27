@@ -105,8 +105,8 @@ impl ScriptDir {
     }
 }
 
-/// A script about to run, as a [`ScriptPolicy`] and the shell's
-/// [`TreatOutput`](crate::TreatOutput) see it.
+/// A script about to run, as a [`ScriptPolicy`], [`RewriteScript`](crate::RewriteScript),
+/// [`TreatOutput`](crate::TreatOutput) and [`PlanPipelines`](crate::PlanPipelines) see it.
 #[derive(Debug, Clone, Copy)]
 pub struct ScriptCheck<'a> {
     /// Identifier of this launch; the [`ScriptEnd`] that reports how it ended

@@ -143,6 +143,13 @@ pub struct CommandResult {
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub interruptions: Vec<Interruption>,
+    /// Natural-language notice surfaced alongside the command's result, such as
+    /// a static script rewrite notice.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub notice: Option<String>,
 }
 
 /// Customizes the prose [`CommandResult::render_for_model_with`],
@@ -203,6 +210,18 @@ pub trait CommandWording: Send + Sync {
         render_interruptions(interruptions)
     }
 
+    /// Renders a natural-language notice appended after the outcome and any
+    /// interruptions.
+    fn notice(&self, notice: &str) -> String {
+        let notice = notice.trim_end_matches(['\r', '\n']);
+        if notice.trim().is_empty() {
+            return String::new();
+        }
+        CommandNoticeTemplate { notice }
+            .render()
+            .expect("command notice template must render")
+    }
+
     /// Renders a binary [`ToolResult`](super::ToolResult) or
     /// [`ToolResultPart`](super::ToolResultPart) placeholder.
     fn binary_placeholder(&self, mime: &str, byte_count: usize) -> String {
@@ -246,6 +265,12 @@ struct RetainedPidTemplate {
 }
 
 #[derive(Template)]
+#[template(path = "command_notice.txt", escape = "none")]
+struct CommandNoticeTemplate<'a> {
+    notice: &'a str,
+}
+
+#[derive(Template)]
 #[template(path = "command_result.txt", escape = "none")]
 struct CommandResultTemplate<'a> {
     empty: &'a str,
@@ -254,6 +279,7 @@ struct CommandResultTemplate<'a> {
     outcome: &'a str,
     retained_pid: &'a str,
     interruptions: &'a str,
+    notice: &'a str,
 }
 
 #[derive(Template)]
@@ -345,6 +371,10 @@ impl CommandResult {
             _ => String::new(),
         };
         let interruptions = wording.interruptions(&self.interruptions);
+        let notice = self
+            .notice
+            .as_deref()
+            .map_or_default(|notice| wording.notice(notice));
         CommandResultTemplate {
             empty: &empty,
             stdout: &stdout,
@@ -352,6 +382,7 @@ impl CommandResult {
             outcome: &outcome,
             retained_pid: &retained_pid,
             interruptions: &interruptions,
+            notice: &notice,
         }
         .render()
         .expect("command result template must render")
@@ -383,6 +414,7 @@ mod tests {
             outcome,
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }
         .render_for_model()
     }
@@ -471,6 +503,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 7 },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         };
         assert_eq!(
             command.render_for_model_with(&CustomWording),
@@ -489,6 +522,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 0 },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         };
         let value = serde_json::to_value(&command).expect("serializes");
         let obj = value.as_object().expect("object");
@@ -503,6 +537,10 @@ mod tests {
         assert!(
             !obj.contains_key("interruptions"),
             "empty interruptions must be omitted: {value}"
+        );
+        assert!(
+            !obj.contains_key("notice"),
+            "None notice must be omitted: {value}"
         );
         let decoded: CommandResult = serde_json::from_value(value).expect("deserializes");
         assert_eq!(decoded, command);
@@ -521,12 +559,17 @@ mod tests {
                 from: "10:00:00".to_string(),
                 to: "10:01:00".to_string(),
             }],
+            notice: Some("Rewrote script before execution.".to_string()),
         };
         let value = serde_json::to_value(&with_fields).expect("serializes");
         let obj = value.as_object().expect("object");
         assert!(obj.contains_key("stderr"));
         assert_eq!(obj.get("retained_pid"), Some(&serde_json::json!(48210)));
         assert!(obj.contains_key("interruptions"));
+        assert_eq!(
+            obj.get("notice"),
+            Some(&serde_json::json!("Rewrote script before execution."))
+        );
         let decoded: CommandResult = serde_json::from_value(value).expect("deserializes");
         assert_eq!(decoded, with_fields);
     }
@@ -582,6 +625,7 @@ mod tests {
                     to: "14:32:05".to_string(),
                 },
             ],
+            notice: None,
         };
         assert_eq!(
             command.render_for_model(),
@@ -599,6 +643,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 1 },
             retained_pid: Some(48210),
             interruptions: Vec::new(),
+            notice: None,
         };
         assert_eq!(
             exited.render_for_model(),
@@ -616,10 +661,59 @@ mod tests {
             },
             retained_pid: Some(48210),
             interruptions: Vec::new(),
+            notice: None,
         };
         assert_eq!(
             running.render_for_model(),
             "Started in background with PID 48210; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt). Its completion is delivered automatically when it exits — end the turn if you have no other work instead of polling or calling monitor just to wait for it.\n"
         );
+    }
+
+    #[test]
+    fn notice_renders_after_foreground_and_background_results() {
+        let exited = CommandResult {
+            stdout: CommandStream::Inline {
+                text: "out\n".to_string(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 0 },
+            retained_pid: None,
+            interruptions: Vec::new(),
+            notice: Some("Note: command was rewritten.\n".to_string()),
+        };
+        assert_eq!(
+            exited.render_for_model(),
+            "out\nNote: command was rewritten.\n"
+        );
+
+        let running = CommandResult {
+            stdout: CommandStream::Inline {
+                text: String::new(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Running {
+                pid: 4242,
+                output: file(),
+            },
+            retained_pid: None,
+            interruptions: Vec::new(),
+            notice: Some("Note: background command was rewritten.".to_string()),
+        };
+        assert_eq!(
+            running.render_for_model(),
+            "Started in background with PID 4242; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt). Its completion is delivered automatically when it exits — end the turn if you have no other work instead of polling or calling monitor just to wait for it.\nNote: background command was rewritten.\n"
+        );
+
+        let blank = CommandResult {
+            stdout: CommandStream::Inline {
+                text: "ok\n".to_string(),
+            },
+            stderr: None,
+            outcome: CommandOutcome::Exited { code: 0 },
+            retained_pid: None,
+            interruptions: Vec::new(),
+            notice: Some("   \n".to_string()),
+        };
+        assert_eq!(blank.render_for_model(), "ok\n");
     }
 }

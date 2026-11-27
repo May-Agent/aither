@@ -53,6 +53,7 @@ mod pipeline;
 mod pipeline_store;
 mod policy;
 mod process_tree;
+mod rewrite;
 mod shell_session;
 mod shell_syntax;
 mod spawn;
@@ -158,6 +159,7 @@ pub use policy::{
 pub use process_tree::{
     JOB_MARKER_VAR, JobProcess, KillTreeError, ProcessTableError, kill_process_tree,
 };
+pub use rewrite::{AnyRewriteScript, RewriteScript, ScriptRewrite};
 pub use shell_session::{
     AnyContainerExec, ContainerExec, ContainerExecOutcome, ContainerProbe, ContainerProbeError,
     ContainerPty, ContainerShellRuntime, ExecLifetime, ShellSessionRegistry,
