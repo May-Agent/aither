@@ -1945,6 +1945,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 3 },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }));
         assert_eq!(result.render_for_model(), "hi\nExit code: 3.\n");
         assert_eq!(
@@ -1971,6 +1972,7 @@ mod tests {
                 outcome: CommandOutcome::Exited { code: 1 },
                 retained_pid: Some(48210),
                 interruptions: Vec::new(),
+                notice: Some("Rewrote command.".to_string()),
             },
             CommandResult {
                 stdout: CommandStream::Stored {
@@ -1982,6 +1984,7 @@ mod tests {
                 outcome: CommandOutcome::Exited { code: 0 },
                 retained_pid: None,
                 interruptions: Vec::new(),
+                notice: None,
             },
             CommandResult {
                 stdout: CommandStream::Image {
@@ -1995,6 +1998,7 @@ mod tests {
                 },
                 retained_pid: None,
                 interruptions: Vec::new(),
+                notice: None,
             },
         ];
         for command in results {

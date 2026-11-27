@@ -7,6 +7,7 @@ use executor_core::AnyExecutor;
 use super::{Interpreter, Shell, ShellToolSettings, TerminalError};
 use crate::output_treatment::AnyTreatOutput;
 use crate::pipeline::{AnyPlanPipelines, PlanPipelines};
+use crate::rewrite::{AnyRewriteScript, RewriteScript};
 use crate::{
     AnyIpcProvider, AnyScriptPolicy, AnyShellWording, HostLaunch, IpcProvider, OutputPolicy,
     Sandbox, ScriptPolicy, ShellEvents, ShellLimits, ShellWording, TreatOutput,
@@ -31,6 +32,7 @@ pub struct ShellParts {
     pub(crate) jobs: Option<crate::Jobs>,
     pub(crate) policies: Vec<AnyScriptPolicy>,
     pub(crate) ipc: Option<AnyIpcProvider>,
+    pub(crate) rewrite_script: Option<AnyRewriteScript>,
     pub(crate) treat_output: Option<AnyTreatOutput>,
     pub(crate) plan_pipelines: Option<AnyPlanPipelines>,
     pub(crate) host_shell: Option<HostLaunch>,
@@ -52,6 +54,7 @@ pub struct ShellBuilder<I, L, O, W, T> {
     jobs: Option<crate::Jobs>,
     policies: Vec<AnyScriptPolicy>,
     ipc: Option<AnyIpcProvider>,
+    rewrite_script: Option<AnyRewriteScript>,
     treat_output: Option<AnyTreatOutput>,
     plan_pipelines: Option<AnyPlanPipelines>,
     host_shell: Option<HostLaunch>,
@@ -78,6 +81,7 @@ impl Shell<Arc<AnyExecutor>> {
             jobs: None,
             policies: Vec::new(),
             ipc: None,
+            rewrite_script: None,
             treat_output: None,
             plan_pipelines: None,
             host_shell: None,
@@ -104,6 +108,7 @@ impl Shell<Arc<AnyExecutor>> {
             jobs: None,
             policies: Vec::new(),
             ipc: None,
+            rewrite_script: None,
             treat_output: None,
             plan_pipelines: None,
             host_shell: Some(host_shell),
@@ -130,6 +135,15 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
     #[must_use]
     pub fn policy(mut self, policy: impl ScriptPolicy) -> Self {
         self.policies.push(AnyScriptPolicy::new(policy));
+        self
+    }
+
+    /// Configures a static shell script rewriter invoked before execution when
+    /// `raw` is `false`, shared with every subagent shell derived from this
+    /// one; it replaces any rewriter set earlier.
+    #[must_use]
+    pub fn rewrite_script(mut self, rewriter: impl RewriteScript) -> Self {
+        self.rewrite_script = Some(AnyRewriteScript::new(rewriter));
         self
     }
 
@@ -190,6 +204,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
+            rewrite_script: self.rewrite_script,
             treat_output: self.treat_output,
             plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
@@ -210,6 +225,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
+            rewrite_script: self.rewrite_script,
             treat_output: self.treat_output,
             plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
@@ -230,6 +246,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
+            rewrite_script: self.rewrite_script,
             treat_output: self.treat_output,
             plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
@@ -253,6 +270,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
+            rewrite_script: self.rewrite_script,
             treat_output: self.treat_output,
             plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
@@ -277,6 +295,7 @@ impl<I, L, O, W, T> ShellBuilder<I, L, O, W, T> {
             jobs: self.jobs,
             policies: self.policies,
             ipc: self.ipc,
+            rewrite_script: self.rewrite_script,
             treat_output: self.treat_output,
             plan_pipelines: self.plan_pipelines,
             host_shell: self.host_shell,
@@ -314,6 +333,7 @@ impl
             jobs,
             policies,
             ipc,
+            rewrite_script,
             treat_output,
             plan_pipelines,
             host_shell,
@@ -332,6 +352,7 @@ impl
                 jobs,
                 policies,
                 ipc,
+                rewrite_script,
                 treat_output,
                 plan_pipelines,
                 host_shell,

@@ -189,7 +189,10 @@ pub fn argument_descriptions()
         ("location", "Where the command runs."),
         ("resolution", "The resolution of returned media."),
         ("max_lines", "The most output lines returned inline."),
-        ("raw", "Whether the output is returned verbatim."),
+        (
+            "raw",
+            "Whether the output is returned verbatim, disabling output compression and automatic script rewriting.",
+        ),
         ("timeout", "The maximum runtime in seconds."),
         ("background", "Whether the command is detached at once."),
         ("pid", "Process ID of the job."),
