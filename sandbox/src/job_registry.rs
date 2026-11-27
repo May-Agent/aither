@@ -118,6 +118,10 @@ pub struct JobInfo {
     pub timeout: Option<Duration>,
     /// Whether this job runs attached to a pseudo-terminal rather than pipes.
     pub pty: bool,
+    /// Whether this job is an internal file-following watcher spawned by
+    /// `MonitorSource::File` (no natural exit of its own) rather than a command
+    /// run by the agent.
+    pub file_monitor: bool,
 }
 
 impl JobInfo {
@@ -521,6 +525,9 @@ enum StateCommand {
     Bound {
         launch: LaunchLease,
         timeout: Duration,
+    },
+    MarkFileMonitor {
+        launch: LaunchId,
     },
     Launching {
         launch: LaunchLease,
@@ -991,6 +998,12 @@ impl JobRegistry {
             timeout,
         })
         .await;
+    }
+
+    /// Marks `launch` as an internal file-following monitor watcher.
+    pub(crate) async fn mark_file_monitor(&self, launch: LaunchId) {
+        self.send_command(StateCommand::MarkFileMonitor { launch })
+            .await;
     }
 
     /// Attaches a stdin input channel to a running job.
@@ -2065,6 +2078,11 @@ async fn handle_state_command(
             register_job(store, parked, cfg.spill_root, reg).await;
         }
         StateCommand::Bound { launch, timeout } => parked.bound(&launch, timeout),
+        StateCommand::MarkFileMonitor { launch } => {
+            if let Some(job) = store.jobs.get_mut(&launch) {
+                job.info.file_monitor = true;
+            }
+        }
         StateCommand::Launching { launch } => parked.launching(&launch),
         StateCommand::Abandon { launch } => {
             if !store.jobs.contains_key(&launch.id()) {
@@ -2646,6 +2664,7 @@ async fn register_job(
         status: JobStatus::Running,
         output_path,
         pty,
+        file_monitor: false,
     };
     let mut state = JobState::new(info, host_pid, launch);
     state.process_tree = process_tree;

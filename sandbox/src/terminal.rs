@@ -13335,6 +13335,7 @@ mod tests {
                     source: MonitorSource::File {
                         file: "/etc/sudoers".to_string(),
                     },
+                    stop_on: Some("DONE".to_string()),
                     ..monitor_command("true", 30)
                 },
                 ToolContext::new(),
@@ -13353,6 +13354,7 @@ mod tests {
                     source: MonitorSource::File {
                         file: "followed.log".to_string(),
                     },
+                    stop_on: Some("DONE".to_string()),
                     ..monitor_command("true", 30)
                 },
                 ToolContext::new(),
@@ -13385,6 +13387,142 @@ mod tests {
             "content written before the monitor started is not delivered: {lines:?}"
         );
         tool.job_registry().kill_running().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitored_file_without_stop_on_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let path = tool.working_dir().join("watch.log");
+        std::fs::write(&path, "initial\n").unwrap();
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
+
+        for stop_on in [None, Some("   ".to_string())] {
+            let err = monitor
+                .call(
+                    MonitorArgs {
+                        source: MonitorSource::File {
+                            file: "watch.log".to_string(),
+                        },
+                        stop_on,
+                        ..monitor_command("true", 30)
+                    },
+                    ToolContext::new(),
+                )
+                .await
+                .expect_err("file monitor without stop_on must be refused");
+            assert!(
+                err.to_string().contains("stop_on"),
+                "refusal should mention stop_on: {err}"
+            );
+        }
+
+        monitor
+            .call(
+                monitor_command("sleep 2; echo done", 30),
+                ToolContext::new(),
+            )
+            .await
+            .expect("command monitor starts");
+        let cmd_jobs = tool.jobs().list().await;
+        assert!(
+            cmd_jobs.iter().any(|job| !job.file_monitor),
+            "command monitor job must not be tagged file_monitor: {cmd_jobs:?}"
+        );
+        tool.job_registry().kill_running().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitored_file_stop_on_kills_internal_tail_even_when_kill_on_stop_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = configured_test_terminal(
+            dir.path(),
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+            Duration::from_secs(600),
+        )
+        .await;
+        let path = tool.working_dir().join("watch.log");
+        std::fs::write(&path, "initial\n").unwrap();
+        let monitor = MonitorTool::new(tool.clone(), crate::monitor::fixture_settings());
+
+        monitor
+            .call(
+                MonitorArgs {
+                    source: MonitorSource::File {
+                        file: "watch.log".to_string(),
+                    },
+                    interval_secs: Some(1),
+                    stop_on: Some("READY".to_string()),
+                    kill_on_stop: false,
+                    ..monitor_command("true", 60)
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("file monitor with stop_on starts");
+
+        let running_monitors: Vec<_> = tool
+            .jobs()
+            .list()
+            .await
+            .into_iter()
+            .filter(|job| job.status == JobStatus::Running && job.file_monitor)
+            .collect();
+        assert_eq!(
+            running_monitors.len(),
+            1,
+            "file monitor job must be tagged file_monitor=true"
+        );
+        let monitor_pid = running_monitors[0].pid;
+
+        let receiver = tool.background_receiver();
+        async_io::Timer::after(Duration::from_millis(1200)).await;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"READY\n").unwrap();
+        drop(file);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut matched = false;
+        while !matched {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let Some(alert) = receiver.recv_timeout(remaining).await else {
+                break;
+            };
+            if let ShellEvent::MonitorEnded(ended) = alert
+                && ended.pid() == monitor_pid
+                && matches!(ended.end(), MonitorEnd::StopMatched { line } if line == "READY")
+            {
+                matched = true;
+            }
+        }
+        assert!(matched, "expected MonitorEnd::StopMatched for file monitor");
+
+        let settled = tool
+            .jobs()
+            .list()
+            .await
+            .into_iter()
+            .find(|job| job.pid == monitor_pid)
+            .expect("monitor job entry");
+        assert_ne!(
+            settled.status,
+            JobStatus::Running,
+            "file monitor's internal tail job must be killed on StopMatched even when kill_on_stop=false"
+        );
     }
 
     // ---- runtime grants -----------------------------------------------------

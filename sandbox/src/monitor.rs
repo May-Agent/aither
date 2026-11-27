@@ -222,6 +222,8 @@ pub enum MonitorRefusal {
         /// The regex error.
         reason: String,
     },
+    /// A `file` source omitted `stop_on` (or gave only whitespace).
+    MissingStopCondition,
     /// A file source the sandbox may not read.
     UnreadableFile {
         /// The path as given.
@@ -254,6 +256,9 @@ struct Watch {
     /// Whether this monitor spawned the job itself and therefore kills it on
     /// deadline timeout.
     owns_job: bool,
+    /// Whether this monitor watches a file via an internal `tail -Fn0` job,
+    /// which must be killed whenever the monitor stops.
+    is_file: bool,
     registry: JobRegistry,
     alerts: EventSender,
     interval: Duration,
@@ -436,6 +441,20 @@ where
     }
 }
 
+fn compile_optional_regex(
+    argument: &'static str,
+    pattern: Option<&str>,
+) -> Result<Option<regex::Regex>, MonitorRefusal> {
+    pattern
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| MonitorRefusal::BadRegex {
+                argument,
+                reason: error.to_string(),
+            })
+        })
+        .transpose()
+}
+
 impl<E: Executor + Clone + 'static> MonitorTool<E> {
     /// Starts the watched job and its pump; returns the job's PID.
     async fn start(&self, args: MonitorArgs) -> Result<u32, MonitorRefusal> {
@@ -454,19 +473,17 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
         if interval_secs == 0 {
             return Err(MonitorRefusal::IntervalTooSmall);
         }
-        let compile = |argument: &'static str, pattern: &Option<String>| {
-            pattern
+        let is_file = matches!(args.source, MonitorSource::File { .. });
+        if is_file
+            && args
+                .stop_on
                 .as_deref()
-                .map(|pattern| {
-                    regex::Regex::new(pattern).map_err(|error| MonitorRefusal::BadRegex {
-                        argument,
-                        reason: error.to_string(),
-                    })
-                })
-                .transpose()
-        };
-        let filter = compile("filter", &args.filter)?;
-        let stop_on = compile("stop_on", &args.stop_on)?;
+                .is_none_or(|pattern| pattern.trim().is_empty())
+        {
+            return Err(MonitorRefusal::MissingStopCondition);
+        }
+        let filter = compile_optional_regex("filter", args.filter.as_deref())?;
+        let stop_on = compile_optional_regex("stop_on", args.stop_on.as_deref())?;
         let (job, owns_job) = match &args.source {
             MonitorSource::Pid { pid } => {
                 let job = self
@@ -508,6 +525,12 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
                     .map_err(|error| MonitorRefusal::StartFailed {
                         reason: error.to_string(),
                     })?;
+                if is_file {
+                    self.terminal
+                        .job_registry()
+                        .mark_file_monitor(job.launch())
+                        .await;
+                }
                 (job, true)
             }
         };
@@ -516,6 +539,7 @@ impl<E: Executor + Clone + 'static> MonitorTool<E> {
         let watch = Watch {
             _job: job,
             owns_job,
+            is_file,
             pid,
             launch,
             registry: self.terminal.job_registry(),
@@ -558,6 +582,7 @@ async fn watch_task(watch: Watch) {
         launch,
         _job,
         owns_job,
+        is_file,
         registry,
         alerts,
         interval,
@@ -626,7 +651,7 @@ async fn watch_task(watch: Watch) {
                     last_output = now;
                 }
                 if let Some(line) = stop {
-                    if kill_on_stop {
+                    if kill_on_stop || is_file {
                         registry.kill_launch(launch).await;
                     }
                     Some(MonitorEnd::StopMatched { line })
