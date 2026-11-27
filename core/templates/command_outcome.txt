@@ -1,5 +1,5 @@
 {% match outcome %}{% when CommandOutcome::Exited { code: 0 } %}{% when CommandOutcome::Exited { code } %}Exit code: {{ code }}.
-{% when CommandOutcome::Running { pid, output } %}Started in background with PID {{ pid }}; output is being written to {{ output.url }} (absolute path: {{ output.path }}).
+{% when CommandOutcome::Running { pid, output } %}Started in background with PID {{ pid }}; output is being written to {{ output.url }} (absolute path: {{ output.path }}). Its completion is delivered automatically when it exits — end the turn if you have no other work instead of polling or calling monitor just to wait for it.
 {% when CommandOutcome::Killed { pid, notice } %}{{ notice }}
 PID: {{ pid }}.
 {% endmatch %}

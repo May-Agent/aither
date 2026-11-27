@@ -96,15 +96,18 @@ struct CutText<'a> {
     text: &'a str,
     max_lines: usize,
     byte_budget: usize,
+    /// Whether recognisable source code may be folded instead of head+tail
+    /// truncated.
+    allow_folding: bool,
 }
 
 /// Delivers a text output that exceeded a limit.
 ///
-/// The model-facing form is the folded view when the text is source code and
-/// the folded view fits `byte_budget`, otherwise the head+tail preview. That
-/// form, with its stored-output notice, is compared in bytes with the
-/// original: when it is not smaller the original is returned inline and
-/// uncut, and nothing is written to disk.
+/// The model-facing form is the folded view when `cut.allow_folding` is set,
+/// the text is source code and the folded view fits `byte_budget`, otherwise
+/// the head+tail preview. That form, with its stored-output notice, is
+/// compared in bytes with the original: when it is not smaller the original is
+/// returned inline and uncut, and nothing is written to disk.
 async fn cut_text_output(
     store: &OutputStore,
     format: OutputFormat,
@@ -115,6 +118,7 @@ async fn cut_text_output(
         text,
         max_lines,
         byte_budget,
+        allow_folding,
     } = cut;
 
     let wording = store.wording().clone();
@@ -122,9 +126,12 @@ async fn cut_text_output(
     let text_owned = text.to_owned();
     let preview = blocking::unblock(move || {
         let wording: &dyn ShellWording = &*wording;
-        let folded =
-            crate::output_compress::folded_code_content(&code_folder, &text_owned, wording)
-                .filter(|folded| folded.len() <= byte_budget);
+        let folded = allow_folding
+            .then(|| {
+                crate::output_compress::folded_code_content(&code_folder, &text_owned, wording)
+                    .filter(|folded| folded.len() <= byte_budget)
+            })
+            .flatten();
         folded.unwrap_or_else(|| {
             crate::output_compress::stored_preview(&text_owned, max_lines, byte_budget, wording)
                 .trim_end_matches('\n')
@@ -351,8 +358,10 @@ impl OutputStore {
     /// Saves text output with a line-count limit.
     ///
     /// When the output exceeds `max_lines` (or the byte limit), the full content
-    /// is saved to a file and the returned content carries a head+tail preview
-    /// within the caller's budget plus the file reference and read guidance.
+    /// is saved to a file and the returned content carries either a folded view
+    /// (when `allow_folding` is set and the output is recognisable source code)
+    /// or a head+tail preview within the caller's budget plus the file reference
+    /// and read guidance.
     ///
     /// # Errors
     ///
@@ -364,6 +373,7 @@ impl OutputStore {
         resolution: MediaResolution,
         max_lines: usize,
         byte_limit: Option<usize>,
+        allow_folding: bool,
     ) -> std::io::Result<CommandStream> {
         if data.is_empty() {
             return Ok(empty_stream());
@@ -407,6 +417,7 @@ impl OutputStore {
                 text: &text,
                 max_lines,
                 byte_budget,
+                allow_folding,
             },
         )
         .await
@@ -648,6 +659,7 @@ async fn save_large_output(
                 text: &text,
                 max_lines: usize::MAX,
                 byte_budget: store.policy().get().preview_bytes,
+                allow_folding: true,
             },
         )
         .await;
@@ -1071,6 +1083,7 @@ mod tests {
                 MediaResolution::Auto,
                 10_000,
                 Some(INLINE_OUTPUT_LIMIT),
+                true,
             )
             .await
             .unwrap();
@@ -1109,6 +1122,7 @@ mod tests {
                 MediaResolution::Auto,
                 3,
                 Some(INLINE_OUTPUT_LIMIT),
+                true,
             )
             .await
             .unwrap();
@@ -1147,6 +1161,7 @@ mod tests {
                 MediaResolution::Auto,
                 usize::MAX,
                 Some(INLINE_OUTPUT_LIMIT),
+                true,
             )
             .await
             .unwrap();
@@ -1215,6 +1230,7 @@ mod tests {
                 MediaResolution::Auto,
                 200,
                 Some(INLINE_OUTPUT_LIMIT),
+                true,
             )
             .await
             .unwrap();
@@ -1238,6 +1254,7 @@ mod tests {
                 MediaResolution::Auto,
                 200,
                 Some(INLINE_OUTPUT_LIMIT),
+                true,
             )
             .await
             .unwrap();
@@ -1303,6 +1320,7 @@ mod tests {
                 MediaResolution::Auto,
                 200,
                 Some(INLINE_OUTPUT_LIMIT),
+                true,
             )
             .await
             .unwrap();
@@ -1325,6 +1343,39 @@ mod tests {
 
     #[cfg(feature = "code-folding")]
     #[tokio::test]
+    async fn source_code_over_the_limit_is_not_folded_when_folding_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = rust_source(40);
+        assert!(data.lines().count() > 200);
+
+        let entry = store(dir.path())
+            .save_text_with_line_limit(
+                data.as_bytes(),
+                OutputFormat::Text,
+                MediaResolution::Auto,
+                200,
+                Some(INLINE_OUTPUT_LIMIT),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let CommandStream::Stored {
+            preview: text,
+            file,
+            ..
+        } = entry
+        else {
+            panic!("expected stored entry with a head+tail preview");
+        };
+        assert!(!text.contains("Code folded"), "{text}");
+        assert!(text.contains("[... lines"), "{text}");
+        assert!(text.contains("step_3 ="), "bodies stay verbatim: {text}");
+        assert_eq!(std::fs::read_to_string(file.path).unwrap(), data);
+    }
+
+    #[cfg(feature = "code-folding")]
+    #[tokio::test]
     async fn small_source_code_is_left_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let data = rust_source(3);
@@ -1336,6 +1387,7 @@ mod tests {
                 MediaResolution::Auto,
                 200,
                 Some(INLINE_OUTPUT_LIMIT),
+                true,
             )
             .await
             .unwrap();

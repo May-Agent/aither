@@ -20,19 +20,34 @@ use crate::ScriptCheck;
 ///
 /// Either way the output is rendered as a terminal shows it: escape
 /// sequences are consumed and `\r` resolves to the last frame of each line.
-/// Output over the inline budget is cut the same way under both: the text
-/// is written to disk whole and named, and the model reads a folded view or
-/// a preview of it.
+/// When output exceeds the inline budget, [`Command`](Self::Command) and
+/// [`VerbatimFoldable`](Self::VerbatimFoldable) replace head+tail truncation
+/// with structural code folding for recognisable source code, while
+/// [`Verbatim`](Self::Verbatim) never folds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputTreatment {
     /// Command output: after rendering, each run of blank lines collapses
-    /// into one marker line, and a JSON array of records becomes TSV whose
-    /// original is written to disk and named.
+    /// into one marker line, a JSON array of records becomes TSV whose
+    /// original is written to disk and named, and cut source code is folded.
     #[default]
     Command,
-    /// Content the script printed as it is, such as a file it read: nothing
-    /// after rendering changes the text.
+    /// Whole-file content printed verbatim (such as an un-ranged `cat` of a
+    /// large file): blank lines and JSON are kept verbatim, while cut source
+    /// code is folded instead of head+tail truncated.
+    VerbatimFoldable,
+    /// Targeted content the script printed as it is (such as a ranged file
+    /// read or search): nothing after rendering changes the text, and cut
+    /// output uses head+tail preview rather than code folding.
     Verbatim,
+}
+
+impl OutputTreatment {
+    /// Whether cut source code under this treatment is folded instead of
+    /// head+tail truncated.
+    #[must_use]
+    pub const fn allows_folding(self) -> bool {
+        matches!(self, Self::Command | Self::VerbatimFoldable)
+    }
 }
 
 /// Chooses the [`OutputTreatment`] of every script of a shell, before it
@@ -67,5 +82,17 @@ impl AnyTreatOutput {
 impl fmt::Debug for AnyTreatOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("AnyTreatOutput")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputTreatment;
+
+    #[test]
+    fn allows_folding_matches_treatment_policy() {
+        assert!(OutputTreatment::Command.allows_folding());
+        assert!(OutputTreatment::VerbatimFoldable.allows_folding());
+        assert!(!OutputTreatment::Verbatim.allows_folding());
     }
 }
