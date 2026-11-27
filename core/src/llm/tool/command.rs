@@ -544,7 +544,7 @@ mod tests {
                     output: file(),
                 },
             ),
-            "Started in background with PID 4242; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt).\n"
+            "Started in background with PID 4242; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt). Its completion is delivered automatically when it exits — end the turn if you have no other work instead of polling or calling monitor just to wait for it.\n"
         );
         assert_eq!(
             result(
@@ -619,7 +619,7 @@ mod tests {
         };
         assert_eq!(
             running.render_for_model(),
-            "Started in background with PID 48210; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt).\n"
+            "Started in background with PID 48210; output is being written to outputs/x.txt (absolute path: /sandbox/outputs/x.txt). Its completion is delivered automatically when it exits — end the turn if you have no other work instead of polling or calling monitor just to wait for it.\n"
         );
     }
 }

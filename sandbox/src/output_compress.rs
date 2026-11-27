@@ -17,14 +17,16 @@
 //! character the command actually produced, down to whether it ended with a
 //! line terminator. Stages 2 and 3 apply to
 //! [`Command`](OutputTreatment::Command) output alone: output the embedder
-//! keeps [`Verbatim`](OutputTreatment::Verbatim), such as a file a script
-//! read, reaches the model as stage 1 rendered it.
+//! keeps [`Verbatim`](OutputTreatment::Verbatim) or
+//! [`VerbatimFoldable`](OutputTreatment::VerbatimFoldable), such as a file a
+//! script read, reaches the model as stage 1 rendered it.
 //!
 //! Stages 3 and 4 are lossy and only run where the text they replace is
 //! written to disk and named in the text the model reads. Stage 3 runs in
 //! [`compress_text`]. Stages 4 and 5 belong to the cut path in
 //! [`crate::output`], which owns the inline budget: output that is not cut is
-//! never folded, and a cut form that is not smaller than the output is
+//! never folded, [`Verbatim`](OutputTreatment::Verbatim) output is never
+//! folded even when cut, and a cut form that is not smaller than the output is
 //! dropped for the output itself.
 
 mod collapse;
@@ -91,7 +93,9 @@ pub async fn compress_text(
 
     let rendered = render::render_terminal(text);
     let cleaned = match treatment {
-        OutputTreatment::Verbatim => return Ok((rendered != text).then_some(rendered)),
+        OutputTreatment::Verbatim | OutputTreatment::VerbatimFoldable => {
+            return Ok((rendered != text).then_some(rendered));
+        }
         OutputTreatment::Command => collapse::collapse_blank_runs(&rendered, &**store.wording()),
     };
 

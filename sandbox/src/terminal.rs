@@ -3324,6 +3324,16 @@ impl StdoutTreatment {
             Self::Cleaned(treatment)
         }
     }
+
+    /// Whether cut source code under this treatment may be folded.
+    ///
+    /// [`Self::Raw`] never folds.
+    const fn allows_folding(self) -> bool {
+        match self {
+            Self::Raw => false,
+            Self::Cleaned(treatment) => treatment.allows_folding(),
+        }
+    }
 }
 
 /// Where a run starts: `dir` on the host, mapped through the workspace
@@ -4646,6 +4656,7 @@ async fn save_completed_stdout(
             format.resolution,
             format.max_lines,
             byte_limit,
+            !format.background_output && format.stdout.allows_folding(),
         )
         .await
     {
@@ -10104,7 +10115,7 @@ mod tests {
         assert_eq!(
             rendered,
             format!(
-                "Started in background with PID {job_pid}; output is being written to {} (absolute path: {}).\n",
+                "Started in background with PID {job_pid}; output is being written to {} (absolute path: {}). Its completion is delivered automatically when it exits — end the turn if you have no other work instead of polling or calling monitor just to wait for it.\n",
                 started.output_file.url, started.output_file.path
             )
         );
