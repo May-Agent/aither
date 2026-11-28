@@ -198,6 +198,29 @@ fn assistants(agent: &TestAgent) -> Vec<Message> {
         .collect()
 }
 
+#[cfg(feature = "connectivity")]
+#[tokio::test]
+async fn a_stream_that_opens_without_a_default_route_is_retried() {
+    let llm = BreakingLlm::new(
+        immediate(1),
+        [
+            vec![Ok(text("partial")), network_break()],
+            vec![Ok(text("complete"))],
+        ],
+    );
+    let (connectivity, _controller) = aither_connectivity::Connectivity::manual(false);
+    let mut agent = AgentBuilder::new(llm.clone())
+        .connectivity(connectivity)
+        .build();
+
+    let (result, events) = run(&mut agent, "answer").await;
+
+    result.expect("the provider was reachable without a default route");
+    assert_eq!(retries(&events), [(1, 1, Duration::ZERO)]);
+    assert_eq!(llm.requests().len(), 2);
+    assert_eq!(assistants(&agent)[0].content(), "complete");
+}
+
 #[tokio::test]
 async fn a_stream_that_breaks_mid_response_is_sent_again_and_only_the_replacement_is_kept() {
     let llm = BreakingLlm::new(

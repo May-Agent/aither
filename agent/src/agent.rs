@@ -1197,10 +1197,10 @@ where
     ///
     /// A failure before the first event is the provider's to retry, since it
     /// retries establishing the stream itself; a break after it is retried
-    /// here, under the model's [`RetryPolicy`], unless the machine is
-    /// offline. The broken attempt's text, calls and reasoning are dropped
-    /// with it, and the request sent again is the one recorded as the last
-    /// request, so the provider reads the same cached prefix.
+    /// here, under the model's [`RetryPolicy`], unless the machine lost
+    /// connectivity during the attempt. The broken attempt's text, calls and
+    /// reasoning are dropped with it, and the retry reuses the recorded
+    /// request so the provider reads the same cached prefix.
     async fn collect_model_turn(
         &mut self,
         mut request: LLMRequest,
@@ -1218,6 +1218,7 @@ where
                 request: id,
                 prefix: prefix.clone(),
             });
+            let started_offline = self.connectivity.is_offline();
             let broken = match self
                 .stream_model_turn(request, &retry_request, id, &mut pending_tail, events)
                 .await
@@ -1232,15 +1233,15 @@ where
                 }
                 Err(broken) => broken,
             };
+            // An already-offline host can still reach a provider on its local
+            // network. Suppress retries when the host goes offline during the attempt.
+            let went_offline = !started_offline && self.connectivity.is_offline();
             let retry_failure = if broken.malformed {
                 let transient = Failure::transient();
-                (policy.allows(retries, &transient) && !self.connectivity.is_offline())
-                    .then_some(transient)
+                (policy.allows(retries, &transient) && !went_offline).then_some(transient)
             } else {
                 broken.error.failure().copied().filter(|failure| {
-                    broken.opened
-                        && policy.allows(retries, failure)
-                        && !self.connectivity.is_offline()
+                    broken.opened && policy.allows(retries, failure) && !went_offline
                 })
             };
             let Some(failure) = retry_failure else {
