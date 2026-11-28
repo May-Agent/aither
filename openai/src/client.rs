@@ -1171,7 +1171,13 @@ fn responses_stream_inner(
         loop {
             let event = match within_idle(cfg.idle_timeout, sse_stream.next()).await {
                 Ok(Some(event)) => event,
-                Ok(None) => break,
+                Ok(None) => {
+                    yield Err(zenwave::BodyError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Responses stream ended before a terminal event",
+                    )).into());
+                    return;
+                }
                 Err(e) => {
                     yield Err(e);
                     return;
@@ -1184,7 +1190,7 @@ fn responses_stream_inner(
                     }
                     let data = e.text_data();
                     if data == "[DONE]" {
-                        continue;
+                        break;
                     }
                     tracing::trace!(sse_event = %data, "Received Responses API SSE event");
 
@@ -1325,6 +1331,7 @@ fn responses_stream_inner(
                                         yield Ok(Event::Usage(final_usage));
                                         usage_emitted = true;
                                     }
+                                    break;
                                 }
                                 ResponsesStreamEvent::ResponseIncomplete { response } => {
                                     let mut final_usage = response
@@ -1346,6 +1353,7 @@ fn responses_stream_inner(
                                     usage = Some(final_usage.clone());
                                     yield Ok(Event::Usage(final_usage));
                                     usage_emitted = true;
+                                    break;
                                 }
                                 ResponsesStreamEvent::ResponseFailed { response } => {
                                     let (code, message) = response
@@ -2042,6 +2050,7 @@ mod tests {
                 script.push(Step::Send(text_event(api, "x")));
                 script.push(Step::Pause(GAP));
             }
+            script.push(Step::Send("data: [DONE]\n\n".to_string()));
             let url = serve_scripted(vec![script]);
             let client = scripted_client(api, url, RetryPolicy::none());
             let started = std::time::Instant::now();
@@ -2216,6 +2225,33 @@ mod tests {
         assert_eq!(mapped2.prompt_tokens, Some(17200));
         assert_eq!(mapped2.total_tokens, Some(17210));
         assert_eq!(mapped2.cache_read_tokens, Some(8200));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_reports_a_network_failure_on_premature_eof() {
+        let url = serve_scripted(vec![vec![
+            Step::Send(SSE_HEAD.to_string()),
+            Step::Send(text_event(ApiKind::Responses, "partial")),
+        ]]);
+        let client = scripted_client(ApiKind::Responses, url, RetryPolicy::none());
+        let stream = client.respond(oneshot("system", "hello"));
+        futures_lite::pin!(stream);
+
+        let text = stream.next().await.expect("text event").expect("ok text");
+        assert!(matches!(text, Event::Text(ref text) if text == "partial"));
+
+        let error = stream
+            .next()
+            .await
+            .expect("terminal error")
+            .expect_err("EOF without a terminal event is a failure");
+        assert!(matches!(
+            error,
+            OpenAIError::Body(zenwave::BodyError::Io(ref source))
+                if source.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(error.failure().kind, aither_core::llm::FailureKind::Network);
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
