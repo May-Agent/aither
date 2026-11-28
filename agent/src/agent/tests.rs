@@ -19,9 +19,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
-    Agent, AgentBuilder, AgentCheckpoint, AgentError, AgentEvent, AgentPath, Block, ContextBlock,
-    ContextSource, Hooks, InjectionKind, Moment, RunOutcome, SourceId, StopCx, StopDecision,
-    SubagentRuns, TimedEvent, ToolDecision, ToolInvocation, ToolVerdict,
+    Agent, AgentBuilder, AgentCheckpoint, AgentError, AgentEvent, AgentPath, Block,
+    CompactionOutcome, ContextBlock, ContextPolicy, ContextSource, Hooks, InjectionKind, Moment,
+    RunOutcome, SourceId, StopCx, StopDecision, SubagentRuns, TimedEvent, ToolDecision,
+    ToolInvocation, ToolVerdict,
 };
 
 #[derive(Debug)]
@@ -1645,4 +1646,144 @@ async fn a_compaction_on_a_compaction_model_carries_no_session_cache_controls() 
         request.parameters().cache.is_empty(),
         "a compaction model's request carries no session cache controls"
     );
+}
+
+#[derive(Clone)]
+struct GatedCompactionModel {
+    requests: Arc<Mutex<Vec<LLMRequest>>>,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    reply: String,
+}
+
+impl LanguageModel for GatedCompactionModel {
+    type Error = NeverFails;
+
+    fn respond(
+        &self,
+        request: LLMRequest,
+    ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+        self.requests.lock().unwrap().push(request);
+        let started = self.started.clone();
+        let release = self.release.clone();
+        let reply = self.reply.clone();
+        futures_lite::stream::once_future(async move {
+            started.notify_one();
+            release.notified().await;
+            Ok(Event::Text(reply))
+        })
+    }
+
+    fn profile(&self) -> impl std::future::Future<Output = Result<Profile, Self::Error>> + Send {
+        std::future::ready(Ok(Profile::new(
+            "mock",
+            "test",
+            "gated-compactor",
+            "gated compactor",
+            128_000,
+        )))
+    }
+}
+
+#[tokio::test]
+async fn manual_compact_while_compaction_in_flight_awaits_it_without_starting_a_second_request() {
+    let handoff_json = r#"{"current_task":"keep going","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":["reply"],"recovery_hints":[],"skills":[]}"#;
+
+    let main_llm = ClaudeScripted::new(
+        128_000,
+        [say("first reply"), say("second reply"), say("third reply")],
+    );
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let compactor = GatedCompactionModel {
+        requests: Arc::new(Mutex::new(Vec::new())),
+        started: started.clone(),
+        release: release.clone(),
+        reply: handoff_json.to_string(),
+    };
+
+    let policy = ContextPolicy {
+        compact_ceiling: 20_000,
+        start_distance: 15_000,
+        warn_distance: 18_000,
+        compaction_floor: 1,
+        ..ContextPolicy::default()
+    };
+
+    let mut agent = AgentBuilder::new(main_llm.clone())
+        .context_policy(policy)
+        .compaction_model(
+            compactor.clone(),
+            aither_core::llm::model::Parameters::default(),
+        )
+        .build();
+
+    // First turn pushes the estimated window past start_point (5_000), forking
+    // a background compaction on `compactor` during the turn.
+    let (first, first_events) = run_to_end(&mut agent, &"word ".repeat(8_000)).await;
+    first.expect("first run");
+    assert!(
+        first_events
+            .iter()
+            .any(|timed| matches!(timed.event, AgentEvent::CompactionStarted { .. })),
+        "background compaction should start during the first turn: {first_events:?}"
+    );
+
+    // Release the in-flight background compaction once it reaches the model.
+    let release_task = {
+        let started = started.clone();
+        let release = release.clone();
+        tokio::spawn(async move {
+            started.notified().await;
+            release.notify_one();
+        })
+    };
+
+    let ControlFlow::Continue(compact_events) = agent
+        .compact(Some("manual focus"))
+        .drive(
+            Vec::new(),
+            std::future::pending::<std::convert::Infallible>(),
+            |mut seen, timed| async move {
+                seen.push(timed.event);
+                ControlFlow::Continue(seen)
+            },
+        )
+        .await
+        .expect("manual compact awaits and applies the in-flight compaction");
+    release_task.await.expect("release task completes");
+
+    assert_eq!(
+        compactor.requests.lock().unwrap().len(),
+        1,
+        "manual compact must reuse the in-flight compaction instead of issuing a second request"
+    );
+    assert!(
+        !compact_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompactionStarted { .. })),
+        "reusing an already-announced compaction must not emit a duplicate start: {compact_events:?}"
+    );
+    assert!(
+        !compact_events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CompactionEnded {
+                outcome: CompactionOutcome::Discarded
+            }
+        )),
+        "in-flight compaction must not be discarded: {compact_events:?}"
+    );
+    assert!(
+        compact_events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CompactionEnded {
+                outcome: CompactionOutcome::Applied(_)
+            }
+        )),
+        "in-flight compaction should apply cleanly: {compact_events:?}"
+    );
+
+    // Next turn succeeds on the compacted context.
+    let (third, _) = run_to_end(&mut agent, "after compact").await;
+    third.expect("third run after applied compaction");
 }

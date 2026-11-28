@@ -3,9 +3,10 @@
 //! Automatic, idle, manual and tool-called compaction all reach the window
 //! through this state, so there is only ever one handoff in the making: it is
 //! either running in the background, landed and waiting for a request
-//! boundary, or absent. Starting a compaction of any kind retires whatever
-//! the state held, and a handoff forked from an older window is therefore
-//! never applied on top of a newer one.
+//! boundary, or absent. While one compaction is running or landed, another
+//! compaction request awaits and applies it rather than starting a duplicate
+//! request; [`CompactionState::retire`] drops a stale handoff only when the
+//! conversation itself is replaced or cleared.
 
 use crate::context::{CompletedCompaction, PendingCompaction};
 

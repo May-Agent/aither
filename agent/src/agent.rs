@@ -2136,11 +2136,12 @@ where
     /// starting fresh, focused on `focus` when one is given. Driven like
     /// [`run`](Self::run).
     ///
-    /// The run emits [`AgentEvent::CompactionStarted`] and then
-    /// [`AgentEvent::CompactionEnded`], whose
-    /// [`CompactionOutcome`] carries the [`CompactResult`] when the handoff
-    /// applied. A compaction forked earlier alongside a run is stale once this
-    /// one starts: it finishes as [`CompactionOutcome::Discarded`] first.
+    /// When no compaction is active, the run emits
+    /// [`AgentEvent::CompactionStarted`] and then
+    /// [`AgentEvent::CompactionEnded`], whose [`CompactionOutcome`] carries the
+    /// [`CompactResult`] when the handoff applied. When a compaction is already
+    /// running in the background or has landed, this run awaits and applies it
+    /// without starting a second compaction request.
     ///
     /// # Errors
     ///
@@ -2168,6 +2169,10 @@ where
     }
 
     /// Runs one compaction to its end, announcing it on `events`.
+    ///
+    /// If a compaction is already running or has landed, waits for and applies
+    /// that in-flight compaction instead of discarding it and issuing a second
+    /// summarization request.
     async fn compact_streaming(
         &mut self,
         focus: Option<&str>,
@@ -2176,10 +2181,22 @@ where
     ) -> Result<Option<CompactResult>, AgentError> {
         self.ensure_initialized().await?;
         self.settle_interrupted_tool_calls();
-        // This handoff describes the whole conversation as it stands, so a
-        // compaction forked earlier, running or landed, is stale from here.
-        self.compaction.retire();
-        self.finish_compaction(events, CompactionOutcome::Discarded);
+        if self.compaction.landed().is_some() {
+            return Ok(self.apply_completed_compaction(events).await);
+        }
+        if let Some(mut pending) = self.compaction.take_running() {
+            match pending.wait().await {
+                Ok(completed) => {
+                    self.compaction.land(completed);
+                    return Ok(self.apply_completed_compaction(events).await);
+                }
+                Err(error) => {
+                    let error = AgentError::from(error);
+                    self.finish_compaction(events, CompactionOutcome::Failed(error.clone()));
+                    return Err(error);
+                }
+            }
+        }
         self.announce_compaction(events, trigger);
         match self.fork_and_apply(focus, events).await {
             Ok(Some(result)) => Ok(Some(result)),
