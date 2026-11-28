@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/core-v0.31.0...core-v0.32.0) - 2026-11-28
+
+### Added
+
+- *(sandbox)* tap pipeline stages and retain expensive stage outputs
+- *(core,agent,providers)* support attachments on tool result messages
+
+### Fixed
+
+- *(core,derive)* fix schema/macro correctness, feature gates, token counting, and command rendering
+
+### Other
+
+- Add RewriteScript hook and CommandResult notice
+- Add folding treatment gate, ForegroundWait scaling, and background delivery wording
+- Merge remote-tracking branch 'origin/main' into feat/816-pid-jobs
+- Expose real PIDs for jobs and enforce signal isolation in heel
+- Merge pull request #815 from May-Agent/fix/794-thiserror
+- Replace anyhow with typed errors across the workspace
+- Port the keep-warm mechanics to per-request, economics-gated entries
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/core-v0.30.0...core-v0.31.0) - 2026-11-13
 
 ### Added

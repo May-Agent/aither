@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/openai-v0.31.0...openai-v0.32.0) - 2026-11-28
+
+### Added
+
+- *(core,agent,providers)* support attachments on tool result messages
+
+### Fixed
+
+- *(openai)* preserve reasoning summary on replay and parse cache_write_tokens
+- *(ci)* gate native-only provider deps off wasm32 and compute changed files from git diff
+
+### Other
+
+- Report premature Responses stream EOF as a network failure
+- inline local file:// images on non-OpenAI and store=false Responses endpoints
+- Replace anyhow with typed errors across the workspace
+- Harden cloud and local provider streaming, auth, and error handling
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/openai-v0.30.0...openai-v0.31.0) - 2026-11-13
 
 ### Added

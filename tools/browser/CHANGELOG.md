@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/browser-v0.31.0...browser-v0.32.0) - 2026-11-28
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/browser-v0.30.0...browser-v0.31.0) - 2026-11-13
 
 ### Added

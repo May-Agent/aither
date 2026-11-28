@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/mcp-v0.31.0...mcp-v0.32.0) - 2026-11-28
+
+### Fixed
+
+- *(mcp,acp,rag)* drain oversized frames, own embed batch inputs, restore docs
+- *(mcp,acp,rag,mem0)* harden protocol, rag, and mem0 crates
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/mcp-v0.30.0...mcp-v0.31.0) - 2026-11-13
 
 ### Added

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/webfetch-v0.31.0...webfetch-v0.32.0) - 2026-11-28
+
+### Fixed
+
+- *(sandbox,tools,cli)* complete approval gating and job lifecycle hardening
+- *(sandbox,tools,cli)* harden ContainerIpc, SSRF/path guards, job buffers, Magika pooling, and CLI approvals
+- gate apple native deps off non-apple targets and const default_fetcher
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/webfetch-v0.30.0...webfetch-v0.31.0) - 2026-11-13
 
 ### Added

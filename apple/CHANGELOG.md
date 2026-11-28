@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/apple-v0.31.0...apple-v0.32.0) - 2026-11-28
+
+### Fixed
+
+- *(apple)* reject tool output attachments in transcript
+- gate apple native deps off non-apple targets and const default_fetcher
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/apple-v0.30.0...apple-v0.31.0) - 2026-11-13
 
 ### Fixed

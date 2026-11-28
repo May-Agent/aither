@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/acp-v0.31.0...acp-v0.32.0) - 2026-11-28
+
+### Added
+
+- *(acp)* [**breaking**] redesign as a dual-stack v1/v2 API
+- *(acp)* add session/fork and custom request fallback on AgentHandler
+
+### Fixed
+
+- *(mcp,acp,rag)* drain oversized frames, own embed batch inputs, restore docs
+- *(acp,mem0)* harden acp rpc and prompt rendering
+- *(acp)* gate PromptTurn's end on its own request; dedupe v1 mode option
+- *(acp)* [**breaking**] nest permission outcome on the wire; forward auth meta
+- *(acp)* gate devin_smoke example on the process feature
+
+### Other
+
+- Add ClientBuilder::in_process_server for configured servers
+- Replace anyhow with typed errors across the workspace
+- *(acp)* feature-free lib examples for the portability lane
+- Closes #785
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/acp-v0.30.0...acp-v0.31.0) - 2026-11-13
 
 ### Added
