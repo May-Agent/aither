@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/copilot-v0.31.0...copilot-v0.32.0) - 2026-11-28
+
+### Added
+
+- *(core,agent,providers)* support attachments on tool result messages
+
+### Other
+
+- Replace anyhow with typed errors across the workspace
+- Widen scheduling margin in Copilot keepalive idle-timeout test
+- Harden cloud and local provider streaming, auth, and error handling
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/copilot-v0.30.0...copilot-v0.31.0) - 2026-11-13
 
 ### Added

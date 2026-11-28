@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/agent-v0.31.0...agent-v0.32.0) - 2026-11-28
+
+### Added
+
+- *(core,agent,providers)* support attachments on tool result messages
+
+### Fixed
+
+- *(agent,sandbox)* reuse in-flight compaction and reap pipeline tap sidecar
+- *(agent)* fold post-fork activity and user turns into compaction handoffs
+- *(agent)* enforce Claude system-turn adjacency, cache invariants, kept exchanges, and stream fusion
+
+### Other
+
+- Retry opened model streams without a default route
+- Merge pull request #815 from May-Agent/fix/794-thiserror
+- Replace anyhow with typed errors across the workspace
+- Merge pull request #813 from May-Agent/feat/812-cache-warming
+- Scale the keep-warm dispatch margin to the entry's lifetime
+- Fuse keep-warm math and fix test doc formatting
+- Port the keep-warm mechanics to per-request, economics-gated entries
+- Warm cache entries with one output token and reset warmth on model swap
+- Skip session cache controls on compaction-model requests
+- require Rust 1.100 and enforce native Cargo dependency lints
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/agent-v0.30.0...agent-v0.31.0) - 2026-11-13
 
 ### Added

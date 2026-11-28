@@ -1,0 +1,45 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.32.0](https://github.com/May-Agent/aither/compare/aither-dap-v0.31.0...aither-dap-v0.32.0) - 2026-11-28
+
+### Added
+
+- *(agent)* [**breaking**] move the workspace consumers onto the new loop surface
+- add Apple Intelligence provider
+- [**breaking**] tools report progress during a call; aither-mcp forwards it as notifications/progress ([#79](https://github.com/May-Agent/aither/pull/79))
+- implement the ACP server and remove the last placeholders
+- add aither-llama integration with initial implementation and dependencies
+- implement Coder and DeepResearchAgent for enhanced coding workflows and research capabilities
+- add thinking configuration and reasoning capabilities to moderation and content generation
+- update CI workflows, add tests for multiple OS, and remove deprecated release-plz workflow
+- Add OpenAI integration with support for various models and functionalities
+- add ai-types-derive crate for procedural macros
+
+### Fixed
+
+- *(dap)* serialize clientID/adapterID and surface structured error details
+
+### Other
+
+- Add aither-dap crate for structured DAP debugging
+- Replace anyhow with typed errors across the workspace
+- remove the sed and patch programs
+- *(sandbox)* [**breaking**] the IPC bridge and the tool distribution leave aither
+- refresh README with agent, sandbox, MCP/ACP, and provider crates
+- Add repository guidelines, integrate Claude and OpenAI modules, and update workspace configuration
+- Rename `ai-types` to aither
+- Release v0.0.1
+- Fix badge x2
+- Fix badge
+- Ready for 0.0.1 again
+- Better document
+- Add audio support
+- Ready for 0.0.1
+- initial comment

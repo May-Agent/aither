@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0](https://github.com/May-Agent/aither/compare/claude-v0.31.0...claude-v0.32.0) - 2026-11-28
+
+### Added
+
+- *(core,agent,providers)* support attachments on tool result messages
+
+### Fixed
+
+- *(ci)* gate native-only provider deps off wasm32 and compute changed files from git diff
+
+### Other
+
+- Merge pull request #815 from May-Agent/fix/794-thiserror
+- Replace anyhow with typed errors across the workspace
+- Port the keep-warm mechanics to per-request, economics-gated entries
+- Harden cloud and local provider streaming, auth, and error handling
+
 ## [0.31.0](https://github.com/May-Agent/aither/compare/claude-v0.30.0...claude-v0.31.0) - 2026-11-13
 
 ### Added
