@@ -6,14 +6,14 @@ import select
 import shutil
 import struct
 import sys
-import tempfile
 import termios
 import time
 
 MAGIC = bytes.fromhex(sys.argv[1])
 MUX_FD = int(sys.argv[2])
 READY_FD = int(sys.argv[3])
-PIPELINES = json.loads(sys.argv[4])
+TAP_DIR = sys.argv[4]
+PIPELINES = json.loads(sys.argv[5])
 
 MAX_FRAME_DATA = 500
 BACKPRESSURE_HIGH = 65536
@@ -100,10 +100,8 @@ def safe_unlink(path):
         pass
 
 
-try:
-    tap_dir = os.path.abspath(tempfile.mkdtemp(prefix=".aither-tap-"))
-except OSError:
-    tap_dir = os.path.abspath(tempfile.mkdtemp(prefix=".aither-tap-", dir="."))
+tap_dir = os.path.abspath(TAP_DIR)
+ready_path = os.path.join(tap_dir, "ready")
 
 rset = set()
 wset = set()
@@ -373,7 +371,7 @@ def drop_unstarted_stages():
                 st.settled = True
 
 
-write_all(READY_FD, (tap_dir + "\n").encode("utf-8"))
+write_all(READY_FD, b"ok\n")
 os.close(READY_FD)
 
 ctl_buf = b""
@@ -424,6 +422,7 @@ try:
                         ctl_w_hold = close_fd(ctl_w_hold)
                         outer_w_hold = close_fd(outer_w_hold)
                         quit_r_hold = close_fd(quit_r_hold)
+                        safe_unlink(ready_path)
                         safe_unlink(ctl_path)
                         safe_unlink(outer_path)
                         safe_unlink(quit_path)

@@ -1577,5 +1577,34 @@ cat patch.txt
             assert!(text.contains("你好 こんにちは 안녕하세요"), "{text}");
             assert!(text.contains("*** Second"), "{text}");
         }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn tapped_foreground_pipeline_reaps_sidecar_with_no_killed_descendants_and_supports_bare_wait()
+         {
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().canonicalize().expect("canonicalize");
+            let shell = build_shell(&dir, test_budgets::limits()).await;
+
+            for script in [
+                "printf 'a\\nb\\nc\\n' | head -n 1",
+                "yes hi | head -n 2",
+                "printf 'x\\n' | cat; sleep 0.05 & wait",
+            ] {
+                let res = shell
+                    .call(shell_args(script, false, false), ToolContext::new())
+                    .await
+                    .expect("tapped pipeline runs");
+                let cmd = res.command().expect("command result");
+                assert_eq!(
+                    cmd.outcome,
+                    CommandOutcome::Exited { code: 0 },
+                    "{script}: {cmd:?}"
+                );
+                assert_eq!(
+                    cmd.notice, None,
+                    "pipeline tap sidecar must exit and be reaped before bash exits ({script}): {cmd:?}"
+                );
+            }
+        }
     }
 }
